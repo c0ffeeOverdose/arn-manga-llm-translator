@@ -1,0 +1,30 @@
+arn-manga-llm-translator
+Copyright 2026 c0ffeeOverdose
+
+This product is licensed under GPL-3.0-only (see LICENSE). The models below
+are downloaded at runtime by the user (never bundled in this repository) from
+the mirror c0ffeeOverdose/arn-manga-models and cached in the browser's
+IndexedDB. They keep their own licenses; all of them permit this use
+(Apache-2.0 components are one-way compatible into GPL-3.0).
+
+This product includes the following developed by third parties:
+
+  Comic Text Detector (ctd-int8.onnx, int8 quantized locally from fp32)
+    Weights: dmMaze/comic-text-detector (https://github.com/dmMaze/comic-text-detector)
+    ONNX export by lemondouble/lemon-manga-translator
+    License: GPL-3.0
+    Reproduce: sh scripts/fetch-models.sh
+
+  Manga panel detector (panel-yolo26n.onnx, exported locally from .pt)
+    Model: leoxs22/manga-panel-detector-yolo26n
+           (https://huggingface.co/leoxs22/manga-panel-detector-yolo26n)
+    by Leandro Narosky, trained on Manga109-s
+    License: Apache-2.0
+    Manga109-s condition 5 allows commercial use of results with dataset
+    attribution. Reproduce: sh scripts/export-panel-onnx.sh
+
+  Baberu OCR (genshiai-daichi/baberu-ocr)
+    License: Apache-2.0
+
+  Tesseract language data (tesseract-ocr/tessdata_fast)
+    License: Apache-2.0

@@ -1,0 +1,48 @@
+# build artifacts
+dist/
+dist-firefox/
+.test-build/
+
+# models (downloaded via scripts/fetch-models.sh, never bundled)
+models/
+*.onnx
+*.pt
+
+# local test state (real profiles, real LLM keys, real site URLs — never commit)
+.test-local/
+tmp/
+demo/
+eval/
+eval/out/
+
+# store submission pack (reviewer URLs, copyrighted screenshots — never public)
+submission/
+
+# dependencies
+node_modules/
+
+# python
+__pycache__/
+.venv/
+
+# agent/tooling config (machine-local; AGENTS.md documents private test sites)
+.agents/
+.opencode/
+.playwright-mcp/
+opencode.json
+skills-lock.json
+AGENTS.md
+
+# secrets
+*.env
+.env*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# misc
+*.log
+arn-manga-*.zip
+# package-lock.json is COMMITTED on purpose: AMO source review requires a
+# lockfile so reviewers can rebuild byte-identical output (npm ci)
