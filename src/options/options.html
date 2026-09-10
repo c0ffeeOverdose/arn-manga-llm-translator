@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arn Manga LLM Translator — Settings</title>
+<style>
+  :root {
+    /* dark is the default; light only when the OS explicitly asks */
+    --bg: #0d0e14;
+    --surface: #151722;
+    --surface-2: #1c1f2e;
+    --border: rgba(255,255,255,.07);
+    --border-strong: rgba(255,255,255,.12);
+    --text: #e8eaf2;
+    --muted: #a3a8c0;
+    --accent: #8b5cf6;
+    --accent-2: #7c3aed;
+    --accent-glow: rgba(139,92,246,.35);
+    --ok: #4ade80;
+    --err: #f87171;
+    --shadow-card: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+    --shadow-pop: 0 2px 4px rgba(0,0,0,.35), 0 12px 32px rgba(0,0,0,.4);
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7fb;
+      --surface: #ffffff;
+      --surface-2: #eef0f7;
+      --border: rgba(20,22,40,.08);
+      --border-strong: rgba(20,22,40,.14);
+      --text: #191b26;
+      --muted: #676d85;
+      --accent: #7c3aed;
+      --accent-2: #6d28d9;
+      --accent-glow: rgba(124,58,237,.28);
+      --ok: #15803d;
+      --err: #dc2626;
+      --shadow-card: 0 1px 2px rgba(20,22,40,.05), 0 8px 24px rgba(20,22,40,.07);
+      --shadow-pop: 0 2px 4px rgba(20,22,40,.08), 0 12px 32px rgba(20,22,40,.12);
+      color-scheme: light;
+    }
+  }
+  /* explicit choice (mtTheme) beats the OS default above */
+  :root[data-theme="dark"] {
+    --bg: #0d0e14;
+    --surface: #151722;
+    --surface-2: #1c1f2e;
+    --border: rgba(255,255,255,.07);
+    --border-strong: rgba(255,255,255,.12);
+    --text: #e8eaf2;
+    --muted: #a3a8c0;
+    --accent: #8b5cf6;
+    --accent-2: #7c3aed;
+    --accent-glow: rgba(139,92,246,.35);
+    --ok: #4ade80;
+    --err: #f87171;
+    --shadow-card: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+    --shadow-pop: 0 2px 4px rgba(0,0,0,.35), 0 12px 32px rgba(0,0,0,.4);
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f7fb;
+    --surface: #ffffff;
+    --surface-2: #eef0f7;
+    --border: rgba(20,22,40,.08);
+    --border-strong: rgba(20,22,40,.14);
+    --text: #191b26;
+    --muted: #676d85;
+    --accent: #7c3aed;
+    --accent-2: #6d28d9;
+    --accent-glow: rgba(124,58,237,.28);
+    --ok: #15803d;
+    --err: #dc2626;
+    --shadow-card: 0 1px 2px rgba(20,22,40,.05), 0 8px 24px rgba(20,22,40,.07);
+    --shadow-pop: 0 2px 4px rgba(20,22,40,.08), 0 12px 32px rgba(20,22,40,.12);
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { font: 14px/1.55 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  .page { max-width: 680px; margin: 0 auto; padding: 28px 20px 32px; }
+
+  /* ---- header ---- */
+  header h1 { font-size: 26px; margin: 0; letter-spacing: -0.02em; font-weight: 700; }
+  header p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+
+  /* ---- first-run banner ---- */
+  #setupBanner {
+    display: none; align-items: center; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 12px; padding: 10px 14px; margin: 18px 0 0;
+    box-shadow: var(--shadow-card); font-size: 13px;
+  }
+  #setupBanner .btn { margin: 0; padding: 5px 14px; }
+
+  /* ---- segmented tabs ---- */
+  .tabs {
+    display: flex; flex-wrap: wrap; gap: 4px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 14px; padding: 4px; margin: 20px 0 22px;
+  }
+  .tabs button {
+    flex: 1; background: none; color: var(--muted); border: 0;
+    border-radius: 10px; padding: 8px 12px; cursor: pointer; font: inherit; font-size: 13px;
+    white-space: nowrap;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button.on {
+    background: var(--surface); color: var(--text); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  }
+  .tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .tab { display: none; }
+  .tab.on { display: block; }
+
+  /* ---- cards ---- */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 22px 24px; margin-bottom: 16px;
+    box-shadow: var(--shadow-card);
+  }
+  h2 { font-size: 11.5px; margin: 0 0 16px; color: var(--muted);
+       font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+  .card + .card { margin-top: 16px; }
+
+  label { display: block; margin: 0 0 6px; font-weight: 550; font-size: 13px; }
+  .field { margin-bottom: 18px; }
+  .field:last-child { margin-bottom: 0; }
+  input[type=text], input[type=password], select, textarea {
+    width: 100%; padding: 9px 12px; border-radius: 10px;
+    border: 1px solid var(--border-strong); background: var(--bg);
+    color: var(--text); font: inherit; transition: border-color .12s, box-shadow .12s;
+  }
+  @media (prefers-color-scheme: light) {
+    input[type=text], input[type=password], select, textarea { background: var(--surface-2); }
+  }
+  /* native arrow hugs the edge in Chrome regardless of padding — hide it
+     and draw our own chevron so the spacing is exact in both themes.
+     Must sit after the media query above: its `background` shorthand would
+     otherwise reset background-image back to none. */
+  select {
+    appearance: none; -webkit-appearance: none;
+    padding-right: 32px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-glow);
+  }
+  /* searchable target-language combobox */
+  .combo { position: relative; }
+  .combo input { padding-right: 36px; }
+  .combo-toggle {
+    position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+    background: none; border: 0; color: var(--muted); cursor: pointer;
+    font-size: 14px; padding: 6px 10px; border-radius: 8px;
+  }
+  .combo-toggle:hover { color: var(--text); }
+  .combo-list {
+    position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 6px);
+    margin: 0; padding: 6px; list-style: none;
+    background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 12px; box-shadow: var(--shadow-pop);
+    max-height: 240px; overflow: auto;
+  }
+  .combo-list li {
+    padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13px;
+    display: flex; justify-content: space-between; gap: 8px;
+  }
+  .combo-list li .native { color: var(--muted); }
+  .combo-list li.active, .combo-list li:hover { background: var(--surface-2); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .range-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .range-head label { flex: 1; margin: 0; }
+  .range-head .val { color: var(--accent); font-weight: 500; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* number input replacing a .val readout: same seat, editable */
+  .range-head .val-input {
+    width: 58px; padding: 2px 4px; text-align: right;
+    font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums;
+    color: var(--accent); background: none; border: 1px solid transparent; border-radius: 6px;
+  }
+  .range-head .val-input:hover { border-color: var(--border-strong); }
+  .range-head .val-input:focus { background: var(--surface-2); border-color: var(--accent); outline: none; }
+  /* hide native spinners — the slider beside it already steps */
+  .range-head .val-input::-webkit-inner-spin-button { display: none; }
+  .range-head .val-input { -moz-appearance: textfield; appearance: textfield; }
+  .range-head .unit-wrap { display: inline-flex; align-items: baseline; gap: 3px; }
+  .range-head .unit { color: var(--muted); font-size: 11px; }
+  fieldset { border: 0; padding: 0; margin: 0; }
+  fieldset:disabled { opacity: 0.45; }
+
+  /* ---- buttons ---- */
+  .btn {
+    background: linear-gradient(180deg, var(--accent), var(--accent-2));
+    color: #fff; border: 1px solid transparent; border-radius: 10px;
+    padding: 9px 18px; cursor: pointer; font: inherit; font-weight: 600;
+    box-shadow: 0 4px 16px var(--accent-glow);
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn.ghost {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong);
+    font-weight: 500; box-shadow: none;
+  }
+  .btn.ghost:hover { border-color: var(--accent); background: var(--surface-2); }
+  .btn.danger {
+    background: transparent; color: var(--err); border: 1px solid var(--err);
+    box-shadow: none; font-weight: 500;
+  }
+  .btn.sm { padding: 6px 14px; font-size: 12px; border-radius: 8px; box-shadow: none; min-height: 24px; }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  a.btn { display: inline-block; text-decoration: none; text-align: center; }
+  .hint a { color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: default; }
+
+  /* ---- dirty bar: fixed bottom on every tab, only while unsaved changes (or a message) exist ---- */
+  #dirtyBar {
+    position: fixed; bottom: 16px; left: 16px; right: 16px; max-width: 680px; margin: 0 auto;
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 14px; padding: 10px 14px; box-shadow: var(--shadow-pop);
+  }
+  /* reserve space so the fixed bar never covers content at full scroll */
+  body.has-bar .page { padding-bottom: 110px; }
+  #barBtns { display: flex; gap: 8px; align-items: center; flex: none; }
+  /* ---- inline save status lives in the dirty bar ---- */
+  #status { font-size: 12.5px; color: var(--muted); flex: 1; min-width: 0;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  /* long errors (e.g. provider 400 dumps) must read in full, not ellipsis */
+  #dirtyBar:has(#status.err) #status { white-space: normal; }
+  /* per-action test status (under each Test button) — errors must not land
+     in the save bar where they read as "Save broke" */
+  #testStatus, #cloudTestStatus { font-size: 12.5px; white-space: normal; }
+  #testStatus.ok, #cloudTestStatus.ok { color: var(--ok); }
+  #testStatus.err, #cloudTestStatus.err { color: var(--err); }
+  .btn.quiet { background: none; border-color: transparent; box-shadow: none;
+               color: var(--muted); font-weight: 400; padding: 6px 4px; }
+  .btn.quiet:hover { background: none; border-color: transparent; color: var(--text); text-decoration: underline; }
+  /* same rhythm as .field gaps — the button follows the thinking fieldset directly */
+  #test { margin-top: 18px; }
+
+  /* ---- theme segmented control (mirrors .tabs) ---- */
+  .seg {
+    display: flex; gap: 4px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 12px; padding: 4px;
+  }
+  .seg button {
+    flex: 1; background: none; color: var(--muted); border: 0;
+    border-radius: 8px; padding: 7px 10px; cursor: pointer; font: inherit; font-size: 13px;
+  }
+  .seg button:hover { color: var(--text); }
+  .seg button.on {
+    background: var(--surface); color: var(--text); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  /* ---- checkbox rows ---- */
+  .check { display: flex; align-items: center; gap: 9px; margin: 9px 0 0; font-weight: 400; font-size: 13px; cursor: pointer; }
+  /* WCAG 2.2 AA: 24px hit area — the visible 16px box sits inside a larger clickable row */
+  .check input { accent-color: var(--accent); width: 16px; height: 16px; margin: 4px; flex: none; }
+  /* ---- color rows: the swatch reads as an input (same 10px language
+     as text fields), not OS chrome and not a foreign circle ---- */
+  .color-row { display: flex; align-items: center; gap: 12px; }
+  .color-row .check { margin: 0; }
+  input[type=color].swatch { -webkit-appearance: none; appearance: none; width: 64px; height: 36px;
+    border: 1px solid var(--border-strong); border-radius: 10px; background: var(--bg);
+    padding: 4px; cursor: pointer; flex: none; }
+  input[type=color].swatch::-webkit-color-swatch-wrapper { padding: 0; }
+  input[type=color].swatch::-webkit-color-swatch { border: none; border-radius: 6px; }
+  input[type=color].swatch::-moz-color-swatch { border: none; border-radius: 6px; }
+  input[type=color].swatch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-color-scheme: light) {
+    input[type=color].swatch { background: var(--surface-2); }
+  }
+  .group-label { margin: 20px 0 4px; font-weight: 600; font-size: 12px; color: var(--muted);
+                 text-transform: uppercase; letter-spacing: .06em; }
+  .adv-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 32px; }
+  @media (max-width: 640px) { .adv-cols { grid-template-columns: 1fr; } }
+
+  /* ---- model manager rows (OCR langs / baberu / fonts) ---- */
+  .dl-list { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
+  .dl-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .dl-row:last-child { border-bottom: 0; }
+  .dl-row .name { flex: 1; }
+  .dl-row .name .ok-mark { color: var(--ok); font-weight: 600; }
+  .dl-bar { width: 90px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; flex: none; }
+  /* empty bars/text stay hidden until a download actually runs — otherwise
+     every row shows a fake "progress track" */
+  .dl-row:not(.busy) .dl-bar, .dl-row:not(.busy) .dl-text { visibility: hidden; }
+  .dl-bar .fill { height: 100%; width: 0; background: var(--accent); transition: width .2s; display: block; }
+  .dl-bar .fill.indet { width: 40%; animation: dl-slide 1s infinite alternate; }
+  @keyframes dl-slide { from { transform: translateX(-60%); } to { transform: translateX(160%); } }
+  .dl-text { font-size: 11px; color: var(--muted); min-width: 70px; text-align: right; }
+
+  /* ---- characters ---- */
+  .char-row { display: flex; align-items: center; gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--border); }
+  .char-row:last-child { border-bottom: 0; }
+  .char-row .desc { flex: 1; min-width: 0; }
+  .char-row .src { font-size: 11px; color: var(--muted); }
+  .char-row select { width: 96px; }
+  .char-row input[type=text] { width: 130px; }
+  .char-saved { color: var(--ok); font-size: 11px; }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+
+  /* font preview: previews render on white manga paper — stays white in both themes */
+  #fontPreview { background: #fff; border: 1px solid var(--border); border-radius: 10px; width: 100%; height: 64px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>Arn Manga LLM Translator</h1>
+    <p>Everything runs on your device. Bring your own API key — it's sent only to the provider you choose.</p>
+  </header>
+
+  <div id="setupBanner">
+    <span>No API key yet — 1) pick a provider &amp; model, 2) paste key, 3) Save Changes &amp; Test.</span>
+    <button id="setupGo" type="button" class="btn sm">Set up your model</button>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button type="button" data-tab="general" class="on">General</button>
+    <button type="button" data-tab="model">Model</button>
+    <button type="button" data-tab="appearance">Appearance</button>
+    <button type="button" data-tab="characters">Characters</button>
+    <button type="button" data-tab="advanced">Advanced</button>
+    <button type="button" data-tab="about">About</button>
+  </div>
+
+  <!-- ============ General ============ -->
+  <div class="tab on" id="tab-general">
+    <div class="card">
+      <h2>Translation</h2>
+      <div class="field">
+        <label for="preset">Quality preset</label>
+        <select id="preset">
+          <option value="balanced">Balanced (recommended)</option>
+          <option value="fast">Fast — fewer tokens</option>
+          <option value="best">Best quality</option>
+          <option value="custom">Custom</option>
+        </select>
+        <div class="hint">Sets detection, image sizes and memory in one go. Manual changes under Advanced make this Custom.</div>
+      </div>
+
+      <div class="field">
+        <label for="targetLang">Translate into</label>
+        <div class="combo">
+          <input type="text" id="targetLang" placeholder="Thai" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="targetLangList" aria-autocomplete="list">
+          <button type="button" id="targetLangToggle" class="combo-toggle" aria-label="Show all languages" tabindex="-1">▾</button>
+          <ul id="targetLangList" class="combo-list" role="listbox" hidden></ul>
+        </div>
+        <div class="hint">Type to search, or pick from the list — any other language works too. Thai ships with a handwriting font.</div>
+      </div>
+
+      <div class="field">
+        <label for="stylePreset">Tone</label>
+        <select id="stylePreset">
+          <option value="">Follow the original tone</option>
+          <option value="Polite and formal register — courteous diction, honorifics where the target language has them">Polite / formal</option>
+          <option value="Casual register, like close friends talking — relaxed diction, no formality markers">Casual / friends</option>
+          <option value="Teen street slang — blunt, slangy diction with interjections">Street / teen</option>
+          <option value="Elevated literary register — formal vocabulary suited to period pieces">Literary / period</option>
+          <option value="__custom">Custom…</option>
+        </select>
+        <textarea id="stylePrompt" rows="2" placeholder="Custom tone rule — e.g. casual youthful speech" style="display:none"></textarea>
+      </div>
+
+      <div class="field">
+        <label>Appearance</label>
+        <div class="seg" id="themeSeg" role="radiogroup" aria-label="Theme">
+          <button type="button" data-theme-val="system" role="radio">System</button>
+          <button type="button" data-theme-val="dark" role="radio">Dark</button>
+          <button type="button" data-theme-val="light" role="radio">Light</button>
+        </div>
+        <label class="check"><input type="checkbox" id="showToasts" checked> Page notifications (done/error popups)</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Auto-translate sites</h2>
+      <div id="autoSites"></div>
+      <div class="field">
+        <button type="button" id="autoSitesClear" class="btn ghost sm">Clear all</button>
+      </div>
+      <div class="hint">Auto-translate is per-site (toggled from the popup on each site). Removing a site stops auto there; manual translate still works everywhere.</div>
+    </div>
+  </div>
+
+  <!-- ============ Model ============ -->
+  <div class="tab" id="tab-model">
+    <div class="card">
+      <h2>Connect your model</h2>
+      <div class="field">
+        <label for="provider">Protocol</label>
+        <select id="provider">
+          <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, ollama…)</option>
+          <option value="responses">Responses API (OpenAI responses)</option>
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="gemini">Google Gemini</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="model">Model</label>
+        <input type="text" id="model" placeholder="e.g. gpt-5.4-mini">
+        <div class="hint" id="modelHint"></div>
+      </div>
+
+      <div class="field">
+        <label for="apiKey">API key</label>
+        <input type="password" id="apiKey" placeholder="sk-…">
+      </div>
+
+      <div class="field">
+        <label for="baseUrl">Base URL <span class="hint">(optional — custom endpoints)</span></label>
+        <input type="text" id="baseUrl" placeholder="https://api.openai.com/v1">
+        <div class="hint" id="baseHint"></div>
+      </div>
+
+      <fieldset id="thinkingField">
+        <div class="field">
+          <label for="thinking">Thinking level</label>
+          <div class="combo">
+            <input type="text" id="thinking" placeholder="auto" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="thinkingList" aria-autocomplete="list">
+            <button type="button" id="thinkingToggle" class="combo-toggle" aria-label="Show all levels" tabindex="-1">▾</button>
+            <ul id="thinkingList" class="combo-list" role="listbox" hidden></ul>
+          </div>
+          <div class="hint" id="thinkingHint"></div>
+        </div>
+      </fieldset>
+
+      <button id="test" type="button" class="btn ghost" style="width:100%">Test connection</button>
+      <div class="hint" id="testStatus" style="min-height:18px;margin-top:6px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Where detection runs</h2>
+      <div class="field">
+        <div class="seg" id="inferSeg" role="radiogroup" aria-label="Inference engine">
+          <button type="button" data-infer-val="local" role="radio">On-device</button>
+          <button type="button" data-infer-val="cloud" role="radio">Cloud</button>
+        </div>
+        <div class="hint">On-device is private and works offline. Cloud runs detection + OCR on your own endpoint — faster on slow phones, needs internet.</div>
+      </div>
+
+      <div class="field" id="detEpField" style="display:none">
+        <label class="check"><input type="checkbox" id="forceWasm"> Force CPU (wasm)</label>
+        <div class="hint">Auto uses the GPU. Tick this only if Auto gives detection errors or blank results — CPU is ~10x slower.</div>
+      </div>
+
+      <div id="detRow" style="display:none">
+        <div class="dl-row">
+          <span class="name" id="detLabel">Detection models (CTD 40MB + panel 10MB)</span>
+          <span class="dl-text"></span>
+          <span class="dl-bar" id="detBar"><span class="fill"></span></span>
+          <button id="detBtn" type="button" class="btn ghost sm">Download</button>
+        </div>
+        <div class="hint" style="margin-top:8px">Downloads once, then works offline. Otherwise fetched automatically on the first on-device page.</div>
+      </div>
+
+      <fieldset id="cloudFields" style="display:none">
+        <div class="field">
+          <label for="cloudEndpoint">Endpoint URL</label>
+          <input type="text" id="cloudEndpoint" placeholder="https://you--arn-manga-api.modal.run">
+        </div>
+
+        <div class="field">
+          <label for="cloudKey">API key</label>
+          <input type="password" id="cloudKey" placeholder="paste from the setup notebook">
+        </div>
+
+        <button id="testCloud" type="button" class="btn ghost" style="width:100%">Test cloud &amp; prewarm</button>
+        <div class="hint" id="cloudTestStatus" style="min-height:18px;margin-top:6px"></div>
+        <div class="hint">No endpoint yet? Open <b>server/cloud-setup.ipynb</b> in <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Google Colab</a> → Run all → paste the 2 values it prints (link works once the repo is public). Testing also wakes a sleeping endpoint, so run it before reading — pages fall back to on-device automatically if cloud fails. Pages go to YOUR endpoint only.</div>
+      </fieldset>
+    </div>
+
+    <div class="card">
+      <h2>How the model reads text</h2>
+      <div class="field">
+        <select id="textSource">
+          <option value="page">Full page + crops — best quality (needs image support)</option>
+          <option value="crops">Crops only — safer for strict models (needs image support)</option>
+          <option value="ocr">OCR text — for text-only models</option>
+        </select>
+        <div class="hint">OCR runs wherever detection runs (see above) — on-device needs the models below, cloud needs none.</div>
+      </div>
+
+      <div class="field">
+        <label for="readingDir">Reading direction</label>
+        <select id="readingDir">
+          <option value="rtl">Right-to-left — manga (top to bottom in each column)</option>
+          <option value="ltr">Left-to-right — manhwa / western comics</option>
+        </select>
+        <div class="hint">Sets the region numbering order for every mode above.</div>
+      </div>
+
+      <div class="field">
+        <label class="check"><input type="checkbox" id="transcribeSrc"> Also transcribe source text (vision only)</label>
+        <div class="hint">The model copies each box's original text alongside the translation — richer cross-page context at roughly 2× output tokens. No effect in OCR mode.</div>
+      </div>
+
+      <div id="ocrManager" style="display:none">
+        <div class="field">
+          <label for="ocrEngine">OCR engine</label>
+          <select id="ocrEngine">
+            <option value="baberu">Baberu — best for Japanese, vertical text and sound effects (122 MB)</option>
+            <option value="tesseract">Tesseract — many languages, small download</option>
+          </select>
+        </div>
+
+        <div id="ocrLangList" class="dl-list"></div>
+        <div id="baberuRow" style="display:none">
+          <div class="dl-row">
+            <span class="name" id="baberuLabel">Baberu OCR model</span>
+            <span class="dl-text"></span>
+            <span class="dl-bar" id="baberuBar"><span class="fill"></span></span>
+            <button id="baberuBtn" type="button" class="btn ghost sm">Download</button>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:8px">Downloads once, then works offline. Delete anytime.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Appearance ============ -->
+  <div class="tab" id="tab-appearance">
+    <div class="card">
+      <h2>Render font</h2>
+      <div class="field">
+        <label for="renderFont">Font</label>
+        <select id="renderFont"><option value="default">Default (per language)</option></select>
+      </div>
+      <div class="field">
+        <div class="range-head"><label for="minFont">Smallest font</label><span class="unit-wrap"><input type="number" id="minFontNum" class="val-input" min="1" max="72" step="1"><span class="unit">px</span></span></div>
+        <input type="range" id="minFont" min="8" max="24" step="1">
+        <div class="hint">Floor for shrink-to-fit: smaller fits long text without clipping, but gets hard to read.</div>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" id="preferHorizontal"> Prefer horizontal text</label>
+        <div class="hint">Tall boxes render left-to-right first and rotate only when the text can't fit. Off = rotate tall columns as before.</div>
+      </div>
+      <div class="field">
+        <div class="range-head"><label for="textStroke">Text outline</label><span class="unit-wrap"><input type="number" id="textStrokeNum" class="val-input" min="0" max="0.5" step="0.01"><span class="unit">×font</span></span></div>
+        <input type="range" id="textStroke" min="0" max="0.3" step="0.01">
+        <div class="hint">Edge around the text (0 = off). Helps on busy art; invisible on matching bubbles. Color follows Auto unless overridden below.</div>
+      </div>
+      <div class="field adv-cols">
+        <div>
+          <label for="textColorPick">Text color</label>
+          <div class="color-row"><input type="color" class="swatch" id="textColorPick" value="#111111"><label class="check"><input type="checkbox" id="textColorAuto" checked> Auto</label></div>
+        </div>
+        <div>
+          <label for="strokeColorPick">Outline color</label>
+          <div class="color-row"><input type="color" class="swatch" id="strokeColorPick" value="#ffffff"><label class="check"><input type="checkbox" id="strokeColorAuto" checked> Auto</label></div>
+        </div>
+      </div>
+      <div class="hint">Auto follows the text: dark edge on light text, white edge on dark text.</div>
+      <div class="field">
+        <label>Downloadable fonts</label>
+        <div class="hint">Presets download once and work offline.</div>
+      </div>
+      <div id="fontPresetList" class="dl-list"></div>
+      <div class="field" style="display:flex;gap:8px;margin-top:12px">
+        <input type="text" id="fontUrl" placeholder="https://…/MyFont.ttf" style="flex:1">
+        <input type="text" id="fontNameInput" placeholder="Name" style="width:100px;flex:none">
+        <button id="fontAdd" type="button" class="btn ghost sm">Add</button>
+      </div>
+      <div class="hint" id="fontAddStatus"></div>
+      <label>Preview on manga paper</label>
+      <canvas id="fontPreview" height="64"></canvas>
+      <input type="text" id="fontPreviewText" value="สวัสดีครับ Hello 123" style="margin-top:8px">
+    </div>
+  </div>
+
+  <!-- ============ Characters ============ -->
+  <div class="tab" id="tab-characters">
+    <div class="card">
+      <h2>Characters</h2>
+      <div class="hint" style="margin:-8px 0 12px">Set a name or gender and your choice always wins.</div>
+      <div id="characters"><div class="empty">No characters yet — translate some pages first.</div></div>
+      <div style="margin-top:16px">
+        <button id="clearChars" class="btn danger">Clear character memory</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Advanced ============ -->
+  <div class="tab" id="tab-advanced">
+    <div class="card">
+      <h2>Advanced tuning</h2>
+      <div class="adv-cols">
+        <div>
+          <div class="group-label">Detection</div>
+          <div class="field">
+            <div class="range-head"><label for="detConf">Confidence</label><input type="number" id="detConfNum" class="val-input" min="0" max="1" step="0.05"></div>
+            <input type="range" id="detConf" min="0.10" max="0.60" step="0.05">
+            <div class="hint">Lower catches more small text, with more false positives.</div>
+          </div>
+          <div class="field">
+            <div class="range-head"><label for="detMinSize">Min region size</label><span class="unit-wrap"><input type="number" id="detMinSizeNum" class="val-input" min="1" max="200" step="1"><span class="unit">px</span></span></div>
+            <input type="range" id="detMinSize" min="6" max="30" step="1">
+          </div>
+          <div class="field">
+            <div class="range-head"><label for="panelConf">Panel confidence</label><input type="number" id="panelConfNum" class="val-input" min="0.05" max="1" step="0.01"></div>
+            <input type="range" id="panelConf" min="0.05" max="0.50" step="0.05">
+            <div class="hint">Lower catches faint panels (bleed), with more false boxes.</div>
+          </div>
+          <label class="check"><input type="checkbox" id="deferLabels"> Small labels read after balloon dialogue</label>
+          <label class="check"><input type="checkbox" id="vlmAssisted"> Model reports missed text (hand-written signs, SFX)</label>
+          <label class="check"><input type="checkbox" id="debugBoxes"> Debug mode: boxes on page + console logs</label>
+
+          <div class="group-label">Memory</div>
+          <label class="check"><input type="checkbox" id="useContext"> Send recent dialogue for consistency</label>
+          <label class="check"><input type="checkbox" id="useCharacters"> Send &amp; learn character genders</label>
+          <label class="check"><input type="checkbox" id="crossChapter"> Keep characters across chapters</label>
+          <div class="field" style="margin-top:12px">
+            <div class="range-head"><label for="contextPairs">Memory depth</label><input type="number" id="contextPairsNum" class="val-input" min="0" max="200" step="5"></div>
+            <input type="range" id="contextPairs" min="0" max="120" step="5">
+            <div class="hint">Typing above 120 works (slider stays pinned) but each page sends more history.</div>
+          </div>
+        </div>
+        <div>
+          <div class="group-label">Images</div>
+          <div class="field">
+            <div class="range-head"><label for="cropSize">Region crop size</label><span class="unit-wrap"><input type="number" id="cropSizeNum" class="val-input" min="100" max="1200" step="20"><span class="unit">px</span></span></div>
+            <input type="range" id="cropSize" min="280" max="720" step="20">
+            <div class="hint">Bigger crops read small text better but cost more tokens.</div>
+          </div>
+          <div class="field">
+            <div class="range-head"><label for="fullPageSize">Full page size</label><span class="unit-wrap"><input type="number" id="fullPageSizeNum" class="val-input" min="400" max="2560" step="80"><span class="unit">px</span></span></div>
+            <input type="range" id="fullPageSize" min="800" max="1600" step="80">
+          </div>
+          <label class="check"><input type="checkbox" id="grayscaleBw"> Send B&amp;W pages as grayscale (smaller)</label>
+
+          <div class="group-label">Performance</div>
+          <div class="field">
+            <div class="range-head"><label for="parallelLlm">Parallel LLM calls</label><input type="number" id="parallelLlmNum" class="val-input" min="1" max="10" step="1"></div>
+            <input type="range" id="parallelLlm" min="1" max="6" step="1">
+            <div class="hint">Only when memory is off. 1 = serial. Lower it if you hit rate limits.</div>
+          </div>
+          <div class="group-label">Translation cache</div>
+          <div class="field">
+            <label class="check"><input type="checkbox" id="cacheEnabled"> Reuse translations when reopening pages</label>
+            <div class="hint">Skips detect + LLM on pages you've already translated.</div>
+            <div class="range-head" style="margin-top:10px"><label for="cacheMax">Stored pages</label><input type="number" id="cacheMaxNum" class="val-input" min="10" max="2000" step="10"></div>
+            <input type="range" id="cacheMax" min="10" max="1000" step="10">
+            <div class="hint">Oldest entries auto-clear past this.</div>
+            <div class="range-head" id="cacheCountRow" style="margin-top:10px"><label>Cached pages</label><span class="hint" id="cacheCount">…</span></div>
+            <button id="cacheClear" type="button" class="btn ghost" style="width:100%;margin-top:10px">Clear translation cache</button>
+          </div>
+        </div>
+      </div>
+      <button id="resetAdv" class="btn quiet">Restore defaults</button>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-about">
+    <div class="card">
+      <h2>Support the project</h2>
+      <p class="hint" style="margin:0 0 12px">Arn Manga LLM Translator is free. No account, no server — translation runs on your machine; donations keep it that way.</p>
+      <a class="btn" href="https://ko-fi.com/c0ffeeoverdose" target="_blank" rel="noopener">Support on Ko-fi</a>
+    </div>
+    <div class="card">
+      <h2>Credits</h2>
+      <p class="hint" style="margin:0 0 8px">Made by c0ffeeOverdose · © 2026<br>Free software under the GNU GPL v3.0 (GPL-3.0-only) — share and modify freely, <a href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/blob/main/LICENSE" target="_blank" rel="noopener">full text</a>.<br>Models keep their own licenses (see <a href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/blob/main/NOTICE" target="_blank" rel="noopener">NOTICE</a>):</p>
+      <p class="hint" style="margin:0 0 12px">Comic Text Detector — dmMaze, ONNX export by lemondouble (GPL-3.0)<br>Manga panel detector — Leandro Narosky, trained on Manga109-s (Apache-2.0)<br>Baberu OCR — genshiai-daichi (Apache-2.0)<br>Tesseract language data — tesseract-ocr (Apache-2.0)</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator" target="_blank" rel="noopener">Source on GitHub</a>
+        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/issues/new" target="_blank" rel="noopener">Report an issue</a>
+        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/releases" target="_blank" rel="noopener">Releases</a>
+        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/blob/main/PRIVACY.md" target="_blank" rel="noopener">Privacy</a>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Diagnostics</h2>
+      <p class="hint" style="margin:0 0 12px">Checks the installed files and downloaded models. Copy the results when reporting a bug.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <button id="diagRun" type="button" class="btn ghost sm">Run diagnostics</button>
+      </div>
+      <div class="hint" id="diagOut" style="margin:0;white-space:pre-line">Not run yet.</div>
+    </div>
+  </div>
+</div>
+
+<div id="dirtyBar" style="display:none">
+  <span id="status"></span>
+  <span id="barBtns" style="display:none">
+    <button id="discard" type="button" class="btn quiet">Reset</button>
+    <button id="saveAll" type="button" class="btn">Save Changes</button>
+  </span>
+</div>
+
+<script src="options.js"></script>
+</body>
+</html>

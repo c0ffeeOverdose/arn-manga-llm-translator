@@ -1,0 +1,70 @@
+{
+  "manifest_version": 3,
+  "name": "Arn Manga LLM Translator",
+  "version": "1.0.0",
+  "description": "Read manga, manhwa & webtoons in your language — detection, OCR & rendering run on-device; translate with your own LLM key (BYOK)",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "contextMenus",
+    "declarativeNetRequest"
+  ],
+  "optional_host_permissions": [
+    "http://*/*"
+  ],
+  "host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*/*"
+      ],
+      "exclude_matches": [
+        "https://api.mangadex.org/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Arn Manga LLM Translator",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+    }
+  },
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "models/*",
+        "ort/*",
+        "iframe/*",
+        "fonts/*"
+      ],
+      "matches": [
+        "https://*/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      /* dark is the default; light only when the OS explicitly asks */
+      --bg: #0d0e14;
+      --surface: #151722;
+      --surface-2: #1c1f2e;
+      --border: rgba(255,255,255,.07);
+      --border-strong: rgba(255,255,255,.12);
+      --text: #e8eaf2;
+      --muted: #a3a8c0;
+      --accent: #8b5cf6;
+      --accent-2: #7c3aed;
+      --accent-glow: rgba(139,92,246,.35);
+      --ok: #4ade80;
+      --err: #f87171;
+      color-scheme: dark;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f6f7fb;
+        --surface: #ffffff;
+        --surface-2: #eef0f7;
+        --border: rgba(20,22,40,.08);
+        --border-strong: rgba(20,22,40,.14);
+        --text: #191b26;
+        --muted: #676d85;
+        --accent: #7c3aed;
+        --accent-2: #6d28d9;
+        --accent-glow: rgba(124,58,237,.28);
+        --ok: #15803d;
+        --err: #dc2626;
+        color-scheme: light;
+      }
+    }
+    /* explicit choice (mtTheme) beats the OS default above */
+    :root[data-theme="dark"] {
+      --bg: #0d0e14;
+      --surface: #151722;
+      --surface-2: #1c1f2e;
+      --border: rgba(255,255,255,.07);
+      --border-strong: rgba(255,255,255,.12);
+      --text: #e8eaf2;
+      --muted: #a3a8c0;
+      --accent: #8b5cf6;
+      --accent-2: #7c3aed;
+      --accent-glow: rgba(139,92,246,.35);
+      --ok: #4ade80;
+      --err: #f87171;
+      color-scheme: dark;
+    }
+    :root[data-theme="light"] {
+      --bg: #f6f7fb;
+      --surface: #ffffff;
+      --surface-2: #eef0f7;
+      --border: rgba(20,22,40,.08);
+      --border-strong: rgba(20,22,40,.14);
+      --text: #191b26;
+      --muted: #676d85;
+      --accent: #7c3aed;
+      --accent-2: #6d28d9;
+      --accent-glow: rgba(124,58,237,.28);
+      --ok: #15803d;
+      --err: #dc2626;
+      color-scheme: light;
+    }
+    * { box-sizing: border-box; }
+    body { width: 280px; margin: 0; background: var(--bg); color: var(--text); font: 13px/1.5 system-ui, sans-serif; }
+    .wrap { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+    h1 { font-size: 15px; margin: 0 0 2px; font-weight: 700; letter-spacing: -0.01em; }
+    header.top { display: flex; align-items: flex-start; gap: 8px; }
+    header.top .titles { flex: 1; min-width: 0; }
+    #settings {
+      flex: none; width: 28px; height: 28px; padding: 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: none; border: 1px solid transparent; border-radius: 8px;
+      color: var(--muted); cursor: pointer;
+    }
+    #settings:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-2); }
+    #settings:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .sub { color: var(--muted); font-size: 11px; }
+    .btn {
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      color: #fff; border: 1px solid transparent; border-radius: 10px;
+      padding: 9px 12px; cursor: pointer; font: inherit; font-weight: 600;
+      box-shadow: 0 4px 16px var(--accent-glow);
+    }
+    .btn:active { transform: translateY(1px); }
+    .btn.ghost {
+      background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong);
+      font-weight: 500; box-shadow: none;
+    }
+    .btn.ghost:hover { border-color: var(--accent); background: var(--surface-2); }
+    /* secondary chapter action: slimmer than the primary page button */
+    .btn.slim { padding: 6px 12px; font-weight: 500; font-size: 12.5px; box-shadow: none; }
+    .btn:disabled { opacity: .5; cursor: default; }
+    .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .row { display: flex; align-items: center; justify-content: space-between; }
+    .divider { height: 1px; background: var(--border); margin: 4px 0; }
+    .group-label { font-size: 10.5px; font-weight: 600; color: var(--muted);
+                   text-transform: uppercase; letter-spacing: .07em; margin: 4px 0 0; }
+    /* status is a native details like token usage: dot + label when closed,
+       full text when open */
+    #statusSection { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+    #statusSection summary { cursor: pointer; }
+    #statusSection summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #statusSection summary #stateDot { display: inline-block; margin-right: 6px; }
+    #statusSection .status { padding-top: 6px; }
+    #stateDot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+    .status { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    #errBanner { display: none; color: var(--err); font-size: 11px; background: var(--surface);
+                 border: 1px solid var(--err); border-left-width: 3px; border-radius: 10px; padding: 8px 10px; }
+    details.usage-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 11px; color: var(--muted); }
+    details.usage-wrap summary { cursor: pointer; font-size: 11px; }
+    details.usage-wrap summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .linkrow { display: flex; gap: 12px; justify-content: center; }
+    .linkrow button { background: none; border: 0; padding: 6px 4px; color: var(--text); font: inherit; font-size: 12px; cursor: pointer; min-height: 24px; }
+    .linkrow button:hover { color: var(--text); text-decoration: underline; }
+    .linkrow button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* WCAG 2.2 AA: the hidden input covers the whole switch = 34×44 hit area */
+    .switch { position: relative; width: 34px; height: 19px; flex: none; }
+    .switch input { position: absolute; inset: -13px 0; width: 100%; height: 44px; margin: 0; opacity: 0; cursor: pointer; }
+    .slider { position: absolute; inset: 0; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 19px; cursor: pointer; transition: .15s; pointer-events: none; }
+    .slider::before { content: ''; position: absolute; width: 15px; height: 15px; left: 2px; top: 1px; background: var(--muted); border-radius: 50%; transition: .15s; }
+    input:checked + .slider { background: linear-gradient(180deg, var(--accent), var(--accent-2)); border-color: transparent; }
+    input:checked + .slider::before { transform: translateX(15px); background: #fff; }
+    input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .usage { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 11px; color: var(--muted); line-height: 1.6; }
+    .errlog { display: none; color: var(--err); font-size: 11px; max-height: 120px; overflow: auto; white-space: pre-line;
+              background: var(--surface); border: 1px solid var(--err); border-radius: 10px; padding: 8px 10px; }
+    /* first-run data-use disclosure (store policy: the user must see where
+       their data goes before the first translation, not just in the listing) */
+    #privacyNote { display: none; font-size: 11px; color: var(--muted); background: var(--surface);
+                  border: 1px solid var(--border-strong); border-radius: 10px; padding: 8px 10px; }
+    #privacyNote button { background: none; border: 0; padding: 4px 0 0; color: var(--accent);
+                         font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+    a { color: var(--accent); font-size: 12.5px; text-decoration: none; cursor: pointer; display: inline-block; padding: 6px 0; }
+    a:empty { display: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="titles">
+        <h1>Arn Manga LLM Translator</h1>
+        <div class="sub">Translate manga, manhwa &amp; webtoons on the page</div>
+      </div>
+      <button id="settings" aria-label="Settings" title="Settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+    </header>
+    <div id="privacyNote">Translating sends page images + text to the AI provider <b>you</b> chose in Settings (your key, your bill). Detection &amp; drawing stay on your device.<br><button id="privacyAck">Got it — don't show again</button></div>
+    <button id="translate" class="btn">Translate this page</button>
+    <div class="grid">
+      <button id="showOriginal" class="btn ghost">Show original</button>
+      <button id="retranslate" class="btn ghost">Re-translate</button>
+    </div>
+    <div class="divider"></div>
+    <div class="row">
+      <span>Auto-translate <span id="autoSite" class="sub"></span></span>
+      <label class="switch"><input type="checkbox" id="auto"><span class="slider"></span></label>
+    </div>
+    <div class="row">
+      <span>Pages ahead</span>
+      <span id="aheadVal" class="sub">3</span>
+    </div>
+    <input type="range" id="ahead" min="1" max="30" step="1" style="width:100%;accent-color:var(--accent)" title="Auto pre-translate window — queued pages ahead (costs tokens per page)">
+    <div class="row">
+      <span>Show token usage</span>
+      <label class="switch"><input type="checkbox" id="showUsage" checked><span class="slider"></span></label>
+    </div>
+    <div class="linkrow">
+      <button id="chars">Characters</button>
+      <button id="context">Context: on</button>
+      <button id="readingDir" title="Region numbering order — retranslate the page to apply">RTL</button>
+    </div>
+    <div class="row">
+      <span id="cacheLabel">Cached pages</span>
+      <button id="cacheClear" class="btn ghost slim" title="Forget all cached translations">Clear</button>
+    </div>
+    <div class="divider"></div>
+    <!-- hidden until refreshStatus has something to show: the popup window
+         sizes to initial content and Chrome won't shrink it afterwards -->
+    <details id="statusSection" style="display:none">
+    <summary class="group-label"><span id="stateDot"></span>Status</summary>
+    <div class="status" id="status"></div>
+    <button id="cancelAll" class="btn ghost slim" style="display:none;width:100%;margin-top:6px">Cancel all</button>
+    </details>
+    <div id="errBanner"></div>
+    <details class="usage-wrap" id="usageWrap" style="display:none"><summary>Token usage</summary><div id="usageBox" class="usage" style="border:0;padding:4px 0 0"></div></details>
+    <div id="errlog" class="errlog"></div>
+    <a href="#" id="errors"></a>
+  </div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
