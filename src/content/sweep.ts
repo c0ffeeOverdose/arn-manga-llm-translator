@@ -427,8 +427,13 @@ async function paintIfLoaded(url: string, hash: string | undefined, direct?: Pag
     enqueue(ref, false, true);
 }
 
-// top-3 visible loaded stateless imgs by content hash (see above). Bounded:
-// exact+path already missed, so at most 3 browser-cached fetches per commit.
+// top-3 visible loaded stateless imgs by content hash (see above). Decoded
+// from the ELEMENT (createImageBitmap) — the proven blob mechanism readPage
+// uses: same-origin blobs are never tainted, while content-script fetch() of
+// a page-minted blob: URL is unreliable (failed silently under a misleading
+// 'hash-mismatch' label for 72 straight commits — never again: decode
+// failures log as hash-unreadable, mismatches only after a real comparison).
+// Bounded: exact+path already missed, so at most 3 local decodes per commit.
 async function viewedByHash(url: string, hash: string): Promise<PageRef | undefined> {
     const cands = getPages()
         .filter(r => {
@@ -438,19 +443,21 @@ async function viewedByHash(url: string, hash: string): Promise<PageRef | undefi
         })
         .sort((a, b) => viewportOverlap(b) - viewportOverlap(a))
         .slice(0, 3);
+    let compared = 0, unreadable = 0;
     for (const c of cands) {
+        let bmp: ImageBitmap | null = null;
         try {
-            const img = c.el as HTMLImageElement;
-            const src = img.currentSrc || img.src;
-            if (!/^(blob:|https?:)/.test(src)) continue;
-            const f = await fetchBitmap(src);
-            let ok = false;
-            try { ok = pageHashFromBitmap(f.bitmap) === hash; }
-            finally { try { f.bitmap.close(); } catch { /* already closed */ } }
-            if (ok) return c;
-        } catch { /* unreadable (taint) — next candidate */ }
+            bmp = await createImageBitmap(c.el as HTMLImageElement);
+        } catch { unreadable++; continue; }
+        try {
+            compared++;
+            if (pageHashFromBitmap(bmp) === hash) return c;
+        } catch { unreadable++; compared--; }
+        finally { try { bmp.close(); } catch { /* already closed */ } }
     }
-    if (cands.length && isDebug()) console.log('[mt] sweep paint hash-mismatch', `${cands.length} tried`, url.slice(-24));
+    if (!isDebug()) return undefined;
+    if (compared) console.log('[mt] sweep paint hash-mismatch', `${compared} tried`, url.slice(-24));
+    else if (unreadable || cands.length) console.log('[mt] sweep paint hash-unreadable', `${unreadable}/${cands.length}`, url.slice(-24));
     return undefined;
 }
 
