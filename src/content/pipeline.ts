@@ -7,7 +7,7 @@ import { renderRegion } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, unpackMask, type CachedPage } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, unpackMask, dropContainedBoxes, type CachedPage } from './page-cache';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
@@ -80,6 +80,11 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
             det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
         }
     }
+    // containment dedup (every EP incl. cloud — this runs after all ordering
+    // branches): a near-threshold fragment inside a real box survives IoU and
+    // would paint double text downstream. Marginal only (conf < 0.5).
+    // Dropped boxes vanish from cloudTexts with them (identity reattach below).
+    det.boxes = dropContainedBoxes(det.boxes, 0.9, 0.5);
     if (cloudTextByBox) det.cloudTexts = det.boxes.map(b => cloudTextByBox.get(b) ?? '');
 }
 
@@ -177,15 +182,21 @@ export function paintRegions(
     const translatedIdx = new Set(
         outputs.filter(o => o.translation && o.translation !== 'keep').map(o => o.index),
     );
-    const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1));
+    // contained-duplicate guard (heals old cache entries on revisit, and
+    // confident dups the detection gate keeps): the lower-conf box is treated
+    // as keep — its source text stays instead of a second colliding paint.
+    const keptBoxes = new Set(dropContainedBoxes(det.boxes));
+    const dupIdx = new Set(det.boxes.map((b, i) => keptBoxes.has(b) ? -1 : i + 1).filter(i => i > 0));
+    const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && !dupIdx.has(i + 1));
     const missedIdx = det.boxes.map((_, i) => i + 1).filter(i => !translatedIdx.has(i) && !keepIdx.has(i));
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
+    if (dupIdx.size && isDebug()) console.log('[mt] contained-duplicate boxes kept as-is:', [...dupIdx].join(','));
     inpaint(canvas, { ...det, boxes: boxesToErase });
 
     // chosen layout per rendered region — diagnoses shrink/clip issues live
     const layouts: { i: number; f: number; n: number }[] = [];
     det.boxes.forEach((box, i) => {
-        if (keepIdx.has(i + 1)) return; // untouched
+        if (keepIdx.has(i + 1) || dupIdx.has(i + 1)) return; // untouched
         const out = outputs.find(o => o.index === i + 1);
         const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
         const placed = renderRegion(ctx, frame, box, text);

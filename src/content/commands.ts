@@ -1,9 +1,9 @@
 // Commands from popup / context menu: element resolution, spread translate,
 // cancel, retranslate, toggles, cache, status poll.
 
-import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, type PageRef } from './state';
+import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, chapterKey, type PageRef } from './state';
 import { getPages, refKey } from './page-io';
-import { cacheClear, cacheCount } from './page-cache';
+import { cacheClear, cacheCount, cacheCountPrefix } from './page-cache';
 import { isDebug } from '../debug';
 import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet } from './queue';
 import { setStatus, idleStatus, pageCounts, makeToast, logError } from './status-ui';
@@ -224,11 +224,11 @@ export function installMessageListener(): void {
             return true;
         }
         if (msg?.type === 'mt:cache-clear') {
-            cacheClear().then(async () => sendResponse({ ok: true, count: await cacheCount(), max: pipeline.cacheMax }));
+            cacheClear().then(async () => sendResponse({ ok: true, count: await cacheCount(), mine: 0, max: pipeline.cacheMax }));
             return true;
         }
         if (msg?.type === 'mt:cache-count') {
-            cacheCount().then(count => sendResponse({ ok: true, count, max: pipeline.cacheMax }));
+            (async () => sendResponse({ ok: true, count: await cacheCount(), mine: await cacheCountPrefix(chapterKey() + '#'), max: pipeline.cacheMax }))();
             return true;
         }
         if (msg?.type === 'mt:status') {

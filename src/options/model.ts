@@ -5,10 +5,10 @@ import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type 
 import { mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
 import { detModelsInstalled, detDownload } from '../llm/ocr-models';
 import { $, setDirty, setStatus, dlProgress } from './shell';
-import { pipeline, syncOcrManager } from './pipeline-section';
+import { pipeline, syncOcrManager, syncOcrSeparateUI } from './pipeline-section';
 
 const MODEL_HINTS: Record<string, string> = {
-    openai: 'e.g. gpt-5.4-mini, gpt-5.4-nano — or qwen/qwen3.7-flash, z-ai/glm-5.3-flash via OpenRouter (vision needs image support; OCR mode takes any text model)',
+    openai: 'e.g. gpt-5.4-mini, gpt-5.4-nano — or qwen/qwen3.7-flash, z-ai/glm-5.3-flash via OpenRouter',
     responses: 'e.g. gpt-5.6-luna, muse-spark-1.3 (cheap + vision)',
     anthropic: 'e.g. claude-haiku-4-5, claude-sonnet-5',
     gemini: 'e.g. gemini-3.5-flash-lite, gemini-3.8-flash',
@@ -53,6 +53,28 @@ export function currentSettings(): LLMSettings {
     };
 }
 
+// split pipeline: the VLM that only transcribes (never translates)
+export function fillOcrFields(s: LLMSettings): void {
+    ($('ocrProvider') as HTMLSelectElement).value = s.provider;
+    ($('ocrModel') as HTMLInputElement).value = s.model;
+    ($('ocrApiKey') as HTMLInputElement).value = s.apiKey;
+    ($('ocrBaseUrl') as HTMLInputElement).value = s.baseUrl ?? '';
+    ($('ocrThinking') as HTMLInputElement).value = pipeline.ocrThinking;
+    renderOcrThinkingList();
+    syncOcrThinkingHint();
+}
+
+export function currentOcrSettings(): LLMSettings {
+    return {
+        provider: ($('ocrProvider') as HTMLSelectElement).value as LLMSettings['provider'],
+        model: ($('ocrModel') as HTMLInputElement).value.trim(),
+        apiKey: ($('ocrApiKey') as HTMLInputElement).value.trim(),
+        baseUrl: ($('ocrBaseUrl') as HTMLInputElement).value.trim(),
+        cloudEndpoint: '',
+        cloudKey: '',
+    };
+}
+
 export function updateHints() {
     const provider = ($('provider') as HTMLSelectElement).value;
     ($('modelHint') as HTMLDivElement).textContent = MODEL_HINTS[provider] ?? '';
@@ -90,8 +112,14 @@ export async function saveAll(): Promise<void> {
         setStatus('Enter a model and API key first.', 'err');
         return;
     }
+    const o = currentOcrSettings();
+    if (pipeline.useOcrModel && pipeline.textSource !== 'ocr' && (!o.model || !o.apiKey)) {
+        setStatus('Enter the OCR model and API key first (or untick the separate reader).', 'err');
+        return;
+    }
     try {
         await ensureHostPermission(s.baseUrl ?? '', s.provider);
+        if (o.model || o.apiKey) await ensureHostPermission(o.baseUrl ?? '', o.provider);
     } catch (e) {
         setStatus(`Not saved — ${(e as Error).message}`, 'err');
         return;
@@ -101,16 +129,17 @@ export async function saveAll(): Promise<void> {
     // would silently revert them
     const { mtPipeline: stored } = await chrome.storage.local.get('mtPipeline');
     Object.assign(pipeline, mergePipeline(stored, pipeline));
-    await chrome.storage.local.set({ mtSettings: s, mtPipeline: pipeline });
+    await chrome.storage.local.set({ mtSettings: s, mtOcrSettings: o, mtPipeline: pipeline });
     setDirty(false);
     setStatus('Saved ✓', 'ok', 2000);
     syncSetupBanner();
 }
 
 export async function discardAll(fill: (s: LLMSettings) => void, syncAdvancedUI: () => void): Promise<void> {
-    const { mtSettings, mtPipeline } = await chrome.storage.local.get(['mtSettings', 'mtPipeline']);
+    const { mtSettings, mtOcrSettings, mtPipeline } = await chrome.storage.local.get(['mtSettings', 'mtOcrSettings', 'mtPipeline']);
     void mtPipeline; // pipeline reload is the caller's business (pipeline-section)
     fill({ ...DEFAULT_SETTINGS, ...(mtSettings ?? {}) } as LLMSettings);
+    fillOcrFields({ ...DEFAULT_SETTINGS, ...(mtOcrSettings ?? {}) } as LLMSettings);
     syncAdvancedUI();
     updateHints();
     syncSetupBanner();
@@ -129,10 +158,12 @@ export async function testConnection(): Promise<void> {
         await ensureHostPermission(s.baseUrl ?? "", s.provider);
         // text-only connectivity check (key + model + reachability) — image
         // support is detected at translation time instead, where the error
-        // carries a "switch to Local OCR" hint.
-        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s });
+        // carries a "switch to Local OCR" hint. Thinking level rides along:
+        // the background probes it with a second call and reports accepted /
+        // rejected (rejected levels silently run without thinking).
+        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s, thinking: pipeline.thinkingLevel });
         if (resp?.ok) {
-            setStatus(`OK — ${resp.reply}`, 'ok', 0, el);
+            setStatus(`OK — ${resp.reply}${thinkingSuffix(pipeline.thinkingLevel, resp)}`, 'ok', 0, el);
         } else {
             setStatus(`Failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
         }
@@ -140,6 +171,101 @@ export async function testConnection(): Promise<void> {
         setStatus(`Failed: ${(e as Error).message}`, 'err', 0, el);
     }
 }
+
+// shared Test-status tail for the thinking probe (main + OCR buttons)
+function thinkingSuffix(level: string, resp: { thinking?: string; thinkingError?: string }): string {
+    if (resp.thinking === 'accepted') return ` · thinking ${level}: accepted`;
+    if (resp.thinking === 'rejected') return ` · thinking ${level}: rejected — runs without it`;
+    if (resp.thinking === 'error') return ` · thinking check failed: ${resp.thinkingError ?? 'unknown'}`;
+    return '';
+}
+
+export async function testOcr(): Promise<void> {
+    const s = currentOcrSettings();
+    const el = $('ocrTestStatus') as HTMLElement;
+    if (!s.model || !s.apiKey) {
+        setStatus('Enter an OCR model and API key first.', 'err', 0, el);
+        return;
+    }
+    setStatus('Testing… (reads the test image)', '', 0, el);
+    try {
+        await ensureHostPermission(s.baseUrl ?? '', s.provider);
+        const imageB64 = await ocrTestImageB64();
+        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-ocr', settings: s, thinking: pipeline.ocrThinking, imageB64, expect: OCR_TEST_EXPECT });
+        if (resp?.ok && resp.verdict === 'exact') {
+            setStatus(`OK — reads correctly ("${resp.got}")`, 'ok', 0, el);
+        } else if (resp?.ok) {
+            setStatus(resp.verdict === 'miss'
+                ? `Saw no text — returned keep on a readable image (expected "${resp.expected}")`
+                : `Mismatch — returned "${resp.got}" (expected "${resp.expected}")`, 'err', 0, el);
+        } else {
+            setStatus(`Failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
+        }
+    } catch (e) {
+        setStatus(`Failed: ${(e as Error).message}`, 'err', 0, el);
+    }
+}
+
+// fixed self-test crop (src/options/ocr-test.png, copied to dist by build.mjs)
+// + its known transcription, character-for-character
+const OCR_TEST_EXPECT = 'We thirst for the seven wailings. We bear the koan of Jericho.';
+
+async function ocrTestImageB64(): Promise<string> {
+    const blob = await (await fetch(chrome.runtime.getURL('options/ocr-test.png'))).blob();
+    const dataUrl: string = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
+        fr.onload = () => resolve(fr.result as string);
+        fr.readAsDataURL(blob);
+    });
+    return dataUrl.slice(dataUrl.indexOf(',') + 1);
+}
+
+// ---- separate VLM reader: behavior knob (dirty-tracked, never Custom) ----
+($('ocrSeparate') as HTMLInputElement).onchange = () => {
+    pipeline.useOcrModel = ($('ocrSeparate') as HTMLInputElement).checked;
+    syncOcrSeparateUI();
+    setDirty(true);
+};
+for (const id of ['ocrModel', 'ocrApiKey', 'ocrBaseUrl'] as const) {
+    ($<HTMLInputElement>(id)).oninput = markModelDirty;
+}
+($('ocrProvider') as HTMLSelectElement).onchange = () => { renderOcrThinkingList(); markModelDirty(); };
+// OCR thinking: native datalist (free-text allowed) — deliberately not the
+// main combo machinery; options follow the OCR provider
+function renderOcrThinkingList(): void {
+    const list = $<HTMLDataListElement>('ocrThinkingList');
+    list.innerHTML = '';
+    const provider = ($('ocrProvider') as HTMLSelectElement).value as keyof typeof THINKING_LEVELS;
+    for (const v of THINKING_LEVELS[provider] ?? THINKING_LEVELS.openai) {
+        const o = document.createElement('option');
+        o.value = v;
+        list.append(o);
+    }
+}
+function syncOcrThinkingHint(): void {
+    const v = ($('ocrThinking') as HTMLInputElement).value.trim().toLowerCase();
+    ($('ocrThinkingHint') as HTMLElement).textContent =
+        (THINKING_HINTS as Record<string, string>)[v]
+        ?? (/^\d+$/.test(v)
+            ? 'Custom token budget — sent as thinkingBudget/budget_tokens where supported.'
+            : v
+                ? 'Custom value — sent as-is; rejected values fall back to the model default.'
+                : THINKING_HINTS.none);
+}
+($('ocrThinking') as HTMLInputElement).oninput = () => {
+    pipeline.ocrThinking = ($('ocrThinking') as HTMLInputElement).value.trim() || 'none';
+    syncOcrThinkingHint();
+    setDirty(true);
+};
+$('ocrCopy').onclick = () => {
+    const s = currentSettings();
+    ($('ocrProvider') as HTMLSelectElement).value = s.provider;
+    ($('ocrModel') as HTMLInputElement).value = s.model;
+    ($('ocrApiKey') as HTMLInputElement).value = s.apiKey;
+    ($('ocrBaseUrl') as HTMLInputElement).value = s.baseUrl ?? '';
+    markModelDirty();
+};
 
 // first-run guidance: show the banner until a key exists
 export function syncSetupBanner(): void {

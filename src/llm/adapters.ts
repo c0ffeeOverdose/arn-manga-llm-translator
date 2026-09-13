@@ -139,9 +139,24 @@ export const THINKING_HINTS: Record<ThinkingPreset, string> = {
 
 const isNumericLevel = (s: string) => /^\d+$/.test(s);
 // error smells like a rejected thinking param (as opposed to e.g. an image error)
-function thinkingSmell(e: unknown): boolean {
+// exported: the Test-connection probe classifies rejections with it
+export function thinkingSmell(e: unknown): boolean {
     return e instanceof LlmHttpError && (e.status === 400 || e.status === 422)
         && /thinking|budget|effort|adaptive|reasoning/i.test(e.message);
+}
+
+// single-shot thinking probe for the Test button: one direct dispatch with NO
+// fallback (callLLM's omit-retry would mask a rejection as success).
+// Resolves 'accepted'; rejects with the provider error for the caller to
+// classify (thinkingSmell = rejected level, anything else = real problem).
+// cacheKey is forwarded so session-affinity headers (x-opencode-session)
+// ride along — without it some proxies 400 the probe for a missing session.
+// Caveat: silent-ignore providers (old OpenAI models dropping reasoning_effort)
+// report accepted without effect — rejection, not effect, is what's probed.
+export async function checkThinking(s: LLMSettings, thinking: string, cacheKey?: string): Promise<'accepted'> {
+    const base = (s.baseUrl || DEFAULT_BASES[s.provider]).replace(/\/$/, '');
+    await dispatch(base, s, 'Reply with exactly: pong', undefined, thinking, cacheKey);
+    return 'accepted';
 }
 
 // OpenAI-compatible chat/completions (OpenAI, OpenRouter, ollama, gemini-compat...)

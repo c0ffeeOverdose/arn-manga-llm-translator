@@ -126,7 +126,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     regPage(state);
     // store fresh translations for the next visit (force re-translates
     // overwrite). Fire-and-forget — a slow IDB write never blocks the sweep.
-    if (!prep.cached && pipeline.cacheEnabled) {
+    // Never cache a void result (boxes but zero outputs — e.g. a stale
+    // background that still returns ok:true on total parse failure): it would
+    // sit "translated" with nothing on it until force. Zero-box pages cache
+    // fine (nothing to find twice).
+    if (!prep.cached && pipeline.cacheEnabled && (det.boxes.length === 0 || outputs.length > 0)) {
         void cachePut({
             key: cacheKey(chapterKey(), prep.hash),
             fp: settingsFingerprint(pipeline),

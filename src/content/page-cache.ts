@@ -410,6 +410,36 @@ export function seamInkLinked(upper: SeamMask, lower: SeamMask): boolean {
     return ov >= 60 && ov >= narrow * 0.3;
 }
 
+// Containment of two boxes (intersection over the SMALLER area): catches a
+// near-threshold fragment inside a real box that IoU lets through (live:
+// conf 0.36 box fully inside a conf 0.95 one, IoU only 0.30 — both painted,
+// double text). Pure.
+export function boxContained(a: SeamBox, b: SeamBox): number {
+    const inter = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
+        * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+    const minA = Math.min((a.x2 - a.x1) * (a.y2 - a.y1), (b.x2 - b.x1) * (b.y2 - b.y1));
+    return minA > 0 ? inter / minA : 0;
+}
+
+// Drop near-fully-contained boxes, loser = lower conf (tie: smaller area).
+// loserCap gates the drop: detection passes 0.5 (marginal fragments only —
+// a confident nested box like a sign in a bubble survives), paint passes the
+// default (heals every old cache entry on revisit). Pure — same refs, order kept.
+export function dropContainedBoxes<T extends SeamBox & { conf: number }>(boxes: T[], ratio = 0.9, loserCap = Infinity): T[] {
+    const drop = new Set<T>();
+    for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+            const a = boxes[i], b = boxes[j];
+            if (drop.has(a) || drop.has(b) || boxContained(a, b) < ratio) continue;
+            const loser = a.conf !== b.conf
+                ? (a.conf < b.conf ? a : b)
+                : (((a.x2 - a.x1) * (a.y2 - a.y1) <= (b.x2 - b.x1) * (b.y2 - b.y1)) ? a : b);
+            if (loser.conf < loserCap) drop.add(loser);
+        }
+    }
+    return boxes.filter(b => !drop.has(b));
+}
+
 // IoU of two boxes — the stitch safety net (below) uses it to suppress solo
 // boxes the stitch detector already found. Pure.
 export function boxIoU(a: SeamBox, b: SeamBox): number {
@@ -516,13 +546,17 @@ export interface FingerprintOpts {
     targetLang: string; textSource: string; ocrEngine: string;
     readingDir: string; detConf: number; panelConf: number; deferLabels: boolean;
     transcribeSrc: boolean; // changes the prompt (src attrs) → separate cache entries
+    useOcrModel: boolean; // split pipeline (VLM transcribe → LLM translate) → separate entries
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
     // trailing detector-generation tag: entries detected before tiled-strip
-    // CTD miss once and heal on overwrite (old entries hold fewer boxes)
+    // CTD miss once and heal on overwrite (old entries hold fewer boxes).
+    // Bumped to tile2: pre-fix entries may hold EMPTY outputs (total parse
+    // failures used to come back ok:true and get cached) — orphan them all at
+    // once instead of making the user Clear by hand.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, 'tile1'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, 'tile2'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----
@@ -594,5 +628,18 @@ export async function cacheCount(): Promise<number> {
         const d = await db();
         if (!d) return 0;
         return await req(d.transaction('pages', 'readonly').objectStore('pages').count());
+    } catch { return 0; }
+}
+
+// entries for one chapter (prefix `chapter#`) — the global count above spans
+// every story ever visited, which reads as "unstable" on a 30-page chapter
+export async function cacheCountPrefix(prefix: string): Promise<number> {
+    try {
+        const d = await db();
+        if (!d) return 0;
+        const keys = await req(d.transaction('pages', 'readonly').objectStore('pages').getAllKeys()) as unknown[];
+        let n = 0;
+        for (const k of keys) if (typeof k === 'string' && k.startsWith(prefix)) n++;
+        return n;
     } catch { return 0; }
 }

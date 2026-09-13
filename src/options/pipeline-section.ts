@@ -73,10 +73,12 @@ export function syncAdvancedUI(): void {
     ($('readingDir') as HTMLSelectElement).value = pipeline.readingDir;
     ($('transcribeSrc') as HTMLInputElement).checked = pipeline.transcribeSrc === true;
     syncOcrManager();
+    syncOcrSeparateUI();
 }
 ($<HTMLSelectElement>('textSource')).onchange = () => {
     pipeline.textSource = ($<HTMLSelectElement>('textSource')).value as 'page' | 'crops' | 'ocr';
     syncOcrManager();
+    syncOcrSeparateUI();
     markCustom();
 };
 ($<HTMLSelectElement>('readingDir')).onchange = () => {
@@ -87,6 +89,13 @@ export function syncAdvancedUI(): void {
     pipeline.transcribeSrc = ($<HTMLInputElement>('transcribeSrc')).checked;
     markCustom();
 };
+
+// ---- separate VLM reader: checkbox always visible, creds only when it can
+// run (vision modes — local-OCR mode never sends images anywhere)
+export function syncOcrSeparateUI(): void {
+    ($('ocrSeparate') as HTMLInputElement).checked = pipeline.useOcrModel;
+    $('ocrSeparateFields').style.display = pipeline.useOcrModel && pipeline.textSource !== 'ocr' ? '' : 'none';
+}
 
 // ---- OCR model manager: download/delete per language, with progress ----
 
@@ -462,7 +471,7 @@ async function refreshCacheCount(): Promise<void> {
     // error as if it were a count — the options page is often opened standalone
     if (!resp?.ok) { row.style.display = 'none'; return; }
     row.style.display = '';
-    el.textContent = `${resp.count}/${resp.max} pages`;
+    el.textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;
 }
 ($('cacheClear') as HTMLButtonElement).onclick = async () => {
     const id = await mangaTab();
@@ -471,6 +480,6 @@ async function refreshCacheCount(): Promise<void> {
     btn.textContent = 'Clearing…';
     const resp = await chrome.tabs.sendMessage(id, { type: 'mt:cache-clear' }).catch(() => null);
     btn.textContent = 'Clear translation cache';
-    if (resp?.ok) ($('cacheCount') as HTMLElement).textContent = `${resp.count}/${resp.max} pages`;
+    if (resp?.ok) ($('cacheCount') as HTMLElement).textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;
 };
 refreshCacheCount();

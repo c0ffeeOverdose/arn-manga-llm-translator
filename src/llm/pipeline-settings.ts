@@ -25,6 +25,7 @@ export interface PipelineSettings {
     // 'crops' = VLM reads: region crops only (artwork never sent — safety-filter dodge)
     // 'ocr'   = Tesseract reads locally, LLM gets text only (works with text-only models)
     textSource: 'page' | 'crops' | 'ocr';
+    useOcrModel: boolean;      // split pipeline: a separate VLM transcribes (page/crops images), the main model translates text-only
     readingDir: 'rtl' | 'ltr';   // region numbering order: manga vs manhwa/western
     ocrEngine: 'tesseract' | 'baberu'; // recognition engine when textSource='ocr'
     ocrLangs: string[];         // traineddata languages to load for OCR (must be downloaded first)
@@ -37,6 +38,7 @@ export interface PipelineSettings {
     contextPairs: number;          // cross-page memory depth
     charLimit: number;         // character book cap
     thinkingLevel: string; // preset (see THINKING_LEVELS), custom text, or a numeric token budget — mapped per provider at send time
+    ocrThinking: string; // thinking level for the separate VLM reader's transcribe call (default 'none' — copying glyphs needs no reasoning)
     parallelLlm: number;        // concurrent LLM calls when context is OFF (1 = serial)
     prefetchN: number;         // auto pre-translate window: queued pages ahead (1-30)
     // rendering
@@ -66,7 +68,8 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     cropSize: 420,
     jpegQuality: 0.85,
     grayscaleBw: true,
-    textSource: 'page',
+    textSource: 'crops',
+    useOcrModel: false,
     readingDir: 'rtl',
     ocrEngine: 'baberu',
     ocrLangs: ['jpn', 'eng'],
@@ -82,6 +85,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     contextPairs: 40,
     charLimit: 10,
     thinkingLevel: 'auto',
+    ocrThinking: 'none',
     parallelLlm: 3,
     prefetchN: 3,
     minFont: 12,
@@ -192,11 +196,24 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         }
         out.thinkingLevel = t;
     }
+    // VLM-reader thinking: same normalization, default 'none' (transcribe needs no reasoning)
+    {
+        let t = String(out.ocrThinking ?? '').trim();
+        if (!t) t = 'none';
+        else if (t === 'minimal') t = 'low';
+        else {
+            const l = t.toLowerCase();
+            if (l !== t && KNOWN_THINKING.includes(l)) t = l;
+        }
+        out.ocrThinking = t;
+    }
     // ---- migration: pre-textSource settings ----
     if (!s.textSource) {
         if (s.ocrModel === 'tesseract') out.textSource = 'ocr';
         else if (s.visionMode === 'text' || s.useVision === false) out.textSource = 'crops';
-        else out.textSource = 'page';
+        // legacy users who explicitly had vision on keep 'page'; fresh installs
+        // (no legacy keys at all) fall through to the current default
+        else if (s.visionMode != null || s.useVision != null || s.ocrModel != null) out.textSource = 'page';
     }
     if (out.readingDir !== 'rtl' && out.readingDir !== 'ltr') out.readingDir = 'rtl';
     if (typeof out.detConf !== 'number' || !(out.detConf >= 0 && out.detConf <= 1)) out.detConf = 0.35;
@@ -210,6 +227,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.deferLabels !== 'boolean') out.deferLabels = true;
     if (typeof out.showToasts !== 'boolean') out.showToasts = true;
     if (typeof out.transcribeSrc !== 'boolean') out.transcribeSrc = false;
+    if (typeof out.useOcrModel !== 'boolean') out.useOcrModel = false;
     if (out.inferEngine !== 'local' && out.inferEngine !== 'cloud') out.inferEngine = 'local';
     if (out.detEp !== 'auto' && out.detEp !== 'wasm') out.detEp = 'auto';
     if (typeof out.prefetchN !== 'number' || !(out.prefetchN >= 1 && out.prefetchN <= 30)) out.prefetchN = 3;
@@ -246,7 +264,7 @@ export function matchingPreset(s: PipelineSettings): string {
         const full = applyPreset(name);
         let same = true;
         for (const k of Object.keys(DEFAULT_PIPELINE_SETTINGS)) {
-            if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts') continue; // behavior knobs, not quality
+            if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts' || k === 'useOcrModel' || k === 'ocrThinking') continue; // behavior knobs, not quality
             if ((full as any)[k] !== (s as any)[k]) { same = false; break; }
         }
         if (same) return name;

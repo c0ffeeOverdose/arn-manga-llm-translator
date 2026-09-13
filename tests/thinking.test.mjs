@@ -11,13 +11,14 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/thinking-adapters.mjs', sourcemap: 'inline',
 });
 
-const { callLLM } =
+const { callLLM, checkThinking, thinkingSmell, LlmHttpError } =
   await import(new URL('../.test-build/thinking-adapters.mjs', import.meta.url).href);
 
 // ---- fetch stub: scripted responses, records request bodies ----
 
 let queue;
 let bodies;
+let headers;
 const okBody = {
   openai: { choices: [{ message: { content: 'x' } }], usage: {} },
   responses: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'x' }] }], usage: {} },
@@ -27,9 +28,11 @@ const okBody = {
 
 function stubFetch(provider) {
   bodies = [];
+  headers = [];
   queue = [];
   globalThis.fetch = async (_url, init) => {
     bodies.push(JSON.parse(init.body));
+    headers.push(init.headers);
     const next = queue.shift() ?? { status: 200 };
     if (next.status !== 200) {
       return { ok: false, status: next.status, text: async () => next.msg };
@@ -148,4 +151,48 @@ test('gemini auto omits generationConfig', async () => {
   stubFetch('gemini');
   await callLLM(settings('gemini'), 'p', undefined, 'auto');
   assert.ok(!('generationConfig' in bodies[0]));
+});
+
+// ---- checkThinking: single-shot probe, no fallback ----
+
+test('checkThinking accepted on 200, exactly one call', async () => {
+  stubFetch('openai');
+  assert.equal(await checkThinking(settings('openai'), 'high'), 'accepted');
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].reasoning_effort, 'high');
+});
+
+test('checkThinking throws thinking-smelling 400 with no retry', async () => {
+  stubFetch('openai');
+  queue = [{ status: 400, msg: 'reasoning_effort is not supported by this model' }];
+  await assert.rejects(checkThinking(settings('openai'), 'high'), (e) => {
+    assert.ok(e instanceof LlmHttpError);
+    assert.ok(thinkingSmell(e));
+    return true;
+  });
+  assert.equal(bodies.length, 1); // no omit-retry — that's callLLM's job
+});
+
+test('checkThinking passes non-thinking errors through unclassified', async () => {
+  stubFetch('openai');
+  queue = [{ status: 429, msg: 'rate limited, slow down' }];
+  await assert.rejects(checkThinking(settings('openai'), 'high'), (e) => {
+    assert.ok(e instanceof LlmHttpError);
+    assert.ok(!thinkingSmell(e));
+    return true;
+  });
+});
+
+test('checkThinking forwards the session header (missing-session proxies)', async () => {
+  stubFetch('responses');
+  await checkThinking(settings('responses'), 'high', 'test');
+  assert.equal(headers[0]['x-opencode-session'], 'mt-test');
+  await checkThinking(settings('responses'), 'high');
+  assert.ok(!('x-opencode-session' in headers[1]));
+});
+
+test("checkThinking probes 'none' too — it is transmitted, not a no-op", async () => {
+  stubFetch('openai');
+  assert.equal(await checkThinking(settings('openai'), 'none', 'test'), 'accepted');
+  assert.equal(bodies[0].reasoning_effort, 'none');
 });

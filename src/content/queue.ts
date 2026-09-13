@@ -15,7 +15,7 @@ import { refKey, getPages } from './page-io';
 import { preparePage, type Prep } from './pipeline';
 import { trySeam, type Job } from './seam';
 import { renderPage } from './render-page';
-import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logError, pillUnDismiss } from './status-ui';
+import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logError, pillUnDismiss, setStatus } from './status-ui';
 import { applyOverlays } from './overlays';
 
 export const queue: Job[] = [];
@@ -216,10 +216,12 @@ export async function runJob(allowSeam: boolean): Promise<void> {
             if (isDebug()) console.log('[mt] job dropped (already translated):', job.key.slice(-14));
             removeActivity(job.key); lastMsgSet(null); renderStatus(); return;
         }
-        // ghost-drop BEFORE any LLM call (auto only — manual intent always wins)
+        // ghost-drop BEFORE any LLM call (auto only — manual intent always wins).
+        // A 2.5s pill flash (not silence): without console access this is the
+        // only trace that a page-turn orphaned the job.
         if (job.auto && (await ghostDropped(job, prep))) {
             if (isDebug()) console.log('[mt] job dropped (ghost):', job.key.slice(-14));
-            removeActivity(job.key); lastMsgSet(null); renderStatus(); return;
+            removeActivity(job.key); lastMsgSet(null); setStatus('Skipped (page changed)', 'idle'); renderStatus(); return;
         }
         const state = (allowSeam && job.ref.kind === 'img' && !prep.cached)
             ? (await trySeam(job, prep, st).catch(e => {
@@ -230,7 +232,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if (state.det && state.det.boxes.length) {
             // auto-show only when the user hasn't pinned "Show original" mid-run
             if (overlayChoice === 'auto') setOverlayOn(true);
-            const mode = state.outputs?.length ? `LLM ${state.outputs.length}/${state.det.boxes.length} regions` : 'no regions';
+            const mode = state.outputs?.length ? `LLM ${state.outputs.length}/${state.det.boxes.length} regions` : 'no usable text';
             removeActivity(job.key);
             lastMsgSet({ text: `Done (${state.det.ep}, ${Math.round(state.det.inferMs)}ms, ${mode}, ${context.characters.length} characters)`, phase: 'done' });
             renderStatus();

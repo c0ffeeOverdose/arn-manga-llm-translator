@@ -21,7 +21,7 @@ test('fast preset changes tuning values', () => {
   const fast = applyPreset('fast');
   assert.equal(fast.cropSize, 360);
   assert.equal(fast.contextPairs, 15);
-  assert.equal(fast.textSource, 'page'); // unchanged from default
+  assert.equal(fast.textSource, 'crops'); // unchanged from default
   assert.equal(matchingPreset(fast), 'fast');
 });
 
@@ -53,6 +53,9 @@ test('migration: old useVision/visionMode/ocrModel map onto textSource', () => {
   assert.equal(loadPipelineSettings({ ocrModel: 'tesseract' }).textSource, 'ocr');
   // default/old vision on → page
   assert.equal(loadPipelineSettings({ useVision: true, visionMode: 'auto' }).textSource, 'page');
+  // fresh installs (no keys at all) follow the current default
+  assert.equal(loadPipelineSettings({}).textSource, DEFAULT_PIPELINE_SETTINGS.textSource);
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.textSource, 'crops');
   // explicit new value wins — no migration
   assert.equal(loadPipelineSettings({ textSource: 'ocr' }).textSource, 'ocr');
 });
@@ -213,6 +216,23 @@ test('transcribeSrc defaults false, wrong types reset', () => {
   assert.equal(loadPipelineSettings({}).transcribeSrc, false);
   assert.equal(loadPipelineSettings({ transcribeSrc: true }).transcribeSrc, true);
   assert.equal(loadPipelineSettings({ transcribeSrc: 'yes' }).transcribeSrc, false);
+});
+
+test('useOcrModel defaults false, wrong types reset, never marks Custom', () => {
+  assert.equal(loadPipelineSettings({}).useOcrModel, false);
+  assert.equal(loadPipelineSettings({ useOcrModel: true }).useOcrModel, true);
+  assert.equal(loadPipelineSettings({ useOcrModel: 'yes' }).useOcrModel, false);
+  assert.equal(matchingPreset({ ...DEFAULT_PIPELINE_SETTINGS, useOcrModel: true }), 'balanced');
+});
+
+test('ocrThinking defaults none, normalizes like thinkingLevel, never marks Custom', () => {
+  assert.equal(loadPipelineSettings({}).ocrThinking, 'none');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'high' }).ocrThinking, 'high');
+  assert.equal(loadPipelineSettings({ ocrThinking: '' }).ocrThinking, 'none');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'minimal' }).ocrThinking, 'low');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'HIGH' }).ocrThinking, 'high');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'turbo' }).ocrThinking, 'turbo'); // custom passes through
+  assert.equal(matchingPreset({ ...DEFAULT_PIPELINE_SETTINGS, ocrThinking: 'high' }), 'balanced');
 });
 
 test('mergePipeline: popup-owned keys survive an options save', () => {

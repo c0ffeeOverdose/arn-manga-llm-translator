@@ -67,6 +67,7 @@ export interface BuildOpts {
                                                     // model stops spending output tokens on speaker IDs.
     maxPairs?: number;      // recent-translation lines kept/sent (default MAX_PAIRS)
     transcribeSrc?: boolean; // model copies source text into src attr (vision-mode context)
+    transcribeOnly?: boolean; // VLM-OCR stage: transcribe each region EXACTLY, no translation (SFX transcribed too — the translate stage decides keep)
 }
 
 // Language-specific translation rules. Thai gets the full particle rule;
@@ -92,6 +93,32 @@ export function buildPrompt(
 ): string {
     const lang = opts.targetLang?.trim() || 'Thai';
     const chars = opts.chars !== false;
+    // VLM-OCR stage: pure transcription, no translation. Same <r> XML shape so
+    // the caller reuses parseResponse (translation field = transcription,
+    // 'keep' = unreadable). SFX is transcribed too — the translate stage owns
+    // the keep decision. No book/pairs/style: a read must not be biased.
+    if (opts.transcribeOnly) {
+        let t = `<task>Transcribe the text in each numbered manga region EXACTLY as written. Do NOT translate.</task>\n`;
+        if (vision && opts.textOnly) {
+            t += `<images>Each image is the crop of region 1, 2, … in order — transcribe each region from its own crop. There is no full-page image.</images>\n`;
+        } else if (vision) {
+            t += `<images>First image = full page with red number badges; the following images are crops of region 1, 2, … in order. Transcribe each region from its crop; use the full page for context.</images>\n`;
+        }
+        t += `<output_format>Output EXACTLY this XML — one element per region, nothing else:
+<r n="REGION">exact transcription</r>
+<r n="REGION" keep="true"/>
+
+The second form (self-closing, keep="true", NO text inside) is ONLY for regions with no readable text (drawings, patterns, faces, objects, scenery). Transcribe everything readable INCLUDING stylized sound-effect lettering — do not judge, do not translate, do not clean up.
+<example>
+<r n="1">一緒に来てくれないか</r>
+<r n="2">ドン</r>
+<r n="3" keep="true"/>
+</example></output_format>\n`;
+        t += `<rules>\n- Copy character-for-character — no paraphrase, no cleanup, no guessing unreadable glyphs (those regions are keep). Never translate.\n</rules>\n`;
+        t += '<regions>\n';
+        for (const r of regions) t += `${r.index} (read from image)\n`;
+        return t + '</regions>\n';
+    }
     // XML-structured prompt (prompt-engineering standard): every section is
     // an explicit tag so the model can't confuse instructions with data —
     // rules never bleed into region lists, character notes never read as
@@ -272,6 +299,14 @@ function parseXml(text: string, expected: number): ParsedResponse | null {
 // an empty result triggers the caller's retry (status says so — never silent).
 export function parseResponse(text: string, expected: number): ParsedResponse {
     return parseXml(text, expected) ?? { regions: [], extras: [], mentions: [] };
+}
+
+// OCR self-test comparison: transcription vs expected text. Collapses all
+// whitespace runs (line breaks included) and trims — layout differences are
+// not reading errors. Case-sensitive: flipped case is misreading.
+export function transcriptionMatches(got: string, expected: string): boolean {
+    const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+    return norm(expected).length > 0 && norm(got) === norm(expected);
 }
 
 // A model answer that DESCRIBES the crop instead of translating it — almost

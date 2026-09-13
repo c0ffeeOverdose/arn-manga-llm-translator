@@ -11,13 +11,13 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 
 const FP = {
   targetLang: 'Thai', textSource: 'page', ocrEngine: 'tesseract',
   readingDir: 'rtl', detConf: 0.35, panelConf: 0.2, deferLabels: true,
-  transcribeSrc: false,
+  transcribeSrc: false, useOcrModel: false,
 };
 
 test('CACHE_MAX is the agreed 200 pages', () => {
@@ -51,8 +51,30 @@ test('settingsFingerprint: stable, every field flips it', () => {
     { ...FP, panelConf: 0.3 },
     { ...FP, deferLabels: false },
     { ...FP, transcribeSrc: true },
+    { ...FP, useOcrModel: true },
   ];
   for (const v of variants) assert.notEqual(settingsFingerprint(v), base, JSON.stringify(v));
+});
+
+test('boxContained/dropContainedBoxes: IoU-blind fragment inside a real box', () => {
+  const big = { x1: 981, y1: 1088, x2: 1227, y2: 1323, conf: 0.95 };
+  const frag = { x1: 1148, y1: 1089, x2: 1227, y2: 1309, conf: 0.36 };
+  assert.ok(boxIoU(big, frag) < 0.5, 'IoU lets the fragment through');
+  assert.equal(boxContained(big, frag), 1);
+  assert.deepEqual(dropContainedBoxes([big, frag]), [big]);
+  assert.deepEqual(dropContainedBoxes([frag, big]), [big]); // order-independent
+  assert.deepEqual(dropContainedBoxes([big, frag], 0.9, 0.5), [big]); // detection gate drops it
+  assert.deepEqual(
+    dropContainedBoxes([big, { ...frag, conf: 0.9 }], 0.9, 0.5),
+    [big, { ...frag, conf: 0.9 }]); // confident nested box survives detection
+  const far = { x1: 0, y1: 0, x2: 10, y2: 10, conf: 0.9 };
+  assert.equal(boxContained(big, far), 0);
+  assert.deepEqual(dropContainedBoxes([big, far]), [big, far]);
+  assert.equal(boxContained({ x1: 5, y1: 5, x2: 5, y2: 9 }, big), 0); // zero area
+  // tie conf → smaller area loses, order preserved
+  const outer = { x1: 0, y1: 0, x2: 100, y2: 100, conf: 0.8 };
+  const inner = { x1: 10, y1: 10, x2: 90, y2: 90, conf: 0.8 };
+  assert.deepEqual(dropContainedBoxes([inner, outer]), [outer]);
 });
 
 test('packMask: downscales to ≤maxSide, block-max keeps text pixels', () => {

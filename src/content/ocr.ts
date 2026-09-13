@@ -310,8 +310,10 @@ export async function translateRegions(
     }));
     try {
         // unified text-source axis: 'page'/'crops' = VLM reads images, 'ocr' =
-        // Tesseract reads locally and the LLM gets text only
-        const ocr = pipeline.textSource === 'ocr';
+        // Tesseract reads locally and the LLM gets text only. Split pipeline
+        // (useOcrModel) transcribes in the background — except cloud pages,
+        // whose texts already arrived with detection (re-reading them is waste).
+        const ocr = pipeline.textSource === 'ocr' || (pipeline.useOcrModel && !!det.cloudTexts?.length);
         const vision = !ocr;
         const cropsOnly = vision && pipeline.textSource === 'crops';
         let imagesB64: string[] | undefined;
@@ -460,7 +462,8 @@ export async function translateRegions(
             bookOps: (resp.bookOps ?? []) as BookOp[],
             raw: resp.raw as string | undefined,
             usage: resp.usage, llmCalls: resp.llmCalls, llmMs: resp.llmMs,
-            ocrStatus, ocrMs,
+            // split pipeline: transcription stats come back from the background
+            ocrStatus: (resp.ocrStatus ?? ocrStatus) as ('ok' | 'empty')[] | undefined, ocrMs: resp.ocrMs ?? ocrMs,
         };
     } catch (e) {
         const err = e as Error & { kind?: string; hint?: string };

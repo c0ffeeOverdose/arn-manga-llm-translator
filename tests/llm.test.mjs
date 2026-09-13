@@ -19,7 +19,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix } =
+const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
@@ -654,6 +654,30 @@ test('buildPrompt transcribeSrc: src requested + verbatim rule, ocr exempt, defa
   assert.ok(!po.includes('Transcribe first') && !po.includes('src="this region'), 'ocr mode exempt');
   const pn = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {});
   assert.ok(!pn.includes('src="this region'), 'default off');
+});
+
+test('buildPrompt transcribeOnly: transcribe task, no translate/book/pairs', () => {
+  const p = buildPrompt([{ index: 1, source: '' }, { index: 2, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false });
+  assert.ok(p.includes('Transcribe the text'), 'transcribe task');
+  assert.ok(!p.includes('Translate the numbered'), 'no translate task');
+  assert.ok(p.includes('Do NOT translate') || p.includes('Never translate'), 'never-translate rule');
+  assert.ok(p.includes('sound-effect'), 'SFX transcribed, not kept');
+  assert.ok(!p.includes('<names>') && !p.includes('known_characters') && !p.includes('recent_translations'), 'no book/pairs');
+  const pc = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false, textOnly: true });
+  assert.ok(pc.includes('There is no full-page image'), 'crops-only variant');
+  // same XML shape: translation field carries the transcription
+  const r = parseResponse('<r n="1">一緒に来て</r>\n<r n="2" keep="true"/>', 2);
+  assert.equal(r.regions[0].translation, '一緒に来て');
+  assert.equal(r.regions[1].translation, 'keep');
+});
+
+test('transcriptionMatches: whitespace-blind, case-strict, empty-expected never matches', () => {
+  assert.ok(transcriptionMatches('The quick brown fox', 'The quick brown fox'));
+  assert.ok(transcriptionMatches('The quick\nbrown   fox ', ' The quick brown fox'));
+  assert.ok(!transcriptionMatches('the quick brown fox', 'The quick brown fox'));
+  assert.ok(!transcriptionMatches('The quick brown cat', 'The quick brown fox'));
+  assert.ok(!transcriptionMatches('', ''));
+  assert.ok(!transcriptionMatches('anything', ''));
 });
 
 test('langOk: real tessdata codes pass, URL-steering values fail', () => {

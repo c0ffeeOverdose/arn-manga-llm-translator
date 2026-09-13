@@ -133,7 +133,7 @@ async function refreshStatus(): Promise<void> {
         lastChars = resp.charsOpen;
         // translation cache size (separate message — IDB read, not part of mt:status)
         const cc = await send({ type: 'mt:cache-count' });
-        cacheLabel.textContent = cc?.ok ? `Cached pages (${cc.count}/${cc.max})` : 'Cached pages';
+        cacheLabel.textContent = cc?.ok ? `Cached pages (${cc.mine ?? cc.count} here · ${cc.count} total)` : 'Cached pages';
     } else {
         statusEl.textContent = 'Open a manga page to translate.';
         btn.disabled = redoBtn.disabled = true;
@@ -200,7 +200,7 @@ ctxBtn.onclick = async () => {
 cacheClearBtn.onclick = async () => {
     cacheClearBtn.textContent = 'Clearing…';
     const resp = await send({ type: 'mt:cache-clear' });
-    if (resp?.ok) cacheLabel.textContent = `Cached pages (${resp.count}/${resp.max ?? '?'})`;
+    if (resp?.ok) cacheLabel.textContent = `Cached pages (${resp.mine ?? resp.count} here · ${resp.count} total)`;
     cacheClearBtn.textContent = 'Clear';
 };
 dirBtn.onclick = async () => {

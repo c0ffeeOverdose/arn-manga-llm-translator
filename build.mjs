@@ -156,6 +156,8 @@ cpSync(join(root, 'src/iframe/worker.html'), join(dist, 'iframe/worker.html'));
 // options page (esbuild handles the JS; HTML copied)
 mkdirSync(join(dist, 'options'), { recursive: true });
 cpSync(join(root, 'src/options/options.html'), join(dist, 'options/options.html'));
+// fixed OCR self-test image (deterministic pixels — never generated at runtime)
+cpSync(join(root, 'src/options/ocr-test.png'), join(dist, 'options/ocr-test.png'));
 await esbuild.build({
   entryPoints: { options: join(root, 'src/options/options.ts') },
   bundle: true,

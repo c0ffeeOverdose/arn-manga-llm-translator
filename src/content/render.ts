@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 5;
+export const RENDER_GEN = 6;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -468,14 +468,21 @@ function hCap(area: Area): number {
 }
 
 // Would this text fit horizontally in the area? Probe for preferHorizontal:
-// measure-only (no paint), same cap the real render uses.
+// measure-only (no paint), same cap the real render uses. A degenerate
+// single-line overflow (one unwrappable unit wider than the area at min
+// font — layoutText's last-resort fallback) is NOT a fit: it would paint
+// one clipped line instead of rotating (live: 38px vertical strip probed
+// true, rendered 4 glyphs in an empty-looking box).
 export function horizontalFits(
     ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
     text: string,
     area: Area,
 ): boolean {
     const laid = layoutText(ctx, text, area.w, area.h, hCap(area));
-    return laid.lines.length > 0 && laid.lines.length * laid.lineHeight <= area.h + 0.5;
+    if (!laid.lines.length || laid.lines.length * laid.lineHeight > area.h + 0.5) return false;
+    setFont(ctx, laid.fontSize);
+    const slack = 0.5 + laid.fontSize * renderTuning.letterSpacing; // trailing-track overstatement
+    return laid.lines.every(l => ctx.measureText(l).width <= area.w + slack);
 }
 
 function renderHorizontal(

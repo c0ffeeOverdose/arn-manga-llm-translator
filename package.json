@@ -7,7 +7,8 @@
   "scripts": {
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "test": "node --test tests/"
+    "test": "node --test tests/",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "onnxruntime-web": "^1.29.0",

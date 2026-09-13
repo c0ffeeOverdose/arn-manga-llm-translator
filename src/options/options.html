@@ -237,9 +237,9 @@
   #dirtyBar:has(#status.err) #status { white-space: normal; }
   /* per-action test status (under each Test button) — errors must not land
      in the save bar where they read as "Save broke" */
-  #testStatus, #cloudTestStatus { font-size: 12.5px; white-space: normal; }
-  #testStatus.ok, #cloudTestStatus.ok { color: var(--ok); }
-  #testStatus.err, #cloudTestStatus.err { color: var(--err); }
+  #testStatus, #cloudTestStatus, #ocrTestStatus { font-size: 12.5px; white-space: normal; }
+  #testStatus.ok, #cloudTestStatus.ok, #ocrTestStatus.ok { color: var(--ok); }
+  #testStatus.err, #cloudTestStatus.err, #ocrTestStatus.err { color: var(--err); }
   .btn.quiet { background: none; border-color: transparent; box-shadow: none;
                color: var(--muted); font-weight: 400; padding: 6px 4px; }
   .btn.quiet:hover { background: none; border-color: transparent; color: var(--text); text-decoration: underline; }
@@ -508,6 +508,51 @@
         <label class="check"><input type="checkbox" id="transcribeSrc"> Also transcribe source text (vision only)</label>
         <div class="hint">The model copies each box's original text alongside the translation — richer cross-page context at roughly 2× output tokens. No effect in OCR mode.</div>
       </div>
+
+      <div class="field">
+        <label class="check"><input type="checkbox" id="ocrSeparate"> Use a separate model just for reading text</label>
+        <div class="hint">A cheap/fast vision model transcribes each box, then your main model translates text-only — 2 LLM calls per page, using the same images as above. No effect in OCR mode.</div>
+      </div>
+
+      <fieldset id="ocrSeparateFields" style="display:none">
+        <div class="field">
+          <label for="ocrProvider">OCR protocol</label>
+          <select id="ocrProvider">
+            <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, ollama…)</option>
+            <option value="responses">Responses API (OpenAI responses)</option>
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="gemini">Google Gemini</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="ocrModel">OCR model</label>
+          <input type="text" id="ocrModel" placeholder="e.g. gpt-5.4-nano">
+        </div>
+
+        <div class="field">
+          <label for="ocrApiKey">OCR API key</label>
+          <input type="password" id="ocrApiKey" placeholder="sk-…">
+        </div>
+
+        <div class="field">
+          <label for="ocrBaseUrl">OCR Base URL <span class="hint">(optional — custom endpoints)</span></label>
+          <input type="text" id="ocrBaseUrl" placeholder="https://api.openai.com/v1">
+        </div>
+
+        <div class="field">
+          <label for="ocrThinking">OCR thinking level</label>
+          <input type="text" id="ocrThinking" list="ocrThinkingList" placeholder="none" autocomplete="off">
+          <datalist id="ocrThinkingList"></datalist>
+          <div class="hint" id="ocrThinkingHint"></div>
+        </div>
+
+        <div class="field" style="display:flex;gap:8px">
+          <button id="ocrCopy" type="button" class="btn ghost sm">Copy from main</button>
+          <button id="ocrTest" type="button" class="btn ghost sm">Test OCR model</button>
+        </div>
+        <div class="hint" id="ocrTestStatus" style="min-height:18px;margin-top:6px"></div>
+      </fieldset>
 
       <div id="ocrManager" style="display:none">
         <div class="field">
