@@ -125,6 +125,10 @@ export async function galleryManifestJson(): Promise<string | null> {
 // the loaded window stays — sweeping DOM refs undercounts). Same public API
 // family resolveMangaId already uses; [] on any failure (external chapter,
 // offline) so callers fall through to the DOM branches silently.
+// Tier match: the reader may show the data-saver variant (different bytes) —
+// sweeping full-data then paints nowhere (URL and hash both miss) and forks
+// a second cache universe the reader can never hit. Probe the first page's
+// full-data dims against a loaded page image; mismatch walks data-saver.
 export async function fetchPagedUrls(): Promise<string[]> {
     const uuid = pagedChapterUuid(location.pathname, location.hostname);
     if (!uuid) return [];
@@ -132,8 +136,32 @@ export async function fetchPagedUrls(): Promise<string[]> {
         const r = await fetch(`https://api.mangadex.org/at-home/server/${encodeURIComponent(uuid)}`, { signal: AbortSignal.timeout(15000) });
         if (!r.ok) return [];
         const j = await r.json();
-        return buildPagedUrls(j?.baseUrl, j?.chapter?.hash, j?.chapter?.data);
+        const baseUrl = j?.baseUrl, hash = j?.chapter?.hash;
+        const data = j?.chapter?.data, saver = j?.chapter?.dataSaver;
+        const tier = await pagedTier(baseUrl, hash, data);
+        const files = tier === 'data-saver' && Array.isArray(saver) && saver.length ? saver : data;
+        return buildPagedUrls(baseUrl, hash, files, tier === 'data-saver' && files === saver ? 'data-saver' : 'data');
     } catch { return []; }
+}
+
+// which at-home tier the reader shows: full-data dims equal a loaded page
+// image, saver dims don't. No loaded page / unreadable probe / junk payload
+// keeps today's full-data default (status quo, never worse).
+async function pagedTier(baseUrl: unknown, hash: unknown, data: unknown): Promise<'data' | 'data-saver'> {
+    try {
+        if (typeof baseUrl !== 'string' || typeof hash !== 'string' || !Array.isArray(data) || !data.length) return 'data';
+        const shown = getPages().find(r => r.kind === 'img' && (r.el as HTMLImageElement).naturalWidth >= 400)?.el as HTMLImageElement | undefined;
+        if (!shown) return 'data';
+        const first = buildPagedUrls(baseUrl, hash, [data[0]], 'data');
+        if (!first.length) return 'data';
+        const f = await fetchBitmap(first[0]);
+        let dw = 0, dh = 0;
+        try { dw = f.bitmap.width; dh = f.bitmap.height; }
+        finally { try { f.bitmap.close(); } catch { /* already closed */ } }
+        const tier = (dw === shown.naturalWidth && dh === shown.naturalHeight) ? 'data' : 'data-saver';
+        if (isDebug()) console.log('[mt] paged tier:', JSON.stringify({ tier, shown: `${shown.naturalWidth}x${shown.naturalHeight}`, data: `${dw}x${dh}` }));
+        return tier;
+    } catch { return 'data'; }
 }
 
 // DOM walk for lazy <img> with an addressable src but no pixels yet (the

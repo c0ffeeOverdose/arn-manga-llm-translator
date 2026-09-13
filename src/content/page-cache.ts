@@ -345,13 +345,14 @@ export function pagedChapterUuid(pathname: string, hostname: string): string | n
     // charset-gated: the id is interpolated into an API URL below
     return m && /^[0-9a-f-]{10,}$/i.test(m[1]) ? m[1] : null;
 }
-export function buildPagedUrls(baseUrl: unknown, hash: unknown, files: unknown): string[] {
+export function buildPagedUrls(baseUrl: unknown, hash: unknown, files: unknown, kind: 'data' | 'data-saver' = 'data'): string[] {
     if (typeof baseUrl !== 'string' || typeof hash !== 'string' || !Array.isArray(files)) return [];
+    if (kind !== 'data' && kind !== 'data-saver') return [];
     const b = baseUrl.replace(/\/+$/, '');
     const out: string[] = [];
     for (const f of files) {
         if (typeof f !== 'string' || !f || f.includes('/') || f.includes('\\')) continue;
-        out.push(`${b}/data/${hash}/${f}`);
+        out.push(`${b}/${kind}/${hash}/${f}`);
     }
     return out;
 }

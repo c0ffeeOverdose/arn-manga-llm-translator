@@ -702,3 +702,11 @@ test('unloadedPageUrls: unloaded http(s) only, deduped against live refs', () =>
     { src: 'blob:https://example.org/x', loaded: false }, // dead without the element — element path owns these
   ], known), ['https://cdn.example.org/lazy1.webp']);
 });
+
+test('buildPagedUrls kinds: data default, data-saver on request, junk kind rejected', () => {
+  assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', ['p1.png']), ['https://svc.example.org/data/h1/p1.png']);
+  assert.deepEqual(
+    buildPagedUrls('https://svc.example.org', 'h1', ['p1.png', 'p2.png'], 'data-saver'),
+    ['https://svc.example.org/data-saver/h1/p1.png', 'https://svc.example.org/data-saver/h1/p2.png']);
+  assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', ['p1.png'], 'orig'), []);
+});
