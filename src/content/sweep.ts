@@ -67,6 +67,27 @@ const foldedHashes = new Set<string>();
 function foldedSync(): void {
     if (foldedChapter !== chapterKey()) { foldedChapter = chapterKey(); foldedHashes.clear(); }
 }
+// ---- session commits: hashes this document's sweep runs committed (fresh or
+// cached). Arrival may paint these WITHOUT auto — the sweep press is explicit
+// chapter-wide intent, unlike stale cache from previous sessions (which stays
+// blank until press/auto, per user verdict). Memory-only: a reopened page
+// starts blank again. Same lifecycle rules as the folded set above.
+let committedChapter = '';
+const committedHashes = new Set<string>();
+function committedSync(): void {
+    if (committedChapter !== chapterKey()) { committedChapter = chapterKey(); committedHashes.clear(); }
+}
+// arrival gate (cheap, no hash needed): a sweep is running, or this chapter
+// already has session commits worth painting on arrival
+export function sweepArrivable(): boolean {
+    committedSync();
+    return sweepActive() || committedHashes.size > 0;
+}
+// arrival paint permission for one hash (called after the pixels hash)
+export function sweepCommitted(hash: string): boolean {
+    committedSync();
+    return committedHashes.has(hash);
+}
 export function bookHas(hash: string): boolean { foldedSync(); return foldedHashes.has(hash); }
 export function bookAdd(hash: string): void { foldedSync(); foldedHashes.add(hash); }
 export function bookDrop(hash: string): void { foldedHashes.delete(hash); }
@@ -345,6 +366,7 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     if ('skip' in c) { s.skipped++; return; }
     if ('cached' in c) {
         s.done++;
+        if (c.hash) { committedSync(); committedHashes.add(c.hash); }
         // unconditional (like the fresh branch below): headless cached commits
         // carry no ref, but the user may be looking at the page right now —
         // paintIfLoaded resolves loaded refs itself and no-ops otherwise
@@ -357,6 +379,7 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
         await saveContext();
     }
     bookAdd(c.hash);
+    committedSync(); committedHashes.add(c.hash);
     if (pipeline.cacheEnabled) {
         void cachePut({
             key: cacheKey(s.chapter, c.hash),

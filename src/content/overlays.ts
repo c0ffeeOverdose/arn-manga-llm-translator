@@ -14,6 +14,7 @@ import { cacheGet, cacheKey, pageHashFromBitmap } from './page-cache';
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
 import { autoOn } from './auto';
+import { sweepArrivable, sweepCommitted } from './sweep';
 import { isDebug } from '../debug';
 
 export function applyOverlays(): void {
@@ -55,7 +56,9 @@ export function applyOverlays(): void {
 // other path (a never-folded entry folds here, an already-folded one paints
 // only). Cross-module calls stay in function bodies (queue↔sweep convention).
 const ARRIVAL_RETRY_MS = 60000;
+const ARRIVAL_GATE_MS = 5000; // gated pages (no auto, uncommitted): recheck cheaply, never hot-loop the fetch
 const arrivalMiss = new WeakMap<Element, { src: string; dims: string; at: number }>();
+const arrivalGate = new WeakMap<Element, number>();
 const arrivalBusy = new WeakSet<Element>();
 function arrivalStuck(el: Element, src: string, dims: string): boolean {
     const m = arrivalMiss.get(el);
@@ -64,9 +67,13 @@ function arrivalStuck(el: Element, src: string, dims: string): boolean {
 async function arrivalPaint(ref: PageRef): Promise<void> {
     const el = ref.el;
     // explicit intent only: a reopened page shows originals until the user
-    // presses Translate chapter / enables auto — silent repainting of cached
-    // pages on arrival reads as haunted (user-verdict, 2026-09-13)
-    if (!autoOn() || arrivalBusy.has(el) || document.hidden) return;
+    // presses Translate chapter / enables auto — silent repainting of stale
+    // cache on arrival reads as haunted (user-verdict, 2026-09-13). The one
+    // exception is this session's own sweep commits: the sweep press covers
+    // the chapter, so arrivals paint those with no auto (checked by hash
+    // below — the cheap pre-gate here just avoids fetching when neither auto
+    // nor any session commit exists).
+    if ((!autoOn() && !sweepArrivable()) || arrivalBusy.has(el) || document.hidden) return;
     let dims = '';
     if (ref.kind === 'img') {
         const img = el as HTMLImageElement;
@@ -76,6 +83,7 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
     if (viewportOverlap(ref) <= 0) return; // the sweep paints loaded offscreen pages itself
     const src = ref.kind === 'img' ? ((el as HTMLImageElement).currentSrc || (el as HTMLImageElement).src) : refKey(ref);
     if (arrivalStuck(el, src, dims)) return;
+    if (Date.now() - (arrivalGate.get(el) ?? 0) < ARRIVAL_GATE_MS) return;
     const key = pageKeyOf(ref);
     if (queue.some(j => j.key === key) || paintHas(key) || activeKeyGet() === key) return;
     arrivalBusy.add(el);
@@ -86,7 +94,11 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         const hash = pageHashFromBitmap(bitmap);
         const hit = pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined;
         const det = hit ? detFromCacheEntry(hit, bitmap.width, bitmap.height) : null;
+        // permission: auto covers everything; otherwise only this session's
+        // sweep commits (stale cache from previous sessions stays blank until
+        // press/auto — never miss-mark a gated page, just come back later)
         if (!det || !hit || stateFor(ref)) { arrivalMiss.set(el, { src, dims, at: Date.now() }); return; }
+        if (!autoOn() && !sweepCommitted(hash)) { arrivalGate.set(el, Date.now()); return; }
         if (isDebug()) console.log('[mt] arrival paint (cache):', src.slice(-24));
         await renderPage(ref, { srcUrl, bitmap, det, hash, cached: hit,
             origBytes: ref.kind === 'canvas' ? bytes : undefined }, () => {}, false);
