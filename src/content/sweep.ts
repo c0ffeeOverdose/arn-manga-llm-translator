@@ -32,7 +32,7 @@ import { resolveHeadlessDet, preparePage } from './pipeline';
 import { translateRegions, type TranslateOutcome } from './ocr';
 import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath } from './page-cache';
 import type { DetectResult, MtOnStatus } from './detection';
-import { failMarks, enqueue, pageKeyOf } from './queue';
+import { failMarks, enqueue, pageKeyOf, viewportOverlap } from './queue';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn } from './status-ui';
 import { isDebug } from '../debug';
 
@@ -51,7 +51,7 @@ interface SweepItem {
 interface SweepRun { cancel: boolean; dead: boolean; failed: boolean; done: number; total: number; errors: number; skipped: number; firstErr: string; chapter: string }
 type Commit =
     | { i: number; url: string; hash: string; w: number; h: number; det: DetectResult; o: TranslateOutcome; ref?: PageRef }
-    | { i: number; url: string; cached: true; ref?: PageRef }
+    | { i: number; url: string; hash?: string; cached: true; ref?: PageRef }
     | { i: number; url: string; skip: true } // blank canvas (translating it poisons) — head advances, counts neither done nor error
     | { i: number; url: string; error: true; msg?: string };
 
@@ -272,7 +272,7 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
             // shared headless resolve (full hit → cached marker, partial →
             // resume, else detect + order + checkpoint)
             const r = await resolveHeadlessDet(bitmap, hash, st);
-            if (!r.det) return { i: job.i, url: job.url, cached: true };
+            if (!r.det) return { i: job.i, url: job.url, hash, cached: true };
             translating++;
             let o: TranslateOutcome;
             try {
@@ -301,14 +301,16 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
 async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter: string): Promise<Commit | null> {
     const st: MtOnStatus = () => {};
     try {
-        if (stateFor(job.ref)) return { i: job.i, url: job.url, cached: true, ref: job.ref };
+        const already = stateFor(job.ref);
+        if (already) return { i: job.i, url: job.url, hash: already.hash, cached: true, ref: job.ref };
         const prep = await preparePage(job.ref, false, st, true);
         if (!prep) {
-            return stateFor(job.ref)
-                ? { i: job.i, url: job.url, cached: true, ref: job.ref }
+            const done = stateFor(job.ref);
+            return done
+                ? { i: job.i, url: job.url, hash: done.hash, cached: true, ref: job.ref }
                 : { i: job.i, url: job.url, skip: true };
         }
-        if (prep.cached) return { i: job.i, url: job.url, cached: true, ref: job.ref };
+        if (prep.cached) return { i: job.i, url: job.url, hash: prep.hash, cached: true, ref: job.ref };
         if (chapterKey() !== chapter) { try { prep.bitmap.close(); } catch {} return null; }
         const w = prep.bitmap.width, h = prep.bitmap.height; // before close below
         translating++;
@@ -346,7 +348,7 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
         // unconditional (like the fresh branch below): headless cached commits
         // carry no ref, but the user may be looking at the page right now —
         // paintIfLoaded resolves loaded refs itself and no-ops otherwise
-        paintIfLoaded(c.url, c.ref);
+        await paintIfLoaded(c.url, c.hash, c.ref);
         return;
     }
     if (shareContext) {
@@ -373,7 +375,7 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
         sessionUsage.cachedInTok += c.o.usage.cachedInTok ?? 0;
     }
     setLastPageUsage({ inTok: c.o.usage?.inTok, outTok: c.o.usage?.outTok, cachedInTok: c.o.usage?.cachedInTok, ms: c.o.llmMs, calls: c.o.llmCalls });
-    paintIfLoaded(c.url, c.ref);
+    await paintIfLoaded(c.url, c.hash, c.ref);
 }
 
 // a commit must paint every copy the user can see — arrival only paints via
@@ -382,14 +384,16 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
 // Cache-hit job (fold skipped when already registered — bookAdd covered it).
 // DOM commits carry their ref directly; headless ones resolve it by claim key
 // (only the viewed page has an element — the rest don't exist yet). Exact key
-// first, samePagePath fallback for CDN host rotation (proven predicate —
-// pixel-hash verify can't cross quality variants, exact or nothing, so no
-// third stage: a miss logs one line with the cause instead of painting blind).
-function paintIfLoaded(url: string, direct?: PageRef): void {
+// first, samePagePath fallback for CDN host rotation, content-hash fallback
+// for opaque-src readers (blob: elements never match any URL — verify the top
+// visible candidates by exact bytes, never paint blind: recycled nodes
+// mismatch and fall through; quality variants correctly miss like before).
+async function paintIfLoaded(url: string, hash: string | undefined, direct?: PageRef): Promise<void> {
     if (!sweep) return;
     const ref = (direct && direct.el.isConnected && !stateFor(direct) ? direct : undefined)
         ?? getPages().find(r => pageKeyOf(r) === url && !stateFor(r))
-        ?? getPages().find(r => !stateFor(r) && samePagePath(pageKeyOf(r), url));
+        ?? getPages().find(r => !stateFor(r) && samePagePath(pageKeyOf(r), url))
+        ?? (hash ? await viewedByHash(url, hash) : undefined);
     if (!ref) { if (isDebug()) console.log('[mt] sweep paint miss: no ref', url.slice(-24)); return; }
     if (stateFor(ref)) return; // painted while resolving
     // zero-rect only (hidden placeholders arrive-paint when the reader shows
@@ -398,6 +402,33 @@ function paintIfLoaded(url: string, direct?: PageRef): void {
     const b = ref.el.getBoundingClientRect();
     if (b.width === 0 && b.height === 0) { if (isDebug()) console.log('[mt] sweep paint miss: zero-rect', url.slice(-24)); return; }
     enqueue(ref, false, true);
+}
+
+// top-3 visible loaded stateless imgs by content hash (see above). Bounded:
+// exact+path already missed, so at most 3 browser-cached fetches per commit.
+async function viewedByHash(url: string, hash: string): Promise<PageRef | undefined> {
+    const cands = getPages()
+        .filter(r => {
+            if (r.kind !== 'img' || stateFor(r)) return false;
+            const img = r.el as HTMLImageElement;
+            return img.complete && img.naturalWidth > 0 && img.getBoundingClientRect().width > 0;
+        })
+        .sort((a, b) => viewportOverlap(b) - viewportOverlap(a))
+        .slice(0, 3);
+    for (const c of cands) {
+        try {
+            const img = c.el as HTMLImageElement;
+            const src = img.currentSrc || img.src;
+            if (!/^(blob:|https?:)/.test(src)) continue;
+            const f = await fetchBitmap(src);
+            let ok = false;
+            try { ok = pageHashFromBitmap(f.bitmap) === hash; }
+            finally { try { f.bitmap.close(); } catch { /* already closed */ } }
+            if (ok) return c;
+        } catch { /* unreadable (taint) — next candidate */ }
+    }
+    if (cands.length && isDebug()) console.log('[mt] sweep paint hash-mismatch', `${cands.length} tried`, url.slice(-24));
+    return undefined;
 }
 
 function pumpSweepStatus(): void {
