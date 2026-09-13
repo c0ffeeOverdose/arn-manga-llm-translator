@@ -1,7 +1,7 @@
 // Background service worker: LLM translation (BYOK). Detection runs in the
 // content script's iframe (src/iframe) — this worker owns LLM calls only.
 
-import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, type LLMSettings, type LlmUsage } from '../llm/adapters';
+import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, type LLMSettings, type LlmUsage } from '../llm/adapters';
 import { buildPrompt, parseResponse, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 
@@ -348,7 +348,38 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
 // be suspended while a sendResponse is still pending (live-proven: reply
 // vanished silently at ~30s) — port replies survive because an open port
 // pins the page. Never rejects; failures come back as {ok:false}.
+// In-flight adoption: identical mt:translate calls share one provider
+// roundtrip instead of each paying it. A page-turn kills the requesting
+// document mid-LLM — the arrival then issues the same payload; attaching it
+// to the still-running call (or the just-finished response) instead of
+// re-spending. Same-doc duplicates (sweep worker vs DOM job on one page)
+// collapse the same way. Misses only cost the optimization (fresh call);
+// SW death wipes the maps and the next call becomes the owner (self-healing).
+const flightWaiters = new Map<string, ((resp: unknown) => void)[]>();
+const flightRecent = new Map<string, { at: number; resp: unknown }>();
+const FLIGHT_RECENT_TTL_MS = 5 * 60 * 1000;
+const FLIGHT_RECENT_MAX = 20;
+// honest counters (numbers only) — E2E asserts dedup through these
+const flightStats = { owners: 0, adopted: 0, recentHits: 0 };
+(globalThis as Record<string, unknown>).__mtFlightStats = flightStats;
+function flightRecentGet(id: string): unknown | undefined {
+    const e = flightRecent.get(id);
+    if (!e) return undefined;
+    if (Date.now() - e.at > FLIGHT_RECENT_TTL_MS) { flightRecent.delete(id); return undefined; }
+    flightRecent.delete(id); // LRU touch
+    flightRecent.set(id, e);
+    return e.resp;
+}
+function flightRecentPut(id: string, resp: unknown): void {
+    flightRecent.delete(id);
+    flightRecent.set(id, { at: Date.now(), resp });
+    if (flightRecent.size > FLIGHT_RECENT_MAX) flightRecent.delete(flightRecent.keys().next().value!);
+}
+
 function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
+    // settles waiters when assigned (post-adoption); pre-adoption failures
+    // (settings reads) answer the caller directly — nothing was claimed.
+    let settle: ((resp: unknown) => void) | null = null;
     (async () => {
         try {
             const settings = await getSettings();
@@ -382,6 +413,54 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                 }
             };
             const split = pipeline.useOcrModel && vision && !!msg.imagesB64?.length;
+            const ocrSettings = split ? await getOcrSettings() : null;
+            // adoption check (atomic: no await between map lookup and claim —
+            // two identical calls racing each other must not both become owner)
+            const reqId = await translateRequestId(translateRequestParts(
+                {
+                    cacheKey: msg.cacheKey ?? '', imagesB64: msg.imagesB64 ?? [],
+                    regions: msg.regions, context: msgCtx,
+                    vision, textOnly: !!msg.textOnly, ocr: !!msg.ocr, split,
+                    pageW: msg.pageW, pageH: msg.pageH,
+                },
+                {
+                    provider: settings.provider, model: settings.model, baseUrl: settings.baseUrl ?? '',
+                    ocrModel: ocrSettings?.model ?? '',
+                    thinkingLevel: pipeline.thinkingLevel, ocrThinking: pipeline.ocrThinking,
+                    useOcrModel: pipeline.useOcrModel, stylePrompt: pipeline.stylePrompt,
+                    targetLang: pipeline.targetLang, useCharacters: pipeline.useCharacters,
+                    contextPairs: pipeline.contextPairs, transcribeSrc: pipeline.transcribeSrc,
+                    vlmAssisted: pipeline.vlmAssistedDetection,
+                },
+            ));
+            const recent = flightRecentGet(reqId);
+            if (recent && (recent as { ok?: unknown })?.ok) {
+                // the twin call finished moments ago (its document died before
+                // writing cache) — serve without spending
+                flightStats.recentHits++;
+                if (dbg) console.log('[mt:bg] flight recent-hit', reqId.slice(0, 12));
+                send(recent);
+                return;
+            }
+            const inflight = flightWaiters.get(reqId);
+            if (inflight) {
+                // the twin call is still running — wait for its outcome instead
+                // of paying a duplicate (ok or error, same handling as our own)
+                flightStats.adopted++;
+                if (dbg) console.log('[mt:bg] flight adopted', reqId.slice(0, 12));
+                send(await new Promise<unknown>(res => inflight.push(res)));
+                return;
+            }
+            const mine: ((resp: unknown) => void)[] = [];
+            flightWaiters.set(reqId, mine);
+            flightStats.owners++;
+            // every exit (ok or error) settles waiters with the same payload
+            settle = (resp: unknown) => {
+                flightWaiters.delete(reqId);
+                if ((resp as { ok?: unknown })?.ok) flightRecentPut(reqId, resp);
+                send(resp);
+                for (const w of mine.splice(0)) { try { w(resp); } catch { /* waiter gone */ } }
+            };
             let regions2 = msg.regions;
             let usage: LlmUsage = {};
             let llmCalls = 0;
@@ -390,15 +469,15 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             let ocrStatus: ('ok' | 'empty')[] | undefined;
             let ocrMs: number | undefined;
             if (split) {
-                const ocrSettings = await getOcrSettings();
-                if (!ocrSettings.model || !ocrSettings.apiKey) {
+                if (!ocrSettings!.model || !ocrSettings!.apiKey) {
                     throw new MtError('auth', 'OCR model not configured — open the extension options');
                 }
+                const ocr = ocrSettings!;
                 const tPrompt = buildPrompt(msg.regions, EMPTY_CONTEXT, true, {
                     textOnly: msg.textOnly, transcribeOnly: true, chars: false,
                 });
                 if (dbg) console.log('[mt:bg] ocr prompt', tPrompt);
-                const t = await callWithRetry(ocrSettings, tPrompt, msg.imagesB64, pipeline.ocrThinking);
+                const t = await callWithRetry(ocr, tPrompt, msg.imagesB64, pipeline.ocrThinking);
                 preRaw = t.text;
                 usage = { ...t.usage };
                 llmCalls = t.calls;
@@ -504,7 +583,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             const { ctx: newCtx, bookOps } = updateContext(msgCtx, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs);
             if (dbg) console.log('[mt:bg] llm raw', rawAll);
             if (dbg && bookOps.length) console.log('[mt:bg] book ops', JSON.stringify(bookOps));
-            send({
+            settle({
                 ok: true, outputs, extras: parsed.extras, mentions, context: newCtx, model: settings.model, raw: rawAll,
                 bookOps: bookOps.length ? bookOps : undefined,
                 usage: usage.inTok != null || usage.outTok != null ? usage : undefined,
@@ -512,7 +591,9 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             });
         } catch (e) {
             const m = toMtError(e);
-            send({ ok: false, error: m.message, kind: m.kind, hint: m.hint });
+            const out = { ok: false, error: m.message, kind: m.kind, hint: m.hint };
+            if (settle) settle(out);
+            else send(out);
         }
     })();
 }

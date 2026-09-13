@@ -5,12 +5,13 @@ import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareCo
 import { getPages, refKey } from './page-io';
 import { cacheClear, cacheCount, cacheCountPrefix } from './page-cache';
 import { isDebug } from '../debug';
-import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet } from './queue';
+import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued } from './queue';
 import { setStatus, idleStatus, pageCounts, makeToast, logError } from './status-ui';
 import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
 import { toggleCharsPanel, charsPanelOpen } from './chars-ui';
-import { setAutoTranslate } from './auto';
+import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
+import { startSweep, cancelSweep, sweepStatus, sweepPages } from './sweep';
 
 export function toggleOverlay(): void {
     setOverlayOn(!overlayOn);
@@ -176,10 +177,14 @@ export function installMessageListener(): void {
         }
         if (msg?.type === 'mt:cancel-all') {
             // drop everything queued (the in-flight page runs out — aborting mid-LLM
-            // wastes spent tokens and corrupts the book)
-            const n = queue.length;
+            // wastes spent tokens and corrupts the book). Background engines stop
+            // too: the chapter sweep (own stop otherwise) and the lookahead chain
+            // (drains after its current page — same no-mid-LLM-abort rule).
+            const n = queue.length + paintQueued();
+            const stopping = !!sweepStatus()?.active || cancelLookahead();
             clearQueue();
-            setStatus(n ? `Cancelled — dropped ${n} queued` : idleStatus(), 'idle');
+            cancelSweep();
+            setStatus(n ? `Cancelled — dropped ${n} queued` : stopping ? 'Stopping background work…' : idleStatus(), 'idle');
             sendResponse({ ok: true, dropped: n });
             return;
         }
@@ -249,6 +254,8 @@ export function installMessageListener(): void {
                 viewedTranslated: viewed ? !!stateFor(viewed)?.det : false,
                 viewedQueued: viewed ? queue.some(j => j.key === pageKeyOf(viewed)) : false,
                 viewedActive: viewed ? pageKeyOf(viewed) === activeKeyGet() : false,
+                sweep: sweepStatus(),
+                lookaheadActive: lookaheadActive(),
                 ...pageCounts(),
             });
             return;
@@ -264,6 +271,18 @@ export function installMessageListener(): void {
             setAutoTranslate(m.on === true);
             sendResponse({ ok: true });
             return;
+        }
+        if (msg?.type === 'mt:sweep-start') {
+            startSweep().then(r => sendResponse(r));
+            return true;
+        }
+        if (msg?.type === 'mt:sweep-cancel') {
+            sendResponse(cancelSweep());
+            return;
+        }
+        if (msg?.type === 'mt:sweep-count') {
+            sweepPages().then(n => sendResponse({ ok: true, count: n }));
+            return true;
         }
     });
 }

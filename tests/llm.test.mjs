@@ -21,7 +21,7 @@ await build({
 
 const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
-const { toMtError, LlmHttpError } =
+const { toMtError, LlmHttpError, translateRequestParts, translateRequestId } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
 const { langOk, fetchWithProgress } =
   await import(new URL('../.test-build/ocr-models.mjs', import.meta.url).href);
@@ -712,5 +712,39 @@ test('fetchWithProgress: throws after 3 attempts', async () => {
     assert.equal(calls, 3);
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+const ADOPT_REQ = {
+  cacheKey: 'manga-1', imagesB64: ['aGVsbG8='],
+  regions: [{ index: 1, source: 'Hello' }],
+  context: { pairs: [['a', 'b']], characters: [] },
+  vision: false, textOnly: true, ocr: true, split: false, pageW: 100, pageH: 100,
+};
+const ADOPT_ST = {
+  provider: 'openai', model: 'm', baseUrl: '', ocrModel: '',
+  thinkingLevel: 'low', ocrThinking: 'none',
+  useOcrModel: false, stylePrompt: '', targetLang: 'Thai',
+  useCharacters: true, contextPairs: 40, transcribeSrc: false, vlmAssisted: false,
+};
+
+test('translateRequestId: stable 64-hex, sensitive to every output-shaping input', async () => {
+  const id = await translateRequestId(translateRequestParts(ADOPT_REQ, ADOPT_ST));
+  assert.match(id, /^[0-9a-f]{64}$/);
+  assert.equal(await translateRequestId(translateRequestParts(ADOPT_REQ, ADOPT_ST)), id);
+  // each of these changes what the model returns → must re-key (fresh call, never a wrong share)
+  const variants = [
+    [{ ...ADOPT_REQ, imagesB64: ['d29ybGQ='] }, ADOPT_ST, 'pixels'],
+    [{ ...ADOPT_REQ, regions: [{ index: 1, source: 'Bye' }] }, ADOPT_ST, 'regions'],
+    [{ ...ADOPT_REQ, context: { pairs: [], characters: [] } }, ADOPT_ST, 'context'],
+    [{ ...ADOPT_REQ, cacheKey: 'manga-2' }, ADOPT_ST, 'manga scope'],
+    [ADOPT_REQ, { ...ADOPT_ST, model: 'm2' }, 'model'],
+    [ADOPT_REQ, { ...ADOPT_ST, thinkingLevel: 'high' }, 'thinking'],
+    [ADOPT_REQ, { ...ADOPT_ST, targetLang: 'English' }, 'target lang'],
+    [ADOPT_REQ, { ...ADOPT_ST, useCharacters: false }, 'chars flag'],
+    [{ ...ADOPT_REQ, split: true }, ADOPT_ST, 'split mode'],
+  ];
+  for (const [r, s, why] of variants) {
+    assert.notEqual(await translateRequestId(translateRequestParts(r, s)), id, `must re-key on ${why}`);
   }
 });

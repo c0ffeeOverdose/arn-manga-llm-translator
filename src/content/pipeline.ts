@@ -7,12 +7,40 @@ import { renderRegion } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, unpackMask, dropContainedBoxes, type CachedPage } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, type CachedPage } from './page-cache';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; cacheMiss?: string; origBytes?: ArrayBuffer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; resumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
+
+// Headless detect resolve — shared by lookahead prefetch and chapter sweep
+// (DOM jobs use preparePage instead: canvas blanks, ghost twins, stashed
+// bytes). Full hit → {det:null} (caller returns); resumable partial → rebuilt
+// det; else fresh detect + order + checkpoint write. Zero-box pages skip the
+// checkpoint (nothing to resume; the full entry covers them).
+export async function resolveHeadlessDet(
+    bitmap: ImageBitmap, hash: string, onStatus: MtOnStatus,
+): Promise<{ det: DetectResult | null; resumed: boolean }> {
+    const key = cacheKey(chapterKey(), hash);
+    const fp = settingsFingerprint(pipeline);
+    if (pipeline.cacheEnabled) {
+        const hit = await cacheGet(key);
+        if (hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+            return { det: null, resumed: false };
+        }
+        if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
+            onStatus('Resuming saved detection…', 'llm');
+            return { det: detFromPartial(hit, bitmap.width, bitmap.height)!, resumed: true };
+        }
+    }
+    const det = await detectPage(bitmap, onStatus);
+    await orderDetection(det, bitmap);
+    if (pipeline.cacheEnabled && det.boxes.length) {
+        void cachePut(partialEntry(key, fp, det, bitmap.width, bitmap.height), pipeline.cacheMax);
+    }
+    return { det, resumed: false };
+}
 
 // Detection for one bitmap (local or cloud), no ordering — shared by the
 // solo path (preparePage) and the seam path (stitched bitmap, same call).
@@ -91,9 +119,16 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
 // Detect phase — kicked off at ENQUEUE time so detection of the next page
 // overlaps the LLM call of the current one (CTD parallel, LLM serial).
 // Returns null when the page is already translated (cache hit, no-op job).
-export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus): Promise<Prep | null> {
+// fromSweep: the caller IS the sweep (already claimed) — skip the sweep-wait
+// or the worker waits on its own claim until timeout.
+export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false): Promise<Prep | null> {
     const existing = stateFor(ref);
     if (existing && !force) return null;
+    // prepMs: read + hash + cache-gate cost (excludes queue wait — the prep
+    // body runs at enqueue time, not when the pump gets to it). Answers
+    // "why is a cache hit slow" without guessing.
+    const tPrep0 = performance.now();
+    const prepMs = () => Math.round(performance.now() - tPrep0);
     // re-translate: always from the ORIGINAL page — when the translated overlay
     // is showing, img.src points at our own rendering (canvas: stashed bytes).
     const srcUrl = existing ? existing.orig : refKey(ref);
@@ -134,6 +169,19 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     }
     // persistent cache: same image bytes + same settings → skip detect + LLM.
     // force (re-translate) always misses and overwrites below.
+    // A previous document may have died mid-job on this exact page (full-load
+    // readers kill all in-memory state per page-turn) — leave a trace so the
+    // next load can name the restart instead of silently redoing it.
+    // read BEFORE our own write below — else every first visit matches the
+    // trace it just wrote and cries "interrupted" over nothing.
+    const prevWarming = readWarming();
+    writeWarming(refKey(ref));
+    // chapter sweep owns this page right now — wait for its commit instead of
+    // paying a duplicate detect + LLM (falls through on cancel/timeout, then
+    // the normal flow finds the fresh cache entry)
+    if (!force && !fromSweep && pipeline.cacheEnabled) {
+        await Promise.race([sweepWait(refKey(ref), onStatus), new Promise(r => setTimeout(r, 150000))]);
+    }
     const hash = pageHashFromBitmap(bitmap);
     // miss-reason instrument: a revisit that SHOULD hit but misses needs a
     // verdict in one dump (absent | fp | dims | mask | disabled) — no guessing
@@ -142,7 +190,8 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         const hit = await cacheGet(cacheKey(chapterKey(), hash));
         const fp = settingsFingerprint(pipeline);
         // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite
-        if (hit && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+        // partial entries never render as Done (cache) — they resume below
+        if (hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
             cacheMiss = undefined;
             onStatus('Cache hit…');
             const det: DetectResult = {
@@ -150,19 +199,42 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                 mask: { width: bitmap.width, height: bitmap.height, data: unpackMask(hit.mask, bitmap.width, bitmap.height) },
                 inferMs: 0, ep: 'cache', dropped: [], panelDropped: [],
             };
-            return { srcUrl, bitmap, det, hash, cached: hit,
+            return { srcUrl, bitmap, det, hash, cached: hit, prepMs: prepMs(),
                 // canvas cache hit still needs the original bytes — the canvas will
                 // show our drawing after this (re-translate reads the stash, §readPage)
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
         if (hit) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : 'mask';
+        // detect checkpoint resume: the previous load finished detect (boxes +
+        // panels + mask on disk) but died before translating — continue at
+        // translateRegions, skipping detect entirely. The pill jumps read→llm,
+        // which reads as "continuing" instead of "restarting".
+        if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
+            cacheMiss = undefined;
+            onStatus('Resuming saved detection…', 'llm');
+            return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, resumed: true as const, prepMs: prepMs(),
+                origBytes: ref.kind === 'canvas' ? bytes : undefined };
+        }
+        if (!hit) {
+            // total miss with a fresh warming trace for this page = the
+            // previous document died before its detect checkpoint landed
+            // (prevWarming, read before our own write above — never self-match)
+            const w = prevWarming;
+            if (w && samePagePath(w.key, refKey(ref)) && warmingFresh(w.ts)) onStatus('Warming was interrupted — restarting…', 'read');
+        }
     }
     const det = await detectPage(bitmap, onStatus);
     await orderDetection(det, bitmap);
+    // detect checkpoint: a page-turn kills this document mid-job — the next
+    // load resumes from this entry (same key the full entry will overwrite).
+    // Zero-box pages skip it (nothing to resume; the full entry covers them).
+    if (!force && pipeline.cacheEnabled && det.boxes.length) {
+        void cachePut(partialEntry(cacheKey(chapterKey(), hash), settingsFingerprint(pipeline), det, bitmap.width, bitmap.height), pipeline.cacheMax);
+    }
     // canvas pages: stash the original bytes (the canvas will show our drawing
     // after this — re-translate must read the original, not our overlay)
     const origBytes = ref.kind === 'canvas' ? (bytes ?? existing?.origBytes) : undefined;
-    return { srcUrl, bitmap, det, hash, cacheMiss, origBytes };
+    return { srcUrl, bitmap, det, hash, cacheMiss, prepMs: prepMs(), origBytes };
 }
 
 // Paint translated regions onto a canvas (inpaint source text, draw the

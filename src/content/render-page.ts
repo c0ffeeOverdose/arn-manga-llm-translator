@@ -4,13 +4,14 @@
 import { ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
-import { cacheKey, settingsFingerprint, cachePut, packMask } from './page-cache';
+import { cacheKey, settingsFingerprint, cachePut, packMask, dropProgressT0 } from './page-cache';
 import { type MtOnStatus } from './detection';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep } from './pipeline';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
 import { rewindContextBefore, replayPagesAfter } from './queue';
+import { bookHas, bookAdd, bookDrop } from './sweep';
 import { saveContext } from './state';
 
 export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean): Promise<PageState> {
@@ -21,6 +22,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // (force still re-translates; the twin's context contribution gets rewound below.)
     if (existing && !force) return existing;
     if (existing && shareContext) await rewindContextBefore(existing);
+    // the rebuilt book excludes this page — its hash must refold (fresh fold
+    // below re-registers; an error leaves it dropped so arrival refolds).
+    // Same for the progress stamp: a force retranslate counts fresh.
+    if (existing?.hash) bookDrop(existing.hash);
+    if (existing) dropProgressT0(srcUrl);
     let outputs: RegionOutput[], extras: ExtraRegion[], usedLLM: boolean;
     let mentions: Mention[] = [];
     let bookOps: BookOp[] | undefined;
@@ -36,16 +42,21 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         usedLLM = false;
         annWCache = bitmap.width; annHCache = bitmap.height;
         rawLLM = '(cached — no LLM call)';
-        if (shareContext) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); }
+        // already folded by whoever produced this entry (sweep commit, an
+        // earlier visit, prefetch) — refolding would duplicate its pairs.
+        // Otherwise fold + register (later arrivals skip via the divert lane).
+        if (shareContext && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
     } else {
         onStatus('Translating…');
-        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, annW: annWCache, annH: annHCache, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs } = await translateRegions(bitmap, det, onStatus));
+        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, annW: annWCache, annH: annHCache, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs } = await translateRegions(bitmap, det, onStatus,
+            { progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled }));
 
         if (error) {
             const e = new Error(`LLM failed: ${error}`) as Error & { kind?: string; hint?: string };
             e.kind = errorKind; e.hint = errorHint;
             throw e;
         }
+        bookAdd(prep.hash); // folded above (translateRegions) — arrivals skip refold
     }
 
     const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
@@ -57,11 +68,13 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
 
     onStatus('Rendering…', 'render');
     // paint translated regions (shared helper — the seam path paints the whole
-    // stitch with it, then slices per member)
+    // stitch, then slices per member)
+    const tRender0 = performance.now();
     const layouts = paintRegions(canvas, frame, det, outputs);
 
     // VLM extras (shared helper — the seam path paints them on the stitch too)
     paintExtras(canvas, frame, det, extras);
+    const renderMs = Math.round(performance.now() - tRender0); // paint only (excludes PNG encode + overlays)
 
     // single debug dump: everything needed to diagnose a bad page render
     if (isDebug()) console.log('[mt] page result', JSON.stringify({
@@ -69,6 +82,9 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         ann: `${annWCache}x${annHCache}`,
         hash: prep.hash, // content hash — same visual page, different hash = read-path pixels differ
         ...(prep.cacheMiss ? { cacheMiss: prep.cacheMiss } : null), // why a revisit re-translated: absent|fp|dims|mask|disabled
+        ...(prep.resumed ? { resumed: true } : null), // continued from a detect checkpoint, not from zero
+        ...(prep.prepMs != null ? { prepMs: prep.prepMs } : null), // read + hash + cache-gate ms (excludes queue wait)
+        renderMs, // paint ms (excludes PNG encode + overlays)
         minFont: renderTuning.minFont, // effective floor — stale options look identical to a render bug
         gen: RENDER_GEN, // render-logic generation — stale extension shows an older number
         detConf: pipeline.detConf, // threshold that let these boxes through — low values explain junk regions

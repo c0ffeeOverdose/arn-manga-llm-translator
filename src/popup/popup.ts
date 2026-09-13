@@ -6,6 +6,7 @@ import { sessGet } from '../storage-session';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const btn = $<HTMLButtonElement>('translate');
+const sweepBtn = $<HTMLButtonElement>('sweep');
 const cancelAllBtn = $<HTMLButtonElement>('cancelAll');
 const statusEl = $<HTMLElement>('status');
 const auto = $<HTMLInputElement>('auto');
@@ -78,6 +79,7 @@ statusSection.ontoggle = () => { if (!statusSection.open) statusPinned = true; }
 // last-known toggle states — click handlers flip the label instantly
 // (optimistic) instead of waiting for the 1s poll; the poll confirms.
 let lastCtx = true, lastChars = false, lastOverlay = true, lastDir: 'rtl' | 'ltr' = 'rtl';
+let sweepRunning = false; // mirrored from mt:status each poll — the button toggles start/cancel
 
 async function refreshStatus(): Promise<void> {
     const resp = await send({ type: 'mt:status' });
@@ -119,10 +121,13 @@ async function refreshStatus(): Promise<void> {
         else if (resp.viewedQueued) btn.textContent = 'Cancel this page';
         else btn.textContent = 'Translate this page';
         redoBtn.disabled = busy || !resp.viewedTranslated;
-        // cancel lives in the status card: visible only while work is queued
+        // cancel lives in the status card: visible while work is queued OR any
+        // background engine runs (lookahead chain, chapter sweep) — otherwise
+        // a running pre-translate has no stop control at all
         const q = resp.queued ?? 0;
-        cancelAllBtn.style.display = q > 0 ? '' : 'none';
-        cancelAllBtn.textContent = `Cancel all (${q})`;
+        const bgRunning = !!resp.lookaheadActive || !!(resp.sweep as { active: boolean } | null)?.active;
+        cancelAllBtn.style.display = q > 0 || bgRunning ? '' : 'none';
+        cancelAllBtn.textContent = q > 0 ? `Cancel all (${q})` : 'Stop background work';
         origBtn.textContent = resp.overlayOn ? 'Show original' : 'Show translated';
         lastOverlay = resp.overlayOn;
         ctxBtn.textContent = `Context: ${resp.shareContext ? 'on' : 'off'}`;
@@ -131,6 +136,19 @@ async function refreshStatus(): Promise<void> {
         dirBtn.textContent = lastDir.toUpperCase();
         charsBtn.textContent = resp.charsOpen ? 'Hide characters' : 'Characters';
         lastChars = resp.charsOpen;
+        // chapter sweep: explicit whole-chapter background run (separate from
+        // auto) — label shows progress while running, page count when idle
+        const sw = resp.sweep as { active: boolean; done: number; total: number; errors: number } | null;
+        sweepRunning = !!sw?.active;
+        if (sweepRunning && sw) {
+            sweepBtn.textContent = `Stop sweep (${sw.done}/${sw.total})`;
+            sweepBtn.disabled = false;
+        } else {
+            const sc = await send({ type: 'mt:sweep-count' }) as { ok?: boolean; count?: number } | null;
+            const n = sc?.count ?? 0;
+            sweepBtn.textContent = n > 0 ? `Translate chapter (${n} pages)` : 'Translate chapter';
+            sweepBtn.disabled = !sc?.ok || n === 0;
+        }
         // translation cache size (separate message — IDB read, not part of mt:status)
         const cc = await send({ type: 'mt:cache-count' });
         cacheLabel.textContent = cc?.ok ? `Cached pages (${cc.mine ?? cc.count} here · ${cc.count} total)` : 'Cached pages';
@@ -156,6 +174,18 @@ btn.onclick = async () => {
 cancelAllBtn.onclick = async () => {
     statusEl.textContent = 'Cancelling…';
     await send({ type: 'mt:cancel-all' });
+    refreshStatus();
+};
+
+sweepBtn.onclick = async () => {
+    if (sweepRunning) {
+        statusEl.textContent = 'Stopping sweep…';
+        await send({ type: 'mt:sweep-cancel' });
+    } else {
+        statusEl.textContent = 'Starting chapter sweep…';
+        const resp = await send({ type: 'mt:sweep-start' }) as { ok?: boolean; total?: number; error?: string } | null;
+        statusEl.textContent = resp?.ok ? `Sweeping ${resp.total} pages…` : (resp?.error ?? 'failed');
+    }
     refreshStatus();
 };
 // pages-ahead slider: persisted to mtPipeline, content picks it up live via

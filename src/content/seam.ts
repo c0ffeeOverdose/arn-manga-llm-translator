@@ -16,7 +16,8 @@ import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage,
 import { getPages, fetchBitmap, writePage } from './page-io';
 import { detectPage, orderDetection, paintRegions, paintExtras, type Prep } from './pipeline';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
-import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet } from './queue';
+import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet, paintFind } from './queue';
+import { bookAdd, bookDrop } from './sweep';
 
 interface SeamMember { ref: PageRef; key: string; srcUrl: string; bitmap: ImageBitmap; hash: string; det: DetectResult }
 export const SEAM_MAX = 4; // owner + 3 — bounds the stitch canvas + pulled jobs
@@ -122,7 +123,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             members.push(null); // placeholder — filled by the join below, order kept
             pend.push((async () => {
                 const idx = members.length - 1;
-                const q = queueFind(key);
+                const q = queueFind(key) ?? paintFind(key);
                 let mp: Prep | null = null;
                 try {
                     if (q) mp = await q.prep;
@@ -298,9 +299,11 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         if (shareContext) {
             const olds = chain.map(m => pages.get(m.key)).filter((s): s is PageState => !!s);
             if (olds.length) await rewindContextBefore(...olds);
+            for (const o of olds) if (o.hash) bookDrop(o.hash); // rebuilt book excludes them — refold below re-registers
         }
         const outcome = await translateRegions(stitchBmp, det, onStatus);
         if (outcome.error) { prune(); return null; } // members fall back to solo (parked normally)
+        for (const m of chain) bookAdd(m.hash); // folded above (whole-stitch context) — arrivals skip refold
         const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs } = outcome;
         const annWCache = outcome.annW, annHCache = outcome.annH;
         const rawLLM = outcome.raw;

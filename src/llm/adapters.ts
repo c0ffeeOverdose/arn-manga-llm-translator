@@ -1,7 +1,7 @@
 // BYOK LLM adapters — 4 protocols, plain fetch, no SDKs.
 // All run in the background service worker (host_permissions cover CORS).
 
-import { splitStablePrefix } from './core';
+import { splitStablePrefix, type ContextState, type RegionInput } from './core';
 
 export interface LLMSettings {
     provider: 'openai' | 'responses' | 'anthropic' | 'gemini';
@@ -325,4 +325,48 @@ async function gemini(base: string, s: LLMSettings, prompt: string, images?: str
     const budget = GEMINI_BUDGET[thinking];
     if (budget == null) throw new LlmHttpError(400, `thinking not supported: ${thinking}`);
     return send({ thinkingBudget: budget });
+}
+
+// ---- in-flight adoption identity: which request fingerprints must match for
+// two mt:translate calls to share one provider roundtrip. Everything that can
+// change the model's output is in (images, regions, context snapshot, mode
+// flags incl. split, both models, thinking levels, prompt-shaping settings,
+// manga scope); routing-only hints (prompt_cache_key, session affinity) stay
+// out. Raw msg values + split (effective flags derive from those — no logic
+// duplication). Deterministic by construction (fixed-order array).
+// A miss only costs the optimization (fresh call, today's behavior); a hit
+// across documents is safe because equal inputs mean an equally valid output
+// (same content-identity philosophy as the page cache).
+export interface TranslateRequestFingerprint {
+    cacheKey: string;
+    imagesB64: string[];
+    regions: RegionInput[];
+    context: ContextState;
+    vision: boolean; textOnly: boolean; ocr: boolean; split: boolean;
+    pageW: number; pageH: number;
+}
+export interface TranslateFingerprintSettings {
+    provider: string; model: string; baseUrl: string; ocrModel: string;
+    thinkingLevel: string; ocrThinking: string;
+    useOcrModel: boolean; stylePrompt: string; targetLang: string;
+    useCharacters: boolean; contextPairs: number; transcribeSrc: boolean; vlmAssisted: boolean;
+}
+export function translateRequestParts(
+    req: TranslateRequestFingerprint, st: TranslateFingerprintSettings,
+): (string | number | boolean)[] {
+    return [
+        'mt-tr-v1', req.cacheKey,
+        st.provider, st.model, st.baseUrl, st.ocrModel,
+        st.thinkingLevel, st.ocrThinking,
+        st.useOcrModel, st.stylePrompt, st.targetLang,
+        st.useCharacters, st.contextPairs, st.transcribeSrc, st.vlmAssisted,
+        req.vision, req.textOnly, req.ocr, req.split, req.pageW, req.pageH,
+        JSON.stringify(req.regions), JSON.stringify(req.context),
+        ...req.imagesB64,
+    ];
+}
+export async function translateRequestId(parts: (string | number | boolean)[]): Promise<string> {
+    const bytes = new TextEncoder().encode(JSON.stringify(parts));
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
 }

@@ -7,6 +7,7 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
+import { readProgressT0, writeProgressT0 } from './page-cache';
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
@@ -296,6 +297,18 @@ export async function translateRegions(
     bitmap: ImageBitmap,
     det: DetectResult,
     onStatus: MtOnStatus,
+    // fold:false leaves the book alone and returns the raw outcome for the
+    // caller to fold later — parallel workers must not setContext out of
+    // order (each response is folded over its dispatch-time snapshot, so a
+    // late page would clobber earlier commits). Default folds immediately,
+    // exactly like before.
+    // progressKey/continued: cross-document pill continuity — stamp this
+    // page's LLM dispatch and count from the earliest fresh stamp (an arrival
+    // continuing a shared SW call) instead of restarting at 1s. continued
+    // needs caller corroboration (resumed checkpoint, or no cache to resume
+    // from) so a dead call never inflates the counter; force callers drop the
+    // entry first (fresh work counts fresh).
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean },
 ): Promise<TranslateOutcome> {
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
     // ponytail: region cap 150 — dense art pages can drown a single LLM call;
@@ -383,7 +396,17 @@ export async function translateRegions(
         // previous status ("OCR n/n…") would otherwise look stuck
         onStatus('LLM translating…', 'llm');
         let llmSeconds = 0;
-        const llmTick = setInterval(() => onStatus(`LLM translating… ${++llmSeconds}s`, 'llm'), 1000);
+        const t0local = Date.now();
+        if (opts?.progressKey) writeProgressT0(opts.progressKey, t0local);
+        // handoff read AFTER our own write is safe by construction: handoffRead
+        // takes the earliest fresh stamp across exact + host-volatile twin keys,
+        // so our just-written entry can never shadow the older twin.
+        const handedT0 = opts?.continued === true && opts?.progressKey ? readProgressT0(opts.progressKey) : null;
+        const tickBase = handedT0 != null && handedT0 <= t0local ? handedT0 : t0local;
+        const llmTick = setInterval(() => {
+            llmSeconds = Math.max(llmSeconds + 1, Math.round((Date.now() - tickBase) / 1000));
+            onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
+        }, 1000);
         let resp: any;
         const payload = {
             type: 'mt:translate',
@@ -451,7 +474,7 @@ export async function translateRegions(
                 e.x2 > e.x1 && e.y2 > e.y1 &&
                 e.x2 <= bitmap.width * 1.05 && e.y2 <= bitmap.height * 1.05 &&
                 (e.x2 - e.x1) > 12 && (e.y2 - e.y1) > 12);
-        if (shareContext) {
+        if (opts?.fold !== false && shareContext) {
             const c = resp.context as ContextState | undefined;
             setContext((c && Array.isArray(c.characters) && Array.isArray(c.pairs)) ? c : context);
             await saveContext();

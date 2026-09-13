@@ -97,6 +97,30 @@ export function episodeManifestSrcs(): string[] | null {
     return srcs ? srcs.filter((s): s is string => !!s) : null;
 }
 
+// gallery-manifest source for single-img readers: the embedded script
+// payload first, same-origin API as fallback (hydration may drop the script —
+// the data-url IS the API route, so a direct GET returns the same gallery
+// object; cached per gallery, and a failed fetch caches null so callers
+// never retry-loop it). Shared by lookahead and chapter sweep.
+let galleryManifestCache: { key: string; json: string | null } | null = null;
+export async function galleryManifestJson(): Promise<string | null> {
+    const script = document.querySelector('script[type="application/json"][data-url^="/api/v2/galleries/"]');
+    if (script?.textContent) return script.textContent;
+    const g = location.pathname.match(/^\/g\/(\d+)\/\d+\/?$/);
+    if (!g) return null;
+    if (galleryManifestCache?.key === g[1]) return galleryManifestCache.json;
+    try {
+        const r = await fetch(`/api/v2/galleries/${g[1]}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const json = JSON.stringify({ body: JSON.stringify(await r.json()) });
+        galleryManifestCache = { key: g[1], json };
+        return json;
+    } catch {
+        galleryManifestCache = { key: g[1], json: null };
+        return null;
+    }
+}
+
 // Last-resort pixel source: the direct read failed (CORS-blocked <img>,
 // tainted canvas, hotlink-guarded CDN). Scroll the element into view and ask
 // the background for a viewport screenshot, then crop to the element rect.

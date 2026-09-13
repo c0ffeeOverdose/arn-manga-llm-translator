@@ -17,9 +17,26 @@ import { trySeam, type Job } from './seam';
 import { renderPage } from './render-page';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logError, pillUnDismiss, setStatus } from './status-ui';
 import { applyOverlays } from './overlays';
+import { bookHas } from './sweep'; // paint-lane divert decision — queue↔sweep calls stay in function bodies only, like the queue↔seam cycle
 
 export const queue: Job[] = [];
 let running = false;
+// paint lane: cache-hit jobs whose outputs are already folded (bookHas) need
+// no LLM and no book mutation, so they must not hold the serial pump — they
+// run here, up to PAINT_JOBS at once. Visible to seam/auto-twin guards:
+// queued paints resolve like queued preps, active paints like the active one.
+const paintQueue: Job[] = [];
+const paintActive = new Map<string, Job>();
+let paintRunning = 0;
+// ponytail: fixed lane — paints are local CPU (inpaint + layout + PNG
+// encode), provider limits don't apply. Raise if dense chapters paint slowly.
+const PAINT_JOBS = 3;
+export function paintFind(key: string): Job | undefined {
+    return paintQueue.find(j => j.key === key) ?? paintActive.get(key);
+}
+export function paintHas(key: string): boolean { return paintQueue.some(j => j.key === key) || paintActive.has(key); }
+export function paintQueued(): number { return paintQueue.length; }
+export function paintBusy(): boolean { return paintRunning > 0 || paintQueue.length > 0; }
 // failure cooldown per page key: a failed job parks for 60s (max 3 attempts)
 // instead of being re-enqueued every autoTick — auto-retry without token burn
 export const failMarks = new Map<string, FailMark>();
@@ -78,6 +95,7 @@ export function enqueue(ref: PageRef, force = false, auto = false): 'queued' | '
     const key = pageKeyOf(ref);
     if (force) cooldownClear(failMarks, key); // manual retranslate retries immediately
     if (key === activeKey) return 'active';
+    if (paintHas(key)) return 'active'; // paint lane owns it — a twin would only double-render
     const twin = queue.findIndex(j => j.key === key);
     if (twin !== -1) {
         if (!force) return 'dup';
@@ -136,6 +154,41 @@ export async function pump(): Promise<void> {
         }
     } finally {
         running = false;
+    }
+}
+
+// paint pump: up to PAINT_JOBS cached repaints at once (local CPU only — no
+// LLM, no book writes). Quiet completions (no per-page Done — the counts +
+// progress bar already report); failures park + surface like normal errors.
+function pumpPaint(): void {
+    while (paintRunning < PAINT_JOBS) {
+        const job = paintQueue.shift();
+        if (!job) return;
+        paintRunning++;
+        paintActive.set(job.key, job);
+        const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
+        void (async () => {
+            try {
+                const prep = await job.prep;
+                if (!prep) { removeActivity(job.key); renderStatus(); return; } // painted while queued
+                await renderPage(job.ref, prep, st, job.force);
+                cooldownClear(failMarks, job.key);
+                removeActivity(job.key);
+                renderStatus();
+            } catch (e) {
+                const err = e as Error & { kind?: string; hint?: string };
+                cooldownMark(failMarks, job.key, Date.now());
+                removeActivity(job.key);
+                lastMsgSet({ text: 'Error: ' + err.message, phase: 'error' });
+                renderStatus();
+                void logError(err.message, err.hint, err.kind);
+            } finally {
+                paintActive.delete(job.key);
+                paintRunning--;
+                applyOverlays();
+                pumpPaint();
+            }
+        })();
     }
 }
 
@@ -223,6 +276,16 @@ export async function runJob(allowSeam: boolean): Promise<void> {
             if (isDebug()) console.log('[mt] job dropped (ghost):', job.key.slice(-14));
             removeActivity(job.key); lastMsgSet(null); setStatus('Skipped (page changed)', 'idle'); renderStatus(); return;
         }
+        // paint-lane divert: cached + already folded — painting it here would
+        // hold the serial pump (and its LLM ordering) for pure local CPU
+        // work. The lane stays visible to seam/auto-twin guards; completions
+        // stay quiet (counts + progress bar already report them).
+        if (prep.cached && bookHas(prep.hash)) {
+            if (isDebug()) console.log('[mt] paint lane divert:', job.key.slice(-14));
+            paintQueue.push(job);
+            pumpPaint();
+            return;
+        }
         const state = (allowSeam && job.ref.kind === 'img' && !prep.cached)
             ? (await trySeam(job, prep, st).catch(e => {
                 console.warn('[mt] seam failed, solo fallback:', (e as Error)?.message ?? e);
@@ -267,8 +330,25 @@ export async function runJob(allowSeam: boolean): Promise<void> {
 
 // Drop everything still queued (story change / manual cancel). The page
 // currently rendering runs to completion — aborting mid-LLM would corrupt
-// the book (and the tokens are spent already).
+// the book (and the tokens are spent already). Paint-lane backlog drops too
+// (in-flight paints are sub-second and run out on their own).
 export function clearQueue(): void {
     for (const j of queue) removeActivity(j.key);
     queue.length = 0;
+    for (const j of paintQueue) removeActivity(j.key);
+    paintQueue.length = 0;
+}
+
+// Toggle-off: drop queued AUTO work (explicit manual/force intent + the
+// in-flight page survive). Completed pages are cached — nothing repeats, the
+// unstarted backlog simply never runs.
+export function dropAutoQueued(): number {
+    let n = 0;
+    for (let i = queue.length - 1; i >= 0; i--) {
+        if (queue[i].auto && !queue[i].force) { removeActivity(queue[i].key); queue.splice(i, 1); n++; }
+    }
+    for (let i = paintQueue.length - 1; i >= 0; i--) {
+        if (paintQueue[i].auto && !paintQueue[i].force) { removeActivity(paintQueue[i].key); paintQueue.splice(i, 1); n++; }
+    }
+    return n;
 }
