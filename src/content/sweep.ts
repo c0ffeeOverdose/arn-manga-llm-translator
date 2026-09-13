@@ -343,7 +343,10 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     if ('skip' in c) { s.skipped++; return; }
     if ('cached' in c) {
         s.done++;
-        if (c.ref) paintIfLoaded(c.url, c.ref);
+        // unconditional (like the fresh branch below): headless cached commits
+        // carry no ref, but the user may be looking at the page right now —
+        // paintIfLoaded resolves loaded refs itself and no-ops otherwise
+        paintIfLoaded(c.url, c.ref);
         return;
     }
     if (shareContext) {
