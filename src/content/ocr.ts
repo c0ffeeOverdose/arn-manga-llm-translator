@@ -55,17 +55,22 @@ async function baberuCrop(bitmap: ImageBitmap, box: DetBox): Promise<ArrayBuffer
 }
 
 // Prefetch pipeline: crop of box n+1 + its vision run START while box n is
-// still decoding — the per-session locks in the worker make the vision of
-// the next box overlap the decode of the current one (OCR ~40s → ~15s/page).
-// Depth 2 keeps memory bounded (two decoded KV states max).
-export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void): Promise<string[]> {
+// still decoding — depth 2 keeps memory bounded (two decoded KV states max).
+// NOTE: the worker's ORT lock is one global chain, so the overlapped vision
+// still queues behind the in-flight decode step — the win is hiding PNG
+// crop/encode + message latency, not parallel inference (OCR ~40s → ~15s/page
+// measured). Per-box lock waits sum into lockWaitMs for the page-result dump.
+export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void): Promise<{ texts: string[]; lockWaitMs: number }> {
     const results: string[] = [];
+    let lockWaitMs = 0;
     let next = 0;
     const startOne = async (): Promise<string> => {
         const i = next++;
         if (i >= boxes.length) return '';
         const png = await baberuCrop(bitmap, boxes[i]);
-        return baberuOcr(png);
+        const { text, lockWaitMs: w } = await baberuOcr(png);
+        lockWaitMs += w;
+        return text;
     };
     let pending: Promise<string> = startOne();
     for (const b of boxes) {
@@ -74,7 +79,7 @@ export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgr
         pending = following;
         onProgress?.(results.length, boxes.length);
     }
-    return results;
+    return { texts: results, lockWaitMs };
 }
 
 // JPEG base64 helper. Grayscale strips ~2/3 of the payload on B&W pages.
@@ -291,6 +296,7 @@ export interface TranslateOutcome {
     llmMs?: number;
     ocrStatus?: ('ok' | 'empty')[]; // per-region OCR result (engine-agnostic)
     ocrMs?: number; // wall ms of the local OCR phase (undefined when the VLM reads images)
+    ocrLockWaitMs?: number; // ms Baberu runs waited on the shared ORT lock (Tesseract path: undefined)
 }
 
 export async function translateRegions(
@@ -332,6 +338,7 @@ export async function translateRegions(
         let imagesB64: string[] | undefined;
         let ocrStatus: ('ok' | 'empty')[] | undefined;
         let ocrMs: number | undefined;
+        let ocrLockWaitMs: number | undefined;
         // dims of the annotated image the model actually sees (extras coords come
         // back in THIS space — the model can't know the full-resolution page)
         let annW = bitmap.width, annH = bitmap.height;
@@ -348,9 +355,10 @@ export async function translateRegions(
                         { kind: 'ocr', hint: 'Download the model first — Settings → Model → Text source → OCR engine → Download' },
                     );
                 }
-                const texts = await baberuOcrAll(bitmap, det.boxes, (done, total) => {
+                const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, (done, total) => {
                     if (done % 4 === 0 || done === total) onStatus(`OCR ${done}/${total}…`, 'ocr');
                 });
+                ocrLockWaitMs = lockWaitMs;
                 texts.forEach((t, i) => { regions[i].source = t; });
             } else {
                 const installed = new Set(await ocrLangsInstalled(pipeline.ocrLangs));
@@ -487,6 +495,7 @@ export async function translateRegions(
             usage: resp.usage, llmCalls: resp.llmCalls, llmMs: resp.llmMs,
             // split pipeline: transcription stats come back from the background
             ocrStatus: (resp.ocrStatus ?? ocrStatus) as ('ok' | 'empty')[] | undefined, ocrMs: resp.ocrMs ?? ocrMs,
+            ocrLockWaitMs,
         };
     } catch (e) {
         const err = e as Error & { kind?: string; hint?: string };

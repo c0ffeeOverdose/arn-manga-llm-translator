@@ -304,7 +304,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         const outcome = await translateRegions(stitchBmp, det, onStatus);
         if (outcome.error) { prune(); return null; } // members fall back to solo (parked normally)
         for (const m of chain) bookAdd(m.hash); // folded above (whole-stitch context) — arrivals skip refold
-        const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs } = outcome;
+        const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = outcome;
         const annWCache = outcome.annW, annHCache = outcome.annH;
         const rawLLM = outcome.raw;
         await ensureFont();
@@ -315,9 +315,9 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             page: `${W}x${H}`, seam: chain.length,
             minFont: renderTuning.minFont, gen: RENDER_GEN, detConf: pipeline.detConf,
             usedLLM,
-            det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null },
+            det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null },
             llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
-            ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null } : null,
+            ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
             boxes: det.boxes.map(b => ({ x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2) })),
             ...(bookOps?.length ? { bookOps } : null),
         }));

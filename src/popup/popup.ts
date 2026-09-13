@@ -128,7 +128,10 @@ async function refreshStatus(): Promise<void> {
         const bgRunning = !!resp.lookaheadActive || !!(resp.sweep as { active: boolean } | null)?.active;
         cancelAllBtn.style.display = q > 0 || bgRunning ? '' : 'none';
         cancelAllBtn.textContent = q > 0 ? `Cancel all (${q})` : 'Stop background work';
-        origBtn.textContent = resp.overlayOn ? 'Show original' : 'Show translated';
+        // state label, not action: the switch shows originals until the first
+        // translation lands (fresh doc defaults off), and users read the
+        // button as "what am I looking at", not "what happens on click"
+        origBtn.textContent = resp.overlayOn ? 'Translated ✓' : 'Original';
         lastOverlay = resp.overlayOn;
         ctxBtn.textContent = `Context: ${resp.shareContext ? 'on' : 'off'}`;
         lastCtx = resp.shareContext;
@@ -217,7 +220,7 @@ redoBtn.onclick = async () => {
 };
 origBtn.onclick = async () => {
     lastOverlay = !lastOverlay;
-    origBtn.textContent = lastOverlay ? 'Show original' : 'Show translated';
+    origBtn.textContent = lastOverlay ? 'Translated ✓' : 'Original';
     await send({ type: 'mt:toggle-original' });
     refreshStatus();
 };

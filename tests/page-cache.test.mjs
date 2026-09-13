@@ -11,7 +11,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 
 const FP = {
@@ -668,4 +668,37 @@ test('handoffDrop: force drops the exact stamp plus volatile twins', () => {
   const I2 = 'https://i2.gallery.example.org/galleries/1/7.webp';
   const OTHER = 'https://i4.gallery.example.org/galleries/1/8.webp';
   assert.deepEqual(handoffDrop({ [I4]: 1, [I2]: 2, [OTHER]: 3 }, I2), { [OTHER]: 3 });
+});
+
+test('pagedChapterUuid: chapter id off mangadex paths only, charset-gated', () => {
+  const UUID = '174e20c7-7c26-4952-ab0e-1eeac62e24de';
+  assert.equal(pagedChapterUuid(`/chapter/${UUID}/20`, 'mangadex.org'), UUID);
+  assert.equal(pagedChapterUuid(`/chapter/${UUID}`, 'www.mangadex.org'), UUID);
+  assert.equal(pagedChapterUuid(`/chapter/${UUID}/20`, 'example.com'), null); // other hosts never call the API
+  assert.equal(pagedChapterUuid('/g/123/4/', 'mangadex.org'), null);
+  assert.equal(pagedChapterUuid('/chapter/../secret', 'mangadex.org'), null); // path games never reach the URL
+  assert.equal(pagedChapterUuid('/chapter/abc', 'mangadex.org'), null); // too short to be an id
+});
+
+test('buildPagedUrls: full data URLs in order, junk fields rejected', () => {
+  assert.deepEqual(
+    buildPagedUrls('https://svc.example.org', 'h1', ['p1.png', 'p2.png']),
+    ['https://svc.example.org/data/h1/p1.png', 'https://svc.example.org/data/h1/p2.png']);
+  assert.deepEqual(buildPagedUrls('https://svc.example.org/', 'h1', ['p1.png']), ['https://svc.example.org/data/h1/p1.png']);
+  assert.deepEqual(buildPagedUrls(null, 'h1', ['p1.png']), []); // at-home error shape
+  assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', null), []);
+  assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', ['ok.png', '../evil', '', 7, 'a/b']), ['https://svc.example.org/data/h1/ok.png']);
+});
+
+test('unloadedPageUrls: unloaded http(s) only, deduped against live refs', () => {
+  const known = new Set(['https://cdn.example.org/live.webp']);
+  assert.deepEqual(unloadedPageUrls([
+    { src: 'https://cdn.example.org/live.webp', loaded: true },
+    { src: 'https://cdn.example.org/live.webp', loaded: false }, // live ref already claims it
+    { src: 'https://cdn.example.org/lazy1.webp', loaded: false },
+    { src: 'https://cdn.example.org/lazy1.webp', loaded: false }, // twin tag, one item
+    { src: 'data:image/png;base64,xx', loaded: false },
+    { src: '', loaded: false },
+    { src: 'blob:https://example.org/x', loaded: false }, // dead without the element — element path owns these
+  ], known), ['https://cdn.example.org/lazy1.webp']);
 });

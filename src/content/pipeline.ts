@@ -14,6 +14,18 @@ import { pageIsGrayscale } from './ocr';
 
 export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; resumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
 
+// cached entry → render-ready det (shared by preparePage and arrival paint —
+// one construction, one gate set: full entry + fp + dims + mask, partials
+// never render as Done). Null when the entry must not paint.
+export function detFromCacheEntry(hit: CachedPage, w: number, h: number): DetectResult | null {
+    if (!hit || hit.partial || hit.fp !== settingsFingerprint(pipeline) || hit.w !== w || hit.h !== h || !hit.mask) return null;
+    return {
+        boxes: hit.boxes, panels: hit.panels,
+        mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
+        inferMs: 0, ep: 'cache', dropped: [], panelDropped: [],
+    };
+}
+
 // Headless detect resolve — shared by lookahead prefetch and chapter sweep
 // (DOM jobs use preparePage instead: canvas blanks, ghost twins, stashed
 // bytes). Full hit → {det:null} (caller returns); resumable partial → rebuilt
@@ -98,10 +110,11 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
         det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
     } else {
         try {
-            const { panels, dropped, inferMs } = await panelsDetect(bitmap, pipeline.panelConf);
+            const { panels, dropped, inferMs, lockWaitMs } = await panelsDetect(bitmap, pipeline.panelConf);
             det.panels = panels;
             det.panelDropped = dropped;
             det.panelMs = Math.round(inferMs);
+            det.lockWaitMs = (det.lockWaitMs ?? 0) + (lockWaitMs ?? 0); // detect + panel contention, one number
             if (!panelsUsable(panels, page.w, page.h)) det.panelSkipped = `${panels.length} panels, biggest <10% page`;
             det.boxes = orderByPanels(det.boxes, panels, pipeline.readingDir, page, defer);
         } catch {
@@ -194,11 +207,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         if (hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
             cacheMiss = undefined;
             onStatus('Cache hit…');
-            const det: DetectResult = {
-                boxes: hit.boxes, panels: hit.panels,
-                mask: { width: bitmap.width, height: bitmap.height, data: unpackMask(hit.mask, bitmap.width, bitmap.height) },
-                inferMs: 0, ep: 'cache', dropped: [], panelDropped: [],
-            };
+            const det = detFromCacheEntry(hit, bitmap.width, bitmap.height)!;
             return { srcUrl, bitmap, det, hash, cached: hit, prepMs: prepMs(),
                 // canvas cache hit still needs the original bytes — the canvas will
                 // show our drawing after this (re-translate reads the stash, §readPage)

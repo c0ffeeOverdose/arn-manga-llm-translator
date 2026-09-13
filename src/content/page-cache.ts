@@ -334,6 +334,42 @@ export function galleryAheadUrls(manifestJson: string | null, imgHost: string, c
     return paths.slice(i + 1, i + 1 + max).map((p) => `${imgHost}/${p}`);
 }
 
+// ---- paged-chapter enumeration: paged readers virtualize the DOM (only the
+// loaded window stays — the rest are lazy <img> with no pixels yet, or absent
+// entirely), so DOM refs undercount the chapter. Paged-reader APIs return the
+// full page list; the parse + URL builder stay pure for tests, the fetch +
+// DOM walk live in page-io (untestable — document/chrome access).
+export function pagedChapterUuid(pathname: string, hostname: string): string | null {
+    if (!/(^|\.)mangadex\./.test(hostname)) return null;
+    const m = pathname.match(/^\/chapter\/([^/]+)/);
+    // charset-gated: the id is interpolated into an API URL below
+    return m && /^[0-9a-f-]{10,}$/i.test(m[1]) ? m[1] : null;
+}
+export function buildPagedUrls(baseUrl: unknown, hash: unknown, files: unknown): string[] {
+    if (typeof baseUrl !== 'string' || typeof hash !== 'string' || !Array.isArray(files)) return [];
+    const b = baseUrl.replace(/\/+$/, '');
+    const out: string[] = [];
+    for (const f of files) {
+        if (typeof f !== 'string' || !f || f.includes('/') || f.includes('\\')) continue;
+        out.push(`${b}/data/${hash}/${f}`);
+    }
+    return out;
+}
+// unloaded-but-addressable pages: lazy <img> with an http(s) src and no
+// pixels yet. Loaded ones are covered by getPages refs (element path handles
+// blob/taint); known dedupes against those + each other. data:/empty/blob:
+// srcs are unusable headless — skip.
+export function unloadedPageUrls(cands: { src: string; loaded: boolean }[], known: Set<string>): string[] {
+    const out: string[] = [];
+    for (const c of cands) {
+        if (c.loaded) continue;
+        if (!/^https?:/.test(c.src) || known.has(c.src)) continue;
+        known.add(c.src);
+        out.push(c.src);
+    }
+    return out;
+}
+
 // chapter sweep needs the WHOLE list in reading order (not just forward of
 // an anchor), plus where the current page sits in it. Same parser, same
 // bails — index -1 when the anchor matches nothing (sweep from page 0).

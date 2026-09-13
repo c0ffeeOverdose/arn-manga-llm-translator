@@ -254,3 +254,5 @@ export async function loadDebug(): Promise<void> {
 let autoTranslateFlagFn: (() => boolean) | null = null;
 export function registerAutoTranslateFlag(fn: () => boolean): void { autoTranslateFlagFn = fn; }
 function autoTranslateFlag(): boolean { return autoTranslateFlagFn?.() ?? false; }
+// readers (sweep status): no new module edges — auto registers here already
+export function autoTranslateOn(): boolean { return autoTranslateFlag(); }

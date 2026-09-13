@@ -1,7 +1,7 @@
 // Page discovery + pixel I/O: getPages, refKey, fetch/read/descramble,
 // write-back (img src swap + canvas repaint), hash-lane repaint + healing.
 
-import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, type EpisodeManifest } from './page-cache';
+import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, type EpisodeManifest } from './page-cache';
 import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
 
@@ -119,6 +119,34 @@ export async function galleryManifestJson(): Promise<string | null> {
         galleryManifestCache = { key: g[1], json: null };
         return null;
     }
+}
+
+// Full-chapter enumeration for paged readers that virtualize the DOM (only
+// the loaded window stays — sweeping DOM refs undercounts). Same public API
+// family resolveMangaId already uses; [] on any failure (external chapter,
+// offline) so callers fall through to the DOM branches silently.
+export async function fetchPagedUrls(): Promise<string[]> {
+    const uuid = pagedChapterUuid(location.pathname, location.hostname);
+    if (!uuid) return [];
+    try {
+        const r = await fetch(`https://api.mangadex.org/at-home/server/${encodeURIComponent(uuid)}`, { signal: AbortSignal.timeout(15000) });
+        if (!r.ok) return [];
+        const j = await r.json();
+        return buildPagedUrls(j?.baseUrl, j?.chapter?.hash, j?.chapter?.data);
+    } catch { return []; }
+}
+
+// DOM walk for lazy <img> with an addressable src but no pixels yet (the
+// sweep can fetch these headless — getPages only sees loaded ones). Thin
+// wrapper: the filter/dedupe predicate is pure in page-cache (tested).
+// Same promo/skip exclusions as getPages — an unloaded ad is still an ad.
+export function collectUnloadedUrls(known: Set<string>): string[] {
+    const cands: { src: string; loaded: boolean }[] = [];
+    for (const img of document.querySelectorAll('img')) {
+        if (img.closest('.link-page') || img.closest('[data-mt-skip]')) continue;
+        cands.push({ src: img.currentSrc || img.src, loaded: img.naturalWidth > 0 });
+    }
+    return unloadedPageUrls(cands, known);
 }
 
 // Last-resort pixel source: the direct read failed (CORS-blocked <img>,

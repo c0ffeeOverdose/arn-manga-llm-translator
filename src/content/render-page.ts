@@ -33,7 +33,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     let error: string | undefined, errorKind: string | undefined, errorHint: string | undefined;
     let annWCache: number, annHCache: number, rawLLM: string | undefined;
     let usage: { inTok?: number; outTok?: number; cachedInTok?: number } | undefined;
-    let llmCalls: number | undefined, llmMs: number | undefined, ocrStatus: ('ok' | 'empty')[] | undefined, ocrMs: number | undefined;
+    let llmCalls: number | undefined, llmMs: number | undefined, ocrStatus: ('ok' | 'empty')[] | undefined, ocrMs: number | undefined, ocrLockWaitMs: number | undefined;
     if (prep.cached) {
         // persistent cache hit: identical image bytes + identical settings — the
         // LLM is not called. Outputs still fold into the book (fresh session).
@@ -48,7 +48,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         if (shareContext && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
     } else {
         onStatus('Translating…');
-        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, annW: annWCache, annH: annHCache, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs } = await translateRegions(bitmap, det, onStatus,
+        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, annW: annWCache, annH: annHCache, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
             { progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled }));
 
         if (error) {
@@ -89,9 +89,9 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         gen: RENDER_GEN, // render-logic generation — stale extension shows an older number
         detConf: pipeline.detConf, // threshold that let these boxes through — low values explain junk regions
         usedLLM,
-        det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null },
+        det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null },
         llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
-        ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null } : null,
+        ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
         boxes: det.boxes.map(b => ({ x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2) })),
         panels: (det.panels ?? []).map(p => ({ x1: Math.round(p.x1), y1: Math.round(p.y1), x2: Math.round(p.x2), y2: Math.round(p.y2), conf: +p.conf.toFixed(2) })),
         ...(det.panelSkipped ? { panelSkipped: det.panelSkipped } : null),

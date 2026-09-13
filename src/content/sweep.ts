@@ -27,13 +27,13 @@
 
 import { updateContext } from '../llm/core';
 import { pipeline, context, setContext, shareContext, loadContext, loadPipeline, resetContextIfNewChapter, saveContext, chapterKey, sessionUsage, setLastPageUsage, stateFor, type PageRef } from './state';
-import { fetchBitmap, getPages, refKey, unscrambleTiles, episodeManifestSrcs, galleryManifestJson } from './page-io';
+import { fetchBitmap, getPages, refKey, unscrambleTiles, episodeManifestSrcs, galleryManifestJson, fetchPagedUrls, collectUnloadedUrls } from './page-io';
 import { resolveHeadlessDet, preparePage } from './pipeline';
 import { translateRegions, type TranslateOutcome } from './ocr';
 import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath } from './page-cache';
 import type { DetectResult, MtOnStatus } from './detection';
 import { failMarks, enqueue, pageKeyOf } from './queue';
-import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss } from './status-ui';
+import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn } from './status-ui';
 import { isDebug } from '../debug';
 
 // ponytail: fixed pool + warm-up, no settings — provider rate limits (not
@@ -163,6 +163,11 @@ function origOf(ref: PageRef): string | null {
 async function sweepItems(): Promise<SweepItem[]> {
     const ep = episodeManifestSrcs();
     if (ep?.length) return ep.map(url => ({ url, descramble: true }));
+    // paged readers virtualize the DOM (loaded window only) — the chapter
+    // API lists every page, so the count is the chapter, not the window.
+    // [] off-host or on any failure → fall through to the DOM branches.
+    const paged = await fetchPagedUrls();
+    if (paged.length) return paged.map(url => ({ url, descramble: false }));
     const refs = getPages().filter(r => r.kind === 'img');
     for (const r of refs) {
         const anchor = origOf(r);
@@ -172,8 +177,19 @@ async function sweepItems(): Promise<SweepItem[]> {
         break; // anchor read, manifest absent — DOM reader, fall through once
     }
     // plain DOM reader: sweep the live refs (blob srcs are document-local but
-    // fetchable in-session; claim = refKey, same key DOM jobs wait on)
-    return getPages().map(ref => ({ url: refKey(ref), descramble: false, ref }));
+    // fetchable in-session; claim = refKey, same key DOM jobs wait on) PLUS
+    // lazy <img> with an http(s) src but no pixels yet — headless URL items,
+    // deduped against the live refs. Junk fetched this way dies at the fetch
+    // size-gate in workPage (skip, never an LLM call).
+    const live = getPages();
+    const known = new Set<string>();
+    for (const r of live) {
+        known.add(refKey(r));
+        if (r.kind === 'img') { known.add(r.el.src); known.add(r.el.currentSrc); }
+    }
+    const items: SweepItem[] = live.map(ref => ({ url: refKey(ref), descramble: false, ref }));
+    for (const u of collectUnloadedUrls(known)) items.push({ url: u, descramble: false });
+    return items;
 }
 
 // ---- the run: N workers, ordered commit, warm-up gate
@@ -240,6 +256,9 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
     try {
         const f = await fetchBitmap(job.url); // direct → SW proxy → DNR retry, same as DOM pages
         let bitmap = f.bitmap;
+        // fetch size-gate (mirrors the getPages floor): unloaded-URL items
+        // arrive unsized — junk below this is skipped, never an LLM call
+        if (bitmap.width < 400 || bitmap.height < 300) return { i: job.i, url: job.url, skip: true };
         if (job.descramble) {
             try {
                 const fixed = await unscrambleTiles(bitmap);
@@ -359,25 +378,34 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
 // stares at finished pages until they click each one (or enable auto).
 // Cache-hit job (fold skipped when already registered — bookAdd covered it).
 // DOM commits carry their ref directly; headless ones resolve it by claim key
-// (only the viewed page has an element — the rest don't exist yet).
+// (only the viewed page has an element — the rest don't exist yet). Exact key
+// first, samePagePath fallback for CDN host rotation (proven predicate —
+// pixel-hash verify can't cross quality variants, exact or nothing, so no
+// third stage: a miss logs one line with the cause instead of painting blind).
 function paintIfLoaded(url: string, direct?: PageRef): void {
     if (!sweep) return;
     const ref = (direct && direct.el.isConnected && !stateFor(direct) ? direct : undefined)
-        ?? getPages().find(r => pageKeyOf(r) === url && !stateFor(r));
-    if (!ref || stateFor(ref)) return;
+        ?? getPages().find(r => pageKeyOf(r) === url && !stateFor(r))
+        ?? getPages().find(r => !stateFor(r) && samePagePath(pageKeyOf(r), url));
+    if (!ref) { if (isDebug()) console.log('[mt] sweep paint miss: no ref', url.slice(-24)); return; }
+    if (stateFor(ref)) return; // painted while resolving
+    // zero-rect only (hidden placeholders arrive-paint when the reader shows
+    // them): offscreen-but-loaded pages paint too — a committed page the user
+    // scrolls to must already carry its translation, not paint on arrival.
     const b = ref.el.getBoundingClientRect();
-    if (b.width === 0 && b.height === 0) return; // hidden placeholder — arrival paints it when the reader shows it
-    if (!direct) {
-        if (b.width <= 0 || b.right <= 0 || b.left >= innerWidth || b.bottom <= 0 || b.top >= innerHeight) return;
-    }
+    if (b.width === 0 && b.height === 0) { if (isDebug()) console.log('[mt] sweep paint miss: zero-rect', url.slice(-24)); return; }
     enqueue(ref, false, true);
 }
 
 function pumpSweepStatus(): void {
     const s = sweep;
     if (!s) return;
+    // auto yields to the sweep by design (its jobs would duplicate sweep work
+    // and clobber the ordered book) — say so, or an enabled-but-silent auto
+    // reads as broken.
+    const paused = autoTranslateOn() ? ' · auto paused' : '';
     const tail = [s.errors ? `${s.errors} failed` : '', s.skipped ? `${s.skipped} skipped` : ''].filter(Boolean).join(' · ');
-    setActivity('sweep', `Sweeping chapter ${s.done}/${s.total}…${tail ? ` (${tail})` : ''}`,
+    setActivity('sweep', `Sweeping chapter ${s.done}/${s.total}${paused}…${tail ? ` (${tail})` : ''}`,
         'sweep', translating > 0 ? 'llm' : 'detect');
 }
 

@@ -75,6 +75,9 @@ const warmedUrls = new Set<string>(); // per script instance — a nav resets it
 // a stale flag blocking future chains is impossible by construction.
 let lookaheadCancel = false;
 export function lookaheadActive(): boolean { return prefetchBusy; }
+// readers (arrival paint): auto.ts imports nobody that imports overlays —
+// this edge is cycle-free, unlike going through status-ui
+export function autoOn(): boolean { return autoTranslate; }
 export function cancelLookahead(): boolean {
     if (!prefetchBusy) return false;
     lookaheadCancel = true;

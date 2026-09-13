@@ -172,11 +172,22 @@ function nms(boxes: number[][], confs: number[]): number[] {
 // gpu-prefill on separate chains). ONE chain for everything ORT. The
 // pipeline overlap lives on the CPU side (crops, preprocess, LLM calls).
 const chains = new Map<string, Promise<void>>();
+// lock contention meter: cumulative ms ORT runs spent queued on the infer
+// lock behind other models' runs. Handlers snapshot per-RPC deltas into
+// their replies — the page-result dump shows whether detect/panel/ocr
+// actually blocked on each other (0 = the lock was free).
+let lockWaitMs = 0;
 function withInferLock<T>(fn: () => Promise<T>, chainId = 'ort'): Promise<T> {
+    const t0 = performance.now();
     const chain = chains.get(chainId) ?? Promise.resolve();
-    const run = chain.then(fn);
+    const run = chain.then(async () => { lockWaitMs += performance.now() - t0; return fn(); });
     chains.set(chainId, run.then(() => {}, () => {}));
     return run;
+}
+async function metered<T>(fn: () => Promise<T>): Promise<{ v: T; lockWait: number }> {
+    const w0 = lockWaitMs;
+    const v = await fn();
+    return { v, lockWait: Math.round(lockWaitMs - w0) };
 }
 
 // One model pass over a bitmap region (full page or one tile): box-head
@@ -780,8 +791,8 @@ window.addEventListener('message', async (ev: MessageEvent) => {
         } else if (msg.type === 'mt:baberu-status') {
             reply({ ok: true, installed: await baberuInstalled() });
         } else if (msg.type === 'mt:baberu-ocr') {
-            const text = await runBaberu(msg.png);
-            reply({ ok: true, text, ms: Math.round(baberuMs) });
+            const { v: text, lockWait } = await metered(() => runBaberu(msg.png));
+            reply({ ok: true, text, ms: Math.round(baberuMs), lockWait });
         } else if (msg.type === 'mt:ocr-download') {
             await ocrDownload(msg.lang); // download + cache (throws on failure)
             reply({ ok: true });
@@ -792,10 +803,11 @@ window.addEventListener('message', async (ev: MessageEvent) => {
             const text = await runOcr(msg.png, msg.langs ?? ['jpn', 'eng']);
             reply({ ok: true, text });
         } else if (msg.type === 'mt:panels') {
-            const r = await runPanels(msg.png, typeof msg.thr === 'number' ? msg.thr : PANEL_CONF_THR);
-            reply({ ok: true, panels: r.panels, dropped: r.dropped, ms: Math.round(r.inferMs) });
+            const { v: r, lockWait } = await metered(() => runPanels(msg.png, typeof msg.thr === 'number' ? msg.thr : PANEL_CONF_THR));
+            reply({ ok: true, panels: r.panels, dropped: r.dropped, ms: Math.round(r.inferMs), lockWait });
         } else {
-            const result = await runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true);
+            const { v: result, lockWait } = await metered(() => runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true));
+            (result as any).lockWaitMs = lockWait;
             (ev.source as Window | null)?.postMessage(
                 { type: 'mt:detect-result', id: msg.id, ok: true, result },
                 '*', [((result as any).mask.data as ArrayBuffer)],
