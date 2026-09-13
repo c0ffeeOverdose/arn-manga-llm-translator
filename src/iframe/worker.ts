@@ -769,19 +769,6 @@ window.addEventListener('message', async (ev: MessageEvent) => {
     if (msg?.token !== TOKEN) return;
     const reply = (payload: object, transfer?: Transferable[]) =>
         (ev.source as Window | null)?.postMessage({ type: 'mt:rpc-result', ...payload, id: msg?.id }, '*', transfer);
-    if (msg?.type === 'mt:probe-gpu') {
-        const port = ev.ports?.[0];
-        let gpu: unknown;
-        try {
-            if (!(navigator as any).gpu) gpu = 'missing';
-            else {
-                const a = await (navigator as any).gpu.requestAdapter();
-                gpu = a ? (a.info?.vendor ?? 'adapter-unknown') : 'no-adapter';
-            }
-        } catch (e) { gpu = 'ERR ' + String(e).slice(0, 100); }
-        port?.postMessage({ gpu });
-        return;
-    }
     if (msg?.type !== 'mt:detect' && msg?.type !== 'mt:ocr' && msg?.type !== 'mt:ocr-status'
         && msg?.type !== 'mt:ocr-download' && msg?.type !== 'mt:ocr-delete' && msg?.type !== 'mt:ocr-list'
         && msg?.type !== 'mt:panels' && msg?.type !== 'mt:baberu-ocr' && msg?.type !== 'mt:baberu-status') return;
