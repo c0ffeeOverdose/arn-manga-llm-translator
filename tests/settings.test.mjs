@@ -55,6 +55,17 @@ test('temperature: null = provider default; numbers clamp to 0-1; junk resets', 
   assert.equal(matchingPreset(loadPipelineSettings({ temperature: 0.3 })), 'custom');
 });
 
+test('ocrTemperature: default 0 (sent), null = provider default, junk → 0', () => {
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.ocrTemperature, 0);
+  assert.equal(loadPipelineSettings({}).ocrTemperature, 0);
+  assert.equal(loadPipelineSettings({ ocrTemperature: null }).ocrTemperature, null);
+  assert.equal(loadPipelineSettings({ ocrTemperature: 0.7 }).ocrTemperature, 0.7);
+  for (const bad of [2, -1, NaN, Infinity, '0.3', true]) {
+    assert.equal(loadPipelineSettings({ ocrTemperature: bad }).ocrTemperature, 0, String(bad));
+  }
+  assert.equal(matchingPreset(loadPipelineSettings({ ocrTemperature: 0.5 })), 'custom');
+});
+
 test('migration: old useVision/visionMode/ocrModel map onto textSource', () => {
   // visionMode 'text' → crops
   assert.equal(loadPipelineSettings({ visionMode: 'text' }).textSource, 'crops');

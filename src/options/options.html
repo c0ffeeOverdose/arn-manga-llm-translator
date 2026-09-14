@@ -558,6 +558,13 @@
         </div>
 
         <div class="field">
+          <div class="range-head"><label for="ocrTemperature">OCR temperature</label><span class="unit-wrap"><input type="number" id="ocrTemperatureNum" class="val-input" min="0" max="1" step="0.05" aria-label="OCR temperature value"></span></div>
+          <input type="range" id="ocrTemperature" min="0" max="1" step="0.05">
+          <label class="check"><input type="checkbox" id="ocrTemperatureAuto"> Provider default</label>
+          <div class="hint">Transcribe calls only — 0 keeps the reading literal and its output format stable. Unticked by default (0 is sent).</div>
+        </div>
+
+        <div class="field">
           <label class="check"><input type="checkbox" id="ocrPerRegion"> Always read one region at a time</label>
           <div class="hint">One crop per call — for models that accept a single image (e.g. Cloudflare llama-3.2-11b-vision). Leave off for auto-detect: a rejected batch falls back to per-region on its own and remembers the model.</div>
         </div>

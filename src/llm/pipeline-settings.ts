@@ -40,6 +40,7 @@ export interface PipelineSettings {
     charLimit: number;         // character book cap
     thinkingLevel: string; // preset (see THINKING_LEVELS), custom text, or a numeric token budget — mapped per provider at send time
     temperature: number | null; // main translate sampling temperature 0-1; null = provider default (parameter not sent)
+    ocrTemperature: number | null; // VLM reader's transcribe calls; default 0 (glyph copying wants no sampling); null = provider default
     ocrThinking: string; // thinking level for the separate VLM reader's transcribe call (default 'none' — copying glyphs needs no reasoning)
     parallelLlm: number;        // concurrent LLM calls when context is OFF (1 = serial)
     prefetchN: number;         // auto pre-translate window: queued pages ahead (1-30)
@@ -89,6 +90,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     charLimit: 10,
     thinkingLevel: 'auto',
     temperature: null,
+    ocrTemperature: 0,
     ocrThinking: 'none',
     parallelLlm: 3,
     prefetchN: 3,
@@ -228,7 +230,12 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     // Reads raw `s`: the nullable default (null) can't match a stored number
     // in the type-guarded copy loop above.
     const temp = s.temperature;
-    out.temperature = typeof temp === 'number' && Number.isFinite(temp) && temp >= 0 && temp <= 1 ? temp : null;    for (const k of ['textColor', 'strokeColor'] as const) {
+    out.temperature = typeof temp === 'number' && Number.isFinite(temp) && temp >= 0 && temp <= 1 ? temp : null;
+    // OCR temperature: default 0 (not provider default), so junk means "back to 0"
+    const otemp = s.ocrTemperature;
+    out.ocrTemperature = otemp === null
+        ? null
+        : typeof otemp === 'number' && Number.isFinite(otemp) && otemp >= 0 && otemp <= 1 ? otemp : 0;    for (const k of ['textColor', 'strokeColor'] as const) {
         if (out[k] !== 'auto' && (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(out[k]))) out[k] = 'auto';
     }
     if (typeof out.textStroke !== 'number' || !(out.textStroke >= 0 && out.textStroke <= 0.5)) out.textStroke = 0.1;

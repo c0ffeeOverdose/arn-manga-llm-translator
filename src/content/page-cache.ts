@@ -698,6 +698,7 @@ export interface FingerprintOpts {
     useOcrModel: boolean; // split pipeline (VLM transcribe → LLM translate) → separate entries
     ocrPerRegion: boolean; // per-region transcribe calls produce different OCR text → separate entries
     temperature: number | null; // pinned main-model sampling → different output, separate entries
+    ocrTemperature: number | null; // pinned VLM-reader sampling → different OCR text, separate entries
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
@@ -707,7 +708,7 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // failures used to come back ok:true and get cached) — orphan them all at
     // once instead of making the user Clear by hand.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', 'tile2'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile2'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

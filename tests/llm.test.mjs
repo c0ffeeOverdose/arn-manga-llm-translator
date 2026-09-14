@@ -21,7 +21,7 @@ await build({
 
 const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches, joinTranscription } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
-const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, isCfAiBase } =
+const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
 const { langOk, fetchWithProgress } =
   await import(new URL('../.test-build/ocr-models.mjs', import.meta.url).href);
@@ -458,36 +458,23 @@ test('cfRunUrl: model in the URL, /ai and /ai/v1 bases both accepted', () => {
     'https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/x');
 });
 
-test('isCfAiBase: the account AI base (with/without /v1) routes, deeper paths do not', () => {
-  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai'), true);
-  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1'), true);
-  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/ '), true);
-  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/x'), false);
-  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/chat/completions'), false);
-  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc'), false);
-  assert.equal(isCfAiBase('https://api.openai.com/v1'), false);
-  assert.equal(isCfAiBase(''), false);
-});
-
-test('dispatch: openai provider + CF base sends image calls to the native run endpoint', async () => {
+test('dispatch: the OpenAI provider never reroutes — a Cloudflare base still posts to chat/completions', async () => {
+  // provider choice is explicit: users pick "Cloudflare Workers AI" for the
+  // native run endpoint; the OpenAI slot must not secretly switch endpoints
   const realFetch = globalThis.fetch;
   const seen = [];
   globalThis.fetch = async (url, init) => {
     seen.push({ url: String(url), body: JSON.parse(String(init?.body)) });
     return {
       ok: true, status: 200,
-      async text() { return JSON.stringify({ result: { response: 'ok', usage: { prompt_tokens: 1, completion_tokens: 2 } }, success: true }); },
+      async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); },
     };
   };
   const s = { provider: 'openai', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/abc/ai/v1', model: '@cf/meta/llama-3.2-11b-vision-instruct', apiKey: 'k' };
   try {
-    const withImg = await callLLM(s, 'p', ['QUJD']);
-    assert.equal(seen[0].url, 'https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/llama-3.2-11b-vision-instruct');
-    assert.equal(seen[0].body.model, undefined, 'native carries the model in the URL');
-    assert.equal(withImg.text, 'ok');
-    await callLLM(s, 'p');
-    assert.equal(seen[1].url, 'https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/chat/completions');
-    assert.equal(seen[1].body.model, s.model, 'text-only stays on the OpenAI-compatible path');
+    await callLLM(s, 'p', ['QUJD']);
+    assert.equal(seen[0].url, 'https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/chat/completions');
+    assert.equal(seen[0].body.model, s.model);
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -529,6 +516,79 @@ test('temperature: each protocol carries it where legal; off = parameter not sen
   }
 });
 
+test('callLLM: a rejected temperature is retried without it and reported (tempDropped)', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    if (calls === 1) {
+      return {
+        ok: false, status: 400,
+        async text() { return JSON.stringify({ error: { message: "Unsupported value: 'temperature' does not support 0 with this model" } }); },
+      };
+    }
+    return {
+      ok: true, status: 200,
+      async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); },
+    };
+  };
+  try {
+    const r = await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(calls, 2, 'rejected request + clean retry');
+    assert.equal(r.text, 'ok');
+    assert.equal(r.tempDropped, true, 'the caller can memoize the rejection');
+    calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); } };
+    };
+    const r2 = await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(calls, 1);
+    assert.equal(r2.tempDropped, undefined, 'accepted temperature reports nothing');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('maxTokens: transcribe caps reach every protocol, default stays 4096', async () => {
+  assert.equal(cfBody('x', ['a']).max_tokens, 4096);
+  assert.equal(cfBody('x', ['a'], null, 0, 512).max_tokens, 512);
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init?.body)), headers: init?.headers ?? {} });
+    return {
+      ok: true, status: 200,
+      async text() {
+        if (String(url).includes('/v1/messages')) return JSON.stringify({ content: [{ type: 'text', text: 'ok' }], usage: {} });
+        if (String(url).includes(':generateContent')) return JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
+        if (String(url).includes('/responses')) return JSON.stringify({ output: [], usage: {} });
+        if (String(url).includes('/ai/run/')) return JSON.stringify({ result: { response: 'ok', usage: {} }, success: true });
+        return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} });
+      },
+    };
+  };
+  try {
+    await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p', ['QUJD'], 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.max_tokens, 512);
+    await callLLM({ provider: 'cloudflare', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/a/ai', model: '@cf/meta/x', apiKey: 'k' }, 'p', ['QUJD'], 'auto', 'manga-7', null, 512);
+    assert.match(seen.at(-1).url, /\/ai\/run\//);
+    assert.equal(seen.at(-1).body.max_tokens, 512);
+    assert.equal(seen.at(-1).headers['x-session-affinity'], 'mt-manga-7', 'prefix-cache affinity rides the conversation key');
+    await callLLM({ provider: 'anthropic', baseUrl: 'https://a.test', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.max_tokens, 512);
+    await callLLM({ provider: 'gemini', baseUrl: 'https://g.test/v1beta', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.generationConfig.maxOutputTokens, 512);
+    await callLLM({ provider: 'responses', baseUrl: 'https://r.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.max_output_tokens, 512);
+    await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p');
+    assert.equal(seen.at(-1).body.max_tokens, 4096, 'no cap passed = previous default');
+    assert.equal(seen.at(-1).headers['x-session-affinity'], undefined, 'affinity is a CF-only header');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('isImageCapError: compat "Unable to add image" is NOT an image-count cap (single image fails too)', () => {
   const e = new MtError('parse', 'AiError: AiError: Unable to add image when there are no user-supplied nor system-supplied messages. (uuid)', undefined);
   assert.equal(isImageCapError(e), false, 'the message is not a cap — the endpoint rejects this model\'s images entirely');
@@ -548,13 +608,16 @@ test('cfBody: explicit max_tokens, images as data-URL parts, no model field', ()
   assert.equal(cfBody('x', ['a'], null).reasoning_effort, undefined);
 });
 
-test('cfParse: result.response and result.choices both parse; usage maps', () => {
+test('cfParse: result.response and result.choices both parse; usage + cached tokens map', () => {
   assert.deepEqual(
     cfParse({ result: { response: 'abc', usage: { prompt_tokens: 7, completion_tokens: 3 } } }),
-    { text: 'abc', usage: { inTok: 7, outTok: 3 } });
+    { text: 'abc', usage: { inTok: 7, outTok: 3, cachedInTok: undefined } });
   assert.equal(cfParse({ result: { choices: [{ message: { content: 'def' } }] } }).text, 'def');
   assert.equal(cfParse({ result: {} }).text, '');
   assert.equal(cfParse(null).text, '');
+  // Workers AI surfaces prefix-cache hits here; the dump's cachedInTok reads it
+  const hit = cfParse({ result: { response: 'x', usage: { prompt_tokens: 2000, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 1536 } } } });
+  assert.equal(hit.usage.cachedInTok, 1536);
 });
 
 test('cfError: errors[] → LlmHttpError (covers HTTP 200 + success:false) with providerCode', () => {
@@ -917,6 +980,7 @@ const ADOPT_ST = {
   provider: 'openai', model: 'm', baseUrl: '', ocrModel: '',
   thinkingLevel: 'low', ocrThinking: 'none',
   temperature: null,
+  ocrTemperature: 0,
   useOcrModel: false, stylePrompt: '', targetLang: 'Thai',
   useCharacters: true, contextPairs: 40, transcribeSrc: false, vlmAssisted: false,
 };
@@ -934,6 +998,7 @@ test('translateRequestId: stable 64-hex, sensitive to every output-shaping input
     [ADOPT_REQ, { ...ADOPT_ST, model: 'm2' }, 'model'],
     [ADOPT_REQ, { ...ADOPT_ST, thinkingLevel: 'high' }, 'thinking'],
     [ADOPT_REQ, { ...ADOPT_ST, temperature: 0.3 }, 'temperature'],
+    [ADOPT_REQ, { ...ADOPT_ST, ocrTemperature: 0.6 }, 'ocr temperature'],
     [ADOPT_REQ, { ...ADOPT_ST, targetLang: 'English' }, 'target lang'],
     [ADOPT_REQ, { ...ADOPT_ST, useCharacters: false }, 'chars flag'],
     [{ ...ADOPT_REQ, split: true }, ADOPT_ST, 'split mode'],

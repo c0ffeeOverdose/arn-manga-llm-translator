@@ -66,6 +66,7 @@ export function fillOcrFields(s: LLMSettings): void {
     ($('ocrThinking') as HTMLInputElement).value = pipeline.ocrThinking;
     renderOcrThinkingList();
     syncOcrThinkingHint();
+    syncOcrTemperatureUI();
 }
 
 export function currentOcrSettings(): LLMSettings {
@@ -195,24 +196,32 @@ export async function testOcr(): Promise<void> {
         return;
     }
     setStatus('Testing… (reads the test image)', '', 0, el);
+    const t0 = Date.now();
+    // a drifting model can take a minute per call (small output caps keep it
+    // bounded, but a cold slow provider still takes seconds) — show the clock
+    const tick = setInterval(() => setStatus(`Testing… ${Math.round((Date.now() - t0) / 1000)}s (reads the test image)`, '', 0, el), 1000);
     try {
         await ensureHostPermission(s.baseUrl ?? '', s.provider);
         const imageB64 = await ocrTestImageB64();
-        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-ocr', settings: s, thinking: pipeline.ocrThinking, imageB64, expect: OCR_TEST_EXPECT });
+        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-ocr', settings: s, thinking: pipeline.ocrThinking, temperature: pipeline.ocrTemperature, imageB64, expect: OCR_TEST_EXPECT });
+        const secs = ` · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
         if (resp?.ok && resp.verdict === 'exact') {
             const cap = resp.multiImage === true ? ' · multi-image OK'
                 : resp.multiImage === false ? ' · single-image only (per-region auto)'
                 : '';
-            setStatus(`OK — reads correctly ("${resp.got}")${cap}`, 'ok', 0, el);
+            const tempNote = resp.tempDropped ? ' · temperature rejected → provider default' : '';
+            setStatus(`OK — reads correctly ("${resp.got}")${cap}${tempNote}${secs}`, 'ok', 0, el);
         } else if (resp?.ok) {
-            setStatus(resp.verdict === 'miss'
+            setStatus((resp.verdict === 'miss'
                 ? `Saw no text — returned keep on a readable image (expected "${resp.expected}")`
-                : `Mismatch — returned "${resp.got}" (expected "${resp.expected}")`, 'err', 0, el);
+                : `Mismatch — returned "${resp.got}" (expected "${resp.expected}")`) + secs, 'err', 0, el);
         } else {
             setStatus(`Failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
         }
     } catch (e) {
         setStatus(`Failed: ${(e as Error).message}`, 'err', 0, el);
+    } finally {
+        clearInterval(tick);
     }
 }
 
@@ -375,37 +384,44 @@ export async function testCloud(): Promise<void> {
 }
 
 // ---- temperature: "Provider default" checkbox; slider/number drop out of
-// auto on touch (same rule as the color pickers — never disabled) ----
-const TEMP_DEFAULT = 0.3; // shown (and sent) when auto is turned off with no stored value
-function syncTemperatureUI(): void {
-    const auto = pipeline.temperature == null;
-    const shown = auto ? TEMP_DEFAULT : pipeline.temperature;
-    ($<HTMLInputElement>('temperatureAuto')).checked = auto;
-    ($<HTMLInputElement>('temperature')).value = String(shown);
-    ($<HTMLInputElement>('temperatureNum')).value = String(shown);
-    ($<HTMLInputElement>('temperature')).classList.toggle('dim', auto);
-    ($<HTMLInputElement>('temperatureNum')).classList.toggle('dim', auto);
+// auto on touch (same rule as the color pickers — never disabled). One
+// implementation for the main model and the VLM reader; only the off-default
+// differs (main 0.3, unless the stored value says otherwise; OCR 0 = literal)
+function wireTemperature(autoId: string, sliderId: string, numId: string, key: 'temperature' | 'ocrTemperature', fallback: number): () => void {
+    const sync = (): void => {
+        const auto = pipeline[key] == null;
+        const shown = auto ? fallback : pipeline[key];
+        ($<HTMLInputElement>(autoId)).checked = auto;
+        ($<HTMLInputElement>(sliderId)).value = String(shown);
+        ($<HTMLInputElement>(numId)).value = String(shown);
+        ($<HTMLInputElement>(sliderId)).classList.toggle('dim', auto);
+        ($<HTMLInputElement>(numId)).classList.toggle('dim', auto);
+    };
+    ($<HTMLInputElement>(autoId)).onchange = () => {
+        pipeline[key] = ($<HTMLInputElement>(autoId)).checked
+            ? null
+            : Number(($<HTMLInputElement>(sliderId)).value);
+        sync();
+        markModelDirty();
+    };
+    ($<HTMLInputElement>(sliderId)).oninput = () => {
+        pipeline[key] = Number(($<HTMLInputElement>(sliderId)).value);
+        sync();
+        markModelDirty();
+    };
+    ($<HTMLInputElement>(numId)).onchange = () => {
+        const raw = ($<HTMLInputElement>(numId)).value.trim();
+        let v = raw === '' ? NaN : Number(raw);
+        if (!Number.isFinite(v)) v = pipeline[key] ?? fallback; // garbage → revert
+        else v = Math.min(1, Math.max(0, Math.round(v * 20) / 20)); // slider step 0.05
+        pipeline[key] = v;
+        sync();
+        markModelDirty();
+    };
+    return sync;
 }
-($<HTMLInputElement>('temperatureAuto')).onchange = () => {
-    const on = ($<HTMLInputElement>('temperatureAuto')).checked;
-    pipeline.temperature = on ? null : Number(($<HTMLInputElement>('temperature')).value);
-    syncTemperatureUI();
-    markModelDirty();
-};
-($<HTMLInputElement>('temperature')).oninput = () => {
-    pipeline.temperature = Number(($<HTMLInputElement>('temperature')).value);
-    syncTemperatureUI();
-    markModelDirty();
-};
-($<HTMLInputElement>('temperatureNum')).onchange = () => {
-    const raw = ($<HTMLInputElement>('temperatureNum')).value.trim();
-    let v = raw === '' ? NaN : Number(raw);
-    if (!Number.isFinite(v)) v = pipeline.temperature ?? TEMP_DEFAULT; // garbage → revert
-    else v = Math.min(1, Math.max(0, Math.round(v * 20) / 20)); // slider step 0.05
-    pipeline.temperature = v;
-    syncTemperatureUI();
-    markModelDirty();
-};
+const syncTemperatureUI = wireTemperature('temperatureAuto', 'temperature', 'temperatureNum', 'temperature', 0.3);
+export const syncOcrTemperatureUI = wireTemperature('ocrTemperatureAuto', 'ocrTemperature', 'ocrTemperatureNum', 'ocrTemperature', 0);
 
 // ---- thinking level: searchable combobox, presets depend on provider, free-text allowed ----
 // ponytail: same .combo pattern as targetLang, duplicated —

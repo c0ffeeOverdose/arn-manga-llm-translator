@@ -18,6 +18,7 @@ const FP = {
   targetLang: 'Thai', textSource: 'page', ocrEngine: 'tesseract',
   readingDir: 'rtl', detConf: 0.35, panelConf: 0.2, deferLabels: true,
   transcribeSrc: false, useOcrModel: false, ocrPerRegion: false, temperature: null,
+  ocrTemperature: 0,
 };
 
 test('CACHE_MAX is the agreed 200 pages', () => {
@@ -54,6 +55,7 @@ test('settingsFingerprint: stable, every field flips it', () => {
     { ...FP, useOcrModel: true },
     { ...FP, ocrPerRegion: true },
     { ...FP, temperature: 0.3 },
+    { ...FP, ocrTemperature: 0.5 },
   ];
   for (const v of variants) assert.notEqual(settingsFingerprint(v), base, JSON.stringify(v));
 });

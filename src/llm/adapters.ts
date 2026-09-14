@@ -37,6 +37,9 @@ export async function callLLM(
     thinkingLevel: string = 'auto', // preset, custom text, or a numeric token budget
     cacheKey?: string, // stable per conversation (manga) — routes provider-side prompt caching
     temperature?: number | null, // pinned sampling temperature; null/undefined = provider default
+    maxTokens?: number, // output cap; undefined = adapter default. Transcribe calls use a small
+                        // cap so a model that drifts past the format can't generate for minutes
+                        // at slow-inference providers (live: 4096-token drift = 106s on CF)
 ): Promise<LlmResult> {
     if (!s.apiKey) throw new MtError('auth', 'No API key configured — open the extension options');
     if (!s.model) throw new MtError('auth', 'No model configured — open the extension options');
@@ -47,42 +50,40 @@ export async function callLLM(
     const imgs = imagesB64?.length ? imagesB64 : undefined;
     const t0 = Date.now();
     try {
-        const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, temp);
+        const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, temp, maxTokens);
         return { ...r, ms: Date.now() - t0 };
     } catch (e) {
         // some models reject the thinking param entirely — retry once without it
         if (thinking && e instanceof LlmHttpError && (e.status === 400 || e.status === 422)) {
             console.warn('[mt:bg] model rejected thinking level, retrying without');
             try {
-                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, temp);
+                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, temp, maxTokens);
                 return { ...r, ms: Date.now() - t0 };
             } catch (e2) {
                 if (!(temp != null && e2 instanceof LlmHttpError && /temperature/i.test(e2.message))) throw e2;
                 console.warn('[mt:bg] model rejected pinned temperature, retrying without');
-                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, null);
-                return { ...r, ms: Date.now() - t0 };
+                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, null, maxTokens);
+                return { ...r, ms: Date.now() - t0, tempDropped: true };
             }
         }
         // reasoning-first models (GPT-5/o-series chat) may reject any non-default
         // temperature — error-driven, no model-name table
         if (temp != null && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /temperature/i.test(e.message)) {
             console.warn('[mt:bg] model rejected pinned temperature, retrying without');
-            const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, null);
-            return { ...r, ms: Date.now() - t0 };
+            const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, null, maxTokens);
+            return { ...r, ms: Date.now() - t0, tempDropped: true };
         }
         throw e;
     }
 }
 
-function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] | undefined, thinking: string | null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
+function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] | undefined, thinking: string | null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
     switch (s.provider) {
-        case 'openai': return imgs?.length && isCfAiBase(base)
-            ? cloudflareChat(base, s, prompt, imgs, thinking, cacheKey, temperature)
-            : openaiChat(base, s, prompt, imgs, thinking, cacheKey, temperature);
-        case 'responses': return responses(base, s, prompt, imgs, thinking, cacheKey, temperature);
-        case 'anthropic': return anthropic(base, s, prompt, imgs, thinking, cacheKey, temperature);
-        case 'gemini': return gemini(base, s, prompt, imgs, thinking, cacheKey, temperature);
-        case 'cloudflare': return cloudflareChat(base, s, prompt, imgs, thinking, cacheKey, temperature);
+        case 'openai': return openaiChat(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'responses': return responses(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'anthropic': return anthropic(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'gemini': return gemini(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'cloudflare': return cloudflareChat(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
     }
 }
 
@@ -111,7 +112,10 @@ export function isImageCapError(e: unknown): boolean {
 
 // result of one LLM call: text + normalized usage (when the provider reports it)
 export interface LlmUsage { inTok?: number; outTok?: number; cachedInTok?: number }
-export interface LlmResult { text: string; usage?: LlmUsage; ms: number }
+export interface LlmResult {
+    text: string; usage?: LlmUsage; ms: number;
+    tempDropped?: boolean; // the model rejected the pinned temperature; retried without it (OCR memoizes this per model)
+}
 
 // provider JSON is untrusted (BYOK baseUrl can be http:// or a MITM'd proxy):
 // coerce usage counters to numbers here or a crafted "prompt_tokens":
@@ -204,13 +208,13 @@ export async function checkThinking(s: LLMSettings, thinking: string, cacheKey?:
 }
 
 // OpenAI-compatible chat/completions (OpenAI, OpenRouter, ollama, gemini-compat...)
-async function openaiChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
+async function openaiChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
     const content: unknown[] = [{ type: 'text', text: prompt }];
     for (const b64 of images ?? []) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
     const body: Record<string, unknown> = {
         model: s.model,
         messages: [{ role: 'user', content }],
-        max_tokens: 4096,
+        max_tokens: maxTokens ?? 4096,
     };
     if (thinking) body.reasoning_effort = thinking; // GPT-5/o-series via chat; ignored by older
     if (temperature != null) body.temperature = temperature;
@@ -234,12 +238,13 @@ async function openaiChat(base: string, s: LLMSettings, prompt: string, images?:
 }
 
 // Responses API (OpenAI responses, OpenCode Zen/Go, Muse Spark)
-async function responses(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
+async function responses(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
     const content: unknown[] = [{ type: 'input_text', text: prompt }];
     for (const b64 of images ?? []) content.push({ type: 'input_image', image_url: `data:image/jpeg;base64,${b64}` });
     const body: Record<string, unknown> = { model: s.model, input: [{ role: 'user', content }] };
     if (thinking) body.reasoning = { effort: thinking };
     if (temperature != null) body.temperature = temperature;
+    if (maxTokens != null) body.max_output_tokens = maxTokens;
     if (cacheKey) body.prompt_cache_key = cacheKey;
     const resp = await fetch(`${base}/responses`, {
         method: 'POST',
@@ -270,7 +275,7 @@ const ANTHROPIC_BUDGET: Record<string, number> = { low: 2048, medium: 4096, high
 const ANTHROPIC_MAXTOK: Record<string, number> = { low: 8192, medium: 8192, high: 16384, xhigh: 32768, max: 65536 };
 
 // Anthropic messages API (direct browser access header)
-async function anthropic(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
+async function anthropic(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
     // cache requires an explicit breakpoint on the STABLE part: split the
     // prompt at <regions> (everything before it repeats across pages of the
     // same manga). Text-first so the volatile images can't cut the prefix.
@@ -285,7 +290,7 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
     for (const b64 of images ?? []) {
         content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } });
     }
-    const baseBody: Record<string, unknown> = { model: s.model, max_tokens: 4096, messages: [{ role: 'user', content }] };
+    const baseBody: Record<string, unknown> = { model: s.model, max_tokens: maxTokens ?? 4096, messages: [{ role: 'user', content }] };
     // temperature and extended thinking are mutually exclusive (API 400) —
     // keep talking to the model rather than let the knob break the page
     if (temperature != null && (!thinking || thinking === 'none')) baseBody.temperature = temperature;
@@ -338,13 +343,14 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
 const GEMINI_BUDGET: Record<string, number> = { none: 0, low: 2048, medium: 4096, high: 8192, xhigh: 16384, max: 24576 };
 
 // Gemini generateContent
-async function gemini(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
+async function gemini(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
     const parts: unknown[] = [{ text: prompt }];
     for (const b64 of images ?? []) parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
     const send = async (thinkingConfig?: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage }> => {
         const body: Record<string, unknown> = { contents: [{ parts }] };
         const generationConfig: Record<string, unknown> = {};
         if (temperature != null) generationConfig.temperature = temperature;
+        if (maxTokens != null) generationConfig.maxOutputTokens = maxTokens;
         if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
         if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
         // no prompt_cache_key: Gemini rejects unknown body fields with a 400
@@ -394,14 +400,7 @@ export function cfRunUrl(base: string, model: string): string {
     const b = base.replace(/\/+$/, '').replace(/\/v1$/, '');
     return `${b}/run/${model.replace(/^\/+/, '')}`;
 }
-// CF's account AI base as pasted from their OpenAI-SDK docs. Users park it under
-// the plain OpenAI provider all the time, where image calls hit the compat
-// endpoint above and die per-model. dispatch() reroutes image calls on this base
-// to the native run endpoint (same key); text-only keeps the compat path.
-export function isCfAiBase(base: string): boolean {
-    return /^https?:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/[^/]+\/ai(?:\/v1)?\/?$/i.test(base.trim());
-}
-export function cfBody(prompt: string, images?: string[], thinking?: string | null, temperature?: number | null): Record<string, unknown> {
+export function cfBody(prompt: string, images?: string[], thinking?: string | null, temperature?: number | null, maxTokens?: number): Record<string, unknown> {
     const content: unknown[] = [{ type: 'text', text: prompt }];
     for (const b64 of images ?? []) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
     // max_tokens is explicit on purpose: the native default is 256 (truncated
@@ -409,7 +408,7 @@ export function cfBody(prompt: string, images?: string[], thinking?: string | nu
     // the transcribe prompt's XML format drifts to bare text in ~1/3 of calls
     // (live-probed 2/3 vs 3/3 compliant) and translations wobble run to run;
     // an explicit user setting overrides.
-    const body: Record<string, unknown> = { messages: [{ role: 'user', content }], max_tokens: 4096, temperature: temperature ?? 0 };
+    const body: Record<string, unknown> = { messages: [{ role: 'user', content }], max_tokens: maxTokens ?? 4096, temperature: temperature ?? 0 };
     // 'none' = no reasoning, i.e. omit the param entirely (CF rejects the
     // literal "none" with a validation 400 — live-probed — and callLLM's
     // retry-without would double every request); other levels ride along and
@@ -421,13 +420,20 @@ export function cfParse(data: {
     result?: {
         response?: unknown;
         choices?: Array<{ message?: { content?: unknown } }>;
-        usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
+        usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } };
     };
 } | null): { text: string; usage?: LlmUsage } {
     const r = data?.result ?? {};
     const msg = r.choices?.[0]?.message;
     const text = typeof r.response === 'string' ? r.response : (typeof msg?.content === 'string' ? msg.content : '');
-    return { text, usage: { inTok: num(r.usage?.prompt_tokens), outTok: num(r.usage?.completion_tokens) } };
+    return {
+        text,
+        usage: {
+            inTok: num(r.usage?.prompt_tokens),
+            outTok: num(r.usage?.completion_tokens),
+            cachedInTok: num(r.usage?.prompt_tokens_details?.cached_tokens),
+        },
+    };
 }
 // CF reports model errors as errors[] — sometimes with HTTP 200 (success:false).
 // providerCode carries the first numeric code so callers can map known buckets.
@@ -445,7 +451,7 @@ export function cfImageCapHint(providerCode: number | undefined, imageCount: num
     if (providerCode !== 3030 || imageCount < 2) return undefined;
     return `This Cloudflare model may not accept ${imageCount} images in one request — switch "How the model reads text" to OCR text (local Baberu), or pick a model that takes multiple images`;
 }
-async function cloudflareChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
+async function cloudflareChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
     if (/<ACCOUNT_ID>/.test(base))
         throw new MtError('auth', 'Cloudflare Base URL still contains <ACCOUNT_ID>',
             'Replace <ACCOUNT_ID> with your Cloudflare account id (Settings → Model → Base URL)');
@@ -454,9 +460,13 @@ async function cloudflareChat(base: string, s: LLMSettings, prompt: string, imag
         headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${s.apiKey}`,
-            ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}` } : {}),
+            // prefix-cache affinity: models that support Workers AI prompt
+            // caching only hit when requests route to the same instance; the
+            // session id is stable per conversation (vision models report 0
+            // cached tokens — live-probed — text models do use it)
+            ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}`, 'x-session-affinity': `mt-${cacheKey}` } : {}),
         },
-        body: JSON.stringify(cfBody(prompt, images, thinking, temperature)),
+        body: JSON.stringify(cfBody(prompt, images, thinking, temperature, maxTokens)),
         signal: AbortSignal.timeout(120_000),
     });
     // read the body FIRST: CF signals model errors as errors[] on both 2xx
@@ -499,6 +509,7 @@ export interface TranslateFingerprintSettings {
     provider: string; model: string; baseUrl: string; ocrModel: string;
     thinkingLevel: string; ocrThinking: string;
     temperature: number | null; // null = provider default; pins the main model's sampling
+    ocrTemperature: number | null; // null = provider default; pins the VLM reader's transcribe sampling
     useOcrModel: boolean; stylePrompt: string; targetLang: string;
     useCharacters: boolean; contextPairs: number; transcribeSrc: boolean; vlmAssisted: boolean;
 }
@@ -510,6 +521,7 @@ export function translateRequestParts(
         st.provider, st.model, st.baseUrl, st.ocrModel,
         st.thinkingLevel, st.ocrThinking,
         st.temperature ?? -1,
+        st.ocrTemperature ?? -1,
         st.useOcrModel, st.stylePrompt, st.targetLang,
         st.useCharacters, st.contextPairs, st.transcribeSrc, st.vlmAssisted,
         req.vision, req.textOnly, req.ocr, req.split, req.pageW, req.pageH,
