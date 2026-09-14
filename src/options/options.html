@@ -192,6 +192,7 @@
   .range-head .val-input { -moz-appearance: textfield; appearance: textfield; }
   .range-head .unit-wrap { display: inline-flex; align-items: baseline; gap: 3px; }
   .range-head .unit { color: var(--muted); font-size: 11px; }
+  .dim { opacity: .45; }
   fieldset { border: 0; padding: 0; margin: 0; }
   fieldset:disabled { opacity: 0.45; }
 
@@ -406,6 +407,7 @@
           <option value="responses">Responses API (OpenAI responses)</option>
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="gemini">Google Gemini</option>
+          <option value="cloudflare">Cloudflare Workers AI (Meta / Qwen / Gemma)</option>
         </select>
       </div>
 
@@ -437,6 +439,13 @@
           <div class="hint" id="thinkingHint"></div>
         </div>
       </fieldset>
+
+      <div class="field">
+        <div class="range-head"><label for="temperature">Temperature</label><span class="unit-wrap"><input type="number" id="temperatureNum" class="val-input" min="0" max="1" step="0.05" aria-label="Temperature value"></span></div>
+        <input type="range" id="temperature" min="0" max="1" step="0.05">
+        <label class="check"><input type="checkbox" id="temperatureAuto" checked> Provider default</label>
+        <div class="hint">Checked = the provider's own default (usually 1.0). Untick to pin a value — lower is more literal and deterministic, better for translation.</div>
+      </div>
 
       <button id="test" type="button" class="btn ghost" style="width:100%">Test connection</button>
       <div class="hint" id="testStatus" style="min-height:18px;margin-top:6px"></div>
@@ -522,6 +531,7 @@
             <option value="responses">Responses API (OpenAI responses)</option>
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="gemini">Google Gemini</option>
+            <option value="cloudflare">Cloudflare Workers AI (Meta / Qwen / Gemma)</option>
           </select>
         </div>
 
@@ -545,6 +555,11 @@
           <input type="text" id="ocrThinking" list="ocrThinkingList" placeholder="none" autocomplete="off">
           <datalist id="ocrThinkingList"></datalist>
           <div class="hint" id="ocrThinkingHint"></div>
+        </div>
+
+        <div class="field">
+          <label class="check"><input type="checkbox" id="ocrPerRegion"> Always read one region at a time</label>
+          <div class="hint">One crop per call — for models that accept a single image (e.g. Cloudflare llama-3.2-11b-vision). Leave off for auto-detect: a rejected batch falls back to per-region on its own and remembers the model.</div>
         </div>
 
         <div class="field" style="display:flex;gap:8px">

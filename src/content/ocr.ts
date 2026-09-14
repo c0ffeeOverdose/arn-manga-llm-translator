@@ -8,6 +8,7 @@ import { pipeline, context, setContext, shareContext, loadContext, saveContext, 
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0 } from './page-cache';
+import { pageArea } from './render';
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
@@ -155,8 +156,9 @@ function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContex
 }
 
 // full-res debug view: translated image + CTD boxes/badges/conf, YOLO panels
-// (cyan, numbered in reading order). Below-threshold near-misses draw dimmed
-// gray with conf and NO badge — a badge means "translated in this order".
+// (cyan, numbered in reading order), dashed green = the placement area the
+// layout actually got. Below-threshold near-misses draw dimmed gray with conf
+// and NO badge — a badge means "translated in this order".
 export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = []): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d')!;
@@ -177,6 +179,19 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
     for (const d of [...dropped, ...panelDropped]) {
         ctx.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
         confPill(ctx, d.x1, d.y1, d.conf.toFixed(2), '#888888', font);
+    }
+    ctx.restore();
+    // placement area the layout actually got (pageArea = bubble fill + canvas
+    // clamp — the same call paintRegions makes), dashed green under the red
+    // boxes. Recomputed from the image being drawn: exact on the original
+    // view, off by an ink-frac hairline on the translated one.
+    const frame = ctx.getImageData(0, 0, c.width, c.height);
+    ctx.save();
+    ctx.setLineDash([font, font * 0.6]);
+    ctx.strokeStyle = '#2bff88';
+    for (const b of boxes) {
+        const a = pageArea(ctx, frame, b);
+        if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
     }
     ctx.restore();
     boxes.forEach((b, i) => {

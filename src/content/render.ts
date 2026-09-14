@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 6;
+export const RENDER_GEN = 7;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -256,6 +256,39 @@ export function inkStats(img: ImageData, box: DetBox): { frac: number; x1: numbe
     return { frac: n ? ink / n : 0, x1: ix1, y1: iy1, x2: ix2, y2: iy2 };
 }
 
+// Flood seed = the box's most common color (bubble interior), NOT the center
+// pixel: a center landing on a glyph seeds a fill of the glyph only, which
+// collapses the area to the padded-box fallback and wraps the translation
+// too narrow (clip bait). Sampled colors are quantized to 4 bits/channel and
+// averaged so anti-aliased noise doesn't split the interior vote; when the
+// center is already interior (the common case) this picks the same color.
+function interiorSeed(data: Uint8ClampedArray, W: number, H: number, box: DetBox): [number, number, number] {
+    const x1 = Math.max(0, Math.floor(box.x1)), y1 = Math.max(0, Math.floor(box.y1));
+    const x2 = Math.min(W - 1, Math.ceil(box.x2)), y2 = Math.min(H - 1, Math.ceil(box.y2));
+    const stepX = Math.max(1, Math.floor((x2 - x1) / 24));
+    const stepY = Math.max(1, Math.floor((y2 - y1) / 24));
+    const buckets = new Map<number, { n: number; r: number; g: number; b: number }>();
+    let best: { n: number; r: number; g: number; b: number } | null = null;
+    for (let y = y1; y <= y2; y += stepY) {
+        for (let x = x1; x <= x2; x += stepX) {
+            const i = (y * W + x) * 4;
+            const r = data[i], g = data[i + 1], b = data[i + 2];
+            const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+            let bkt = buckets.get(key);
+            if (!bkt) { bkt = { n: 0, r: 0, g: 0, b: 0 }; buckets.set(key, bkt); }
+            bkt.n++; bkt.r += r; bkt.g += g; bkt.b += b;
+            if (!best || bkt.n > best.n) best = bkt;
+        }
+    }
+    const cx = Math.max(0, Math.min(W - 1, Math.floor((box.x1 + box.x2) / 2)));
+    const cy = Math.max(0, Math.min(H - 1, Math.floor((box.y1 + box.y2) / 2)));
+    if (!best) {
+        const i = (cy * W + cx) * 4;
+        return [data[i], data[i + 1], data[i + 2]];
+    }
+    return [Math.round(best.r / best.n), Math.round(best.g / best.n), Math.round(best.b / best.n)];
+}
+
 // Text placement area: flood-fill the bubble interior from the detection box
 // center, hard-limited to box+30% in every direction — in B&W manga the fill
 // used to walk through faces (same white as bubble interiors) and claim the
@@ -266,7 +299,8 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
     const cx = Math.floor((box.x1 + box.x2) / 2);
     const cy = Math.floor((box.y1 + box.y2) / 2);
     const si = (cy * W + cx) * 4;
-    const [r0, g0, b0] = [data[si], data[si + 1], data[si + 2]];
+    const center: [number, number, number] = [data[si], data[si + 1], data[si + 2]];
+    const modal = interiorSeed(data, W, H, box);
 
     // Vertical text columns are narrow by nature (CTD hugs the glyphs, not the
     // bubble) while the bubble is wide — the uniform 30% cap below starves the
@@ -282,31 +316,45 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
     const loY = Math.max(0, Math.floor(box.y1 - (box.y2 - box.y1) * grow));
     const hiY = Math.min(H - 1, Math.ceil(box.y2 + (box.y2 - box.y1) * grow));
 
-    const visited = new Uint8Array(W * H);
-    const queue = [cy * W + cx];
-    visited[cy * W + cx] = 1;
-    let minX = cx, maxX = cx, minY = cy, maxY = cy, count = 0;
-    const minFill = (box.x2 - box.x1) * (box.y2 - box.y1) * 0.25;
-
-    while (queue.length) {
-        const p = queue.pop()!;
-        const x = p % W, y = (p / W) | 0;
-        if (x < minX) minX = x; if (x > maxX) maxX = x;
-        if (y < minY) minY = y; if (y > maxY) maxY = y;
-        count++;
-        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-            const nx = x + dx, ny = y + dy;
-            if (nx < loX || ny < loY || nx > hiX || ny > hiY) continue;
-            const np = ny * W + nx;
-            if (visited[np]) continue;
-            const i = np * 4;
-            const dist = Math.abs(data[i] - r0) + Math.abs(data[i + 1] - g0) + Math.abs(data[i + 2] - b0);
-            if (dist < 60) {
-                visited[np] = 1;
-                queue.push(np);
+    const minFill = boxW * boxH * 0.25;
+    const fillFrom = (seed: [number, number, number]) => {
+        const visited = new Uint8Array(W * H);
+        const queue = [cy * W + cx];
+        visited[cy * W + cx] = 1;
+        let minX = cx, maxX = cx, minY = cy, maxY = cy, count = 0;
+        while (queue.length) {
+            const p = queue.pop()!;
+            const x = p % W, y = (p / W) | 0;
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+            count++;
+            for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+                const nx = x + dx, ny = y + dy;
+                if (nx < loX || ny < loY || nx > hiX || ny > hiY) continue;
+                const np = ny * W + nx;
+                if (visited[np]) continue;
+                const i = np * 4;
+                const dist = Math.abs(data[i] - seed[0]) + Math.abs(data[i + 1] - seed[1]) + Math.abs(data[i + 2] - seed[2]);
+                if (dist < 60) {
+                    visited[np] = 1;
+                    queue.push(np);
+                }
             }
         }
+        return { minX, minY, maxX, maxY, count, seed };
+    };
+    // Interior seed first (fixes a center that landed on a glyph), the old
+    // center-pixel seed as fallback — whichever flooded more pixels wins.
+    // Identical seeds (common case: the center is already interior) skip the
+    // second fill; a text-heavy box where the ink wins the vote still lands
+    // back on the old behavior instead of collapsing to the padded box.
+    let fill = fillFrom(modal);
+    if (modal[0] !== center[0] || modal[1] !== center[1] || modal[2] !== center[2]) {
+        const alt = fillFrom(center);
+        if (alt.count > fill.count) fill = alt;
     }
+    let { minX, minY, maxX, maxY } = fill;
+    const [r0, g0, b0] = fill.seed;
 
     // Border-cross clamp: the fill above may have slipped through a
     // thin/anti-aliased bubble border into a neighbor bubble's white
@@ -361,9 +409,15 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
             w: box.x2 - box.x1 + 2 * px, h: box.y2 - box.y1 + 2 * py,
         };
     }
-    // 8% inner margin so text doesn't touch bubble edges
+    // 8% inner margin so text doesn't touch bubble edges. Floored at the
+    // detection box: a fill trapped in a pocket between glyph strokes comes
+    // out narrower/shorter than the box it must hold (live: 85x57 area in a
+    // 112x74 box → f:13 overflow clip; 55x38 in 65x45) — the box is text by
+    // construction, so the placement area never goes below it.
     const mx = (maxX - minX) * 0.08, my = (maxY - minY) * 0.08;
-    return { x: minX + mx, y: minY + my, w: maxX - minX - 2 * mx, h: maxY - minY - 2 * my };
+    const fx1 = Math.min(minX + mx, box.x1), fy1 = Math.min(minY + my, box.y1);
+    const fx2 = Math.max(maxX - mx, box.x2), fy2 = Math.max(maxY - my, box.y2);
+    return { x: fx1, y: fy1, w: fx2 - fx1, h: fy2 - fy1 };
 }
 
 // Layout area the renderer actually uses: the bubble fill, except a big
@@ -444,8 +498,9 @@ interface Area { x: number; y: number; w: number; h: number }
 
 // Shared placement-area resolution (layoutArea + canvas clamp + 20px floor).
 // Both orientations and the horizontal-fit probe use it, so the probe can
-// never disagree with the real render about the area.
-function pageArea(
+// never disagree with the real render about the area. Exported for the debug
+// overlay (renderDebugView draws the rect the layout actually got).
+export function pageArea(
     ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
     img: ImageData,
     box: DetBox,

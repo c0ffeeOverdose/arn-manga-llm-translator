@@ -9,6 +9,7 @@ import { type MtOnStatus } from './detection';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep } from './pipeline';
+import { ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
 import { rewindContextBefore, replayPagesAfter } from './queue';
 import { bookHas, bookAdd, bookDrop } from './sweep';
@@ -123,6 +124,13 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         origBytes: prep.origBytes ?? existing?.origBytes,
         translatedBmp: ref.kind === 'canvas' ? canvas.transferToImageBitmap() : undefined,
     };
+    // blob-origin readers: keep an extension-owned copy of the original now —
+    // once we swap in the translated blob the reader's URL may be dead and
+    // "Show original" has nothing to restore from (see ownOriginalUrl)
+    if (ownCopyNeeded(srcUrl, bitmap.width, bitmap.height)) {
+        state.origOwn = await ownOriginalUrl(bitmap);
+        if (isDebug() && state.origOwn) console.log('[mt] orig copy', JSON.stringify({ src: srcUrl.slice(-14), px: bitmap.width * bitmap.height }));
+    }
     // debug views ride along only when debug is on — zero cost otherwise.
     // one on each frame so Original/Translate toggle keeps its debug boxes.
     if (debugOn && det.boxes.length) {

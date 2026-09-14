@@ -51,6 +51,65 @@ test('horizontal boxes keep the tight 30% cap (face-walk guard)', () => {
   assert.ok(a.w <= 80 * 1.6 + 1 && a.h <= 40 * 1.6 + 1, `stays box+30%, got ${a.w}x${a.h}`);
 });
 
+test('bubbleArea: center-on-ink does not collapse the fill (interior seed)', () => {
+  // live case: tight box whose center pixel lands on a glyph stroke. The old
+  // center-pixel seed flooded the glyph only, fell under the 25% minFill and
+  // returned the padded box — translation wrapped too narrow and clipped.
+  const W = 400, H = 300;
+  const img = page(W, H, [76, 204]); // real bubble borders at the grow bounds
+  for (const y0 of [88, 98, 108]) {
+    for (let y = y0; y < y0 + 3; y++) {
+      for (let x = 110; x < 170; x++) {
+        const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+      }
+    }
+  }
+  const box = { x1: 100, y1: 80, x2: 180, y2: 120, conf: 0.9 }; // center (140,100) on the middle bar
+  assert.equal(img.data[(100 * W + 140) * 4], 0, 'premise: box center is on ink');
+  const a = bubbleArea(img, box);
+  assert.ok(a.w > 100, `fill reaches the bubble borders, got w=${a.w}`);
+  assert.ok(a.x >= 76 && a.x + a.w <= 205, `stays inside the real borders, got x=${a.x} w=${a.w}`);
+});
+
+test('bubbleArea: ink-heavy box keeps the center-seed fill when the vote flips', () => {
+  // center pixel is interior (white) but ~70% of the box is ink, so the modal
+  // vote picks ink — only the center-seed fallback keeps the real area.
+  const W = 400, H = 300;
+  const img = page(W, H, [76, 204]);
+  for (let y0 = 80; y0 < 122; y0 += 8) {
+    for (let y = y0; y < Math.min(y0 + 5, 122); y++) {
+      for (let x = 100; x < 180; x++) {
+        const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+      }
+    }
+  }
+  const box = { x1: 100, y1: 80, x2: 180, y2: 122, conf: 0.9 }; // center (140,101) on a white gap
+  assert.ok(img.data[(101 * W + 140) * 4] > 60, 'premise: box center is interior');
+  const a = bubbleArea(img, box);
+  assert.ok(a.w > 100, `fallback keeps the white fill, got w=${a.w}`);
+});
+
+test('bubbleArea: pocket-trapped fill floors at the detection box', () => {
+  // fill enclosed by glyph strokes: bbox 56x20 inside an 80x40 box — the old
+  // code returned the pocket minus margin, i.e. an area SMALLER than the text
+  // box (live: 85x57 inside 112x74 → f:13 overflow clip).
+  const W = 300, H = 220;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const img = { width: W, height: H, data };
+  const ink = (x1, y1, x2, y2) => {
+    for (let y = y1; y < y2; y++) for (let x = x1; x < x2; x++) {
+      const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0;
+    }
+  };
+  ink(100, 88, 180, 90);   // top bar
+  ink(100, 110, 180, 112); // bottom bar
+  ink(110, 88, 112, 112);  // left bar
+  ink(168, 88, 170, 112);  // right bar
+  const box = { x1: 100, y1: 80, x2: 180, y2: 120, conf: 0.9 };
+  const a = bubbleArea(img, box);
+  assert.ok(a.w >= 80 && a.h >= 40, `never below the box, got ${a.w}x${a.h}`);
+});
+
 test('firstColX: fitting block centers, overflow right-aligns', () => {
   // live case (a narrow box): area 48 wide, 2 cols x 21.6 = 43.2 total.
   // Old code started the first column at the block-left (356.4) and the

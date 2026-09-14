@@ -55,6 +55,17 @@ export function sweepWait(url: string, onStatus: MtOnStatus): Promise<void> {
     return sweepWaiter ? sweepWaiter(url, onStatus) : Promise.resolve();
 }
 
+// ---- lookahead-abort registry (same neutral-ground pattern): sweep.ts must
+// not import auto.ts (one-way edge — auto imports sweep), but starting/stopping
+// a sweep must stop a lookahead chain that is warming the same pages.
+let lookaheadAbort: (() => boolean) | null = null;
+export function registerLookaheadAbort(fn: () => boolean): void {
+    lookaheadAbort = fn;
+}
+export function abortLookahead(): boolean {
+    return lookaheadAbort ? lookaheadAbort() : false;
+}
+
 // ---- ordered commit: parallel workers finish out of order, but the book
 // must fold page-by-page (updateContext is order-sensitive: pairs append,
 // names are first-wins). Buffer results by chapter index and drain only the
@@ -69,6 +80,16 @@ export function takeOrdered<T>(ready: Map<number, T>, head: number): { items: T[
         head++;
     }
     return { items, head };
+}
+
+// Sweep lifecycle phase (pure — popup/pill label + unit tests). `starting` is
+// the enumeration window before a run object exists: cancel must be possible
+// there too (it used to be a silent no-op and the run started anyway).
+export function sweepPhase(s: { cancel: boolean; dead: boolean; starting?: boolean } | null): 'idle' | 'starting' | 'running' | 'stopping' | 'dead' {
+    if (!s) return 'idle';
+    if (s.dead) return 'dead';
+    if (s.cancel) return 'stopping';
+    return s.starting ? 'starting' : 'running';
 }
 
 export interface CachedPage {
@@ -675,6 +696,8 @@ export interface FingerprintOpts {
     readingDir: string; detConf: number; panelConf: number; deferLabels: boolean;
     transcribeSrc: boolean; // changes the prompt (src attrs) → separate cache entries
     useOcrModel: boolean; // split pipeline (VLM transcribe → LLM translate) → separate entries
+    ocrPerRegion: boolean; // per-region transcribe calls produce different OCR text → separate entries
+    temperature: number | null; // pinned main-model sampling → different output, separate entries
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
@@ -684,7 +707,7 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // failures used to come back ok:true and get cached) — orphan them all at
     // once instead of making the user Clear by hand.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, 'tile2'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', 'tile2'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

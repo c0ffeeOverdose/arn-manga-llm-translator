@@ -14,6 +14,11 @@ declare const __BUILD_ID__: string; // injected by build.mjs — which build is 
 export interface PageState {
     orig: string;
     translated: string;
+    // blob-origin readers (MangaDex etc.): extension-owned PNG copy of the
+    // original pixels. The reader's blob URL is dead or unassignable (the
+    // dead-orig guard), so this is the only reliable way back for
+    // "Show original" — minted while the pixels are still readable.
+    origOwn?: string;
     debug?: string; // full-res boxes+badges+conf view on the TRANSLATED image
     debugOrig?: string; // same boxes on the ORIGINAL (Show original keeps its debug)
     det?: DetectResult;
@@ -90,6 +95,7 @@ export function retireBlob(blob: string | undefined, orig: string): void {
 export function regPage(state: PageState): void {
     pages.set(state.orig, state);
     pages.set(state.translated, state);
+    if (state.origOwn) pages.set(state.origOwn, state);
     if (state.debug) pages.set(state.debug, state);
     if (state.debugOrig) pages.set(state.debugOrig, state);
     // content index for the fast repaint lane (back-nav after blob rotation):
@@ -99,11 +105,13 @@ export function regPage(state: PageState): void {
 }
 export function unregPage(state: PageState): void {
     retireBlob(state.translated, state.orig);
+    retireBlob(state.origOwn, state.orig);
     retireBlob(state.debug, state.orig);
     retireBlob(state.debugOrig, state.orig);
     if (state.hash && hashStates.get(state.hash)?.state === state) hashStates.delete(state.hash);
     pages.delete(state.orig);
     pages.delete(state.translated);
+    if (state.origOwn) { URL.revokeObjectURL(state.origOwn); pages.delete(state.origOwn); }
     if (state.debug) pages.delete(state.debug);
     if (state.debugOrig) pages.delete(state.debugOrig);
     state.translatedBmp?.close(); // canvas write-back bitmap — freed with the page

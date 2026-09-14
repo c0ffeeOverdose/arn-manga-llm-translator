@@ -26,6 +26,7 @@ export interface PipelineSettings {
     // 'ocr'   = Tesseract reads locally, LLM gets text only (works with text-only models)
     textSource: 'page' | 'crops' | 'ocr';
     useOcrModel: boolean;      // split pipeline: a separate VLM transcribes (page/crops images), the main model translates text-only
+    ocrPerRegion: boolean;     // force per-region transcribe calls (1 image/call). Default false = auto: batched first, then per-region when the provider rejects the image count (memorized per OCR model)
     readingDir: 'rtl' | 'ltr';   // region numbering order: manga vs manhwa/western
     ocrEngine: 'tesseract' | 'baberu'; // recognition engine when textSource='ocr'
     ocrLangs: string[];         // traineddata languages to load for OCR (must be downloaded first)
@@ -38,6 +39,7 @@ export interface PipelineSettings {
     contextPairs: number;          // cross-page memory depth
     charLimit: number;         // character book cap
     thinkingLevel: string; // preset (see THINKING_LEVELS), custom text, or a numeric token budget — mapped per provider at send time
+    temperature: number | null; // main translate sampling temperature 0-1; null = provider default (parameter not sent)
     ocrThinking: string; // thinking level for the separate VLM reader's transcribe call (default 'none' — copying glyphs needs no reasoning)
     parallelLlm: number;        // concurrent LLM calls when context is OFF (1 = serial)
     prefetchN: number;         // auto pre-translate window: queued pages ahead (1-30)
@@ -70,6 +72,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     grayscaleBw: true,
     textSource: 'crops',
     useOcrModel: false,
+    ocrPerRegion: false,
     readingDir: 'rtl',
     ocrEngine: 'baberu',
     ocrLangs: ['jpn', 'eng'],
@@ -85,6 +88,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     contextPairs: 40,
     charLimit: 10,
     thinkingLevel: 'auto',
+    temperature: null,
     ocrThinking: 'none',
     parallelLlm: 3,
     prefetchN: 3,
@@ -220,7 +224,11 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.detMinSize !== 'number' || !(out.detMinSize >= 1 && out.detMinSize <= 200)) out.detMinSize = 12;
     else out.detMinSize = Math.round(out.detMinSize);
     if (typeof out.panelConf !== 'number' || !(out.panelConf >= 0.05 && out.panelConf <= 1)) out.panelConf = 0.20;
-    for (const k of ['textColor', 'strokeColor'] as const) {
+    // sampling temperature: null = provider default; otherwise pinned 0-1.
+    // Reads raw `s`: the nullable default (null) can't match a stored number
+    // in the type-guarded copy loop above.
+    const temp = s.temperature;
+    out.temperature = typeof temp === 'number' && Number.isFinite(temp) && temp >= 0 && temp <= 1 ? temp : null;    for (const k of ['textColor', 'strokeColor'] as const) {
         if (out[k] !== 'auto' && (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(out[k]))) out[k] = 'auto';
     }
     if (typeof out.textStroke !== 'number' || !(out.textStroke >= 0 && out.textStroke <= 0.5)) out.textStroke = 0.1;
@@ -228,6 +236,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.showToasts !== 'boolean') out.showToasts = true;
     if (typeof out.transcribeSrc !== 'boolean') out.transcribeSrc = false;
     if (typeof out.useOcrModel !== 'boolean') out.useOcrModel = false;
+    if (typeof out.ocrPerRegion !== 'boolean') out.ocrPerRegion = false;
     if (out.inferEngine !== 'local' && out.inferEngine !== 'cloud') out.inferEngine = 'local';
     if (out.detEp !== 'auto' && out.detEp !== 'wasm') out.detEp = 'auto';
     if (typeof out.prefetchN !== 'number' || !(out.prefetchN >= 1 && out.prefetchN <= 30)) out.prefetchN = 3;

@@ -11,13 +11,13 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, registerLookaheadAbort, abortLookahead } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 
 const FP = {
   targetLang: 'Thai', textSource: 'page', ocrEngine: 'tesseract',
   readingDir: 'rtl', detConf: 0.35, panelConf: 0.2, deferLabels: true,
-  transcribeSrc: false, useOcrModel: false,
+  transcribeSrc: false, useOcrModel: false, ocrPerRegion: false, temperature: null,
 };
 
 test('CACHE_MAX is the agreed 200 pages', () => {
@@ -52,6 +52,8 @@ test('settingsFingerprint: stable, every field flips it', () => {
     { ...FP, deferLabels: false },
     { ...FP, transcribeSrc: true },
     { ...FP, useOcrModel: true },
+    { ...FP, ocrPerRegion: true },
+    { ...FP, temperature: 0.3 },
   ];
   for (const v of variants) assert.notEqual(settingsFingerprint(v), base, JSON.stringify(v));
 });
@@ -606,6 +608,25 @@ test('takeOrdered: consecutive run from head only, failures must still buffer', 
   const m3 = new Map([[0, 'a'], [2, 'c']]);
   assert.deepEqual(takeOrdered(m3, 0), { items: ['a'], head: 1 });
   assert.equal(m3.size, 1);
+});
+
+test('sweepPhase: idle/starting/running/stopping/dead (popup + pill labels)', () => {
+  assert.equal(sweepPhase(null), 'idle');
+  assert.equal(sweepPhase({ cancel: false, dead: false, starting: true }), 'starting');
+  assert.equal(sweepPhase({ cancel: false, dead: false }), 'running');
+  // cancelled-but-draining must read as stopping, not running (the 90s drain
+  // used to show "Sweeping x/y" with a live Stop button)
+  assert.equal(sweepPhase({ cancel: true, dead: false }), 'stopping');
+  // dead (chapter moved on) wins over stopping — quiet abort, no message
+  assert.equal(sweepPhase({ cancel: true, dead: true }), 'dead');
+});
+
+test('lookahead-abort registry: sweep start/stop reaches the auto chain', () => {
+  assert.equal(abortLookahead(), false, 'no chain registered yet');
+  let cancelled = 0;
+  registerLookaheadAbort(() => { cancelled++; return true; });
+  assert.equal(abortLookahead(), true);
+  assert.equal(cancelled, 1);
 });
 
 test('pickActivity: sweep ties lookahead at the bottom, loses to view', () => {

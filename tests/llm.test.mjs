@@ -19,9 +19,9 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches } =
+const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches, joinTranscription } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
-const { toMtError, LlmHttpError, translateRequestParts, translateRequestId } =
+const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, isCfAiBase } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
 const { langOk, fetchWithProgress } =
   await import(new URL('../.test-build/ocr-models.mjs', import.meta.url).href);
@@ -436,6 +436,198 @@ test('toMtError: plain 400 without image keywords gets no hint', () => {
   assert.equal(m.hint, undefined);
 });
 
+// live: Cloudflare Workers AI 403 for un-agreed Meta models — the generic
+// "API key is wrong" hint sent the user to re-check a working token
+test('toMtError: CF license 403 gets the agree hint, other 403s keep the key hint', () => {
+  const license = toMtError(new LlmHttpError(403,
+    'LLM API 403: {"errors":[{"message":"AiError: Model Agreement: Prior to using this model, you must submit the prompt \'agree\'. ' +
+    'By submitting \'agree\', you hereby agree to the llama-3.2-11b-vision-instruct Community License …"}]}'));
+  assert.equal(license.kind, 'auth');
+  assert.match(license.hint ?? '', /agree/);
+  assert.doesNotMatch(license.hint ?? '', /API key is wrong/);
+  const plain = toMtError(new LlmHttpError(403, 'LLM API 403: {"errors":[{"message":"Authentication error"}]}'));
+  assert.match(plain.hint ?? '', /API key is wrong/);
+});
+
+// ---- Cloudflare Workers AI native run (live-probed shapes) ----
+
+test('cfRunUrl: model in the URL, /ai and /ai/v1 bases both accepted', () => {
+  assert.equal(cfRunUrl('https://api.cloudflare.com/client/v4/accounts/abc/ai', '@cf/meta/x'),
+    'https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/x');
+  assert.equal(cfRunUrl('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/', '@cf/meta/x'),
+    'https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/x');
+});
+
+test('isCfAiBase: the account AI base (with/without /v1) routes, deeper paths do not', () => {
+  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai'), true);
+  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1'), true);
+  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/ '), true);
+  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/x'), false);
+  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/chat/completions'), false);
+  assert.equal(isCfAiBase('https://api.cloudflare.com/client/v4/accounts/abc'), false);
+  assert.equal(isCfAiBase('https://api.openai.com/v1'), false);
+  assert.equal(isCfAiBase(''), false);
+});
+
+test('dispatch: openai provider + CF base sends image calls to the native run endpoint', async () => {
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return {
+      ok: true, status: 200,
+      async text() { return JSON.stringify({ result: { response: 'ok', usage: { prompt_tokens: 1, completion_tokens: 2 } }, success: true }); },
+    };
+  };
+  const s = { provider: 'openai', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/abc/ai/v1', model: '@cf/meta/llama-3.2-11b-vision-instruct', apiKey: 'k' };
+  try {
+    const withImg = await callLLM(s, 'p', ['QUJD']);
+    assert.equal(seen[0].url, 'https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/llama-3.2-11b-vision-instruct');
+    assert.equal(seen[0].body.model, undefined, 'native carries the model in the URL');
+    assert.equal(withImg.text, 'ok');
+    await callLLM(s, 'p');
+    assert.equal(seen[1].url, 'https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/chat/completions');
+    assert.equal(seen[1].body.model, s.model, 'text-only stays on the OpenAI-compatible path');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('temperature: each protocol carries it where legal; off = parameter not sent', async () => {
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return {
+      ok: true, status: 200,
+      async text() {
+        if (String(url).includes('/v1/messages')) return JSON.stringify({ content: [{ type: 'text', text: 'ok' }], usage: {} });
+        if (String(url).includes(':generateContent')) return JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
+        return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+      },
+    };
+  };
+  const openai = { provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' };
+  const anthropic = { provider: 'anthropic', baseUrl: 'https://a.test', model: 'm', apiKey: 'k' };
+  const gemini = { provider: 'gemini', baseUrl: 'https://g.test/v1beta', model: 'm', apiKey: 'k' };
+  try {
+    await callLLM(openai, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(seen.at(-1).body.temperature, 0.25);
+    await callLLM(openai, 'p');
+    assert.equal(seen.at(-1).body.temperature, undefined, 'off = parameter not sent (provider default)');
+    await callLLM(anthropic, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(seen.at(-1).body.temperature, 0.25);
+    await callLLM(anthropic, 'p', undefined, 'low', undefined, 0.25);
+    assert.equal(seen.at(-1).body.temperature, undefined, 'Anthropic forbids temperature together with thinking');
+    await callLLM(gemini, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(seen.at(-1).body.generationConfig.temperature, 0.25);
+    await callLLM(gemini, 'p', undefined, 'high', undefined, null);
+    assert.equal(seen.at(-1).body.generationConfig.temperature, undefined);
+    assert.ok(seen.at(-1).body.generationConfig.thinkingConfig, 'thinking config survives without a temperature');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('isImageCapError: compat "Unable to add image" is NOT an image-count cap (single image fails too)', () => {
+  const e = new MtError('parse', 'AiError: AiError: Unable to add image when there are no user-supplied nor system-supplied messages. (uuid)', undefined);
+  assert.equal(isImageCapError(e), false, 'the message is not a cap — the endpoint rejects this model\'s images entirely');
+});
+
+
+test('cfBody: explicit max_tokens, images as data-URL parts, no model field', () => {
+  const b = cfBody('hi', ['QUJD'], null);
+  assert.equal(b.max_tokens, 4096, 'native default is 256 — must be explicit');
+  assert.equal(b.model, undefined, 'model lives in the URL');
+  const content = b.messages[0].content;
+  assert.deepEqual(content[0], { type: 'text', text: 'hi' });
+  assert.deepEqual(content[1], { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,QUJD' } });
+  assert.equal(cfBody('x').messages[0].content.length, 1, 'text-only request carries no image parts');
+  assert.equal(cfBody('x', ['a'], 'low').reasoning_effort, 'low');
+  assert.equal(cfBody('x', ['a'], 'none').reasoning_effort, undefined, 'CF rejects the literal "none" — omit it');
+  assert.equal(cfBody('x', ['a'], null).reasoning_effort, undefined);
+});
+
+test('cfParse: result.response and result.choices both parse; usage maps', () => {
+  assert.deepEqual(
+    cfParse({ result: { response: 'abc', usage: { prompt_tokens: 7, completion_tokens: 3 } } }),
+    { text: 'abc', usage: { inTok: 7, outTok: 3 } });
+  assert.equal(cfParse({ result: { choices: [{ message: { content: 'def' } }] } }).text, 'def');
+  assert.equal(cfParse({ result: {} }).text, '');
+  assert.equal(cfParse(null).text, '');
+});
+
+test('cfError: errors[] → LlmHttpError (covers HTTP 200 + success:false) with providerCode', () => {
+  assert.equal(cfError({ errors: [] }, 200), null);
+  assert.equal(cfError(null, 200), null);
+  const e = cfError({ errors: [{ message: 'Model Agreement: …agree…' }] }, 403);
+  assert.ok(e instanceof LlmHttpError);
+  assert.equal(e.status, 403);
+  assert.equal(e.providerCode, undefined);
+  assert.match(e.message, /agree/);
+  const img = cfError({ errors: [{ message: 'AiError: Internal Server Error', code: 3030 }] }, 400);
+  assert.equal(img.providerCode, 3030);
+});
+
+test('cfImageCapHint: only CF 3030 with 2+ images (no model-name table)', () => {
+  assert.match(cfImageCapHint(3030, 3) ?? '', /OCR text/, 'multi-image rejection gets the actionable hint');
+  assert.equal(cfImageCapHint(3030, 1), undefined, 'single-image request: 3030 is not a cap problem');
+  assert.equal(cfImageCapHint(5001, 3), undefined, 'other codes stay unmapped');
+  assert.equal(cfImageCapHint(undefined, 3), undefined);
+});
+
+// ---- split-OCR auto-detect: image-count vs image-support classification ----
+
+test('isImageCapError: tagged CF cap, keyword caps, and NOT "cannot read images"', () => {
+  // tagged by cloudflareChat (CF 3030 + 2+ images)
+  assert.equal(isImageCapError(new MtError('parse', 'AiError: Internal Server Error', undefined, true)), true);
+  // keyword shapes from OpenAI-compatible providers
+  assert.equal(isImageCapError(new MtError('parse', 'You uploaded 5 images but this model supports a maximum of 1 image per request')), true);
+  assert.equal(isImageCapError(new MtError('parse', 'too many images: this model accepts only one image per message')), true);
+  // "cannot read images at all" must NOT route to per-region calls
+  assert.equal(isImageCapError(new MtError('parse', 'this model does not support images', 'switch to Local OCR')), false);
+  assert.equal(isImageCapError(new MtError('parse', 'invalid base64 in data URI at content[1]')), false);
+  // unrelated / non-MtError
+  assert.equal(isImageCapError(new MtError('auth', 'API key is wrong')), false);
+  assert.equal(isImageCapError(new Error('image cap')), false);
+  assert.equal(isImageCapError(undefined), false);
+});
+
+test('joinTranscription: multi-element answers join in order, keep/empty drop out', () => {
+  assert.equal(joinTranscription('<r n="1">ネクスト</r>\n<r n="2">ヒロイン</r>\n<r n="3" keep="true"/>'),
+    'ネクスト ヒロイン', 'line-splitting models keep every line');
+  assert.equal(joinTranscription('<r n="1">I\'M SORRY!</r>'), 'I\'M SORRY!');
+  assert.equal(joinTranscription('<r n="1" keep="true"/>'), '', 'keep-only → empty source');
+});
+
+test('joinTranscription: bare text (format drift) is used, not thrown away', () => {
+  assert.equal(joinTranscription('CLEAR!.'), 'CLEAR!.', 'live: CF llama-3.2 drifts to bare text ~1/3 of the time');
+  assert.equal(joinTranscription('I CLEARED IT WITH AN S RANK!\n\n(r n="1" keep="true")'),
+    'I CLEARED IT WITH AN S RANK!', 'dangling keep tag line dropped');
+  assert.equal(joinTranscription('```\nWOW!.\n```'), 'WOW!.', 'code fences stripped');
+  assert.equal(joinTranscription('no readable text in this crop'), '', 'refusal prose stays empty');
+  assert.equal(joinTranscription('(r n="1" keep="true")'), '', 'tag-only fallback → empty');
+  assert.equal(joinTranscription('この画像は、ワインのブドウの画像です。'), '',
+    'description of a text-less crop must not become a source (live-probed leak)');
+  assert.equal(joinTranscription('<r n="1">この画像は、ワインのブドウの画像です。</r>'), '',
+    'descriptions wrapped in the XML element are rejected too');
+  assert.equal(joinTranscription('<r n="1">写真を撮ってよ</r>'), '写真を撮ってよ',
+    'a real line that merely contains 写真 survives');
+});
+
+test('cfBody pins temperature 0 (CF default 0.6 drifts the XML format)', () => {
+  assert.equal(cfBody('x', ['a']).temperature, 0);
+  assert.equal(cfBody('x', ['a'], null, 0.3).temperature, 0.3, 'a user pin overrides the CF default');
+});
+
+test('transcribeOne prompt: one element, all lines joined, no multi-image wording', () => {
+  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false });
+  assert.match(p, /single manga region/);
+  assert.match(p, /Exactly one element/);
+  assert.doesNotMatch(p, /following images/, 'no crop-list wording — the request carries one image');
+  assert.doesNotMatch(p, /Translate the numbered/, 'pure transcription, no translation task');
+});
+
 // live: bracketed system message translated with brackets kept must render
 // (box 7 on a strip: "[WELCOME...]" -> "[ยินดีต้อนรับ...]" was parsed as keep)
 test('bracketed system message renders', () => {
@@ -724,6 +916,7 @@ const ADOPT_REQ = {
 const ADOPT_ST = {
   provider: 'openai', model: 'm', baseUrl: '', ocrModel: '',
   thinkingLevel: 'low', ocrThinking: 'none',
+  temperature: null,
   useOcrModel: false, stylePrompt: '', targetLang: 'Thai',
   useCharacters: true, contextPairs: 40, transcribeSrc: false, vlmAssisted: false,
 };
@@ -740,6 +933,7 @@ test('translateRequestId: stable 64-hex, sensitive to every output-shaping input
     [{ ...ADOPT_REQ, cacheKey: 'manga-2' }, ADOPT_ST, 'manga scope'],
     [ADOPT_REQ, { ...ADOPT_ST, model: 'm2' }, 'model'],
     [ADOPT_REQ, { ...ADOPT_ST, thinkingLevel: 'high' }, 'thinking'],
+    [ADOPT_REQ, { ...ADOPT_ST, temperature: 0.3 }, 'temperature'],
     [ADOPT_REQ, { ...ADOPT_ST, targetLang: 'English' }, 'target lang'],
     [ADOPT_REQ, { ...ADOPT_ST, useCharacters: false }, 'chars flag'],
     [{ ...ADOPT_REQ, split: true }, ADOPT_ST, 'split mode'],

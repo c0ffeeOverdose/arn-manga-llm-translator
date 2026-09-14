@@ -4,7 +4,7 @@
 import { splitStablePrefix, type ContextState, type RegionInput } from './core';
 
 export interface LLMSettings {
-    provider: 'openai' | 'responses' | 'anthropic' | 'gemini';
+    provider: 'openai' | 'responses' | 'anthropic' | 'gemini' | 'cloudflare';
     model: string;
     apiKey: string;
     baseUrl?: string; // override for openai-compatible endpoints (openrouter, ollama, opencode...)
@@ -27,6 +27,7 @@ export const DEFAULT_BASES: Record<LLMSettings['provider'], string> = {
     responses: 'https://opencode.ai/zen/v1',
     anthropic: 'https://api.anthropic.com',
     gemini: 'https://generativelanguage.googleapis.com/v1beta',
+    cloudflare: 'https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai',
 };
 
 export async function callLLM(
@@ -35,34 +36,53 @@ export async function callLLM(
     imagesB64?: string[], // jpeg base64 (no data: prefix); [0] = full page, rest = region crops
     thinkingLevel: string = 'auto', // preset, custom text, or a numeric token budget
     cacheKey?: string, // stable per conversation (manga) — routes provider-side prompt caching
+    temperature?: number | null, // pinned sampling temperature; null/undefined = provider default
 ): Promise<LlmResult> {
     if (!s.apiKey) throw new MtError('auth', 'No API key configured — open the extension options');
     if (!s.model) throw new MtError('auth', 'No model configured — open the extension options');
     const base = (s.baseUrl || DEFAULT_BASES[s.provider]).replace(/\/$/, '');
     const t = thinkingLevel.trim();
     const thinking = !t || t === 'auto' ? null : t;
+    const temp = typeof temperature === 'number' && Number.isFinite(temperature) ? temperature : null;
     const imgs = imagesB64?.length ? imagesB64 : undefined;
     const t0 = Date.now();
     try {
-        const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey);
+        const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, temp);
         return { ...r, ms: Date.now() - t0 };
     } catch (e) {
         // some models reject the thinking param entirely — retry once without it
         if (thinking && e instanceof LlmHttpError && (e.status === 400 || e.status === 422)) {
             console.warn('[mt:bg] model rejected thinking level, retrying without');
-            const r = await dispatch(base, s, prompt, imgs, null, cacheKey);
+            try {
+                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, temp);
+                return { ...r, ms: Date.now() - t0 };
+            } catch (e2) {
+                if (!(temp != null && e2 instanceof LlmHttpError && /temperature/i.test(e2.message))) throw e2;
+                console.warn('[mt:bg] model rejected pinned temperature, retrying without');
+                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, null);
+                return { ...r, ms: Date.now() - t0 };
+            }
+        }
+        // reasoning-first models (GPT-5/o-series chat) may reject any non-default
+        // temperature — error-driven, no model-name table
+        if (temp != null && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /temperature/i.test(e.message)) {
+            console.warn('[mt:bg] model rejected pinned temperature, retrying without');
+            const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, null);
             return { ...r, ms: Date.now() - t0 };
         }
         throw e;
     }
 }
 
-function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] | undefined, thinking: string | null, cacheKey?: string): Promise<{ text: string; usage?: LlmUsage }> {
+function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] | undefined, thinking: string | null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
     switch (s.provider) {
-        case 'openai': return openaiChat(base, s, prompt, imgs, thinking, cacheKey);
-        case 'responses': return responses(base, s, prompt, imgs, thinking, cacheKey);
-        case 'anthropic': return anthropic(base, s, prompt, imgs, thinking, cacheKey);
-        case 'gemini': return gemini(base, s, prompt, imgs, thinking, cacheKey);
+        case 'openai': return imgs?.length && isCfAiBase(base)
+            ? cloudflareChat(base, s, prompt, imgs, thinking, cacheKey, temperature)
+            : openaiChat(base, s, prompt, imgs, thinking, cacheKey, temperature);
+        case 'responses': return responses(base, s, prompt, imgs, thinking, cacheKey, temperature);
+        case 'anthropic': return anthropic(base, s, prompt, imgs, thinking, cacheKey, temperature);
+        case 'gemini': return gemini(base, s, prompt, imgs, thinking, cacheKey, temperature);
+        case 'cloudflare': return cloudflareChat(base, s, prompt, imgs, thinking, cacheKey, temperature);
     }
 }
 
@@ -71,7 +91,22 @@ function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] |
 export type MtErrorKind = 'auth' | 'ratelimit' | 'network' | 'server' | 'parse';
 
 export class MtError extends Error {
-    constructor(public kind: MtErrorKind, msg: string, public hint?: string) { super(msg); }
+    // set when the provider rejected the REQUEST's image COUNT (not its image
+    // support): the split-OCR stage falls back to one-image-per-region calls
+    // and remembers the verdict for the model
+    constructor(public kind: MtErrorKind, msg: string, public hint?: string, public imageCap?: boolean) { super(msg); }
+}
+// "too many images for this model" classification: tagged by our own adapters
+// when they know the shape (CF 3030), keyword-matched otherwise. Must NOT match
+// "this model can't read images" (that needs Local OCR, not per-region calls).
+export function isImageCapError(e: unknown): boolean {
+    if (!(e instanceof MtError)) return false;
+    if (e.imageCap) return true;
+    if (e.kind !== 'parse') return false;
+    const m = e.message;
+    if (!/image/i.test(m)) return false;
+    if (/not support|unsupported|invalid|base64|data uri|media_type|can't read|cannot read/i.test(m)) return false;
+    return /too many|maximum|max(imum)? of|only one|single image|one image per|limit/i.test(m);
 }
 
 // result of one LLM call: text + normalized usage (when the provider reports it)
@@ -85,7 +120,7 @@ export interface LlmResult { text: string; usage?: LlmUsage; ms: number }
 const num = (v: unknown): number | undefined => { const n = Number(v); return Number.isFinite(n) ? n : undefined; };
 
 class LlmHttpError extends Error {
-    constructor(public status: number, msg: string) { super(msg); }
+    constructor(public status: number, msg: string, public providerCode?: number) { super(msg); }
 }
 
 // exported for tests (lets them build a faithful 400 without touching fetch)
@@ -101,7 +136,15 @@ async function checkOk(resp: Response): Promise<string> {
 export function toMtError(e: unknown): MtError {
     if (e instanceof MtError) return e;
     if (e instanceof LlmHttpError) {
-        if (e.status === 401 || e.status === 403) return new MtError('auth', e.message, 'API key is wrong or expired — check the key in Settings');
+        if (e.status === 401 || e.status === 403) {
+            // Cloudflare Workers AI gates some models (Meta llama-3.2-11b-vision)
+            // behind a one-time license agreement — the 403 body says exactly
+            // that, but the generic key hint sent users to re-check a working
+            // key (live-reported).
+            if (/model agreement|[Cc]ommunity [Ll]icense|submit the prompt/i.test(e.message))
+                return new MtError('auth', e.message, 'Model license not accepted — send {"prompt":"agree"} once to the model\'s /ai/run URL (Cloudflare), then Test again');
+            return new MtError('auth', e.message, 'API key is wrong or expired — check the key in Settings');
+        }
         if (e.status === 402) return new MtError('auth', e.message, 'Out of credits/quota — top up or switch provider');
         if (e.status === 404) return new MtError('auth', e.message, 'Wrong model name — check the model in Settings');
         if (e.status === 429) return new MtError('ratelimit', e.message, 'Rate limited — lower Parallel LLM in Settings or wait a moment');
@@ -126,6 +169,7 @@ export const THINKING_LEVELS: Record<LLMSettings['provider'], ThinkingPreset[]> 
     responses: FULL_LEVELS,
     anthropic: FULL_LEVELS,
     gemini: ['auto', 'none', 'low', 'medium', 'high'],
+    cloudflare: ['auto', 'none', 'low', 'medium', 'high'],
 };
 export const THINKING_HINTS: Record<ThinkingPreset, string> = {
     auto: 'Leave it to the model.',
@@ -160,7 +204,7 @@ export async function checkThinking(s: LLMSettings, thinking: string, cacheKey?:
 }
 
 // OpenAI-compatible chat/completions (OpenAI, OpenRouter, ollama, gemini-compat...)
-async function openaiChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string): Promise<{ text: string; usage?: LlmUsage }> {
+async function openaiChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
     const content: unknown[] = [{ type: 'text', text: prompt }];
     for (const b64 of images ?? []) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
     const body: Record<string, unknown> = {
@@ -169,6 +213,7 @@ async function openaiChat(base: string, s: LLMSettings, prompt: string, images?:
         max_tokens: 4096,
     };
     if (thinking) body.reasoning_effort = thinking; // GPT-5/o-series via chat; ignored by older
+    if (temperature != null) body.temperature = temperature;
     if (cacheKey) body.prompt_cache_key = cacheKey; // OpenAI routing stickiness (60→87% hit in their docs); ignored by others
     const resp = await fetch(`${base}/chat/completions`, {
         method: 'POST',
@@ -189,11 +234,12 @@ async function openaiChat(base: string, s: LLMSettings, prompt: string, images?:
 }
 
 // Responses API (OpenAI responses, OpenCode Zen/Go, Muse Spark)
-async function responses(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string): Promise<{ text: string; usage?: LlmUsage }> {
+async function responses(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
     const content: unknown[] = [{ type: 'input_text', text: prompt }];
     for (const b64 of images ?? []) content.push({ type: 'input_image', image_url: `data:image/jpeg;base64,${b64}` });
     const body: Record<string, unknown> = { model: s.model, input: [{ role: 'user', content }] };
     if (thinking) body.reasoning = { effort: thinking };
+    if (temperature != null) body.temperature = temperature;
     if (cacheKey) body.prompt_cache_key = cacheKey;
     const resp = await fetch(`${base}/responses`, {
         method: 'POST',
@@ -224,7 +270,7 @@ const ANTHROPIC_BUDGET: Record<string, number> = { low: 2048, medium: 4096, high
 const ANTHROPIC_MAXTOK: Record<string, number> = { low: 8192, medium: 8192, high: 16384, xhigh: 32768, max: 65536 };
 
 // Anthropic messages API (direct browser access header)
-async function anthropic(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string): Promise<{ text: string; usage?: LlmUsage }> {
+async function anthropic(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
     // cache requires an explicit breakpoint on the STABLE part: split the
     // prompt at <regions> (everything before it repeats across pages of the
     // same manga). Text-first so the volatile images can't cut the prefix.
@@ -240,6 +286,9 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
         content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } });
     }
     const baseBody: Record<string, unknown> = { model: s.model, max_tokens: 4096, messages: [{ role: 'user', content }] };
+    // temperature and extended thinking are mutually exclusive (API 400) —
+    // keep talking to the model rather than let the knob break the page
+    if (temperature != null && (!thinking || thinking === 'none')) baseBody.temperature = temperature;
     const send = async (patch: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage }> => {
         const body = { ...baseBody, ...patch };
         const resp = await fetch(`${base}/v1/messages`, {
@@ -289,12 +338,15 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
 const GEMINI_BUDGET: Record<string, number> = { none: 0, low: 2048, medium: 4096, high: 8192, xhigh: 16384, max: 24576 };
 
 // Gemini generateContent
-async function gemini(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string): Promise<{ text: string; usage?: LlmUsage }> {
+async function gemini(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
     const parts: unknown[] = [{ text: prompt }];
     for (const b64 of images ?? []) parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
     const send = async (thinkingConfig?: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage }> => {
         const body: Record<string, unknown> = { contents: [{ parts }] };
-        if (thinkingConfig) body.generationConfig = { thinkingConfig };
+        const generationConfig: Record<string, unknown> = {};
+        if (temperature != null) generationConfig.temperature = temperature;
+        if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
+        if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
         // no prompt_cache_key: Gemini rejects unknown body fields with a 400
         const resp = await fetch(`${base}/models/${s.model}:generateContent?key=${encodeURIComponent(s.apiKey)}`, {
             method: 'POST',
@@ -327,6 +379,104 @@ async function gemini(base: string, s: LLMSettings, prompt: string, images?: str
     return send({ thinkingBudget: budget });
 }
 
+// Cloudflare Workers AI (native run endpoint). The `/ai/v1` OpenAI-compatible
+// endpoint routes images per model and dies on some of them — llama-3.2-11b-vision
+// 400s with "Unable to add image when there are no user-supplied nor
+// system-supplied messages" even for a single image, while llama-4-scout works
+// there (all live-probed) — so vision goes through /ai/run/<model> with
+// OpenAI-style image_url parts (live-probed working for both models).
+// Some models cap images per request (llama-3.2-11b-vision: exactly 1 —
+// live-probed 2+ → HTTP 400 code 3030); that cap is NOT hardcoded here — the
+// request goes out and the 3030 maps to an actionable hint, so renamed or new
+// single-image models degrade to the same hint instead of a raw 400.
+export function cfRunUrl(base: string, model: string): string {
+    // accept both bases: .../ai and the OpenAI-compatible .../ai/v1
+    const b = base.replace(/\/+$/, '').replace(/\/v1$/, '');
+    return `${b}/run/${model.replace(/^\/+/, '')}`;
+}
+// CF's account AI base as pasted from their OpenAI-SDK docs. Users park it under
+// the plain OpenAI provider all the time, where image calls hit the compat
+// endpoint above and die per-model. dispatch() reroutes image calls on this base
+// to the native run endpoint (same key); text-only keeps the compat path.
+export function isCfAiBase(base: string): boolean {
+    return /^https?:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/[^/]+\/ai(?:\/v1)?\/?$/i.test(base.trim());
+}
+export function cfBody(prompt: string, images?: string[], thinking?: string | null, temperature?: number | null): Record<string, unknown> {
+    const content: unknown[] = [{ type: 'text', text: prompt }];
+    for (const b64 of images ?? []) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
+    // max_tokens is explicit on purpose: the native default is 256 (truncated
+    // translations). temperature defaults to 0 (not the CF 0.6 default): at 0.6
+    // the transcribe prompt's XML format drifts to bare text in ~1/3 of calls
+    // (live-probed 2/3 vs 3/3 compliant) and translations wobble run to run;
+    // an explicit user setting overrides.
+    const body: Record<string, unknown> = { messages: [{ role: 'user', content }], max_tokens: 4096, temperature: temperature ?? 0 };
+    // 'none' = no reasoning, i.e. omit the param entirely (CF rejects the
+    // literal "none" with a validation 400 — live-probed — and callLLM's
+    // retry-without would double every request); other levels ride along and
+    // fall back the same way when a model doesn't take them
+    if (thinking && thinking !== 'none') body.reasoning_effort = thinking;
+    return body;
+}
+export function cfParse(data: {
+    result?: {
+        response?: unknown;
+        choices?: Array<{ message?: { content?: unknown } }>;
+        usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
+    };
+} | null): { text: string; usage?: LlmUsage } {
+    const r = data?.result ?? {};
+    const msg = r.choices?.[0]?.message;
+    const text = typeof r.response === 'string' ? r.response : (typeof msg?.content === 'string' ? msg.content : '');
+    return { text, usage: { inTok: num(r.usage?.prompt_tokens), outTok: num(r.usage?.completion_tokens) } };
+}
+// CF reports model errors as errors[] — sometimes with HTTP 200 (success:false).
+// providerCode carries the first numeric code so callers can map known buckets.
+export function cfError(data: { errors?: Array<{ message?: unknown; code?: unknown }> } | null, status: number): LlmHttpError | null {
+    const errs = data?.errors;
+    if (!errs?.length) return null;
+    const msg = errs.map(e => (typeof e?.message === 'string' ? e.message : '')).filter(Boolean).join('; ') || 'Cloudflare Workers AI error';
+    const code = typeof errs[0]?.code === 'number' ? errs[0].code : undefined;
+    return new LlmHttpError(status, msg, code);
+}
+// CF's 3030 is the AiError bucket; on a well-formed native request that
+// carried images it is the multi-image rejection (live-probed). Soft wording —
+// the code can cover other AiErrors — but it turns an opaque 400 into a fix.
+export function cfImageCapHint(providerCode: number | undefined, imageCount: number): string | undefined {
+    if (providerCode !== 3030 || imageCount < 2) return undefined;
+    return `This Cloudflare model may not accept ${imageCount} images in one request — switch "How the model reads text" to OCR text (local Baberu), or pick a model that takes multiple images`;
+}
+async function cloudflareChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage }> {
+    if (/<ACCOUNT_ID>/.test(base))
+        throw new MtError('auth', 'Cloudflare Base URL still contains <ACCOUNT_ID>',
+            'Replace <ACCOUNT_ID> with your Cloudflare account id (Settings → Model → Base URL)');
+    const resp = await fetch(cfRunUrl(base, s.model), {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${s.apiKey}`,
+            ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}` } : {}),
+        },
+        body: JSON.stringify(cfBody(prompt, images, thinking, temperature)),
+        signal: AbortSignal.timeout(120_000),
+    });
+    // read the body FIRST: CF signals model errors as errors[] on both 2xx
+    // (success:false) and 4xx — checkOk would throw before the code-based hint
+    // mapping ever runs (live-probed: multi-image 3030 arrives as HTTP 400)
+    const text = await resp.text();
+    let data: unknown = null;
+    try { data = JSON.parse(text); } catch { /* non-JSON below */ }
+    const failed = !resp.ok || (data as { success?: unknown } | null)?.success === false;
+    if (failed) {
+        const err = cfError(data as { errors?: Array<{ message?: unknown; code?: unknown }> }, resp.status)
+            ?? new LlmHttpError(resp.status, `LLM API ${resp.status}: ${text.slice(0, 300)}`);
+        const hint = cfImageCapHint(err.providerCode, images?.length ?? 0);
+        if (hint) throw new MtError('parse', err.message, hint, true);
+        throw err;
+    }
+    if (!data) throw new LlmHttpError(resp.status, `Cloudflare Workers AI returned non-JSON: ${text.slice(0, 200)}`);
+    return cfParse(data as Parameters<typeof cfParse>[0]);
+}
+
 // ---- in-flight adoption identity: which request fingerprints must match for
 // two mt:translate calls to share one provider roundtrip. Everything that can
 // change the model's output is in (images, regions, context snapshot, mode
@@ -348,6 +498,7 @@ export interface TranslateRequestFingerprint {
 export interface TranslateFingerprintSettings {
     provider: string; model: string; baseUrl: string; ocrModel: string;
     thinkingLevel: string; ocrThinking: string;
+    temperature: number | null; // null = provider default; pins the main model's sampling
     useOcrModel: boolean; stylePrompt: string; targetLang: string;
     useCharacters: boolean; contextPairs: number; transcribeSrc: boolean; vlmAssisted: boolean;
 }
@@ -358,6 +509,7 @@ export function translateRequestParts(
         'mt-tr-v1', req.cacheKey,
         st.provider, st.model, st.baseUrl, st.ocrModel,
         st.thinkingLevel, st.ocrThinking,
+        st.temperature ?? -1,
         st.useOcrModel, st.stylePrompt, st.targetLang,
         st.useCharacters, st.contextPairs, st.transcribeSrc, st.vlmAssisted,
         req.vision, req.textOnly, req.ocr, req.split, req.pageW, req.pageH,

@@ -1,8 +1,8 @@
 // Background service worker: LLM translation (BYOK). Detection runs in the
 // content script's iframe (src/iframe) — this worker owns LLM calls only.
 
-import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, type LLMSettings, type LlmUsage } from '../llm/adapters';
-import { buildPrompt, parseResponse, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
+import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, type LLMSettings, type LlmUsage } from '../llm/adapters';
+import { buildPrompt, parseResponse, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 
 // content scripts can't touch storage.session by default — open it up.
@@ -26,6 +26,7 @@ interface TestLlmMsg {
     type: 'mt:test-llm';
     settings: LLMSettings;
     thinking?: string; // options thinking level — probed separately when set
+    temperature?: number | null; // options "Custom temperature" pin — rides the connectivity call
 }
 interface TestOcrMsg {
     type: 'mt:test-ocr';
@@ -71,6 +72,63 @@ async function getOcrSettings(): Promise<LLMSettings> {
 async function getPipeline(): Promise<PipelineSettings> {
     const { mtPipeline } = await chrome.storage.local.get('mtPipeline');
     return loadPipelineSettings(mtPipeline);
+}
+
+// ---- split-pipeline OCR: batched vs one-region-per-call -------------------
+// Some vision models accept exactly ONE image per request (CF llama-3.2-11b:
+// 2+ → 400 code 3030, live-probed) — no provider exposes that capability, so
+// "auto" learns it from one failed batch and remembers per OCR model. The memo
+// is SW-lifetime on purpose: a restart costs one failed batch, never a wrong
+// permanent state (the user's checkbox forces per-region when wanted).
+const ocrSingleImage = new Set<string>();
+function ocrCapKey(s: LLMSettings): string { return `${s.provider}|${s.baseUrl ?? ''}|${s.model}`; }
+
+interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage: LlmUsage; calls: number; ms: number }
+// the handler owns retry/backoff (rate-limit aware) — helpers just call through
+type LlmCaller = (s: LLMSettings, p: string, imgs?: string[], thinking?: string) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number }>;
+
+async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller): Promise<TranscribeResult> {
+    const prompt = buildPrompt(msg.regions, EMPTY_CONTEXT, true, { textOnly: msg.textOnly, transcribeOnly: true, chars: false });
+    const t = await call(ocr, prompt, msg.imagesB64, pipeline.ocrThinking);
+    const sources = new Map(parseResponse(t.text, msg.regions.length).regions
+        .map(o => [o.index, o.translation === 'keep' ? '' : o.translation] as const));
+    return { preRaw: t.text, sources, usage: t.usage ?? {}, calls: t.calls, ms: t.ms };
+}
+
+// per-region: one crop per request (the annotated full page is dropped), run
+// in batches of parallelLlm. Usage sums; ms is the wall time of the phase.
+// A single region failing leaves its source empty (the page retries it later);
+// ALL regions failing rethrows the first error (never a silent empty page).
+async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller): Promise<TranscribeResult> {
+    const crops = msg.textOnly ? (msg.imagesB64 ?? []) : (msg.imagesB64 ?? []).slice(1);
+    const prompt = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false });
+    const sources = new Map<number, string>();
+    const raws: string[] = [];
+    const usage: LlmUsage = {};
+    let calls = 0, failures = 0;
+    let firstErr: unknown;
+    const t0 = performance.now();
+    const width = Math.max(1, Math.min(6, pipeline.parallelLlm || 3));
+    for (let i = 0; i < msg.regions.length; i += width) {
+        await Promise.all(msg.regions.slice(i, i + width).map(async (r, j) => {
+            const crop = crops[i + j];
+            if (!crop) { failures++; return; }
+            try {
+                const res = await call(ocr, prompt, [crop], pipeline.ocrThinking);
+                raws.push(`--- region ${r.index} ---\n${res.text}`);
+                sources.set(r.index, joinTranscription(res.text));
+                usage.inTok = (usage.inTok ?? 0) + (res.usage?.inTok ?? 0);
+                usage.outTok = (usage.outTok ?? 0) + (res.usage?.outTok ?? 0);
+                calls += res.calls;
+            } catch (e) {
+                failures++;
+                if (!firstErr) firstErr = e;
+                console.warn('[mt:bg] ocr region failed:', r.index, (e as Error)?.message);
+            }
+        }));
+    }
+    if (msg.regions.length && failures === msg.regions.length && firstErr) throw firstErr;
+    return { preRaw: raws.join('\n'), sources, usage, calls, ms: Math.round(performance.now() - t0) };
 }
 
 // ArrayBuffer → base64 for MV3 message passing (JSON-serializes the channel)
@@ -135,7 +193,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         // (reasoning_effort/thinkingLevel) and can reject it.
         (async () => {
             try {
-                const reply = await callLLM(msg.settings, 'Reply with exactly: pong', undefined, undefined, 'test');
+                const reply = await callLLM(msg.settings, 'Reply with exactly: pong', undefined, undefined, 'test', msg.temperature);
                 const t = (msg.thinking ?? '').trim();
                 let thinking: 'accepted' | 'rejected' | 'error' | undefined;
                 let thinkingError: string | undefined;
@@ -175,7 +233,20 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                     sendResponse({ ok: true, verdict: got ? 'mismatch' : 'miss', got, expected: msg.expect });
                     return;
                 }
-                sendResponse({ ok: true, verdict: 'exact', got, expected: msg.expect });
+                // capability probe (2 images): the verdict is reported in options
+                // and seeds the split-stage memo, so the first real page doesn't
+                // waste a doomed batched call on a single-image model
+                let multiImage: boolean | undefined;
+                try {
+                    await callLLM(msg.settings, prompt, [msg.imageB64, msg.imageB64], t, 'test');
+                    multiImage = true;
+                    ocrSingleImage.delete(ocrCapKey(msg.settings));
+                } catch (e) {
+                    const m = toMtError(e);
+                    if (isImageCapError(m)) { multiImage = false; ocrSingleImage.add(ocrCapKey(msg.settings)); }
+                    else console.warn('[mt:bg] ocr multi-image probe failed:', m.message);
+                }
+                sendResponse({ ok: true, verdict: 'exact', got, expected: msg.expect, multiImage });
             } catch (e) { const m = toMtError(e); sendResponse({ ok: false, error: `${m.message}${m.hint ? ` — ${m.hint}` : ''}` }); }
         })();
         return true;
@@ -395,13 +466,13 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             // LLM call with strategic retry: 429/5xx/network get backoff retries
             // (a page costing 2 retries still beats failing the whole job);
             // auth/quota errors fail fast — retrying can't fix them.
-            const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number }> => {
+            const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number }> => {
                 let calls = 0;
                 let ms = 0;
                 for (let attempt = 0; ; attempt++) {
                     calls++;
                     try {
-                        const r = await callLLM(s, p, imgs, thinking ?? pipeline.thinkingLevel, msg.cacheKey);
+                        const r = await callLLM(s, p, imgs, thinking ?? pipeline.thinkingLevel, msg.cacheKey, temperature);
                         ms += r.ms;
                         return { text: r.text, usage: r.usage, calls, ms };
                     } catch (e) {
@@ -427,6 +498,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                     provider: settings.provider, model: settings.model, baseUrl: settings.baseUrl ?? '',
                     ocrModel: ocrSettings?.model ?? '',
                     thinkingLevel: pipeline.thinkingLevel, ocrThinking: pipeline.ocrThinking,
+                    temperature: pipeline.temperature,
                     useOcrModel: pipeline.useOcrModel, stylePrompt: pipeline.stylePrompt,
                     targetLang: pipeline.targetLang, useCharacters: pipeline.useCharacters,
                     contextPairs: pipeline.contextPairs, transcribeSrc: pipeline.transcribeSrc,
@@ -473,18 +545,23 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                     throw new MtError('auth', 'OCR model not configured — open the extension options');
                 }
                 const ocr = ocrSettings!;
-                const tPrompt = buildPrompt(msg.regions, EMPTY_CONTEXT, true, {
-                    textOnly: msg.textOnly, transcribeOnly: true, chars: false,
-                });
-                if (dbg) console.log('[mt:bg] ocr prompt', tPrompt);
-                const t = await callWithRetry(ocr, tPrompt, msg.imagesB64, pipeline.ocrThinking);
-                preRaw = t.text;
+                const key = ocrCapKey(ocr);
+                // per-region when forced, when this model already rejected a
+                // batch once, or when the batch fails with an image-count error
+                // (auto-detect — the failed request is not billed by CF)
+                const t = pipeline.ocrPerRegion || ocrSingleImage.has(key)
+                    ? await transcribePerRegion(ocr, msg, pipeline, callWithRetry)
+                    : await transcribeBatched(ocr, msg, pipeline, callWithRetry).catch(async (e) => {
+                        if (!isImageCapError(e)) throw e;
+                        if (dbg) console.log('[mt:bg] ocr image cap → per-region fallback');
+                        ocrSingleImage.add(key);
+                        return await transcribePerRegion(ocr, msg, pipeline, callWithRetry);
+                    });
+                preRaw = t.preRaw;
                 usage = { ...t.usage };
                 llmCalls = t.calls;
                 llmMs = t.ms;
-                const byIdx = new Map(parseResponse(t.text, msg.regions.length).regions
-                    .map(o => [o.index, o.translation === 'keep' ? '' : o.translation] as const));
-                regions2 = msg.regions.map(r => ({ index: r.index, source: byIdx.get(r.index) ?? '' }));
+                regions2 = msg.regions.map(r => ({ index: r.index, source: t.sources.get(r.index) ?? '' }));
                 ocrStatus = regions2.map(r => r.source ? 'ok' : 'empty');
                 ocrMs = t.ms;
             }
@@ -503,7 +580,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             });
             if (dbg) console.log('[mt:bg] llm prompt', prompt);
 
-            const r1 = await callWithRetry(settings, prompt, vision2 ? msg.imagesB64 : undefined);
+            const r1 = await callWithRetry(settings, prompt, vision2 ? msg.imagesB64 : undefined, undefined, pipeline.temperature);
             const raw = r1.text;
             if (split) {
                 usage.inTok = (usage.inTok ?? 0) + (r1.usage?.inTok ?? 0);
@@ -538,7 +615,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                 const retryImgs = vision2 && msg.imagesB64
                     ? [...(msg.textOnly ? [] : [msg.imagesB64[0]]), ...missing.map(r => msg.imagesB64![r.index]).filter(Boolean)]
                     : undefined;
-                const r2 = await callWithRetry(settings, retryPrompt, retryImgs);
+                const r2 = await callWithRetry(settings, retryPrompt, retryImgs, undefined, pipeline.temperature);
                 rawAll += '\n--- retry (missing regions) ---\n' + r2.text;
                 llmCalls += r2.calls;
                 llmMs += r2.ms;
@@ -564,7 +641,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                     maxPairs: pipeline.contextPairs,
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
-                const r3 = await callWithRetry(settings, fullPrompt, vision2 ? msg.imagesB64 : undefined);
+                const r3 = await callWithRetry(settings, fullPrompt, vision2 ? msg.imagesB64 : undefined, undefined, pipeline.temperature);
                 rawAll += '\n--- retry (no regions parsed) ---\n' + r3.text;
                 llmCalls += r3.calls;
                 llmMs += r3.ms;

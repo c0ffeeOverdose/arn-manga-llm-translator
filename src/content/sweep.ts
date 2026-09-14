@@ -30,9 +30,9 @@ import { pipeline, context, setContext, shareContext, loadContext, loadPipeline,
 import { fetchBitmap, getPages, refKey, unscrambleTiles, episodeManifestSrcs, galleryManifestJson, fetchPagedUrls, collectUnloadedUrls } from './page-io';
 import { resolveHeadlessDet, preparePage } from './pipeline';
 import { translateRegions, type TranslateOutcome } from './ocr';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, abortLookahead } from './page-cache';
 import type { DetectResult, MtOnStatus } from './detection';
-import { failMarks, enqueue, pageKeyOf, viewportOverlap } from './queue';
+import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued } from './queue';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn } from './status-ui';
 import { isDebug } from '../debug';
 
@@ -41,7 +41,11 @@ import { isDebug } from '../debug';
 const SWEEP_JOBS = 3;
 const SWEEP_WARMUP = 2;
 const SWEEP_MAX_CONSECUTIVE_ERRORS = 3;
-const SWEEP_SETTLE_MS = 150000; // DOM waiter gives up waiting (sweep died silently) and translates solo
+// run watchdog: no dispatch/commit progress for this long = a hung fetch/infer
+// (no per-stage timeout can cover every ORT stall) — the run is force-finished
+// so Stop/new starts/auto can never be blocked by a wedged worker.
+const SWEEP_STALL_MS = 300000;
+const SWEEP_WATCHDOG_MS = 30000;
 
 interface SweepItem {
     url: string; // claim key (manifest URL headless, refKey for DOM) — DOM jobs wait on it
@@ -56,6 +60,10 @@ type Commit =
     | { i: number; url: string; error: true; msg?: string };
 
 let sweep: SweepRun | null = null;
+let starting = false; // enumeration in flight — no run object yet, cancel must still land
+let startCancel = false;
+let lastProgress = 0; // ms timestamp of the last dispatch/commit (watchdog)
+let watchdog: ReturnType<typeof setInterval> | null = null;
 const inflight = new Map<string, true>(); // claimed urls (DOM jobs wait on these)
 const waiters = new Map<string, Set<() => void>>();
 let translating = 0; // workers inside translateRegions (pill stage honesty)
@@ -101,7 +109,7 @@ function settleUrl(url: string): void {
     for (const r of set) { try { r(); } catch { /* waiter gone */ } }
 }
 export function sweepHas(url: string): boolean {
-    return !!sweep && !sweep.cancel && !sweep.dead && claimFor(url) !== undefined;
+    return !!sweep && !sweep.dead && claimFor(url) !== undefined;
 }
 // claim lookup with host-volatile fallback (same file, different CDN host)
 function claimFor(url: string): string | undefined {
@@ -111,7 +119,7 @@ function claimFor(url: string): string | undefined {
 }
 export function awaitSweep(url: string, onStatus: MtOnStatus): Promise<void> {
     const s = sweep;
-    const claim = s && !s.cancel && !s.dead ? claimFor(url) : undefined;
+    const claim = s && !s.dead ? claimFor(url) : undefined;
     if (!claim) return Promise.resolve();
     onStatus('Waiting for chapter sweep…');
     return new Promise<void>(res => {
@@ -124,8 +132,29 @@ export function awaitSweep(url: string, onStatus: MtOnStatus): Promise<void> {
 }
 
 // ---- control + status (popup)
-export function sweepStatus(): { active: boolean; done: number; total: number; errors: number; skipped: number } | null {
-    return sweep ? { active: true, done: sweep.done, total: sweep.total, errors: sweep.errors, skipped: sweep.skipped } : null;
+export interface SweepStatus {
+    active: boolean;
+    phase: 'starting' | 'running' | 'stopping' | 'dead';
+    stopping: boolean;
+    inflight: number;
+    done: number;
+    total: number;
+    errors: number;
+    skipped: number;
+}
+// During enumeration there is no run yet — still report active/starting so the
+// popup offers Stop instead of Translate-chapter (a second press used to
+// launch a second concurrent run while the first was still enumerating).
+export function sweepStatus(): SweepStatus | null {
+    if (sweep) {
+        const phase = sweepPhase(sweep);
+        return {
+            active: true, phase: phase === 'idle' ? 'running' : phase, stopping: sweep.cancel && !sweep.dead,
+            inflight: inflight.size, done: sweep.done, total: sweep.total, errors: sweep.errors, skipped: sweep.skipped,
+        };
+    }
+    if (starting) return { active: true, phase: 'starting', stopping: false, inflight: 0, done: 0, total: 0, errors: 0, skipped: 0 };
+    return null;
 }
 // autoTick consults this (auto jobs would duplicate sweep work and clobber
 // its ordered book) — a cancelled-but-draining sweep still counts: its
@@ -141,26 +170,47 @@ export async function sweepPages(): Promise<number> {
     pagesCache = { chapter: ch, n };
     return n;
 }
-export async function startSweep(): Promise<{ ok: boolean; total?: number; error?: string }> {
+export async function startSweep(): Promise<{ ok: boolean; total?: number; error?: string; starting?: boolean; cancelled?: boolean }> {
     if (sweep) return { ok: true, total: sweep.total };
-    resetContextIfNewChapter();
-    await loadPipeline();
-    await loadContext();
-    const now = Date.now();
-    const items = await sweepItems();
-    const usable = items.filter(it => !cooldownParked(failMarks, it.url, now));
-    if (!usable.length) {
-        return { ok: false, error: items.length ? 'all pages parked after errors — force one manually to retry' : 'no sweepable pages found' };
+    if (starting) return { ok: true, starting: true }; // enumeration already in flight — never a second run
+    starting = true;
+    startCancel = false;
+    try {
+        // a running lookahead chain would warm the same pages in parallel (and
+        // fold them out of the sweep's commit order) — the sweep wins
+        abortLookahead();
+        dropAutoQueued(); // queued auto jobs would duplicate sweep workers (manual/force intent survives)
+        resetContextIfNewChapter();
+        await loadPipeline();
+        await loadContext();
+        const now = Date.now();
+        const items = await sweepItems();
+        if (startCancel) return { ok: true, cancelled: true }; // Stop pressed mid-enumeration
+        const usable = items.filter(it => !cooldownParked(failMarks, it.url, now));
+        if (!usable.length) {
+            return { ok: false, error: items.length ? 'all pages parked after errors — force one manually to retry' : 'no sweepable pages found' };
+        }
+        sweep = { cancel: false, dead: false, failed: false, done: 0, total: usable.length, errors: 0, skipped: 0, firstErr: '', chapter: chapterKey() };
+        pagesCache = { chapter: sweep.chapter, n: usable.length };
+        lastProgress = Date.now();
+        watchdog = setInterval(sweepWatchdog, SWEEP_WATCHDOG_MS);
+        pillUnDismiss();
+        pumpSweepStatus();
+        // runSweep owns finishSweep via its finally — a crash mid-run can no
+        // longer leak a zombie `sweep` that blocks Stop/new starts/auto forever
+        void runSweep(usable);
+        return { ok: true, total: usable.length };
+    } finally {
+        starting = false;
     }
-    sweep = { cancel: false, dead: false, failed: false, done: 0, total: usable.length, errors: 0, skipped: 0, firstErr: '', chapter: chapterKey() };
-    pagesCache = { chapter: sweep.chapter, n: usable.length };
-    pillUnDismiss();
-    pumpSweepStatus();
-    void runSweep(usable);
-    return { ok: true, total: usable.length };
 }
 export function cancelSweep(): { ok: boolean } {
-    if (sweep) sweep.cancel = true;
+    startCancel = true; // enumeration abort (no-op once the run exists)
+    abortLookahead(); // user stop must also stop a warming chain (auto resumes after the drain)
+    if (sweep) {
+        sweep.cancel = true;
+        pumpSweepStatus(); // pill flips to Stopping now, not after the 90s drain
+    }
     return { ok: true };
 }
 export function initSweep(): void {
@@ -213,7 +263,9 @@ async function sweepItems(): Promise<SweepItem[]> {
     return items;
 }
 
-// ---- the run: N workers, ordered commit, warm-up gate
+// ---- the run: N workers, ordered commit, warm-up gate. finishSweep lives in
+// the finally: a commit/context crash must never leak the run (a zombie sweep
+// blocked Stop, new starts and auto forever until reload).
 async function runSweep(items: SweepItem[]): Promise<void> {
     const chapter = sweep!.chapter;
     let next = 0, head = 0, streak = 0;
@@ -229,8 +281,18 @@ async function runSweep(items: SweepItem[]): Promise<void> {
                 for (const d of r.items) settleUrl(d.url);
                 return;
             }
-            await commitPage(c, s);
-            if ('error' in c) streak++;
+            let bad = 'error' in c;
+            try {
+                await commitPage(c, s);
+            } catch (e) {
+                // one bad commit must not kill the run: count it, keep the order
+                bad = true;
+                s.errors++;
+                if (!s.firstErr) s.firstErr = (e as Error)?.message ?? String(e);
+                console.warn('[mt] sweep commit failed:', c.url.slice(-14), e);
+            }
+            lastProgress = Date.now();
+            if (bad) streak++;
             else streak = 0;
         }
     };
@@ -246,6 +308,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
             const job = items[k];
             if (!job) return;
             inflight.set(job.url, true);
+            lastProgress = Date.now();
             let res: Commit | null = null;
             try {
                 res = await workPage({ ...job, i: k }, chapter);
@@ -265,8 +328,34 @@ async function runSweep(items: SweepItem[]): Promise<void> {
             }
         }
     };
-    await Promise.all(Array.from({ length: Math.min(SWEEP_JOBS, items.length) }, () => worker()));
-    await commitAhead(); // final drain (usually a no-op)
+    try {
+        await Promise.all(Array.from({ length: Math.min(SWEEP_JOBS, items.length) }, () => worker()));
+        await commitAhead(); // final drain (usually a no-op)
+    } catch (e) {
+        // workers/commitAhead are internally caught — anything landing here is
+        // a bug; report it and let the finally release the run
+        const s = sweep;
+        if (s && s.chapter === chapter) {
+            s.failed = true;
+            if (!s.firstErr) s.firstErr = (e as Error)?.message ?? String(e);
+        }
+        console.warn('[mt] sweep run crashed:', e);
+    } finally {
+        finishSweep();
+    }
+}
+
+// stalled run (hung fetch/infer with no timeout): force-finish so the popup,
+// Stop and auto can never be blocked by a wedged worker. The worker's late
+// commit is dropped by the `!sweep` guard.
+function sweepWatchdog(): void {
+    const s = sweep;
+    if (!s || s.dead) return;
+    if (Date.now() - lastProgress <= SWEEP_STALL_MS) return;
+    console.warn('[mt] sweep stalled — no progress for', Math.round((Date.now() - lastProgress) / 1000), 's; aborting run');
+    s.failed = true;
+    s.cancel = true;
+    if (!s.firstErr) s.firstErr = 'stalled (no progress for 5 min)';
     finishSweep();
 }
 
@@ -468,6 +557,15 @@ function pumpSweepStatus(): void {
     // and clobber the ordered book) — say so, or an enabled-but-silent auto
     // reads as broken.
     const paused = autoTranslateOn() ? ' · auto paused' : '';
+    if (s.cancel && !s.dead) {
+        // Stop was pressed — the in-flight pages still drain (no mid-LLM
+        // abort), and this line is the only proof the press landed. Without
+        // it the pill read "Sweeping x/36…" for the whole ~90s drain and the
+        // stop looked broken.
+        const finishing = inflight.size || translating ? ` — finishing ${Math.max(inflight.size, 1)} page${Math.max(inflight.size, 1) > 1 ? 's' : ''}…` : '…';
+        setActivity('sweep', `Stopping sweep ${s.done}/${s.total}${finishing}${paused}`, 'sweep', translating > 0 ? 'llm' : 'detect');
+        return;
+    }
     const tail = [s.errors ? `${s.errors} failed` : '', s.skipped ? `${s.skipped} skipped` : ''].filter(Boolean).join(' · ');
     setActivity('sweep', `Sweeping chapter ${s.done}/${s.total}${paused}…${tail ? ` (${tail})` : ''}`,
         'sweep', translating > 0 ? 'llm' : 'detect');
@@ -476,6 +574,7 @@ function pumpSweepStatus(): void {
 function finishSweep(): void {
     const s = sweep;
     sweep = null;
+    if (watchdog) { clearInterval(watchdog); watchdog = null; }
     removeActivity('sweep');
     for (const url of [...waiters.keys()]) settleUrl(url); // undispatched claims never exist — belt & braces
     if (!s) { renderStatus(); return; }
@@ -485,9 +584,11 @@ function finishSweep(): void {
         // start new work): elements that appeared after their commit (lazy
         // canvases) otherwise wait for a manual click. Uncached leftovers
         // translate solo here — the user asked for the whole chapter;
-        // failures park via the normal cooldown.
+        // failures park via the normal cooldown. Parked pages are skipped so a
+        // persistent failure isn't retried by the finish pass itself.
+        const now = Date.now();
         for (const ref of getPages()) {
-            if (!stateFor(ref) && ref.el.isConnected) enqueue(ref, false, true);
+            if (!stateFor(ref) && ref.el.isConnected && !cooldownParked(failMarks, pageKeyOf(ref), now)) enqueue(ref, false, true);
         }
     }    const gaps = [s.errors ? `${s.errors} failed` : '', s.skipped ? `${s.skipped} skipped` : ''].filter(Boolean).join(', ');
     const until = Date.now() + 6000;

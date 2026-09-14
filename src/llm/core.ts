@@ -68,6 +68,7 @@ export interface BuildOpts {
     maxPairs?: number;      // recent-translation lines kept/sent (default MAX_PAIRS)
     transcribeSrc?: boolean; // model copies source text into src attr (vision-mode context)
     transcribeOnly?: boolean; // VLM-OCR stage: transcribe each region EXACTLY, no translation (SFX transcribed too — the translate stage decides keep)
+    transcribeOne?: boolean;  // per-region VLM-OCR (single-image models): the request has ONE crop and must answer with ONE element (all lines joined)
 }
 
 // Language-specific translation rules. Thai gets the full particle rule;
@@ -98,6 +99,30 @@ export function buildPrompt(
     // 'keep' = unreadable). SFX is transcribed too — the translate stage owns
     // the keep decision. No book/pairs/style: a read must not be biased.
     if (opts.transcribeOnly) {
+        // per-region variant (single-image OCR models): one crop in, ONE element
+        // out — the model used to split lines into separate numbered elements
+        // (live-probed), which would drop every line after the first when the
+        // caller expects one region per request.
+        if (opts.transcribeOne) {
+            return `<task>Transcribe the text in this single manga region EXACTLY as written. Do NOT translate.</task>
+<images>One image: the crop of the region.</images>
+<output_format>Output EXACTLY one element — ALL lines of the region joined with a single space, nothing else:
+<r n="1">exact transcription</r>
+<r n="1" keep="true"/>
+
+The second form (self-closing, keep="true", NO text inside) is ONLY for an image with no readable text (drawings, patterns, faces, objects, scenery). Transcribe everything readable INCLUDING stylized sound-effect lettering — do not judge, do not translate, do not clean up.
+<example>
+<r n="1">一緒に来てくれないか</r>
+</example></output_format>
+<rules>
+- Exactly one element. Put every line into it, joined with a space — never split into multiple elements.
+- Copy character-for-character — no paraphrase, no cleanup, no guessing unreadable glyphs (that is keep). Never translate.
+</rules>
+<regions>
+1 (read from image)
+</regions>
+`;
+        }
         let t = `<task>Transcribe the text in each numbered manga region EXACTLY as written. Do NOT translate.</task>\n`;
         if (vision && opts.textOnly) {
             t += `<images>Each image is the crop of region 1, 2, … in order — transcribe each region from its own crop. There is no full-page image.</images>\n`;
@@ -299,6 +324,39 @@ function parseXml(text: string, expected: number): ParsedResponse | null {
 // an empty result triggers the caller's retry (status says so — never silent).
 export function parseResponse(text: string, expected: number): ParsedResponse {
     return parseXml(text, expected) ?? { regions: [], extras: [], mentions: [] };
+}
+
+// Per-region transcribe responses: the model may split a multi-line region
+// into several numbered elements (live-probed: a title crop came back as 5) —
+// concatenate every element's text in order. keep/empty contributes nothing.
+// Some models drift and answer with bare text instead of the requested <r>
+// element (live: ~1/3 of CF llama-3.2 calls at the default temperature) — use
+// the bare text rather than silently emptying the region, dropping dangling
+// tags and "no readable text" prose. Temperature 0 in cfBody makes the drift
+// rare; this keeps the slip from eating the line.
+// The bare path also rejects image DESCRIPTIONS: on a text-less crop this model
+// answers "<r n=\"1\">この画像は、ブドウの写真です</r>" instead of keep
+// (live-probed) — a description must not become a translation source. The
+// pattern is deliberately sentence-shaped ("この画像…", "…写真です", "the image
+// is/show") so a real line that merely contains 写真/photo survives.
+const DESCRIBES_IMAGE = /この画像|画像には|画像です|写真です|イラストです|the image (shows|is|depicts)|this (image|picture) (is|shows)|a (photo|picture) of/i;
+export function joinTranscription(text: string): string {
+    const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
+    const parsed = parseResponse(text, Number.MAX_SAFE_INTEGER);
+    if (parsed.regions.length) {
+        const joined = clean(parsed.regions
+            .filter(r => r.translation && r.translation !== 'keep')
+            .map(r => r.translation)
+            .join(' '));
+        return isMetaNoText(joined) || DESCRIBES_IMAGE.test(joined) ? '' : joined;
+    }
+    const bare = text
+        .replace(/```[a-z]*\n?/gi, ' ')
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !/^[<(]?\s*\/?r\b/i.test(l) && !/keep="true"/i.test(l))
+        .join(' ');
+    return isMetaNoText(bare) || DESCRIBES_IMAGE.test(bare) ? '' : clean(bare);
 }
 
 // OCR self-test comparison: transcription vs expected text. Collapses all

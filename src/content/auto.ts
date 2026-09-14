@@ -1,7 +1,7 @@
 // Auto-translate: follow the reader's scroll, pre-translate ahead, off-DOM
 // lookahead for single-img and canvas-manifest readers.
 
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, autoBudget, galleryLookaheadUrls, manifestAheadUrls, readWarming, warmingFresh, writeWarming, samePagePath } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, autoBudget, galleryLookaheadUrls, manifestAheadUrls, readWarming, warmingFresh, writeWarming, samePagePath, registerLookaheadAbort } from './page-cache';
 import { isAutoSite } from '../llm/pipeline-settings';
 import { isDebug } from '../debug';
 import type { MtOnStatus } from './detection';
@@ -195,6 +195,7 @@ async function prefetchAhead(): Promise<void> {
         for (const url of urls) {
             if (chapterKey() !== chapter) break; // SPA story change — abort quietly
             if (lookaheadCancel) break; // user stop — drain after the in-flight page below
+            if (sweepActive()) break; // sweep started mid-chain — it owns these pages now (startSweep also aborts us, belt & braces)
             try {
                 if (isDebug()) console.log('[mt] prefetch lookahead:', url); // full URL — host matters (volatile CDN hosts)
                 await prefetchHeadless(url, cur.kind !== 'img', lkStatus); // canvas-branch URLs are manifest puzzles (descramble); img-branch URLs are final pixels
@@ -259,6 +260,7 @@ export async function setAutoTranslate(on: boolean): Promise<void> {
 }
 
 registerAutoTranslateFlag(() => autoTranslate);
+registerLookaheadAbort(cancelLookahead); // sweep start/stop must not leave a warming chain running
 
 // per-site: auto runs only where the user enabled it (see isAutoSite).
 // Persistence lives in the popup (the toggle owner); here we only evaluate.

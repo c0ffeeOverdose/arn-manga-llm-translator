@@ -44,6 +44,17 @@ test('load fills missing keys, drops unknown, resets wrong types', () => {
   assert.equal(merged.bogusKey, undefined);
 });
 
+test('temperature: null = provider default; numbers clamp to 0-1; junk resets', () => {
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.temperature, null);
+  assert.equal(loadPipelineSettings({ temperature: 0.3 }).temperature, 0.3);
+  assert.equal(loadPipelineSettings({ temperature: 0 }).temperature, 0);
+  for (const bad of [2, -1, NaN, Infinity, '0.3', true, {}]) {
+    assert.equal(loadPipelineSettings({ temperature: bad }).temperature, null, String(bad));
+  }
+  // pinned temperature is a quality knob: presets read as "custom"
+  assert.equal(matchingPreset(loadPipelineSettings({ temperature: 0.3 })), 'custom');
+});
+
 test('migration: old useVision/visionMode/ocrModel map onto textSource', () => {
   // visionMode 'text' → crops
   assert.equal(loadPipelineSettings({ visionMode: 'text' }).textSource, 'crops');

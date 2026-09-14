@@ -5,13 +5,14 @@ import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type 
 import { mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
 import { detModelsInstalled, detDownload } from '../llm/ocr-models';
 import { $, setDirty, setStatus, dlProgress } from './shell';
-import { pipeline, syncOcrManager, syncOcrSeparateUI } from './pipeline-section';
+import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI } from './pipeline-section';
 
 const MODEL_HINTS: Record<string, string> = {
     openai: 'e.g. gpt-5.4-mini, gpt-5.4-nano — or qwen/qwen3.7-flash, z-ai/glm-5.3-flash via OpenRouter',
     responses: 'e.g. gpt-5.6-luna, muse-spark-1.3 (cheap + vision)',
     anthropic: 'e.g. claude-haiku-4-5, claude-sonnet-5',
     gemini: 'e.g. gemini-3.5-flash-lite, gemini-3.8-flash',
+    cloudflare: 'e.g. @cf/meta/llama-3.2-11b-vision-instruct (pair with OCR text mode; needs a one-time "agree")',
 };
 
 // model input placeholder follows the selected protocol (static HTML keeps
@@ -21,6 +22,7 @@ const MODEL_PLACEHOLDERS: Record<string, string> = {
     responses: 'e.g. gpt-5.6-luna',
     anthropic: 'e.g. claude-haiku-4-5',
     gemini: 'e.g. gemini-3.5-flash-lite',
+    cloudflare: 'e.g. @cf/meta/llama-4-scout-17b-16e-instruct',
 };
 
 // per-provider Base URL examples (defaults live in DEFAULT_BASES)
@@ -29,6 +31,7 @@ const BASE_HINTS: Record<string, string> = {
     responses: ' · OpenCode Go: https://opencode.ai/zen/go/v1 (use a /responses model, e.g. gpt-5.6-luna)',
     anthropic: '',
     gemini: '',
+    cloudflare: ' · replace <ACCOUNT_ID>; token needs Workers AI permission (either /ai or /ai/v1 works)',
 };
 
 export function fillModelFields(s: LLMSettings): void {
@@ -40,6 +43,7 @@ export function fillModelFields(s: LLMSettings): void {
     ($('cloudKey') as HTMLInputElement).value = s.cloudKey ?? '';
     syncInferUI();
     syncThinkingUI();
+    syncTemperatureUI();
 }
 
 export function currentSettings(): LLMSettings {
@@ -137,7 +141,10 @@ export async function saveAll(): Promise<void> {
 
 export async function discardAll(fill: (s: LLMSettings) => void, syncAdvancedUI: () => void): Promise<void> {
     const { mtSettings, mtOcrSettings, mtPipeline } = await chrome.storage.local.get(['mtSettings', 'mtOcrSettings', 'mtPipeline']);
-    void mtPipeline; // pipeline reload is the caller's business (pipeline-section)
+    // reload the pipeline too: syncAdvancedUI (and fillModelFields' thinking/
+    // temperature controls) read the in-memory object, so a Reset without this
+    // left every edited pipeline field on screen
+    loadStoredPipeline(mtPipeline as PipelineSettings | undefined);
     fill({ ...DEFAULT_SETTINGS, ...(mtSettings ?? {}) } as LLMSettings);
     fillOcrFields({ ...DEFAULT_SETTINGS, ...(mtOcrSettings ?? {}) } as LLMSettings);
     syncAdvancedUI();
@@ -161,7 +168,7 @@ export async function testConnection(): Promise<void> {
         // carries a "switch to Local OCR" hint. Thinking level rides along:
         // the background probes it with a second call and reports accepted /
         // rejected (rejected levels silently run without thinking).
-        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s, thinking: pipeline.thinkingLevel });
+        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s, thinking: pipeline.thinkingLevel, temperature: pipeline.temperature });
         if (resp?.ok) {
             setStatus(`OK — ${resp.reply}${thinkingSuffix(pipeline.thinkingLevel, resp)}`, 'ok', 0, el);
         } else {
@@ -193,7 +200,10 @@ export async function testOcr(): Promise<void> {
         const imageB64 = await ocrTestImageB64();
         const resp = await chrome.runtime.sendMessage({ type: 'mt:test-ocr', settings: s, thinking: pipeline.ocrThinking, imageB64, expect: OCR_TEST_EXPECT });
         if (resp?.ok && resp.verdict === 'exact') {
-            setStatus(`OK — reads correctly ("${resp.got}")`, 'ok', 0, el);
+            const cap = resp.multiImage === true ? ' · multi-image OK'
+                : resp.multiImage === false ? ' · single-image only (per-region auto)'
+                : '';
+            setStatus(`OK — reads correctly ("${resp.got}")${cap}`, 'ok', 0, el);
         } else if (resp?.ok) {
             setStatus(resp.verdict === 'miss'
                 ? `Saw no text — returned keep on a readable image (expected "${resp.expected}")`
@@ -364,6 +374,39 @@ export async function testCloud(): Promise<void> {
     }
 }
 
+// ---- temperature: "Provider default" checkbox; slider/number drop out of
+// auto on touch (same rule as the color pickers — never disabled) ----
+const TEMP_DEFAULT = 0.3; // shown (and sent) when auto is turned off with no stored value
+function syncTemperatureUI(): void {
+    const auto = pipeline.temperature == null;
+    const shown = auto ? TEMP_DEFAULT : pipeline.temperature;
+    ($<HTMLInputElement>('temperatureAuto')).checked = auto;
+    ($<HTMLInputElement>('temperature')).value = String(shown);
+    ($<HTMLInputElement>('temperatureNum')).value = String(shown);
+    ($<HTMLInputElement>('temperature')).classList.toggle('dim', auto);
+    ($<HTMLInputElement>('temperatureNum')).classList.toggle('dim', auto);
+}
+($<HTMLInputElement>('temperatureAuto')).onchange = () => {
+    const on = ($<HTMLInputElement>('temperatureAuto')).checked;
+    pipeline.temperature = on ? null : Number(($<HTMLInputElement>('temperature')).value);
+    syncTemperatureUI();
+    markModelDirty();
+};
+($<HTMLInputElement>('temperature')).oninput = () => {
+    pipeline.temperature = Number(($<HTMLInputElement>('temperature')).value);
+    syncTemperatureUI();
+    markModelDirty();
+};
+($<HTMLInputElement>('temperatureNum')).onchange = () => {
+    const raw = ($<HTMLInputElement>('temperatureNum')).value.trim();
+    let v = raw === '' ? NaN : Number(raw);
+    if (!Number.isFinite(v)) v = pipeline.temperature ?? TEMP_DEFAULT; // garbage → revert
+    else v = Math.min(1, Math.max(0, Math.round(v * 20) / 20)); // slider step 0.05
+    pipeline.temperature = v;
+    syncTemperatureUI();
+    markModelDirty();
+};
+
 // ---- thinking level: searchable combobox, presets depend on provider, free-text allowed ----
 // ponytail: same .combo pattern as targetLang, duplicated —
 // extract a shared helper if a third combo appears
@@ -390,8 +433,7 @@ function syncThinkingHint(): void {
 
 export function syncThinkingUI(): void {
     thinkInput.value = pipeline.thinkingLevel;
-    syncThinkingHint();
-    closeThinkList();
+    syncThinkingHint();    closeThinkList();
 }
 
 function closeThinkList(): void {

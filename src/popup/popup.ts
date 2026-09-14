@@ -140,10 +140,22 @@ async function refreshStatus(): Promise<void> {
         charsBtn.textContent = resp.charsOpen ? 'Hide characters' : 'Characters';
         lastChars = resp.charsOpen;
         // chapter sweep: explicit whole-chapter background run (separate from
-        // auto) — label shows progress while running, page count when idle
-        const sw = resp.sweep as { active: boolean; done: number; total: number; errors: number } | null;
+        // auto) — label shows progress while running, page count when idle.
+        // stopping: Stop was pressed but in-flight pages still drain (no mid-LLM
+        // abort) — say so instead of showing a live Stop button that "does
+        // nothing". starting: enumeration in flight — cancel is still possible.
+        const sw = resp.sweep as { active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean; done: number; total: number; errors: number } | null;
         sweepRunning = !!sw?.active;
-        if (sweepRunning && sw) {
+        if (sw?.stopping) {
+            sweepBtn.textContent = `Stopping… (${sw.done}/${sw.total})`;
+            sweepBtn.disabled = true;
+        } else if (sw?.phase === 'starting') {
+            sweepBtn.textContent = 'Cancel start';
+            sweepBtn.disabled = false;
+        } else if (sw?.phase === 'dead') {
+            sweepBtn.textContent = 'Finishing previous sweep…';
+            sweepBtn.disabled = true;
+        } else if (sw?.active) {
             sweepBtn.textContent = `Stop sweep (${sw.done}/${sw.total})`;
             sweepBtn.disabled = false;
         } else {
@@ -186,8 +198,8 @@ sweepBtn.onclick = async () => {
         await send({ type: 'mt:sweep-cancel' });
     } else {
         statusEl.textContent = 'Starting chapter sweep…';
-        const resp = await send({ type: 'mt:sweep-start' }) as { ok?: boolean; total?: number; error?: string } | null;
-        statusEl.textContent = resp?.ok ? `Sweeping ${resp.total} pages…` : (resp?.error ?? 'failed');
+        const resp = await send({ type: 'mt:sweep-start' }) as { ok?: boolean; total?: number; error?: string; starting?: boolean; cancelled?: boolean } | null;
+        statusEl.textContent = resp?.starting ? 'Starting…' : resp?.ok ? `Sweeping ${resp.total} pages…` : (resp?.error ?? 'failed');
     }
     refreshStatus();
 };

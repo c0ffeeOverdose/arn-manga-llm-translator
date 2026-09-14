@@ -202,13 +202,15 @@ async function screenshotPage(el: Element): Promise<ImageBitmap> {
 }
 
 export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap; bytes: ArrayBuffer }> {
-    // fast path: direct fetch (CORS-open CDNs — comix, MangaDex image servers)
+    // fast path: direct fetch (CORS-open CDNs — comix, MangaDex image servers).
+    // Timeout: a long-tail hang here would wedge a sweep worker forever (the
+    // run watchdog is the last resort — page fetch is the first).
     try {
-        const resp = await fetch(srcUrl);
+        const resp = await fetch(srcUrl, { signal: AbortSignal.timeout(120_000) });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const bytes = await (await resp.blob()).arrayBuffer();
         return { bitmap: await createImageBitmap(new Blob([bytes])), bytes };
-    } catch { /* CORS/hotlink-blocked → worker proxy below */ }
+    } catch { /* CORS/hotlink-blocked/timeout → worker proxy below */ }
     // content-script fetch is CORS-gated on the page origin even with host
     // permissions (some image servers send no ACAO) — the worker fetches free of
     // page CORS, so proxy the bytes through it (readPage falls back to
@@ -374,10 +376,32 @@ function syncPictureSources(img: HTMLImageElement, translated: boolean): boolean
     return false;
 }
 
+// Extension-owned copy of the original page, for "Show original" on
+// blob-origin readers (MangaDex etc.): the reader's blob URL is dead or
+// unassignable (the dead-orig guard in writePage), so the only reliable way
+// back is a blob WE own, minted while the pixels are still readable. PNG on
+// purpose — healImgBinding/repaintByHash re-hash element pixels against
+// state.hash; a lossy re-encode would never match and would drop bindings /
+// re-translate the page. Giant strips skip the copy (encode + memory cost):
+// blob readers serve book-sized pages, not 13k-px manhwa strips.
+export const OWN_COPY_MAX_PIXELS = 4_000_000;
+export function ownCopyNeeded(orig: string, w: number, h: number): boolean {
+    return orig.startsWith('blob:') && w * h <= OWN_COPY_MAX_PIXELS;
+}
+export async function ownOriginalUrl(bitmap: ImageBitmap): Promise<string | undefined> {
+    try {
+        const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+        c.getContext('2d')!.drawImage(bitmap, 0, 0);
+        return URL.createObjectURL(await c.convertToBlob({ type: 'image/png' }));
+    } catch {
+        return undefined; // no copy — the old (blocked) behavior, never a broken page
+    }
+}
+
 // explicit "show original" beats everything; each side keeps its own debug
 // view when debug is on (falls back gracefully on pages rendered before it)
 export function shownSrc(st: PageState): string {
-    if (!overlayOn) return debugOn && st.debugOrig ? st.debugOrig : st.orig;
+    if (!overlayOn) return debugOn && st.debugOrig ? st.debugOrig : (st.origOwn ?? st.orig);
     if (debugOn && st.debug) return st.debug;
     return st.translated;
 }

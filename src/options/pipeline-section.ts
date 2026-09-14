@@ -90,10 +90,16 @@ export function syncAdvancedUI(): void {
     markCustom();
 };
 
+($<HTMLInputElement>('ocrPerRegion')).onchange = () => {
+    pipeline.ocrPerRegion = ($<HTMLInputElement>('ocrPerRegion')).checked;
+    markCustom();
+};
+
 // ---- separate VLM reader: checkbox always visible, creds only when it can
 // run (vision modes — local-OCR mode never sends images anywhere)
 export function syncOcrSeparateUI(): void {
     ($('ocrSeparate') as HTMLInputElement).checked = pipeline.useOcrModel;
+    ($('ocrPerRegion') as HTMLInputElement).checked = pipeline.ocrPerRegion;
     $('ocrSeparateFields').style.display = pipeline.useOcrModel && pipeline.textSource !== 'ocr' ? '' : 'none';
 }
 

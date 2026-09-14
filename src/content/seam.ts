@@ -13,7 +13,7 @@ import { updateContext, type Mention, type RegionOutput } from '../llm/core';
 import { isDebug } from '../debug';
 import { type DetectResult, type DetBox, type MtOnStatus } from './detection';
 import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, type PageRef, type PageState } from './state';
-import { getPages, fetchBitmap, writePage } from './page-io';
+import { getPages, fetchBitmap, writePage, ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { detectPage, orderDetection, paintRegions, paintExtras, type Prep } from './pipeline';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
 import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet, paintFind } from './queue';
@@ -368,6 +368,11 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 mentions: i === 0 ? mentions : [], // page-level list — top member only, folds once
                 hash: m.hash,
             };
+            // blob-origin reader: extension-owned original copy per member (see ownOriginalUrl)
+            if (ownCopyNeeded(m.srcUrl, m.bitmap.width, m.bitmap.height)) {
+                state.origOwn = await ownOriginalUrl(m.bitmap);
+                if (isDebug() && state.origOwn) console.log('[mt] orig copy (seam)', JSON.stringify({ src: m.srcUrl.slice(-14) }));
+            }
             if (debugOn && boxes.length) {
                 state.debugOrig = await renderDebugView(m.bitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? []);
                 state.debug = await renderDebugView(await createImageBitmap(sc), boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? []);
