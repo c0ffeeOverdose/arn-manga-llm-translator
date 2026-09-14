@@ -583,6 +583,17 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                         return await transcribePerRegion(ocr, msg, pipeline, callWithRetry, ocrTemp);
                     });
                 if (t.tempDropped) ocrNoTemperature.add(key);
+                // zero parsed regions = the OCR model answered nothing usable
+                // (empty response or format drift), NOT "this page has no text"
+                // — an all-keep page still parses one element per region. Without
+                // this the text-only translator gets regions with no source at
+                // all, keeps every one, and the page reports Done with nothing
+                // translated (live: a 53s drifting call, all keep, no visible
+                // change).
+                if (!t.sources.size) {
+                    throw new MtError('parse', `OCR model returned no text (${msg.regions.length} regions)`,
+                        'Retry the page, or check the OCR model in Options');
+                }
                 preRaw = t.preRaw;
                 usage = { ...t.usage };
                 llmCalls = t.calls;

@@ -9,8 +9,8 @@ mkdirSync('.test-build', { recursive: true });
 await build({
   stdin: {
     contents: [
-      `export { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS } from './src/content/page-io.ts';`,
-      `export { setOverlayOn, setDebugOn } from './src/content/state.ts';`,
+      `export { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage } from './src/content/page-io.ts';`
+      + `\nexport { setOverlayOn, setDebugOn } from './src/content/state.ts';`,
     ].join('\n'),
     resolveDir: process.cwd(),
     loader: 'ts',
@@ -21,7 +21,7 @@ await build({
 // state.ts computes contextChapter at import time (needs location)
 globalThis.location = { origin: 'https://test.local', pathname: '/chapter/1', search: '', hash: '' };
 
-const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, setOverlayOn, setDebugOn } =
+const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, setOverlayOn, setDebugOn } =
   await import(new URL('../.test-build/page-io.mjs', import.meta.url).href);
 
 function fakeState(extra = {}) {
@@ -58,4 +58,48 @@ test('ownCopyNeeded: only blob origins under the strip cap', () => {
   assert.equal(ownCopyNeeded('blob:https://x/strip', 800, 13650), false, `giant strips skip the copy (cap ${OWN_COPY_MAX_PIXELS})`);
   assert.equal(ownCopyNeeded('blob:https://x/edge', 2000, 2000), true, 'exactly at the cap is allowed');
   assert.equal(ownCopyNeeded('blob:https://x/edge2', 2001, 2000), false);
+});
+
+// re-translate used to decode the live <img>, which after a render shows our
+// translated blob — the pipeline then re-detected and re-OCR'd its own drawing
+// (live: VLM read nothing, all regions kept, page reported Done unchanged).
+function imgEl(src, currentSrc = src) { return { src, currentSrc }; }
+
+test('readPage: blob shown by the element still decodes locally (revoked-blob path)', async () => {
+  const seen = [];
+  globalThis.createImageBitmap = async (arg) => { seen.push(arg); return { width: 1, height: 1, close() {} }; };
+  globalThis.fetch = async (url) => { seen.push('fetch:' + url); throw new Error('network down'); };
+  const src = 'blob:https://mangadex.org/page';
+  const el = imgEl(src);
+  const r = await readPage({ kind: 'img', el }, src);
+  assert.equal(r.bitmap.width, 1, 'element decode is the only path for revoked blobs');
+  assert.deepEqual(seen, [el], 'no fetch attempt when the element shows the requested url');
+});
+
+test('readPage: element showing our render is not the source — fetch the stashed url', async () => {
+  const seen = [];
+  globalThis.createImageBitmap = async (arg) => { seen.push(arg); return { width: 7, height: 7, close() {} }; };
+  globalThis.fetch = async (url) => {
+    seen.push('fetch:' + url);
+    return { ok: true, blob: async () => ({ arrayBuffer: async () => new Uint8Array([9]).buffer }) };
+  };
+  const orig = 'blob:https://mangadex.org/orig';
+  const el = imgEl('blob:https://ext/translated');
+  const r = await readPage({ kind: 'img', el }, orig);
+  assert.equal(r.bytes.byteLength, 1);
+  assert.equal(seen[0], 'fetch:' + orig, 'the original url is fetched');
+  assert.ok(!seen.includes(el), 'the element (holding our translation) is never decoded');
+});
+
+test('readPage: dead stashed blob fails loud instead of screenshotting our own render', async () => {
+  const msgs = [];
+  globalThis.createImageBitmap = async () => ({ width: 1, height: 1, close() {} });
+  globalThis.fetch = async () => { throw new Error('Failed to fetch'); };
+  globalThis.chrome = { runtime: { sendMessage: async (m) => { msgs.push(m?.type); return { ok: false, error: 'image fetch blocked' }; } } };
+  const el = imgEl('blob:https://ext/translated');
+  await assert.rejects(
+    () => readPage({ kind: 'img', el }, 'blob:https://mangadex.org/dead'),
+    /no longer available/,
+  );
+  assert.ok(!msgs.includes('mt:screenshot'), 'a screenshot here would photograph our translation');
 });

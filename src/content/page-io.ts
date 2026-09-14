@@ -298,9 +298,30 @@ export async function readPage(ref: PageRef, srcUrl: string, stashed?: ArrayBuff
             // TAINTED bitmap that explodes later at getImageData, while same-origin
             // blobs are never tainted.
             if (srcUrl.startsWith('blob:')) {
-                try {
-                    return { bitmap: await createImageBitmap(ref.el) };
-                } catch { /* not decoded yet → fetch below */ }
+                const live = ref.el.currentSrc || ref.el.src;
+                if (live === srcUrl) {
+                    try {
+                        return { bitmap: await createImageBitmap(ref.el) };
+                    } catch { /* not decoded yet → fetch below */ }
+                } else {
+                    // the element is showing something else: our own translated
+                    // render (re-translate), a Show-original copy, or a newer blob
+                    // the reader minted. Its pixels are NOT the source — decoding
+                    // them fed the translated page back through detect + OCR
+                    // (live: 6 regions read nothing, a 53s drifting call, and the
+                    // page reported Done with every region kept; the hash was the
+                    // render's, not the page's). The stashed URL is the only
+                    // correct source, and when it is dead the screenshot fallback
+                    // would photograph our own drawing — fail loud instead.
+                    try {
+                        return await fetchBitmap(srcUrl);
+                    } catch {
+                        throw Object.assign(
+                            new Error('original image is no longer available — reload the page and translate again'),
+                            { noScreenshot: true },
+                        );
+                    }
+                }
             }
             // return AWAIT — a bare `return fetchBitmap(...)` skips this try's
             // catch (the promise escapes before the try closes) and the screenshot
@@ -331,6 +352,8 @@ export async function readPage(ref: PageRef, srcUrl: string, stashed?: ArrayBuff
         const bytes = await blob.arrayBuffer();
         return { bitmap: await createImageBitmap(new Blob([bytes])), bytes };
     } catch (e) {
+        // a stale-source verdict must not turn into a photo of our own render
+        if ((e as { noScreenshot?: boolean })?.noScreenshot) throw e;
         // direct read blocked → screenshot fallback, else a clear error naming it
         try {
             return { bitmap: await screenshotPage(ref.el) };
