@@ -106,7 +106,7 @@ tests/          unit tests (node --test)
 
 ```bash
 npx tsc --noEmit   # typecheck
-node --test tests/ # unit tests
+node --test "tests/**/*.test.mjs" # unit tests
 node build.mjs     # build both targets, see above
 ```
 
