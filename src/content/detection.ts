@@ -14,6 +14,7 @@ export interface DetectResult {
     inferMs: number;
     initMs?: number;    // one-time session cost (0/absent on reuse) — timing breakdown only
     ep: string;
+    lockWaitMs?: number; // ms this page's detect runs waited on the shared ORT lock (0 = uncontended)
     cloudTexts?: string[]; // cloud path: OCR texts aligned 1:1 with boxes (raw — caller trims)
     cloudMs?: { detect: number; ocr: number }; // cloud path: server-side breakdown
     panelMs?: number;   // YOLO panel infer ms (0/absent when skipped) — timing breakdown only
@@ -417,11 +418,11 @@ export async function baberuInstalled(): Promise<boolean> {
 
 // Baberu reads vertical text and dirty backgrounds natively — no rotation,
 // no binarization, tighter padding than Tesseract needs
-export async function baberuOcr(png: ArrayBuffer): Promise<string> {
+export async function baberuOcr(png: ArrayBuffer): Promise<{ text: string; lockWaitMs: number }> {
     await ensureIframe();
-    const resp = await iframeRpc({ type: 'mt:baberu-ocr', png }, [png]) as { ok: boolean; text?: string; error?: string };
+    const resp = await iframeRpc({ type: 'mt:baberu-ocr', png }, [png]) as { ok: boolean; text?: string; lockWait?: number; error?: string };
     if (!resp?.ok) throw new Error(resp?.error ?? 'Baberu OCR failed');
-    return (resp.text ?? '').replace(/\s+/g, ' ').trim();
+    return { text: (resp.text ?? '').replace(/\s+/g, ' ').trim(), lockWaitMs: resp.lockWait ?? 0 };
 }
 
 // ---- Panels: YOLO26n in the same iframe (bundled model, graceful fallback
@@ -431,6 +432,7 @@ export interface PanelDetectResult {
     panels: DetBox[];
     dropped: DetBox[];
     inferMs: number;
+    lockWaitMs?: number; // ms the panel run waited on the shared ORT lock
 }
 
 export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_THR): Promise<PanelDetectResult> {
@@ -440,9 +442,9 @@ export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_TH
     const blob = await c.convertToBlob({ type: 'image/png' });
     const png = await blob.arrayBuffer();
     const resp = await iframeRpc({ type: 'mt:panels', png, thr }, [png]) as
-        { ok: boolean; panels?: DetBox[]; dropped?: DetBox[]; ms?: number; error?: string };
+        { ok: boolean; panels?: DetBox[]; dropped?: DetBox[]; ms?: number; lockWait?: number; error?: string };
     if (!resp?.ok) throw new Error(resp?.error ?? 'panel detection failed');
-    return { panels: resp.panels ?? [], dropped: resp.dropped ?? [], inferMs: resp.ms ?? 0 };
+    return { panels: resp.panels ?? [], dropped: resp.dropped ?? [], inferMs: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0 };
 }
 
 // ---- Cloud: panel+detect+OCR on your own endpoint (opt-in, Modal).

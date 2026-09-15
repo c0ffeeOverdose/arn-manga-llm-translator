@@ -7,16 +7,17 @@
 // concurrent owners could interleave slice writes). Any failure → null → the
 // caller falls back to the solo path; members render solo as if seamless.
 
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, seamLinked, seamInkLinked, seamTruncated, boxIoU, bandSpan, seamRowsMatch } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, seamLinked, seamInkLinked, seamTruncated, boxIoU, bandSpan, seamRowsMatch } from './page-cache';
 import { ensureFont, renderTuning, RENDER_GEN } from './render';
 import { updateContext, type Mention, type RegionOutput } from '../llm/core';
 import { isDebug } from '../debug';
 import { type DetectResult, type DetBox, type MtOnStatus } from './detection';
-import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, type PageRef, type PageState } from './state';
-import { getPages, fetchBitmap, writePage } from './page-io';
+import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, loadContext, type PageRef, type PageState } from './state';
+import { getPages, fetchBitmap, writePage, ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { detectPage, orderDetection, paintRegions, paintExtras, type Prep } from './pipeline';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
-import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet } from './queue';
+import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet, paintFind } from './queue';
+import { bookAdd, bookDrop } from './sweep';
 
 interface SeamMember { ref: PageRef; key: string; srcUrl: string; bitmap: ImageBitmap; hash: string; det: DetectResult }
 export const SEAM_MAX = 4; // owner + 3 — bounds the stitch canvas + pulled jobs
@@ -122,7 +123,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             members.push(null); // placeholder — filled by the join below, order kept
             pend.push((async () => {
                 const idx = members.length - 1;
-                const q = queueFind(key);
+                const q = queueFind(key) ?? paintFind(key);
                 let mp: Prep | null = null;
                 try {
                     if (q) mp = await q.prep;
@@ -298,10 +299,18 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         if (shareContext) {
             const olds = chain.map(m => pages.get(m.key)).filter((s): s is PageState => !!s);
             if (olds.length) await rewindContextBefore(...olds);
+            for (const o of olds) if (o.hash) bookDrop(o.hash); // rebuilt book excludes them — refold below re-registers
         }
+        // pre-chain snapshot for every member state — a later re-translate of
+        // any slice restores this instead of replaying states it may not have
+        // (load first: the context is lazy and translateRegions folds later)
+        await loadContext();
+        const bookBefore = context.characters;
+        const pairsBefore = context.pairs;
         const outcome = await translateRegions(stitchBmp, det, onStatus);
         if (outcome.error) { prune(); return null; } // members fall back to solo (parked normally)
-        const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs } = outcome;
+        for (const m of chain) bookAdd(m.hash); // folded above (whole-stitch context) — arrivals skip refold
+        const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = outcome;
         const annWCache = outcome.annW, annHCache = outcome.annH;
         const rawLLM = outcome.raw;
         await ensureFont();
@@ -312,9 +321,9 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             page: `${W}x${H}`, seam: chain.length,
             minFont: renderTuning.minFont, gen: RENDER_GEN, detConf: pipeline.detConf,
             usedLLM,
-            det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null },
+            det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null },
             llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
-            ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null } : null,
+            ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
             boxes: det.boxes.map(b => ({ x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2) })),
             ...(bookOps?.length ? { bookOps } : null),
         }));
@@ -363,8 +372,15 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 det: localDet,
                 outputs: memberOutputs,
                 mentions: i === 0 ? mentions : [], // page-level list — top member only, folds once
+                bookBefore,
+                pairsBefore,
                 hash: m.hash,
             };
+            // blob-origin reader: extension-owned original copy per member (see ownOriginalUrl)
+            if (ownCopyNeeded(m.srcUrl, m.bitmap.width, m.bitmap.height)) {
+                state.origOwn = await ownOriginalUrl(m.bitmap);
+                if (isDebug() && state.origOwn) console.log('[mt] orig copy (seam)', JSON.stringify({ src: m.srcUrl.slice(-14) }));
+            }
             if (debugOn && boxes.length) {
                 state.debugOrig = await renderDebugView(m.bitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? []);
                 state.debug = await renderDebugView(await createImageBitmap(sc), boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? []);
@@ -386,6 +402,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     outputs: memberOutputs, extras: memberExtras, mentions: state.mentions ?? [],
                     mask: packMask(localDet.mask),
                 }, pipeline.cacheMax);
+            } else {
+                void cacheDelete(cacheKey(chapterKey(), m.hash)); // cache off: drop the member's resume checkpoint
             }
             writePage(m.ref, state);
             if (!top) top = state;

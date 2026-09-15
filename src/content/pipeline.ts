@@ -3,16 +3,59 @@
 
 import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type MtOnStatus } from './detection';
 import { inpaint, inpaintBoxRegion } from './inpaint';
-import { renderRegion } from './render';
+import { boxIsVertical, renderRegion, sizeCapFrom } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, unpackMask, type CachedPage } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, type CachedPage } from './page-cache';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; cacheMiss?: string; origBytes?: ArrayBuffer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
+
+// cached entry → render-ready det (shared by preparePage and arrival paint —
+// one construction, one gate set: full entry + fp + dims + mask, partials
+// never render as Done). Null when the entry must not paint.
+export function detFromCacheEntry(hit: CachedPage, w: number, h: number): DetectResult | null {
+    if (!hit || hit.partial || hit.fp !== settingsFingerprint(pipeline) || hit.w !== w || hit.h !== h || !hit.mask) return null;
+    return {
+        boxes: hit.boxes, panels: hit.panels,
+        mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
+        inferMs: 0, ep: 'cache', dropped: [], panelDropped: [],
+    };
+}
+
+// Headless detect resolve — shared by lookahead prefetch and chapter sweep
+// (DOM jobs use preparePage instead: canvas blanks, ghost twins, stashed
+// bytes). Full hit → {det:null} (caller returns); resumable partial → rebuilt
+// det; else fresh detect + order + checkpoint write. Zero-box pages skip the
+// checkpoint (nothing to resume; the full entry covers them).
+export async function resolveHeadlessDet(
+    bitmap: ImageBitmap, hash: string, onStatus: MtOnStatus,
+): Promise<{ det: DetectResult | null; resumed: boolean }> {
+    const key = cacheKey(chapterKey(), hash);
+    const fp = settingsFingerprint(pipeline);
+    {
+        // full entries are the translation cache (cacheEnabled gates them);
+        // resume checkpoints are in-flight work and always ride (a retry after
+        // a failed LLM must never re-pay detection/OCR, cache or not)
+        const hit = await cacheGet(key);
+        if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+            return { det: null, resumed: false };
+        }
+        if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
+            onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
+            return { det: detFromPartial(hit, bitmap.width, bitmap.height)!, resumed: true };
+        }
+    }
+    const det = await detectPage(bitmap, onStatus);
+    await orderDetection(det, bitmap);
+    if (det.boxes.length) {
+        void cachePut(partialEntry(key, fp, det, bitmap.width, bitmap.height), pipeline.cacheMax);
+    }
+    return { det, resumed: false };
+}
 
 // Detection for one bitmap (local or cloud), no ordering — shared by the
 // solo path (preparePage) and the seam path (stitched bitmap, same call).
@@ -70,25 +113,38 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
         det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
     } else {
         try {
-            const { panels, dropped, inferMs } = await panelsDetect(bitmap, pipeline.panelConf);
+            const { panels, dropped, inferMs, lockWaitMs } = await panelsDetect(bitmap, pipeline.panelConf);
             det.panels = panels;
             det.panelDropped = dropped;
             det.panelMs = Math.round(inferMs);
+            det.lockWaitMs = (det.lockWaitMs ?? 0) + (lockWaitMs ?? 0); // detect + panel contention, one number
             if (!panelsUsable(panels, page.w, page.h)) det.panelSkipped = `${panels.length} panels, biggest <10% page`;
             det.boxes = orderByPanels(det.boxes, panels, pipeline.readingDir, page, defer);
         } catch {
             det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
         }
     }
+    // containment dedup (every EP incl. cloud — this runs after all ordering
+    // branches): a near-threshold fragment inside a real box survives IoU and
+    // would paint double text downstream. Marginal only (conf < 0.5).
+    // Dropped boxes vanish from cloudTexts with them (identity reattach below).
+    det.boxes = dropContainedBoxes(det.boxes, 0.9, 0.5);
     if (cloudTextByBox) det.cloudTexts = det.boxes.map(b => cloudTextByBox.get(b) ?? '');
 }
 
 // Detect phase — kicked off at ENQUEUE time so detection of the next page
 // overlaps the LLM call of the current one (CTD parallel, LLM serial).
 // Returns null when the page is already translated (cache hit, no-op job).
-export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus): Promise<Prep | null> {
+// fromSweep: the caller IS the sweep (already claimed) — skip the sweep-wait
+// or the worker waits on its own claim until timeout.
+export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false): Promise<Prep | null> {
     const existing = stateFor(ref);
     if (existing && !force) return null;
+    // prepMs: read + hash + cache-gate cost (excludes queue wait — the prep
+    // body runs at enqueue time, not when the pump gets to it). Answers
+    // "why is a cache hit slow" without guessing.
+    const tPrep0 = performance.now();
+    const prepMs = () => Math.round(performance.now() - tPrep0);
     // re-translate: always from the ORIGINAL page — when the translated overlay
     // is showing, img.src points at our own rendering (canvas: stashed bytes).
     const srcUrl = existing ? existing.orig : refKey(ref);
@@ -129,35 +185,71 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     }
     // persistent cache: same image bytes + same settings → skip detect + LLM.
     // force (re-translate) always misses and overwrites below.
+    // A previous document may have died mid-job on this exact page (full-load
+    // readers kill all in-memory state per page-turn) — leave a trace so the
+    // next load can name the restart instead of silently redoing it.
+    // read BEFORE our own write below — else every first visit matches the
+    // trace it just wrote and cries "interrupted" over nothing.
+    const prevWarming = readWarming();
+    writeWarming(refKey(ref));
+    // chapter sweep owns this page right now — wait for its commit instead of
+    // paying a duplicate detect + LLM (falls through on cancel/timeout, then
+    // the normal flow finds the fresh cache entry)
+    if (!force && !fromSweep && pipeline.cacheEnabled) {
+        await Promise.race([sweepWait(refKey(ref), onStatus), new Promise(r => setTimeout(r, 150000))]);
+    }
     const hash = pageHashFromBitmap(bitmap);
     // miss-reason instrument: a revisit that SHOULD hit but misses needs a
     // verdict in one dump (absent | fp | dims | mask | disabled) — no guessing
     let cacheMiss: string | undefined = pipeline.cacheEnabled ? 'absent' : 'disabled';
-    if (!force && pipeline.cacheEnabled) {
+    if (!force) {
         const hit = await cacheGet(cacheKey(chapterKey(), hash));
         const fp = settingsFingerprint(pipeline);
         // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite
-        if (hit && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+        // partial entries never render as Done (cache) — they resume below
+        if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
             cacheMiss = undefined;
             onStatus('Cache hit…');
-            const det: DetectResult = {
-                boxes: hit.boxes, panels: hit.panels,
-                mask: { width: bitmap.width, height: bitmap.height, data: unpackMask(hit.mask, bitmap.width, bitmap.height) },
-                inferMs: 0, ep: 'cache', dropped: [], panelDropped: [],
-            };
-            return { srcUrl, bitmap, det, hash, cached: hit,
+            const det = detFromCacheEntry(hit, bitmap.width, bitmap.height)!;
+            return { srcUrl, bitmap, det, hash, cached: hit, prepMs: prepMs(),
                 // canvas cache hit still needs the original bytes — the canvas will
                 // show our drawing after this (re-translate reads the stash, §readPage)
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
-        if (hit) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : 'mask';
+        if (hit && pipeline.cacheEnabled) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : 'mask';
+        // detect checkpoint resume: the previous load finished detect (boxes +
+        // panels + mask on disk) but died before translating — continue at
+        // translateRegions, skipping detect entirely. The pill jumps read→llm,
+        // which reads as "continuing" instead of "restarting".
+        if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
+            cacheMiss = undefined;
+            onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
+            return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, resumed: true as const,
+                ...(hit.texts?.length ? { ocrResumed: true as const } : null), prepMs: prepMs(),
+                origBytes: ref.kind === 'canvas' ? bytes : undefined };
+        }
+        if (!hit) {
+            // total miss with a fresh warming trace for this page = the
+            // previous document died before its detect checkpoint landed
+            // (prevWarming, read before our own write above — never self-match)
+            const w = prevWarming;
+            if (w && samePagePath(w.key, refKey(ref)) && warmingFresh(w.ts)) onStatus('Warming was interrupted — restarting…', 'read');
+        }
     }
     const det = await detectPage(bitmap, onStatus);
     await orderDetection(det, bitmap);
+    // detect checkpoint: a page-turn kills this document mid-job — the next
+    // load resumes from this entry (same key the full entry will overwrite).
+    // Zero-box pages skip it (nothing to resume; the full entry covers them).
+    // Written even with the cache off (in-flight work, not a cached
+    // translation): the successful job deletes it again in that mode.
+    if (!force && det.boxes.length) {
+        void cachePut(partialEntry(cacheKey(chapterKey(), hash), settingsFingerprint(pipeline), det, bitmap.width, bitmap.height), pipeline.cacheMax);
+    }
     // canvas pages: stash the original bytes (the canvas will show our drawing
     // after this — re-translate must read the original, not our overlay)
     const origBytes = ref.kind === 'canvas' ? (bytes ?? existing?.origBytes) : undefined;
-    return { srcUrl, bitmap, det, hash, cacheMiss, origBytes };
+    return { srcUrl, bitmap, det, hash, cacheMiss, prepMs: prepMs(), origBytes };
 }
 
 // Paint translated regions onto a canvas (inpaint source text, draw the
@@ -177,19 +269,33 @@ export function paintRegions(
     const translatedIdx = new Set(
         outputs.filter(o => o.translation && o.translation !== 'keep').map(o => o.index),
     );
-    const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1));
+    // contained-duplicate guard (heals old cache entries on revisit, and
+    // confident dups the detection gate keeps): the lower-conf box is treated
+    // as keep — its source text stays instead of a second colliding paint.
+    const keptBoxes = new Set(dropContainedBoxes(det.boxes));
+    const dupIdx = new Set(det.boxes.map((b, i) => keptBoxes.has(b) ? -1 : i + 1).filter(i => i > 0));
+    const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && !dupIdx.has(i + 1));
     const missedIdx = det.boxes.map((_, i) => i + 1).filter(i => !translatedIdx.has(i) && !keepIdx.has(i));
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
+    if (dupIdx.size && isDebug()) console.log('[mt] contained-duplicate boxes kept as-is:', [...dupIdx].join(','));
     inpaint(canvas, { ...det, boxes: boxesToErase });
 
     // chosen layout per rendered region — diagnoses shrink/clip issues live
     const layouts: { i: number; f: number; n: number }[] = [];
     det.boxes.forEach((box, i) => {
-        if (keepIdx.has(i + 1)) return; // untouched
+        if (keepIdx.has(i + 1) || dupIdx.has(i + 1)) return; // untouched
         const out = outputs.find(o => o.index === i + 1);
         const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
         const placed = renderRegion(ctx, frame, box, text);
-        if (placed) layouts.push({ i: i + 1, f: placed.fontSize, n: placed.lines.length, ...(placed.overflow ? { o: 1 as const } : {}) });
+        if (placed) layouts.push({
+            i: i + 1, f: placed.fontSize, n: placed.lines.length,
+            ...(placed.overflow ? { o: 1 as const } : {}),
+            ...(isDebug() && placed.color ? { c: placed.color } : null),
+            ...(isDebug() && placed.block ? { ly: placed.block.map(Math.round) } : null),
+            // font ceiling from the measured source pitch (debug): f at sc
+            // with no o = the cap is doing its job, f far below sc = the area
+            ...(isDebug() ? { sc: sizeCapFrom(frame, box, boxIsVertical(box)) ?? undefined } : null),
+        });
     });
     return layouts;
 }

@@ -6,7 +6,7 @@ import type { MtStage } from './detection';
 import { initDebug, isDebug } from '../debug';
 import { pipeline, ui, mtPal, mtDot, stateFor, setDebugOn, type MtState } from './state';
 import { getPages } from './page-io';
-import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap } from './queue';
+import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap, paintFind, paintHas, paintQueued, autoHalted } from './queue';
 import { ensureDebugViews } from './ocr';
 import { applyOverlays } from './overlays';
 
@@ -15,13 +15,14 @@ import { applyOverlays } from './overlays';
 // pill directly — whoever wrote last won, so progress jumped between pages
 // mid-run ("LLM 3s" A → "OCR 4/8" B → …). Now the pill is a VIEW:
 //  - activities: live jobs keyed by page, each with a kind for priority
-//    (force > most-visible > lookahead — the user reads the page they're
-//    looking at, not FIFO). Stale writes from dropped jobs are ignored.
+//    (force > most-visible > background sweep/lookahead — the user reads the
+//    page they're looking at, not FIFO). Stale writes from dropped jobs are
+//    ignored.
 //  - lastMsg: the most recent settled job (Done/Error) — lingers like the
 //    old single-job behavior until the next job replaces it.
 //  - override: one-shot user feedback (click acks), wins briefly over
 //    running jobs so a click response is never eaten by background work.
-export interface Activity { text: string; kind: 'force' | 'view' | 'lookahead'; stage?: MtStage }
+export interface Activity { text: string; kind: 'force' | 'view' | 'lookahead' | 'sweep'; stage?: MtStage }
 const activities = new Map<string, Activity>();
 let lastMsg: { text: string; phase: MtState; until?: number } | null = null;
 let overrideMsg: { text: string; phase: MtState; until: number } | null = null;
@@ -30,14 +31,16 @@ let pillDismissed = false; // user closed the pill — stay hidden until the nex
 
 export function pillUnDismiss(): void { pillDismissed = false; }
 
-// a job's status is only valid while it is queued or running — dropped
-// preps (dequeue/cancel/twin-splice) keep resolving and would otherwise
-// resurrect as ghost pill entries
+// a job's status is only valid while it is queued, painting, or running —
+// dropped preps (dequeue/cancel/twin-splice) keep resolving and would
+// otherwise resurrect as ghost pill entries
 function jobLive(key: string): boolean {
-    return key === activeKeyGet() || queue.some(j => j.key === key);
+    return key === activeKeyGet() || queue.some(j => j.key === key) || paintHas(key);
 }
 export function setActivity(key: string, text: string, kind: Activity['kind'], stage: MtStage | undefined): void {
-    if (kind !== 'lookahead' && !jobLive(key)) return;
+    // background work (lookahead, sweep) owns no queue entry — exempt from
+    // the liveness gate like lookahead always was
+    if (kind !== 'lookahead' && kind !== 'sweep' && !jobLive(key)) return;
     activities.set(key, { text, kind, stage });
     renderStatus();
 }
@@ -55,10 +58,18 @@ export function pageCounts(): { loaded: number; translated: number; queued: numb
     const refs = getPages();
     let translated = 0;
     for (const ref of refs) if (stateFor(ref)?.det) translated++;
-    return { loaded: refs.length, translated, queued: queue.length };
+    return { loaded: refs.length, translated, queued: queue.length + paintQueued() };
 }
 
 export function idleStatus(): string {
+    // a provider halt outranks the counts: nothing else will run until the user
+    // acts, and that is the one thing the pill should be saying (see haltAuto)
+    const halted = autoHalted();
+    if (halted) {
+        if (halted.kind !== 'ratelimit') return 'Auth/quota error — fix the key, then press Translate';
+        const left = halted.until > Date.now() ? ` (${Math.ceil((halted.until - Date.now()) / 1000)}s)` : '';
+        return `Rate limited${left} — stopped; press Translate to resume`;
+    }
     const { loaded, translated, queued } = pageCounts();
     // pages parked after errors — shown only while auto is on (the mode that
     // would otherwise retry them silently). Counts loaded pages only.
@@ -114,6 +125,7 @@ export function renderStatus(): void {
     if (primary && parts.length) text += ` · ${parts.join(' · ')}`;
     const el = ui.querySelector('#mt-ui-text') as HTMLElement ?? ui.querySelector('span') as HTMLElement;
     el.textContent = text;
+    el.title = text; // hover shows what line-clamp cuts
     (ui.querySelector('#mt-ui-dot') as HTMLElement | null)?.style.setProperty('background', mtDot(phase));
     renderSteps(phase === 'busy' ? stage : undefined);
     // progress from translated/loaded counts — same numbers the popup shows
@@ -133,11 +145,11 @@ export function renderStatus(): void {
     ui.style.display = show ? 'block' : 'none';
 }
 
-// viewport overlap for an activity key: resolve the queued/active job's
-// element (the queue holds the ref); 0 when it can't be found (dropped)
+// viewport overlap for an activity key: resolve the queued/active/painting
+// job's element (the queue holds the ref); 0 when it can't be found (dropped)
 function viewportOverlapByKey(key: string): number {
     if (key === activeKeyGet() && activeRefGet()) return viewportOverlap(activeRefGet()!);
-    const j = queue.find(j => j.key === key);
+    const j = queue.find(j => j.key === key) ?? paintFind(key);
     return j ? viewportOverlap(j.ref) : 0;
 }
 
@@ -200,7 +212,7 @@ export async function logError(msg: string, hint?: string, kind?: string): Promi
 export function makePill(): HTMLDivElement {
     const div = document.createElement('div');
     div.id = 'mt-ui';
-    div.style.cssText = `position:fixed;bottom:16px;right:16px;z-index:99999;background:${mtPal.bg};color:${mtPal.text};padding:10px 28px 10px 14px;border:1px solid ${mtPal.border};border-radius:12px;font:13px system-ui;box-shadow:0 4px 16px rgba(0,0,0,.4);display:none;width:280px`;
+    div.style.cssText = `position:fixed;bottom:16px;right:16px;z-index:99999;background:${mtPal.bg};color:${mtPal.text};padding:10px 28px 10px 14px;border:1px solid ${mtPal.border};border-radius:12px;font:13px system-ui;box-shadow:0 4px 16px rgba(0,0,0,.4);display:none;width:340px`;
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:8px';
     const dot = document.createElement('span');
@@ -208,7 +220,7 @@ export function makePill(): HTMLDivElement {
     dot.style.cssText = `width:8px;height:8px;border-radius:50%;background:${mtPal.muted};flex:none`;
     const status = document.createElement('span');
     status.id = 'mt-ui-text';
-    status.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    status.style.cssText = 'flex:1;min-width:0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical';
     status.textContent = '';
     row.append(dot, status);
     const steps = document.createElement('div');
@@ -250,3 +262,5 @@ export async function loadDebug(): Promise<void> {
 let autoTranslateFlagFn: (() => boolean) | null = null;
 export function registerAutoTranslateFlag(fn: () => boolean): void { autoTranslateFlagFn = fn; }
 function autoTranslateFlag(): boolean { return autoTranslateFlagFn?.() ?? false; }
+// readers (sweep status): no new module edges — auto registers here already
+export function autoTranslateOn(): boolean { return autoTranslateFlag(); }

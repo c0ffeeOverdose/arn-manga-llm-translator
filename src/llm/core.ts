@@ -67,6 +67,8 @@ export interface BuildOpts {
                                                     // model stops spending output tokens on speaker IDs.
     maxPairs?: number;      // recent-translation lines kept/sent (default MAX_PAIRS)
     transcribeSrc?: boolean; // model copies source text into src attr (vision-mode context)
+    transcribeOnly?: boolean; // VLM-OCR stage: transcribe each region EXACTLY, no translation (SFX transcribed too — the translate stage decides keep)
+    transcribeOne?: boolean;  // per-region VLM-OCR (single-image models): the request has ONE crop and must answer with ONE element (all lines joined)
 }
 
 // Language-specific translation rules. Thai gets the full particle rule;
@@ -92,6 +94,56 @@ export function buildPrompt(
 ): string {
     const lang = opts.targetLang?.trim() || 'Thai';
     const chars = opts.chars !== false;
+    // VLM-OCR stage: pure transcription, no translation. Same <r> XML shape so
+    // the caller reuses parseResponse (translation field = transcription,
+    // 'keep' = unreadable). SFX is transcribed too — the translate stage owns
+    // the keep decision. No book/pairs/style: a read must not be biased.
+    if (opts.transcribeOnly) {
+        // per-region variant (single-image OCR models): one crop in, ONE element
+        // out — the model used to split lines into separate numbered elements
+        // (live-probed), which would drop every line after the first when the
+        // caller expects one region per request.
+        if (opts.transcribeOne) {
+            return `<task>Transcribe the text in this single manga region EXACTLY as written. Do NOT translate.</task>
+<images>One image: the crop of the region.</images>
+<output_format>Output EXACTLY one element — ALL lines of the region joined with a single space, nothing else:
+<r n="1">exact transcription</r>
+<r n="1" keep="true"/>
+
+The second form (self-closing, keep="true", NO text inside) is ONLY for an image with no readable text (drawings, patterns, faces, objects, scenery). Transcribe everything readable INCLUDING stylized sound-effect lettering — do not judge, do not translate, do not clean up.
+<example>
+<r n="1">一緒に来てくれないか</r>
+</example></output_format>
+<rules>
+- Exactly one element. Put every line into it, joined with a space — never split into multiple elements.
+- Copy character-for-character — no paraphrase, no cleanup, no guessing unreadable glyphs (that is keep). Never translate.
+</rules>
+<regions>
+1 (read from image)
+</regions>
+`;
+        }
+        let t = `<task>Transcribe the text in each numbered manga region EXACTLY as written. Do NOT translate.</task>\n`;
+        if (vision && opts.textOnly) {
+            t += `<images>Each image is the crop of region 1, 2, … in order — transcribe each region from its own crop. There is no full-page image.</images>\n`;
+        } else if (vision) {
+            t += `<images>First image = full page with red number badges; the following images are crops of region 1, 2, … in order. Transcribe each region from its crop; use the full page for context.</images>\n`;
+        }
+        t += `<output_format>Output EXACTLY this XML — one element per region, nothing else:
+<r n="REGION">exact transcription</r>
+<r n="REGION" keep="true"/>
+
+The second form (self-closing, keep="true", NO text inside) is ONLY for regions with no readable text (drawings, patterns, faces, objects, scenery). Transcribe everything readable INCLUDING stylized sound-effect lettering — do not judge, do not translate, do not clean up.
+<example>
+<r n="1">一緒に来てくれないか</r>
+<r n="2">ドン</r>
+<r n="3" keep="true"/>
+</example></output_format>\n`;
+        t += `<rules>\n- Copy character-for-character — no paraphrase, no cleanup, no guessing unreadable glyphs (those regions are keep). Never translate.\n</rules>\n`;
+        t += '<regions>\n';
+        for (const r of regions) t += `${r.index} (read from image)\n`;
+        return t + '</regions>\n';
+    }
     // XML-structured prompt (prompt-engineering standard): every section is
     // an explicit tag so the model can't confuse instructions with data —
     // rules never bleed into region lists, character notes never read as
@@ -114,6 +166,7 @@ The second form (self-closing, keep="true", NO text inside) is for regions you d
 Never put a description, brackets, or invented dialogue in a keep element. Never leave a translation empty — if there is nothing to translate, it is a keep element.
 ${chars ? `
 name is OPTIONAL: set it only when THIS page states the speaker's actual name (introduction, narration naming them, a name label) — write it in ${lang} form. Omit it when the page doesn't say.
+spk is a PERSON only: for narration boxes, signs, labels, SFX and any text that is not a person speaking, omit spk/g/name entirely — never write a box type (narration, sign, caption, SFX) as spk.
 ` : ``}
 <example>
 <r n="1"${opts.transcribeSrc && !opts.ocr ? ' src="一緒に来てくれないか"' : ''}${chars ? ' spk="boy with spiky hair" g="M" name="ยามาดะ"' : ''}>ไปด้วยกันไหมครับ</r>
@@ -126,6 +179,7 @@ After the regions, if anyone is NAMED in the dialogue or narration (the speaker,
 <m name="short name" full="full name ONLY if the page states it" g="M|F">who this is in one short phrase (role or relation, not looks)</m>
 </names>
 Omit the whole block when no one is named. full: never assemble or guess a surname — leave it out unless the page says the full name. g: only when the page makes it obvious (particles, pronouns, explicit words); otherwise leave it out. Never invent a person.
+Credits, bylines and copyright text (author/artist names on a cover or credits panel) are not story characters — never report them.
 Two entries in <known_characters> are the same person: <m name="A" sameAs="B">…</m> (both must be in the book).
 The book is wrong and THIS page proves it: <m name="A" correct="gender|name|desc|full" now="new value" why="exact quote from this page">…</m> — no quote, no change. Never touch entries marked "confirmed by user".` : ``}</output_format>\n`;
     p += `<rules>\n- ${LANG_RULES[lang] ?? GENERIC_RULE(lang)}\n`;
@@ -150,9 +204,13 @@ The book is wrong and THIS page proves it: <m name="A" correct="gender|name|desc
         p += `- Missed text (no badge): <extra n="new" x="x1,y1,x2,y2">${lang} translation</extra> (pixels on the ${opts.pageW}x${opts.pageH} first image). Dialogue only, no SFX.\n`;
     }
     p += `</rules>\n`;
-    if (chars && ctx.characters.length) {
+    // a book already polluted with box-type rows must not keep teaching them
+    // back to the model (that is what perpetuates them) — user rows stay, they
+    // are the user's call
+    const book = chars ? ctx.characters.filter(c => c.source === 'user' || !isNonPersonLabel(c.name ?? c.desc)) : [];
+    if (book.length) {
         p += '<known_characters>\n';
-        for (const c of ctx.characters) {
+        for (const c of book) {
             const label = c.fullName && c.fullName !== c.name
                 ? (c.name ? `${c.name} (${c.fullName})` : c.fullName)
                 : c.name;
@@ -274,6 +332,47 @@ export function parseResponse(text: string, expected: number): ParsedResponse {
     return parseXml(text, expected) ?? { regions: [], extras: [], mentions: [] };
 }
 
+// Per-region transcribe responses: the model may split a multi-line region
+// into several numbered elements (live-probed: a title crop came back as 5) —
+// concatenate every element's text in order. keep/empty contributes nothing.
+// Some models drift and answer with bare text instead of the requested <r>
+// element (live: ~1/3 of CF llama-3.2 calls at the default temperature) — use
+// the bare text rather than silently emptying the region, dropping dangling
+// tags and "no readable text" prose. Temperature 0 in cfBody makes the drift
+// rare; this keeps the slip from eating the line.
+// The bare path also rejects image DESCRIPTIONS: on a text-less crop this model
+// answers "<r n=\"1\">この画像は、ブドウの写真です</r>" instead of keep
+// (live-probed) — a description must not become a translation source. The
+// pattern is deliberately sentence-shaped ("この画像…", "…写真です", "the image
+// is/show") so a real line that merely contains 写真/photo survives.
+const DESCRIBES_IMAGE = /この画像|画像には|画像です|写真です|イラストです|the image (shows|is|depicts)|this (image|picture) (is|shows)|a (photo|picture) of/i;
+export function joinTranscription(text: string): string {
+    const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
+    const parsed = parseResponse(text, Number.MAX_SAFE_INTEGER);
+    if (parsed.regions.length) {
+        const joined = clean(parsed.regions
+            .filter(r => r.translation && r.translation !== 'keep')
+            .map(r => r.translation)
+            .join(' '));
+        return isMetaNoText(joined) || DESCRIBES_IMAGE.test(joined) ? '' : joined;
+    }
+    const bare = text
+        .replace(/```[a-z]*\n?/gi, ' ')
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !/^[<(]?\s*\/?r\b/i.test(l) && !/keep="true"/i.test(l))
+        .join(' ');
+    return isMetaNoText(bare) || DESCRIBES_IMAGE.test(bare) ? '' : clean(bare);
+}
+
+// OCR self-test comparison: transcription vs expected text. Collapses all
+// whitespace runs (line breaks included) and trims — layout differences are
+// not reading errors. Case-sensitive: flipped case is misreading.
+export function transcriptionMatches(got: string, expected: string): boolean {
+    const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+    return norm(expected).length > 0 && norm(got) === norm(expected);
+}
+
 // A model answer that DESCRIBES the crop instead of translating it — almost
 // always "this is not text" said in prose. Checked against the FINAL
 // translation (after spk/arrow extraction) so a trailing "|| spk: girl, F"
@@ -292,6 +391,23 @@ function isMetaNoText(t: string): boolean {
 // ---- character book ----
 const PRIORITY: Record<CharacterEntry['source'], number> = { user: 3, vlm: 2, speech: 1, mention: 1 };
 
+// Box types the model reports as "the speaker" on regions with no person in
+// them. Learning them burns the 10-slot book and teaches the model to emit
+// spk="narration"/"sign" forever (it picks the vocabulary up from the book and
+// feeds it back — live-proven). Structural-meta class, same as isMetaNoText;
+// only generic labels, never a story-specific name.
+const NON_PERSON_LABEL = /^(?:narration|narrator|caption|subtitle|subtitle text|sfx|sound effect|sound effects|onomatopoeia|sign|signage|shop sign|text|no text|translation note|tn|บรรยาย|บรรยายภาพ|คำบรรยาย|ผู้บรรยาย|ป้าย|ป้ายข้อความ|ข้อความ|เสียง|เสียงประกอบ|ไม่มีข้อความ)$/i;
+const isNonPersonLabel = (s: string | undefined): boolean => !!s && NON_PERSON_LABEL.test(s.trim());
+
+// Address suffixes are not part of a name: "คุจินาชิคุง" is คุจินาชิ,
+// "ฮิมุโระ-ซัง" is ฮิมุโระ. Without this the book grows one row per form of
+// address (live: three rows for one heroine — ฮิมุโระ / ฮิมุโร / ฮิมุโระ-ซัง).
+const HONORIFIC = /[-・\s]?(?:คุง|คุน|จัง|จัน|ซัง|ซามะ|เซ็นเซย์|senpai|sensei|kun|chan|san|sama)$/i;
+function stripHonorific(s: string): string {
+    const t = s.replace(HONORIFIC, '').trim();
+    return t || s;
+}
+
 function similar(a: string, b: string): boolean {
     const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9ก-๙ ]/g, ' ').replace(/\s+/g, ' ').trim();
     const wa = new Set(norm(a).split(' ').filter(w => w.length > 2));
@@ -307,8 +423,9 @@ function similar(a: string, b: string): boolean {
 // different characters are possible; the user override is the escape hatch.
 function samePerson(a: string | undefined, b: string | undefined): boolean {
     if (!a || !b) return false;
-    const na = a.toLowerCase().trim(), nb = b.toLowerCase().trim();
-    if (!na || !nb || na === nb) return na === nb;
+    const na = stripHonorific(a.toLowerCase().trim()), nb = stripHonorific(b.toLowerCase().trim());
+    if (!na || !nb) return false;
+    if (na === nb) return true;
     const ta = new Set(na.split(/\s+/)), tb = new Set(nb.split(/\s+/));
     const [shorter, longer] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
     for (const t of shorter) if (!longer.has(t)) return false;
@@ -330,9 +447,18 @@ export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry): Cha
     if (i === -1) {
         const next = [...book, obs];
         if (next.length > MAX_CHARACTERS) {
-            // evict lowest-priority, oldest
-            next.sort((a, b) => PRIORITY[b.source] - PRIORITY[a.source]);
-            next.length = MAX_CHARACTERS;
+            // Evict the OLDEST lowest-priority row, not the newest: the book is
+            // append-ordered, and dropping the tail let a full book of stale
+            // junk (narration/sign/credits rows) silently refuse every new
+            // character forever — live-proven. User rows never evict (top
+            // priority); ties go to the earlier (older) row.
+            while (next.length > MAX_CHARACTERS) {
+                let victim = 0;
+                for (let j = 1; j < next.length; j++) {
+                    if (PRIORITY[next[j].source] < PRIORITY[next[victim].source]) victim = j;
+                }
+                next.splice(victim, 1);
+            }
         }
         return next;
     }
@@ -393,7 +519,7 @@ export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
     const ops: BookOp[] = [];
     const done: number[] = [];
     mentions.forEach((m, i) => {
-        if (!m.name || (!m.sameAs && !m.correct)) return;
+        if (!m.name || isNonPersonLabel(m.name) || (!m.sameAs && !m.correct)) return;
         if (m.sameAs) {
             // resolve the target first — the main entry often matches BOTH refs
             // (name + fullName), so the source is searched outside the target
@@ -467,7 +593,8 @@ export function updateContext(
     let bookOps: BookOp[] = [];
     if (learn) {
         for (const o of outputs) {
-            if (o.spk && o.spk.desc && o.translation !== 'keep') {
+            if (o.spk && o.spk.desc && o.translation !== 'keep'
+                && !isNonPersonLabel(o.spk.desc) && !isNonPersonLabel(o.spk.name)) {
                 characters = mergeCharacter(characters, { ...o.spk, source: o.spk.desc.includes('guess') ? 'speech' : 'vlm' });
             }
         }
@@ -475,7 +602,7 @@ export function updateContext(
         characters = applied.characters;
         bookOps = applied.ops;
         mentions.forEach((m, idx) => {
-            if (!m.name || applied.done.includes(idx)) return;
+            if (!m.name || applied.done.includes(idx) || isNonPersonLabel(m.name) || isNonPersonLabel(m.desc)) return;
             characters = mergeCharacter(characters, {
                 desc: m.desc || m.name, name: m.name, fullName: m.fullName, gender: m.gender, source: 'mention',
             });

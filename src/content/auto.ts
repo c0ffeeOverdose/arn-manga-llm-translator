@@ -1,15 +1,16 @@
 // Auto-translate: follow the reader's scroll, pre-translate ahead, off-DOM
 // lookahead for single-img and canvas-manifest readers.
 
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, cachePut, packMask, autoBudget, galleryLookaheadUrls, manifestAheadUrls } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, autoBudget, galleryLookaheadUrls, manifestAheadUrls, readWarming, warmingFresh, writeWarming, samePagePath, registerLookaheadAbort } from './page-cache';
 import { isAutoSite } from '../llm/pipeline-settings';
 import { isDebug } from '../debug';
 import type { MtOnStatus } from './detection';
 import { pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, sessionUsage, setLastPageUsage, stateFor, type PageRef } from './state';
-import { fetchBitmap, getPages, unscrambleTiles, episodeManifestSrcs } from './page-io';
-import { detectPage, orderDetection } from './pipeline';
+import { fetchBitmap, getPages, unscrambleTiles, episodeManifestSrcs, galleryManifestJson } from './page-io';
+import { resolveHeadlessDet } from './pipeline';
+import { sweepHas, sweepActive, bookAdd } from './sweep';
 import { translateRegions } from './ocr';
-import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet } from './queue';
+import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto } from './queue';
 import { cooldownMark, cooldownParked } from './page-cache';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, registerAutoTranslateFlag } from './status-ui';
 
@@ -35,6 +36,15 @@ async function autoTick(): Promise<void> {
         }
     }
     if (!autoTranslate) return;
+    // provider refused (rate limit / auth): auto is stopped until the user acts
+    // — every request in the meantime would be refused again (see haltAuto)
+    if (autoHalted()) return;
+    // chapter sweep owns this chapter right now — its commits paint arrivals
+    // and its folds must stay ordered; auto jobs would duplicate work, and a
+    // fresh-translate setContext would clobber the sweep's book. Manual
+    // intent (popup/menu/force) bypasses this entirely; auto resumes when the
+    // sweep ends.
+    if (sweepActive()) return;
     const now = Date.now();
     const ahead = Math.min(30, Math.max(1, pipeline.prefetchN ?? 3));
     // live-only budget: ghost jobs (dead elements) sitting in the queue must
@@ -42,7 +52,7 @@ async function autoTick(): Promise<void> {
     const budget = autoBudget(queue.filter(j => j.auto && j.ref.el.isConnected).length, ahead);
     if (!budget) return;
     const cands = getPages()
-        .filter(r => !stateFor(r) && !queue.some(j => j.ref.el === r.el) && !cooldownParked(failMarks, pageKeyOf(r), now))
+        .filter(r => !stateFor(r) && !queue.some(j => j.ref.el === r.el) && !paintHas(pageKeyOf(r)) && !cooldownParked(failMarks, pageKeyOf(r), now) && !sweepHas(pageKeyOf(r)))
         .sort((a, b) => viewportOverlap(b) - viewportOverlap(a))
         .slice(0, budget);
     for (const ref of cands) {
@@ -62,10 +72,29 @@ async function autoTick(): Promise<void> {
 // outputs into the persisted book itself. Serial, forward-only, auto-quiet.
 let prefetchBusy = false;
 const warmedUrls = new Set<string>(); // per script instance — a nav resets it, correctly (new page, new lookahead)
+// user cancel (popup button / auto toggle-off): the chain stops AFTER the
+// in-flight page (mid-LLM abort wastes tokens + corrupts the book — same rule
+// as queue/sweep). Armed only while a chain runs, consumed by its epilogue —
+// a stale flag blocking future chains is impossible by construction.
+let lookaheadCancel = false;
+export function lookaheadActive(): boolean { return prefetchBusy; }
+// readers (arrival paint): auto.ts imports nobody that imports overlays —
+// this edge is cycle-free, unlike going through status-ui
+export function autoOn(): boolean { return autoTranslate; }
+export function cancelLookahead(): boolean {
+    if (!prefetchBusy) return false;
+    lookaheadCancel = true;
+    return true;
+}
 let lastMtAutoFlag: string | undefined; // E2E auto hook above — transition-only writes
 async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnStatus = () => {}): Promise<void> {
     resetContextIfNewChapter();
     await loadPipeline();
+    // trace before work: a page-turn kills this chain silently, and the next
+    // load names the restart off this (see preparePage). Read first — our own
+    // write below must not mask a previous load's trace.
+    const prev = readWarming();
+    writeWarming(url);
     onStatus('Reading page…', 'read');
     const f = await fetchBitmap(url); // direct → SW proxy → DNR retry, same as DOM pages
     let bitmap = f.bitmap;
@@ -81,26 +110,34 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
     }
     try {
         const hash = pageHashFromBitmap(bitmap);
-        if (pipeline.cacheEnabled) {
-            const hit = await cacheGet(cacheKey(chapterKey(), hash));
-            if (hit && hit.fp === settingsFingerprint(pipeline) && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) return;
+        const key = cacheKey(chapterKey(), hash);
+        const fp = settingsFingerprint(pipeline);
+        // shared headless resolve (full hit → return, partial → resume,
+        // else detect + order + checkpoint) — see resolveHeadlessDet
+        const r = await resolveHeadlessDet(bitmap, hash, onStatus);
+        if (!r.det) return;
+        if (!r.resumed && prev && samePagePath(prev.key, url) && warmingFresh(prev.ts)) {
+            onStatus('Warming was interrupted — restarting…', 'read');
         }
-        const det = await detectPage(bitmap, onStatus);
-        await orderDetection(det, bitmap);
+        const det = r.det;
         // solo only: seam needs DOM siblings (unknown off-DOM) — a solo result
         // still beats an untranslated arrival, and arrival can force if needed
-        const o = await translateRegions(bitmap, det, onStatus);
-        if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint });
+        const o = await translateRegions(bitmap, det, onStatus,
+            { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled });
+        if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
         onStatus('Saving…', 'render'); // headless has no paint — the cache write is the last leg
+        bookAdd(hash); // folded above (translateRegions) — arrival must not refold
         if (pipeline.cacheEnabled) {
             void cachePut({
-                key: cacheKey(chapterKey(), hash),
-                fp: settingsFingerprint(pipeline),
+                key,
+                fp,
                 w: bitmap.width, h: bitmap.height,
                 boxes: det.boxes, panels: det.panels ?? [],
                 outputs: o.outputs, extras: o.extras, mentions: o.mentions,
                 mask: packMask(det.mask),
             }, pipeline.cacheMax);
+        } else {
+            void cacheDelete(key); // cache off: drop the resume checkpoint this headless job finished
         }
         if (o.usage) {
             sessionUsage.pages++;
@@ -114,34 +151,11 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
     }
 }
 
-// manifest source: the embedded SvelteKit payload first, same-origin API as
-// fallback (hydration may drop the script — the data-url IS the API route,
-// so a direct GET returns the same gallery object; cached per gallery, and a
-// failed fetch caches null so ticks never retry-loop it)
-let manifestCache: { key: string; json: string | null } | null = null;
-async function galleryManifestJson(): Promise<string | null> {
-    const script = document.querySelector('script[type="application/json"][data-url^="/api/v2/galleries/"]');
-    if (script?.textContent) return script.textContent;
-    const g = location.pathname.match(/^\/g\/(\d+)\/\d+\/?$/);
-    if (!g) return null;
-    if (manifestCache?.key === g[1]) return manifestCache.json;
-    try {
-        const r = await fetch(`/api/v2/galleries/${g[1]}`);
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const json = JSON.stringify({ body: JSON.stringify(await r.json()) });
-        manifestCache = { key: g[1], json };
-        return json;
-    } catch {
-        manifestCache = { key: g[1], json: null };
-        return null;
-    }
-}
-
 // lookahead driver: runs when the DOM window is exhausted but budget remains
 // AND the viewed page is done (viewed-first — never races the current page
 // for the LLM, and the book holds its context before farther pages build on
-// it). One chain per page-view: warmed/parked URLs are skipped, a busy chain
-// is never doubled, and a chapter change aborts the run.
+// it). One chain per page-view: warmed/parked/sweep-claimed URLs are skipped,
+// a busy chain is never doubled, and a chapter change aborts the run.
 async function prefetchAhead(): Promise<void> {
     if (prefetchBusy) return;
     const ahead = Math.min(30, Math.max(1, pipeline.prefetchN ?? 3));
@@ -170,21 +184,26 @@ async function prefetchAhead(): Promise<void> {
         cands = srcs && anchor ? manifestAheadUrls(srcs, anchor, budget) : [];
     }
     const urls = cands
-        .filter(u => !warmedUrls.has(u) && !cooldownParked(failMarks, u, Date.now()));
+        .filter(u => !warmedUrls.has(u) && !sweepHas(u) && !paintHas(u) && !cooldownParked(failMarks, u, Date.now()));
     if (!urls.length) return;
     prefetchBusy = true;
     const chapter = chapterKey();
-    setActivity('lookahead', 'Pre-translating next page…', 'lookahead', undefined); // visible: the only proof lookahead fired (auto is quiet otherwise)
+    setActivity('lookahead', `Pre-translating 1/${urls.length}…`, 'lookahead', undefined); // visible: the only proof lookahead fired (auto is quiet otherwise)
     // stages flow into the same activity — the stepper lights up read→detect→
     // ocr→llm→render exactly like a visible job (priority stays lowest, so a
-    // real page's progress always wins the pill while both run)
-    const lkStatus: MtOnStatus = (s, stage) => setActivity('lookahead', `Pre-translating: ${s}`, 'lookahead', stage);
+    // real page's progress always wins the pill while both run). The count
+    // survives page advances (same key overwritten) so the chain no longer
+    // reads as "restarted" every page.
+    const lkStatus: MtOnStatus = (s, stage) => setActivity('lookahead', `Pre-translating ${warmed + 1}/${urls.length}: ${s}`, 'lookahead', stage);
     let warmed = 0, firstErr = '';
     try {
         for (const url of urls) {
             if (chapterKey() !== chapter) break; // SPA story change — abort quietly
+            if (lookaheadCancel) break; // user stop — drain after the in-flight page below
+            if (autoHalted()) break; // provider refused — the job that hit it already stopped us
+            if (sweepActive()) break; // sweep started mid-chain — it owns these pages now (startSweep also aborts us, belt & braces)
             try {
-                if (isDebug()) console.log('[mt] prefetch lookahead:', url.slice(-24));
+                if (isDebug()) console.log('[mt] prefetch lookahead:', url); // full URL — host matters (volatile CDN hosts)
                 await prefetchHeadless(url, cur.kind !== 'img', lkStatus); // canvas-branch URLs are manifest puzzles (descramble); img-branch URLs are final pixels
                 warmedUrls.add(url);
                 warmed++;
@@ -201,8 +220,17 @@ async function prefetchAhead(): Promise<void> {
     // restore the pill: success reports what was warmed (a short done-message,
     // then idle counts — background work, so 4s not the usual lingering Done);
     // total failure names the reason for 10s (then idle — a stuck error
-    // misleads worse than silence)
+    // misleads worse than silence). A user-cancelled run goes quiet — the
+    // cancel control already said its piece, and error reports of a run the
+    // user killed would read as fresh failures.
     removeActivity('lookahead');
+    const cancelled = lookaheadCancel;
+    lookaheadCancel = false;
+    if (cancelled) {
+        lastMsgSet(null);
+        renderStatus();
+        return;
+    }
     if (warmed > 0) {
         lastMsgSet({
             text: firstErr ? `Prepared ${warmed} pages ahead (1 failed)` : `Next ${warmed} page${warmed > 1 ? 's' : ''} ready`,
@@ -221,13 +249,25 @@ async function prefetchAhead(): Promise<void> {
 
 export async function setAutoTranslate(on: boolean): Promise<void> {
     autoTranslate = on;
-    if (on && autoTimer == null) {
+    if (!on) {
+        // stopping the loop stops the backlog too: queued AUTO jobs are
+        // dropped (explicit manual/force intent + the in-flight page survive)
+        // and a running lookahead chain drains after its current page (no
+        // restart — the flag is off). Completed pages are cached.
+        let touched = dropAutoQueued() > 0;
+        touched = cancelLookahead() || touched;
+        if (touched) renderStatus();
+        return;
+    }
+    resumeAuto(); // the user switched auto on again — their intent outranks a provider halt
+    if (autoTimer == null) {
         autoTimer = setInterval(autoTick, 2500);
         autoTick(); // start with the page the reader is on right now
     }
 }
 
 registerAutoTranslateFlag(() => autoTranslate);
+registerLookaheadAbort(cancelLookahead); // sweep start/stop must not leave a warming chain running
 
 // per-site: auto runs only where the user enabled it (see isAutoSite).
 // Persistence lives in the popup (the toggle owner); here we only evaluate.

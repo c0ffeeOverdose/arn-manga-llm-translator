@@ -7,6 +7,8 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
+import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources } from './page-cache';
+import { chosenOrientation, pageArea } from './render';
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
@@ -54,17 +56,22 @@ async function baberuCrop(bitmap: ImageBitmap, box: DetBox): Promise<ArrayBuffer
 }
 
 // Prefetch pipeline: crop of box n+1 + its vision run START while box n is
-// still decoding — the per-session locks in the worker make the vision of
-// the next box overlap the decode of the current one (OCR ~40s → ~15s/page).
-// Depth 2 keeps memory bounded (two decoded KV states max).
-export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void): Promise<string[]> {
+// still decoding — depth 2 keeps memory bounded (two decoded KV states max).
+// NOTE: the worker's ORT lock is one global chain, so the overlapped vision
+// still queues behind the in-flight decode step — the win is hiding PNG
+// crop/encode + message latency, not parallel inference (OCR ~40s → ~15s/page
+// measured). Per-box lock waits sum into lockWaitMs for the page-result dump.
+export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void): Promise<{ texts: string[]; lockWaitMs: number }> {
     const results: string[] = [];
+    let lockWaitMs = 0;
     let next = 0;
     const startOne = async (): Promise<string> => {
         const i = next++;
         if (i >= boxes.length) return '';
         const png = await baberuCrop(bitmap, boxes[i]);
-        return baberuOcr(png);
+        const { text, lockWaitMs: w } = await baberuOcr(png);
+        lockWaitMs += w;
+        return text;
     };
     let pending: Promise<string> = startOne();
     for (const b of boxes) {
@@ -73,7 +80,7 @@ export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgr
         pending = following;
         onProgress?.(results.length, boxes.length);
     }
-    return results;
+    return { texts: results, lockWaitMs };
 }
 
 // JPEG base64 helper. Grayscale strips ~2/3 of the payload on B&W pages.
@@ -111,10 +118,15 @@ export function pageIsGrayscale(bitmap: ImageBitmap): boolean {
 function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, x: number, y: number, num: number, r: number, W: number, H: number): void {
     x = Math.min(Math.max(x, r), W - r);
     y = Math.min(Math.max(y, r), H - r);
-    ctx.fillStyle = '#ff2222';
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff2222';
     ctx.fill();
+    // thin white rim: separates the red disc from red/busy artwork (cheap,
+    // grows the mark by half a line width only)
+    ctx.lineWidth = Math.max(1.5, r * 0.16);
+    ctx.strokeStyle = '#fff';
+    ctx.stroke();
     ctx.fillStyle = '#fff';
     ctx.font = `bold ${r / 0.9}px sans-serif`;
     ctx.textAlign = 'center';
@@ -122,16 +134,21 @@ function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingConte
     ctx.fillText(String(num), x, y + r * 0.055);
 }
 
-// Draw numbered badges over each region so the VLM can map them, downscale.
+// Badge size comes from page-cache's annotFont (pure + unit-tested); draw a
+// numbered badge over each region so the VLM can map them, downscale.
 async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: boolean): Promise<string> {
     const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
     const c = new OffscreenCanvas(Math.round(bitmap.width * scale), Math.round(bitmap.height * scale));
     const ctx = c.getContext('2d')!;
     if (grayscale) ctx.filter = 'grayscale(1)';
     ctx.drawImage(bitmap, 0, 0, c.width, c.height);
-    const font = Math.max(18, Math.round(28 * scale * 2));
+    // canvas filters stick to every later draw: without this reset the badges
+    // come out gray whenever the page was grayscale-stripped, while the prompt
+    // tells the model to look for "red number badges" (live-proven mismatch)
+    ctx.filter = 'none';
+    const font = annotFont(scale);
     boxes.forEach((b, i) => drawBadge(ctx, b.x1 * scale, b.y1 * scale, i + 1, font * 0.9, c.width, c.height));
-    return toJpegB64(c, pipeline.jpegQuality); // keep badges red
+    return toJpegB64(c, pipeline.jpegQuality);
 }
 
 // dark pill with exact conf in threshold units (0.xx) — answers directly
@@ -149,9 +166,10 @@ function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContex
 }
 
 // full-res debug view: translated image + CTD boxes/badges/conf, YOLO panels
-// (cyan, numbered in reading order). Below-threshold near-misses draw dimmed
-// gray with conf and NO badge — a badge means "translated in this order".
-export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = []): Promise<string> {
+// (cyan, numbered in reading order), dashed green = the placement area the
+// layout actually got. Below-threshold near-misses draw dimmed gray with conf
+// and NO badge — a badge means "translated in this order".
+export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = []): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d')!;
     ctx.drawImage(bitmap, 0, 0);
@@ -172,6 +190,46 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
         ctx.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
         confPill(ctx, d.x1, d.y1, d.conf.toFixed(2), '#888888', font);
     }
+    ctx.restore();
+    // placement area the layout actually got (pageArea = bubble fill + canvas
+    // clamp — the same call paintRegions makes), dashed green under the red
+    // boxes. Recomputed from the image being drawn: exact on the original
+    // view, off by an ink-frac hairline on the translated one.
+    const frame = ctx.getImageData(0, 0, c.width, c.height);
+    // the orientation the layout will choose for this region's own text, not
+    // the box aspect: a tall box whose translation fits horizontally is laid
+    // out horizontally, and drawing the vertical area under it misled more
+    // than one diagnosis.
+    const textFor = (i: number) => outputs.find(o => o.index === i + 1)?.translation ?? '';
+    ctx.save();
+    ctx.setLineDash([font, font * 0.6]);
+    ctx.strokeStyle = '#2bff88';
+    boxes.forEach((b, i) => {
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
+        if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
+    });
+    // measured per-line runs (enclosed bubbles): orange outline of the shape
+    // the layout actually follows — short at a round bubble's top, long in the
+    // middle. Not drawn for the no-frame fallback (rect only, as before).
+    ctx.setLineDash([font * 0.5, font * 0.4]);
+    ctx.strokeStyle = '#ffa02b';
+    boxes.forEach((b, i) => {
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
+        const prof = a?.runs;
+        if (!prof) return; // forEach: skip boxes without a measured profile
+        const left: [number, number][] = [], right: [number, number][] = [];
+        for (let p = prof.p0; p <= prof.p1; p++) {
+            const k = p - prof.p0;
+            if (prof.i1[k] > prof.i2[k]) continue;
+            left.push(prof.vertical ? [p, prof.i1[k]] : [prof.i1[k], p]);
+            right.unshift(prof.vertical ? [p, prof.i2[k]] : [prof.i2[k], p]);
+        }
+        if (!left.length) return;
+        ctx.beginPath();
+        [...left, ...right].forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+        ctx.closePath();
+        ctx.stroke();
+    });
     ctx.restore();
     boxes.forEach((b, i) => {
         ctx.strokeStyle = '#ff2222';
@@ -205,12 +263,12 @@ export async function ensureDebugViews(): Promise<void> {
                 if (!st.debugOrig) {
                     const orig = await canvasPaintSrc(st, 'orig');
                     if (orig) {
-                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                         pages.set(st.debugOrig, st);
                     }
                 }
                 if (!st.debug && st.translatedBmp) {
-                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                     pages.set(st.debug, st);
                 }
             } catch (e) {
@@ -222,11 +280,11 @@ export async function ensureDebugViews(): Promise<void> {
         try {
             const ranks = panelRanks(st.det.panels ?? []);
             if (!st.debugOrig) {
-                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                 pages.set(st.debugOrig, st);
             }
             if (!st.debug) {
-                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                 pages.set(st.debug, st);
             }
         } catch (e) {
@@ -282,20 +340,35 @@ export interface TranslateOutcome {
     error?: string;          // LLM failure reason (shown in status, no silent dummy)
     errorKind?: string;      // auth | ratelimit | server | network | parse
     errorHint?: string;      // actionable hint for the toast
+    errorRetryAfterMs?: number; // 429: provider cooldown the content arms its auto-halt from
     annW: number; // annotated image dims (LLM coordinate space for extras)
     annH: number;
+    badgeR?: number; // drawn badge radius in that space (absent: no annotated page sent)
     raw?: string;            // present unless the background is stale
     usage?: { inTok?: number; outTok?: number; cachedInTok?: number };
     llmCalls?: number;
     llmMs?: number;
     ocrStatus?: ('ok' | 'empty')[]; // per-region OCR result (engine-agnostic)
     ocrMs?: number; // wall ms of the local OCR phase (undefined when the VLM reads images)
+    ocrLockWaitMs?: number; // ms Baberu runs waited on the shared ORT lock (Tesseract path: undefined)
 }
 
 export async function translateRegions(
     bitmap: ImageBitmap,
     det: DetectResult,
     onStatus: MtOnStatus,
+    // fold:false leaves the book alone and returns the raw outcome for the
+    // caller to fold later — parallel workers must not setContext out of
+    // order (each response is folded over its dispatch-time snapshot, so a
+    // late page would clobber earlier commits). Default folds immediately,
+    // exactly like before.
+    // progressKey/continued: cross-document pill continuity — stamp this
+    // page's LLM dispatch and count from the earliest fresh stamp (an arrival
+    // continuing a shared SW call) instead of restarting at 1s. continued
+    // needs caller corroboration (resumed checkpoint, or no cache to resume
+    // from) so a dead call never inflates the counter; force callers drop the
+    // entry first (fresh work counts fresh).
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean },
 ): Promise<TranslateOutcome> {
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
     // ponytail: region cap 150 — dense art pages can drown a single LLM call;
@@ -308,24 +381,42 @@ export async function translateRegions(
         index: i + 1,
         source: '',           // vision mode: the model reads from the annotated image
     }));
+    // post-OCR checkpoint: the OCR text is the paid half of the split pipeline —
+    // persist it onto the same partial entry detect wrote, so a reload or a
+    // retry after a failed LLM resumes at the translation instead of paying the
+    // OCR again (detFromPartial restores the texts as cloudTexts, which the ocr
+    // gate above accepts). Cloud texts are already in that entry; the 150-region
+    // cap keeps boxes and texts aligned by prefix. Written even with the cache
+    // off (in-flight work, not a cached translation): the finished job deletes
+    // it again in that mode (render-page/seam/sweep).
+    const checkpointOcr = (texts: string[]) => {
+        if (det.cloudTexts || !texts.some(t => t)) return;
+        const boxes = det.boxes.length === texts.length ? det.boxes : det.boxes.slice(0, texts.length);
+        void cachePut(partialEntry(cacheKey(chapterKey(), pageHashFromBitmap(bitmap)), settingsFingerprint(pipeline),
+            { ...det, boxes, cloudTexts: texts }, bitmap.width, bitmap.height), pipeline.cacheMax);
+    };
     try {
         // unified text-source axis: 'page'/'crops' = VLM reads images, 'ocr' =
-        // Tesseract reads locally and the LLM gets text only
-        const ocr = pipeline.textSource === 'ocr';
+        // Tesseract reads locally and the LLM gets text only. Split pipeline
+        // (useOcrModel) transcribes in the background — except cloud pages,
+        // whose texts already arrived with detection (re-reading them is waste).
+        const ocr = pipeline.textSource === 'ocr' || (pipeline.useOcrModel && !!det.cloudTexts?.length);
         const vision = !ocr;
         const cropsOnly = vision && pipeline.textSource === 'crops';
         let imagesB64: string[] | undefined;
         let ocrStatus: ('ok' | 'empty')[] | undefined;
         let ocrMs: number | undefined;
+        let ocrLockWaitMs: number | undefined;
         // dims of the annotated image the model actually sees (extras coords come
         // back in THIS space — the model can't know the full-resolution page)
         let annW = bitmap.width, annH = bitmap.height;
+        let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
         if (ocr) {
             const tOcr = performance.now();
             onStatus('OCR…', 'ocr');
             if (det.cloudTexts) {
                 // cloud path: texts arrived with detection — no local OCR models needed
-                det.cloudTexts.forEach((t, i) => { regions[i].source = t; });
+                det.cloudTexts.forEach((t, i) => { if (regions[i]) regions[i].source = t; });
             } else if (pipeline.ocrEngine === 'baberu') {
                 if (!(await baberuInstalled())) {
                     throw Object.assign(
@@ -333,9 +424,10 @@ export async function translateRegions(
                         { kind: 'ocr', hint: 'Download the model first — Settings → Model → Text source → OCR engine → Download' },
                     );
                 }
-                const texts = await baberuOcrAll(bitmap, det.boxes, (done, total) => {
+                const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, (done, total) => {
                     if (done % 4 === 0 || done === total) onStatus(`OCR ${done}/${total}…`, 'ocr');
                 });
+                ocrLockWaitMs = lockWaitMs;
                 texts.forEach((t, i) => { regions[i].source = t; });
             } else {
                 const installed = new Set(await ocrLangsInstalled(pipeline.ocrLangs));
@@ -355,6 +447,7 @@ export async function translateRegions(
             ocrMs = det.cloudTexts && det.cloudMs
                 ? det.cloudMs.ocr
                 : Math.round(performance.now() - tOcr);
+            checkpointOcr(regions.map(r => r.source));
         } else {
             const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
             if (cropsOnly) {
@@ -364,6 +457,7 @@ export async function translateRegions(
                 const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
                 annW = Math.round(bitmap.width * scale);
                 annH = Math.round(bitmap.height * scale);
+                badgeR = Math.round(annotFont(scale) * 0.9);
                 imagesB64 = [await annotateForVLM(bitmap, det.boxes, gs)];
                 for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs));
             }
@@ -381,8 +475,22 @@ export async function translateRegions(
         // previous status ("OCR n/n…") would otherwise look stuck
         onStatus('LLM translating…', 'llm');
         let llmSeconds = 0;
-        const llmTick = setInterval(() => onStatus(`LLM translating… ${++llmSeconds}s`, 'llm'), 1000);
+        const t0local = Date.now();
+        if (opts?.progressKey) writeProgressT0(opts.progressKey, t0local);
+        // handoff read AFTER our own write is safe by construction: handoffRead
+        // takes the earliest fresh stamp across exact + host-volatile twin keys,
+        // so our just-written entry can never shadow the older twin.
+        const handedT0 = opts?.continued === true && opts?.progressKey ? readProgressT0(opts.progressKey) : null;
+        const tickBase = handedT0 != null && handedT0 <= t0local ? handedT0 : t0local;
+        const llmTick = setInterval(() => {
+            llmSeconds = Math.max(llmSeconds + 1, Math.round((Date.now() - tickBase) / 1000));
+            onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
+        }, 1000);
         let resp: any;
+        // transcripts seen on the interim message — if the RPC channel dies
+        // mid-translate (service worker killed / reloaded), the fallback below
+        // re-sends them so the new worker translates instead of re-transcribing
+        let interimTexts: string[] | null = null;
         const payload = {
             type: 'mt:translate',
             imagesB64,
@@ -394,6 +502,7 @@ export async function translateRegions(
             pageW: annW,
             pageH: annH,
             cacheKey: await resolveMangaId() ?? chapterKey(), // stable per manga → prompt-cache affinity
+            interim: true, // this version handles the mid-flight transcripts message (see portSend)
         };
         // suspend-proof channel: an open runtime port pins the background
         // page alive AND its replies always arrive (Firefox drops a pending
@@ -403,8 +512,16 @@ export async function translateRegions(
         const portSend = () => new Promise<unknown>((resolve, reject) => {
             let port: chrome.runtime.Port;
             try { port = chrome.runtime.connect({ name: 'mt-rpc' }); } catch (e) { reject(e); return; }
-            const to = setTimeout(() => { try { port.disconnect(); } catch { /* gone */ } reject(new Error('translate RPC timeout')); }, 180000);
-            port.onMessage.addListener((r: unknown) => { clearTimeout(to); try { port.disconnect(); } catch { /* gone */ } resolve(r); });
+            const to = setTimeout(() => { try { port.disconnect(); } catch { /* gone */ } reject(new Error('translate RPC timeout')); }, 260000);
+            port.onMessage.addListener((r: unknown) => {
+                // interim: the split pipeline's transcribe finished while the
+                // translate call runs — checkpoint the transcripts now, or a
+                // reload mid-translate re-pays the OCR (the final reply settles
+                // this promise)
+                const m = r as { type?: string; texts?: string[] };
+                if (m?.type === 'mt:ocr-texts' && Array.isArray(m.texts)) { interimTexts = m.texts; checkpointOcr(m.texts); return; }
+                clearTimeout(to); try { port.disconnect(); } catch { /* gone */ } resolve(r);
+            });
             port.onDisconnect.addListener(() => { clearTimeout(to); reject(new Error('background disconnected')); });
             try { port.postMessage(payload); } catch (e) { clearTimeout(to); reject(e); }
         });
@@ -419,7 +536,13 @@ export async function translateRegions(
                 for (const wait of [5000, 20000, 60000]) {
                     await new Promise(r => setTimeout(r, wait));
                     try {
-                        resp = await chrome.runtime.sendMessage(payload);
+                        // transcripts already paid for: the re-send is the same
+                        // text-only translate stage the split pipeline would have
+                        // run, not a re-transcription (images dropped too)
+                        const retryPayload = interimTexts
+                            ? { ...payload, imagesB64: undefined, regions: withSources(payload.regions, interimTexts), vision: false, textOnly: true, ocr: true }
+                            : payload;
+                        resp = await chrome.runtime.sendMessage(retryPayload);
                         lastErr = null;
                         break;
                     } catch (e2) {
@@ -433,8 +556,8 @@ export async function translateRegions(
             clearInterval(llmTick);
         }
         if (!resp?.ok) {
-            const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string };
-            err.kind = resp?.kind; err.hint = resp?.hint;
+            const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string; retryAfterMs?: number };
+            err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
             throw err;
         }
         // extras arrive in annotated-image space → rescale to full-page pixels
@@ -449,26 +572,29 @@ export async function translateRegions(
                 e.x2 > e.x1 && e.y2 > e.y1 &&
                 e.x2 <= bitmap.width * 1.05 && e.y2 <= bitmap.height * 1.05 &&
                 (e.x2 - e.x1) > 12 && (e.y2 - e.y1) > 12);
-        if (shareContext) {
+        if (opts?.fold !== false && shareContext) {
             const c = resp.context as ContextState | undefined;
             setContext((c && Array.isArray(c.characters) && Array.isArray(c.pairs)) ? c : context);
             await saveContext();
         }
         return {
             outputs: resp.outputs as RegionOutput[], extras, usedLLM: true, annW, annH,
+            ...(badgeR != null ? { badgeR } : null),
             mentions: (resp.mentions ?? []) as Mention[],
             bookOps: (resp.bookOps ?? []) as BookOp[],
             raw: resp.raw as string | undefined,
             usage: resp.usage, llmCalls: resp.llmCalls, llmMs: resp.llmMs,
-            ocrStatus, ocrMs,
+            // split pipeline: transcription stats come back from the background
+            ocrStatus: (resp.ocrStatus ?? ocrStatus) as ('ok' | 'empty')[] | undefined, ocrMs: resp.ocrMs ?? ocrMs,
+            ocrLockWaitMs,
         };
     } catch (e) {
-        const err = e as Error & { kind?: string; hint?: string };
+        const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         const error = String(err.message ?? e).slice(0, 160);
         console.warn('[mt] LLM translation failed:', e);
         return {
             outputs: [], extras: [], mentions: [], usedLLM: false, error,
-            errorKind: err.kind, errorHint: err.hint,
+            errorKind: err.kind, errorHint: err.hint, errorRetryAfterMs: err.retryAfterMs,
             annW: bitmap.width, annH: bitmap.height,
         };
     }

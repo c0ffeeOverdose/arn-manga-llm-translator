@@ -25,6 +25,8 @@ export interface PipelineSettings {
     // 'crops' = VLM reads: region crops only (artwork never sent — safety-filter dodge)
     // 'ocr'   = Tesseract reads locally, LLM gets text only (works with text-only models)
     textSource: 'page' | 'crops' | 'ocr';
+    useOcrModel: boolean;      // split pipeline: a separate VLM transcribes (page/crops images), the main model translates text-only
+    ocrPerRegion: boolean;     // force per-region transcribe calls (1 image/call). Default false = auto: batched first, then per-region when the provider rejects the image count (memorized per OCR model)
     readingDir: 'rtl' | 'ltr';   // region numbering order: manga vs manhwa/western
     ocrEngine: 'tesseract' | 'baberu'; // recognition engine when textSource='ocr'
     ocrLangs: string[];         // traineddata languages to load for OCR (must be downloaded first)
@@ -37,6 +39,9 @@ export interface PipelineSettings {
     contextPairs: number;          // cross-page memory depth
     charLimit: number;         // character book cap
     thinkingLevel: string; // preset (see THINKING_LEVELS), custom text, or a numeric token budget — mapped per provider at send time
+    temperature: number | null; // main translate sampling temperature 0-1; null = provider default (parameter not sent)
+    ocrTemperature: number | null; // VLM reader's transcribe calls; default 0 (glyph copying wants no sampling); null = provider default
+    ocrThinking: string; // thinking level for the separate VLM reader's transcribe call (default 'none' — copying glyphs needs no reasoning)
     parallelLlm: number;        // concurrent LLM calls when context is OFF (1 = serial)
     prefetchN: number;         // auto pre-translate window: queued pages ahead (1-30)
     // rendering
@@ -48,6 +53,7 @@ export interface PipelineSettings {
     textColor: string;         // 'auto' (contrast vs background) or '#rrggbb'
     strokeColor: string;       // 'auto' (opposite of resolved text) or '#rrggbb'
     textStroke: number;        // stroke width as fraction of font size (0 = off)
+    textScale: number;         // font ceiling vs the original text's line pitch (1 = same size)
     showToasts: boolean;       // in-page done/error popups (status pill + popup log stay)
 }
 
@@ -66,7 +72,9 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     cropSize: 420,
     jpegQuality: 0.85,
     grayscaleBw: true,
-    textSource: 'page',
+    textSource: 'crops',
+    useOcrModel: false,
+    ocrPerRegion: false,
     readingDir: 'rtl',
     ocrEngine: 'baberu',
     ocrLangs: ['jpn', 'eng'],
@@ -82,6 +90,9 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     contextPairs: 40,
     charLimit: 10,
     thinkingLevel: 'auto',
+    temperature: null,
+    ocrTemperature: 0,
+    ocrThinking: 'none',
     parallelLlm: 3,
     prefetchN: 3,
     minFont: 12,
@@ -92,6 +103,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     textColor: 'auto',
     strokeColor: 'auto',
     textStroke: 0.1,
+    textScale: 1,
     showToasts: true,
 };
 
@@ -192,24 +204,49 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         }
         out.thinkingLevel = t;
     }
+    // VLM-reader thinking: same normalization, default 'none' (transcribe needs no reasoning)
+    {
+        let t = String(out.ocrThinking ?? '').trim();
+        if (!t) t = 'none';
+        else if (t === 'minimal') t = 'low';
+        else {
+            const l = t.toLowerCase();
+            if (l !== t && KNOWN_THINKING.includes(l)) t = l;
+        }
+        out.ocrThinking = t;
+    }
     // ---- migration: pre-textSource settings ----
     if (!s.textSource) {
         if (s.ocrModel === 'tesseract') out.textSource = 'ocr';
         else if (s.visionMode === 'text' || s.useVision === false) out.textSource = 'crops';
-        else out.textSource = 'page';
+        // legacy users who explicitly had vision on keep 'page'; fresh installs
+        // (no legacy keys at all) fall through to the current default
+        else if (s.visionMode != null || s.useVision != null || s.ocrModel != null) out.textSource = 'page';
     }
     if (out.readingDir !== 'rtl' && out.readingDir !== 'ltr') out.readingDir = 'rtl';
     if (typeof out.detConf !== 'number' || !(out.detConf >= 0 && out.detConf <= 1)) out.detConf = 0.35;
     if (typeof out.detMinSize !== 'number' || !(out.detMinSize >= 1 && out.detMinSize <= 200)) out.detMinSize = 12;
     else out.detMinSize = Math.round(out.detMinSize);
     if (typeof out.panelConf !== 'number' || !(out.panelConf >= 0.05 && out.panelConf <= 1)) out.panelConf = 0.20;
-    for (const k of ['textColor', 'strokeColor'] as const) {
+    // sampling temperature: null = provider default; otherwise pinned 0-1.
+    // Reads raw `s`: the nullable default (null) can't match a stored number
+    // in the type-guarded copy loop above.
+    const temp = s.temperature;
+    out.temperature = typeof temp === 'number' && Number.isFinite(temp) && temp >= 0 && temp <= 1 ? temp : null;
+    // OCR temperature: default 0 (not provider default), so junk means "back to 0"
+    const otemp = s.ocrTemperature;
+    out.ocrTemperature = otemp === null
+        ? null
+        : typeof otemp === 'number' && Number.isFinite(otemp) && otemp >= 0 && otemp <= 1 ? otemp : 0;    for (const k of ['textColor', 'strokeColor'] as const) {
         if (out[k] !== 'auto' && (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(out[k]))) out[k] = 'auto';
     }
     if (typeof out.textStroke !== 'number' || !(out.textStroke >= 0 && out.textStroke <= 0.5)) out.textStroke = 0.1;
+    if (typeof out.textScale !== 'number' || !(out.textScale >= 0.6 && out.textScale <= 1.6)) out.textScale = 1;
     if (typeof out.deferLabels !== 'boolean') out.deferLabels = true;
     if (typeof out.showToasts !== 'boolean') out.showToasts = true;
     if (typeof out.transcribeSrc !== 'boolean') out.transcribeSrc = false;
+    if (typeof out.useOcrModel !== 'boolean') out.useOcrModel = false;
+    if (typeof out.ocrPerRegion !== 'boolean') out.ocrPerRegion = false;
     if (out.inferEngine !== 'local' && out.inferEngine !== 'cloud') out.inferEngine = 'local';
     if (out.detEp !== 'auto' && out.detEp !== 'wasm') out.detEp = 'auto';
     if (typeof out.prefetchN !== 'number' || !(out.prefetchN >= 1 && out.prefetchN <= 30)) out.prefetchN = 3;
@@ -246,7 +283,7 @@ export function matchingPreset(s: PipelineSettings): string {
         const full = applyPreset(name);
         let same = true;
         for (const k of Object.keys(DEFAULT_PIPELINE_SETTINGS)) {
-            if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts') continue; // behavior knobs, not quality
+            if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts' || k === 'useOcrModel' || k === 'ocrThinking') continue; // behavior knobs, not quality
             if ((full as any)[k] !== (s as any)[k]) { same = false; break; }
         }
         if (same) return name;

@@ -1,7 +1,7 @@
 // Page discovery + pixel I/O: getPages, refKey, fetch/read/descramble,
 // write-back (img src swap + canvas repaint), hash-lane repaint + healing.
 
-import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, type EpisodeManifest } from './page-cache';
+import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, type EpisodeManifest } from './page-cache';
 import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
 
@@ -97,6 +97,86 @@ export function episodeManifestSrcs(): string[] | null {
     return srcs ? srcs.filter((s): s is string => !!s) : null;
 }
 
+// gallery-manifest source for single-img readers: the embedded script
+// payload first, same-origin API as fallback (hydration may drop the script —
+// the data-url IS the API route, so a direct GET returns the same gallery
+// object; cached per gallery, and a failed fetch caches null so callers
+// never retry-loop it). Shared by lookahead and chapter sweep.
+let galleryManifestCache: { key: string; json: string | null } | null = null;
+export async function galleryManifestJson(): Promise<string | null> {
+    const script = document.querySelector('script[type="application/json"][data-url^="/api/v2/galleries/"]');
+    if (script?.textContent) return script.textContent;
+    const g = location.pathname.match(/^\/g\/(\d+)\/\d+\/?$/);
+    if (!g) return null;
+    if (galleryManifestCache?.key === g[1]) return galleryManifestCache.json;
+    try {
+        const r = await fetch(`/api/v2/galleries/${g[1]}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const json = JSON.stringify({ body: JSON.stringify(await r.json()) });
+        galleryManifestCache = { key: g[1], json };
+        return json;
+    } catch {
+        galleryManifestCache = { key: g[1], json: null };
+        return null;
+    }
+}
+
+// Full-chapter enumeration for paged readers that virtualize the DOM (only
+// the loaded window stays — sweeping DOM refs undercounts). Same public API
+// family resolveMangaId already uses; [] on any failure (external chapter,
+// offline) so callers fall through to the DOM branches silently.
+// Tier match: the reader may show the data-saver variant (different bytes) —
+// sweeping full-data then paints nowhere (URL and hash both miss) and forks
+// a second cache universe the reader can never hit. Probe the first page's
+// full-data dims against a loaded page image; mismatch walks data-saver.
+export async function fetchPagedUrls(): Promise<string[]> {
+    const uuid = pagedChapterUuid(location.pathname, location.hostname);
+    if (!uuid) return [];
+    try {
+        const r = await fetch(`https://api.mangadex.org/at-home/server/${encodeURIComponent(uuid)}`, { signal: AbortSignal.timeout(15000) });
+        if (!r.ok) return [];
+        const j = await r.json();
+        const baseUrl = j?.baseUrl, hash = j?.chapter?.hash;
+        const data = j?.chapter?.data, saver = j?.chapter?.dataSaver;
+        const tier = await pagedTier(baseUrl, hash, data);
+        const files = tier === 'data-saver' && Array.isArray(saver) && saver.length ? saver : data;
+        return buildPagedUrls(baseUrl, hash, files, tier === 'data-saver' && files === saver ? 'data-saver' : 'data');
+    } catch { return []; }
+}
+
+// which at-home tier the reader shows: full-data dims equal a loaded page
+// image, saver dims don't. No loaded page / unreadable probe / junk payload
+// keeps today's full-data default (status quo, never worse).
+async function pagedTier(baseUrl: unknown, hash: unknown, data: unknown): Promise<'data' | 'data-saver'> {
+    try {
+        if (typeof baseUrl !== 'string' || typeof hash !== 'string' || !Array.isArray(data) || !data.length) return 'data';
+        const shown = getPages().find(r => r.kind === 'img' && (r.el as HTMLImageElement).naturalWidth >= 400)?.el as HTMLImageElement | undefined;
+        if (!shown) return 'data';
+        const first = buildPagedUrls(baseUrl, hash, [data[0]], 'data');
+        if (!first.length) return 'data';
+        const f = await fetchBitmap(first[0]);
+        let dw = 0, dh = 0;
+        try { dw = f.bitmap.width; dh = f.bitmap.height; }
+        finally { try { f.bitmap.close(); } catch { /* already closed */ } }
+        const tier = (dw === shown.naturalWidth && dh === shown.naturalHeight) ? 'data' : 'data-saver';
+        if (isDebug()) console.log('[mt] paged tier:', JSON.stringify({ tier, shown: `${shown.naturalWidth}x${shown.naturalHeight}`, data: `${dw}x${dh}` }));
+        return tier;
+    } catch { return 'data'; }
+}
+
+// DOM walk for lazy <img> with an addressable src but no pixels yet (the
+// sweep can fetch these headless — getPages only sees loaded ones). Thin
+// wrapper: the filter/dedupe predicate is pure in page-cache (tested).
+// Same promo/skip exclusions as getPages — an unloaded ad is still an ad.
+export function collectUnloadedUrls(known: Set<string>): string[] {
+    const cands: { src: string; loaded: boolean }[] = [];
+    for (const img of document.querySelectorAll('img')) {
+        if (img.closest('.link-page') || img.closest('[data-mt-skip]')) continue;
+        cands.push({ src: img.currentSrc || img.src, loaded: img.naturalWidth > 0 });
+    }
+    return unloadedPageUrls(cands, known);
+}
+
 // Last-resort pixel source: the direct read failed (CORS-blocked <img>,
 // tainted canvas, hotlink-guarded CDN). Scroll the element into view and ask
 // the background for a viewport screenshot, then crop to the element rect.
@@ -122,13 +202,15 @@ async function screenshotPage(el: Element): Promise<ImageBitmap> {
 }
 
 export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap; bytes: ArrayBuffer }> {
-    // fast path: direct fetch (CORS-open CDNs — comix, MangaDex image servers)
+    // fast path: direct fetch (CORS-open CDNs — comix, MangaDex image servers).
+    // Timeout: a long-tail hang here would wedge a sweep worker forever (the
+    // run watchdog is the last resort — page fetch is the first).
     try {
-        const resp = await fetch(srcUrl);
+        const resp = await fetch(srcUrl, { signal: AbortSignal.timeout(120_000) });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const bytes = await (await resp.blob()).arrayBuffer();
         return { bitmap: await createImageBitmap(new Blob([bytes])), bytes };
-    } catch { /* CORS/hotlink-blocked → worker proxy below */ }
+    } catch { /* CORS/hotlink-blocked/timeout → worker proxy below */ }
     // content-script fetch is CORS-gated on the page origin even with host
     // permissions (some image servers send no ACAO) — the worker fetches free of
     // page CORS, so proxy the bytes through it (readPage falls back to
@@ -216,9 +298,30 @@ export async function readPage(ref: PageRef, srcUrl: string, stashed?: ArrayBuff
             // TAINTED bitmap that explodes later at getImageData, while same-origin
             // blobs are never tainted.
             if (srcUrl.startsWith('blob:')) {
-                try {
-                    return { bitmap: await createImageBitmap(ref.el) };
-                } catch { /* not decoded yet → fetch below */ }
+                const live = ref.el.currentSrc || ref.el.src;
+                if (live === srcUrl) {
+                    try {
+                        return { bitmap: await createImageBitmap(ref.el) };
+                    } catch { /* not decoded yet → fetch below */ }
+                } else {
+                    // the element is showing something else: our own translated
+                    // render (re-translate), a Show-original copy, or a newer blob
+                    // the reader minted. Its pixels are NOT the source — decoding
+                    // them fed the translated page back through detect + OCR
+                    // (live: 6 regions read nothing, a 53s drifting call, and the
+                    // page reported Done with every region kept; the hash was the
+                    // render's, not the page's). The stashed URL is the only
+                    // correct source, and when it is dead the screenshot fallback
+                    // would photograph our own drawing — fail loud instead.
+                    try {
+                        return await fetchBitmap(srcUrl);
+                    } catch {
+                        throw Object.assign(
+                            new Error('original image is no longer available — reload the page and translate again'),
+                            { noScreenshot: true },
+                        );
+                    }
+                }
             }
             // return AWAIT — a bare `return fetchBitmap(...)` skips this try's
             // catch (the promise escapes before the try closes) and the screenshot
@@ -249,6 +352,8 @@ export async function readPage(ref: PageRef, srcUrl: string, stashed?: ArrayBuff
         const bytes = await blob.arrayBuffer();
         return { bitmap: await createImageBitmap(new Blob([bytes])), bytes };
     } catch (e) {
+        // a stale-source verdict must not turn into a photo of our own render
+        if ((e as { noScreenshot?: boolean })?.noScreenshot) throw e;
         // direct read blocked → screenshot fallback, else a clear error naming it
         try {
             return { bitmap: await screenshotPage(ref.el) };
@@ -294,10 +399,32 @@ function syncPictureSources(img: HTMLImageElement, translated: boolean): boolean
     return false;
 }
 
+// Extension-owned copy of the original page, for "Show original" on
+// blob-origin readers (MangaDex etc.): the reader's blob URL is dead or
+// unassignable (the dead-orig guard in writePage), so the only reliable way
+// back is a blob WE own, minted while the pixels are still readable. PNG on
+// purpose — healImgBinding/repaintByHash re-hash element pixels against
+// state.hash; a lossy re-encode would never match and would drop bindings /
+// re-translate the page. Giant strips skip the copy (encode + memory cost):
+// blob readers serve book-sized pages, not 13k-px manhwa strips.
+export const OWN_COPY_MAX_PIXELS = 4_000_000;
+export function ownCopyNeeded(orig: string, w: number, h: number): boolean {
+    return orig.startsWith('blob:') && w * h <= OWN_COPY_MAX_PIXELS;
+}
+export async function ownOriginalUrl(bitmap: ImageBitmap): Promise<string | undefined> {
+    try {
+        const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+        c.getContext('2d')!.drawImage(bitmap, 0, 0);
+        return URL.createObjectURL(await c.convertToBlob({ type: 'image/png' }));
+    } catch {
+        return undefined; // no copy — the old (blocked) behavior, never a broken page
+    }
+}
+
 // explicit "show original" beats everything; each side keeps its own debug
 // view when debug is on (falls back gracefully on pages rendered before it)
 export function shownSrc(st: PageState): string {
-    if (!overlayOn) return debugOn && st.debugOrig ? st.debugOrig : st.orig;
+    if (!overlayOn) return debugOn && st.debugOrig ? st.debugOrig : (st.origOwn ?? st.orig);
     if (debugOn && st.debug) return st.debug;
     return st.translated;
 }
