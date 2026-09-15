@@ -194,7 +194,10 @@ for (const f of ['LICENSE', 'NOTICE']) cpSync(join(root, f), join(dist, f));
 if (release) {
   // store upload artifact: <name>-<version>-{chrome,firefox}.zip next to dist
   const out = join(root, `arn-manga-${pkgVersion}-${firefox ? 'firefox' : 'chrome'}.zip`);
-  execSync(`zip -qr ${out} .`, { cwd: dist });
+  // zip records file mtimes: stamp a fixed time and drop extra attributes so
+  // two rebuilds of the same source are byte-identical (CI asserts this)
+  execSync('find . -exec touch -t 200001010000 {} +', { cwd: dist });
+  execSync(`TZ=UTC zip -qrX ${out} .`, { cwd: dist });
   console.log('release zip ->', out);
 }
 
