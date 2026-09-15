@@ -32,7 +32,7 @@ import { resolveHeadlessDet, preparePage } from './pipeline';
 import { translateRegions, type TranslateOutcome } from './ocr';
 import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, abortLookahead } from './page-cache';
 import type { DetectResult, MtOnStatus } from './detection';
-import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued } from './queue';
+import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued, autoHalted, resumeAuto } from './queue';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn } from './status-ui';
 import { isDebug } from '../debug';
 
@@ -180,6 +180,7 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         // fold them out of the sweep's commit order) — the sweep wins
         abortLookahead();
         dropAutoQueued(); // queued auto jobs would duplicate sweep workers (manual/force intent survives)
+        resumeAuto(); // the button is explicit user intent — a previous provider halt must not block it
         resetContextIfNewChapter();
         await loadPipeline();
         await loadContext();
@@ -303,6 +304,14 @@ async function runSweep(items: SweepItem[]): Promise<void> {
                 if (s && !s.dead && chapterKey() !== chapter) s.dead = true; // SPA story change — quiet abort
                 return;
             }
+            // provider refused (rate limit / auth): the remaining pages would be
+            // refused too — stop dispatch and drain (same path as the error cap)
+            if (autoHalted()) {
+                s.failed = true;
+                s.cancel = true;
+                if (!s.firstErr) s.firstErr = 'provider refused requests (rate limit / auth) — see the error log';
+                return;
+            }
             if (inflight.size >= (s.done >= SWEEP_WARMUP ? SWEEP_JOBS : 1)) { await sleep(400); continue; }
             const k = next++;
             const job = items[k];
@@ -391,7 +400,7 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
             } finally {
                 translating--;
             }
-            if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint });
+            if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
             return { i: job.i, url: job.url, hash, w, h, det: r.det, o };
         } finally {
             try { bitmap.close(); } catch { /* already closed */ }
@@ -431,7 +440,7 @@ async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter
             translating--;
             try { prep.bitmap.close(); } catch { /* already closed */ }
         }
-        if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint });
+        if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
         return { i: job.i, url: job.url, hash: prep.hash, w, h, det: prep.det, o, ref: job.ref };
     } catch (e) {
         cooldownMark(failMarks, job.url, Date.now());

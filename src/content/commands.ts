@@ -5,7 +5,7 @@ import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareCo
 import { getPages, refKey } from './page-io';
 import { cacheClear, cacheCount, cacheCountPrefix } from './page-cache';
 import { isDebug } from '../debug';
-import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued } from './queue';
+import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued, resumeAuto } from './queue';
 import { setStatus, idleStatus, pageCounts, makeToast, logError } from './status-ui';
 import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
@@ -101,6 +101,7 @@ function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => void): 
         return;
     }
     setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
+    resumeAuto(); // user intent — a provider halt (rate limit/auth) waits for exactly this
     let queued = 0, cancelled = 0, active = false;
     for (const c of fresh) {
         const r = enqueue(c.r);
@@ -163,6 +164,7 @@ export function installMessageListener(): void {
                 return;
             }
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
+            resumeAuto(); // user intent — clears a provider halt (rate limit/auth)
             const r = enqueue(ref);
             if (r === 'dup') {
                 // second click on a queued page = cancel it
@@ -191,6 +193,7 @@ export function installMessageListener(): void {
         if (msg?.type === 'mt:retranslate') {
             // re-translate only the page the reader is on (with context rewind)
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
+            resumeAuto(); // user intent — clears a provider halt (rate limit/auth)
             const ref = imgInViewport();
             if (!ref) { sendResponse({ ok: false, error: 'no manga image in view' }); return; }
             if (pageKeyOf(ref) === activeKeyGet()) { sendResponse({ ok: false, error: 'page is rendering right now' }); return; }

@@ -48,6 +48,12 @@ export async function callLLM(
 ): Promise<LlmResult> {
     if (!s.apiKey) throw new MtError('auth', 'No API key configured — open the extension options');
     if (!s.model) throw new MtError('auth', 'No model configured — open the extension options');
+    // provider still in its refusal window: refuse locally, no request sent
+    const limited = rateLimitLeft(s);
+    if (limited) throw new MtError('ratelimit',
+        `Rate limited — ${Math.ceil(limited / 1000)}s left for this provider`,
+        'Auto-translate is stopped while the provider cools down; press Translate on a page to retry, or switch model/provider',
+        undefined, limited);
     const base = (s.baseUrl || DEFAULT_BASES[s.provider]).replace(/\/$/, '');
     const t = thinkingLevel.trim();
     const thinking = !t || t === 'auto' ? null : t;
@@ -58,6 +64,9 @@ export async function callLLM(
         const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, temp, maxTokens);
         return { ...r, ms: Date.now() - t0 };
     } catch (e) {
+        // refused by the provider: arm the window for this provider|baseUrl
+        // before the retry-without branches below (a 429 is neither 400 nor 422)
+        if (e instanceof LlmHttpError && e.status === 429) noteRateLimit(s, e.retryAfterMs ?? RATE_LIMIT_DEFAULT_MS);
         // some models reject the thinking param entirely — retry once without it
         if (thinking && e instanceof LlmHttpError && (e.status === 400 || e.status === 422)) {
             console.warn('[mt:bg] model rejected thinking level, retrying without');
@@ -118,7 +127,10 @@ export class MtError extends Error {
     // set when the provider rejected the REQUEST's image COUNT (not its image
     // support): the split-OCR stage falls back to one-image-per-region calls
     // and remembers the verdict for the model
-    constructor(public kind: MtErrorKind, msg: string, public hint?: string, public imageCap?: boolean) { super(msg); }
+    constructor(public kind: MtErrorKind, msg: string, public hint?: string, public imageCap?: boolean,
+        // 429 only: how long the provider asked us to wait. The content script
+        // arms its auto-halt window from this.
+        public retryAfterMs?: number) { super(msg); }
 }
 // "too many images for this model" classification: tagged by our own adapters
 // when they know the shape (CF 3030), keyword-matched otherwise. Must NOT match
@@ -148,15 +160,46 @@ export interface LlmResult {
 const num = (v: unknown): number | undefined => { const n = Number(v); return Number.isFinite(n) ? n : undefined; };
 
 class LlmHttpError extends Error {
-    constructor(public status: number, msg: string, public providerCode?: number) { super(msg); }
+    constructor(public status: number, msg: string, public providerCode?: number, public retryAfterMs?: number) { super(msg); }
 }
 
 // exported for tests (lets them build a faithful 400 without touching fetch)
 export { LlmHttpError };
 
+// ---- provider rate-limit breaker ----
+// A 429 is a refusal, not a hiccup: retrying inside the window only burns the
+// allowance that is left. Live case: three stacked retry layers (per-call
+// attempts x page cooldown x sweep/lookahead workers) turned one OpenRouter
+// 429 into 24 identical requests in three minutes. Once a provider refuses,
+// every further call to that provider is refused locally until the window
+// passes — the content script halts auto and the user decides what to do next.
+const RATE_LIMIT_DEFAULT_MS = 45_000;
+const RATE_LIMIT_MAX_MS = 300_000;
+const rateLimitedUntil = new Map<string, number>();
+function rlKey(s: LLMSettings): string { return `${s.provider}|${s.baseUrl ?? ''}`; }
+// Retry-After: seconds or HTTP-date (missing/garbage = the default window).
+function retryAfterFrom(resp: Response): number {
+    const h = resp.headers?.get?.('Retry-After')?.trim();
+    if (!h) return RATE_LIMIT_DEFAULT_MS;
+    const secs = Number(h);
+    const ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(h) - Date.now();
+    if (!Number.isFinite(ms)) return RATE_LIMIT_DEFAULT_MS;
+    return Math.min(RATE_LIMIT_MAX_MS, Math.max(1000, ms));
+}
+function rateLimitLeft(s: LLMSettings): number {
+    const until = rateLimitedUntil.get(rlKey(s));
+    if (!until) return 0;
+    if (until <= Date.now()) { rateLimitedUntil.delete(rlKey(s)); return 0; }
+    return until - Date.now();
+}
+function noteRateLimit(s: LLMSettings, ms: number): void {
+    rateLimitedUntil.set(rlKey(s), Date.now() + Math.min(RATE_LIMIT_MAX_MS, Math.max(1000, ms)));
+}
+
 async function checkOk(resp: Response): Promise<string> {
     const text = await resp.text();
-    if (!resp.ok) throw new LlmHttpError(resp.status, `LLM API ${resp.status}: ${text.slice(0, 300)}`);
+    if (!resp.ok) throw new LlmHttpError(resp.status, `LLM API ${resp.status}: ${text.slice(0, 300)}`,
+        undefined, resp.status === 429 ? retryAfterFrom(resp) : undefined);
     return text;
 }
 
@@ -175,7 +218,9 @@ export function toMtError(e: unknown): MtError {
         }
         if (e.status === 402) return new MtError('auth', e.message, 'Out of credits/quota — top up or switch provider');
         if (e.status === 404) return new MtError('auth', e.message, 'Wrong model name — check the model in Settings');
-        if (e.status === 429) return new MtError('ratelimit', e.message, 'Rate limited — lower Parallel LLM in Settings or wait a moment');
+        if (e.status === 429) return new MtError('ratelimit', e.message,
+            'Rate limited by the provider — auto-translate is stopped. Wait for the cooldown, then press Translate on a page (or lower Parallel LLM / check the model quota)',
+            undefined, e.retryAfterMs);
         if (e.status === 400 && /image|base64|data uri|input_image|multimodal|media_type|content\[|not support/i.test(e.message))
             return new MtError('parse', e.message, "This model can't read images — switch to Local OCR or pick another model");
         if (e.status >= 500) return new MtError('server', e.message, 'Provider is temporarily down — you can retry');
@@ -524,6 +569,7 @@ async function cloudflareChat(base: string, s: LLMSettings, prompt: string, imag
             ?? new LlmHttpError(resp.status, `LLM API ${resp.status}: ${text.slice(0, 300)}`);
         const hint = cfImageCapHint(err.providerCode, images?.length ?? 0);
         if (hint) throw new MtError('parse', err.message, hint, true);
+        if (resp.status === 429) err.retryAfterMs = retryAfterFrom(resp);
         throw err;
     }
     if (!data) throw new LlmHttpError(resp.status, `Cloudflare Workers AI returned non-JSON: ${text.slice(0, 200)}`);

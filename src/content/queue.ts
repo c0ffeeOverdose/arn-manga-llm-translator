@@ -40,6 +40,19 @@ export function paintBusy(): boolean { return paintRunning > 0 || paintQueue.len
 // failure cooldown per page key: a failed job parks for 60s (max 3 attempts)
 // instead of being re-enqueued every autoTick — auto-retry without token burn
 export const failMarks = new Map<string, FailMark>();
+// provider stop ("halt"): a rate-limit refusal — or an auth/quota error — cannot
+// be fixed by translating the next page, and the stacked retry layers (call
+// attempts x page cooldown x lookahead/sweep workers) are what turned one 429
+// into a request storm (live: 24 identical requests in 3 minutes). The first
+// refusal arms a window (the adapter refuses further calls to that provider)
+// and halts auto fanout; only explicit user intent resumes: Translate /
+// Retranslate, the popup auto toggle, Translate chapter, or a page reload.
+let autoHalt: { kind: string; until: number } | null = null;
+export function haltAuto(kind: string, retryAfterMs = 0): void {
+    autoHalt = { kind, until: retryAfterMs > 0 ? Date.now() + retryAfterMs : 0 };
+}
+export function autoHalted(): { kind: string; until: number } | null { return autoHalt; }
+export function resumeAuto(): void { autoHalt = null; }
 let activeRef: PageRef | null = null; // job currently rendering
 let activeKey: string | null = null; // its page key — twins on swapped elements map here
 let activePrep: Promise<Prep | null> | null = null; // its prep — seam owners await members' preps, active included
@@ -329,8 +342,14 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         applyOverlays();
         cooldownClear(failMarks, job.key);
     } catch (e) {
-        const err = e as Error & { kind?: string; hint?: string };
+        const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         cooldownMark(failMarks, job.key, Date.now());
+        // a refusal stops the chapter's background work: retrying page after
+        // page cannot succeed while the provider refuses (see haltAuto)
+        if (err.kind === 'ratelimit' || err.kind === 'auth') {
+            haltAuto(err.kind, err.retryAfterMs ?? 0);
+            dropAutoQueued();
+        }
         const msg = 'Error: ' + err.message;
         removeActivity(job.key);
         lastMsgSet({ text: msg, phase: 'error' });

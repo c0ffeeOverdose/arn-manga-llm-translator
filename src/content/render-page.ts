@@ -39,7 +39,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     let outputs: RegionOutput[], extras: ExtraRegion[], usedLLM: boolean;
     let mentions: Mention[] = [];
     let bookOps: BookOp[] | undefined;
-    let error: string | undefined, errorKind: string | undefined, errorHint: string | undefined;
+    let error: string | undefined, errorKind: string | undefined, errorHint: string | undefined, errorRetryAfterMs: number | undefined;
     let annWCache: number, annHCache: number, rawLLM: string | undefined;
     let usage: { inTok?: number; outTok?: number; cachedInTok?: number } | undefined;
     let llmCalls: number | undefined, llmMs: number | undefined, ocrStatus: ('ok' | 'empty')[] | undefined, ocrMs: number | undefined, ocrLockWaitMs: number | undefined, badgeR: number | undefined;
@@ -57,12 +57,12 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         if (shareContext && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
     } else {
         onStatus('Translating…');
-        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
+        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, errorRetryAfterMs, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
             { progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled }));
 
         if (error) {
-            const e = new Error(`LLM failed: ${error}`) as Error & { kind?: string; hint?: string };
-            e.kind = errorKind; e.hint = errorHint;
+            const e = new Error(`LLM failed: ${error}`) as Error & { kind?: string; hint?: string; retryAfterMs?: number };
+            e.kind = errorKind; e.hint = errorHint; e.retryAfterMs = errorRetryAfterMs;
             throw e;
         }
         bookAdd(prep.hash); // folded above (translateRegions) — arrivals skip refold

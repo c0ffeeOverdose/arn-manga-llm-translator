@@ -340,6 +340,7 @@ export interface TranslateOutcome {
     error?: string;          // LLM failure reason (shown in status, no silent dummy)
     errorKind?: string;      // auth | ratelimit | server | network | parse
     errorHint?: string;      // actionable hint for the toast
+    errorRetryAfterMs?: number; // 429: provider cooldown the content arms its auto-halt from
     annW: number; // annotated image dims (LLM coordinate space for extras)
     annH: number;
     badgeR?: number; // drawn badge radius in that space (absent: no annotated page sent)
@@ -555,8 +556,8 @@ export async function translateRegions(
             clearInterval(llmTick);
         }
         if (!resp?.ok) {
-            const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string };
-            err.kind = resp?.kind; err.hint = resp?.hint;
+            const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string; retryAfterMs?: number };
+            err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
             throw err;
         }
         // extras arrive in annotated-image space → rescale to full-page pixels
@@ -588,12 +589,12 @@ export async function translateRegions(
             ocrLockWaitMs,
         };
     } catch (e) {
-        const err = e as Error & { kind?: string; hint?: string };
+        const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         const error = String(err.message ?? e).slice(0, 160);
         console.warn('[mt] LLM translation failed:', e);
         return {
             outputs: [], extras: [], mentions: [], usedLLM: false, error,
-            errorKind: err.kind, errorHint: err.hint,
+            errorKind: err.kind, errorHint: err.hint, errorRetryAfterMs: err.retryAfterMs,
             annW: bitmap.width, annH: bitmap.height,
         };
     }

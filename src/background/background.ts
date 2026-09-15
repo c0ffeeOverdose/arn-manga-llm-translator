@@ -137,6 +137,9 @@ async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: 
 // in batches of parallelLlm. Usage sums; ms is the wall time of the phase.
 // A single region failing leaves its source empty (the page retries it later);
 // ALL regions failing rethrows the first error (never a silent empty page).
+// A refusal (429) or auth error stops the remaining regions: they would fail
+// the same way, and on a rate-limited provider that fanout is what turns one
+// 429 into a request storm.
 async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller, temperature: number | null): Promise<TranscribeResult> {
     const crops = msg.textOnly ? (msg.imagesB64 ?? []) : (msg.imagesB64 ?? []).slice(1);
     const prompt = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false });
@@ -144,6 +147,7 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
     const raws: string[] = [];
     const usage: LlmUsage = {};
     let calls = 0, failures = 0;
+    let stopped = false;
     let tempDropped = false;
     let thinkingDropped = false;
     let firstErr: unknown;
@@ -165,11 +169,16 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
             } catch (e) {
                 failures++;
                 if (!firstErr) firstErr = e;
+                const k = toMtError(e).kind;
+                if (k === 'ratelimit' || k === 'auth') stopped = true;
                 console.warn('[mt:bg] ocr region failed:', r.index, (e as Error)?.message);
             }
         }));
+        if (stopped) break; // no further regions — the provider is refusing
     }
-    if (msg.regions.length && failures === msg.regions.length && firstErr) throw firstErr;
+    // every region failed, or we stopped early on a refusal: fail loudly (a
+    // partial page would sail past the caller's "no text" guard)
+    if (firstErr && (stopped || failures === msg.regions.length)) throw firstErr;
     return { preRaw: raws.join('\n'), sources, usage, calls, ms: Math.round(performance.now() - t0), tempDropped, thinkingDropped };
 }
 
@@ -515,9 +524,11 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 ? msg.context : EMPTY_CONTEXT;
             const ctx = applyOverrides(msgCtx, (mtCharOverrides ?? {}) as Record<string, { gender: 'M' | 'F' | '?'; name?: string }>);
             const vision = !msg.ocr && !!msg.imagesB64?.length;
-            // LLM call with strategic retry: 429/5xx/network get backoff retries
+            // LLM call with strategic retry: 5xx/network get backoff retries
             // (a page costing 2 retries still beats failing the whole job);
-            // auth/quota errors fail fast — retrying can't fix them.
+            // auth/quota errors fail fast — retrying can't fix them; a 429 is
+            // refused locally by the adapter's breaker until its window passes
+            // (live: retrying 429s turned one refusal into 24 requests in 3min).
             const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }> => {
                 let calls = 0;
                 let ms = 0;
@@ -533,7 +544,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                         return { text: r.text, usage: r.usage, calls, ms, tempDropped, thinkingDropped };
                     } catch (e) {
                         const m = toMtError(e);
-                        const retryable = m.kind === 'ratelimit' || m.kind === 'server' || m.kind === 'network';
+                        const retryable = m.kind === 'server' || m.kind === 'network';
                         if (!retryable || attempt >= 2) throw m;
                         await new Promise(r => setTimeout(r, attempt === 0 ? 1000 : 4000));
                     }
@@ -751,7 +762,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             });
         } catch (e) {
             const m = toMtError(e);
-            const out = { ok: false, error: m.message, kind: m.kind, hint: m.hint };
+            const out = { ok: false, error: m.message, kind: m.kind, hint: m.hint, retryAfterMs: m.retryAfterMs };
             if (settle) settle(out);
             else send(out);
         }

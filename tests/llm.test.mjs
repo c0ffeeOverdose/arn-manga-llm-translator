@@ -1094,3 +1094,91 @@ test('translateRequestId: stable 64-hex, sensitive to every output-shaping input
     assert.notEqual(await translateRequestId(translateRequestParts(r, s)), id, `must re-key on ${why}`);
   }
 });
+
+// ---- provider rate-limit breaker: a 429 is a refusal, not a hiccup ----
+// Live case (OpenRouter free VLM): per-call retries x page cooldown x
+// sweep/lookahead workers turned one 429 into 24 identical requests in 3min.
+
+test('429: no retry, one request only, and Retry-After arms the window', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return {
+      ok: false, status: 429,
+      headers: { get: (h) => (String(h).toLowerCase() === 'retry-after' ? '2' : null) },
+      async text() { return JSON.stringify({ error: { message: 'rate limited, slow down' } }); },
+    };
+  };
+  const s = { provider: 'openai', baseUrl: 'https://rl-a.test/v1', model: 'm', apiKey: 'k' };
+  try {
+    let first;
+    try { await callLLM(s, 'p'); } catch (e) { first = e; }
+    assert.equal(calls, 1, 'a refusal is not retried (the breaker owns the wait)');
+    const m = toMtError(first);
+    assert.equal(m.kind, 'ratelimit');
+    assert.equal(m.retryAfterMs, 2000, 'window follows the Retry-After header');
+    // inside the window: refused locally, no request goes out
+    let second;
+    try { await callLLM(s, 'p'); } catch (e) { second = e; }
+    assert.equal(calls, 1, 'no request while the provider is refusing');
+    assert.equal(second.kind, 'ratelimit');
+    assert.ok(second.retryAfterMs > 0 && second.retryAfterMs <= 2000, 'remaining time is reported');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('429 without Retry-After: the default cooldown still blocks the retry', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return { ok: false, status: 429, async text() { return '{}'; } };
+  };
+  const s = { provider: 'openai', baseUrl: 'https://rl-b.test/v1', model: 'm', apiKey: 'k' };
+  try {
+    await callLLM(s, 'p').catch(() => {});
+    await callLLM(s, 'p').catch(() => {});
+    assert.equal(calls, 1, 'default window (45s) blocks the second call too');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('429: the window is per provider|baseUrl and expires', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const realFetch = globalThis.fetch;
+  let limited = 0, other = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('rl-c.test')) {
+      limited++;
+      return {
+        ok: false, status: 429,
+        headers: { get: () => '2' },
+        async text() { return '{}'; },
+      };
+    }
+    other++;
+    return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }] }); } };
+  };
+  const a = { provider: 'openai', baseUrl: 'https://rl-c.test/v1', model: 'm', apiKey: 'k' };
+  const b = { provider: 'openai', baseUrl: 'https://rl-d.test/v1', model: 'm', apiKey: 'k' };
+  try {
+    await callLLM(a, 'p').catch(() => {});
+    assert.equal(limited, 1);
+    // another provider keeps working — a 429 on a free OCR model must not
+    // block the (separate) translation provider
+    await callLLM(b, 'p');
+    assert.equal(other, 1, 'separate provider unaffected');
+    // window still open → blocked; after it expires → request goes out again
+    await callLLM(a, 'p').catch(() => {});
+    assert.equal(limited, 1);
+    t.mock.timers.tick(2100);
+    await callLLM(a, 'p').catch(() => {});
+    assert.equal(limited, 2, 'window expired — the next call is allowed through');
+  } finally {
+    t.mock.timers.reset();
+    globalThis.fetch = realFetch;
+  }
+});

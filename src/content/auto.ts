@@ -10,7 +10,7 @@ import { fetchBitmap, getPages, unscrambleTiles, episodeManifestSrcs, galleryMan
 import { resolveHeadlessDet } from './pipeline';
 import { sweepHas, sweepActive, bookAdd } from './sweep';
 import { translateRegions } from './ocr';
-import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas } from './queue';
+import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto } from './queue';
 import { cooldownMark, cooldownParked } from './page-cache';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, registerAutoTranslateFlag } from './status-ui';
 
@@ -36,6 +36,9 @@ async function autoTick(): Promise<void> {
         }
     }
     if (!autoTranslate) return;
+    // provider refused (rate limit / auth): auto is stopped until the user acts
+    // — every request in the meantime would be refused again (see haltAuto)
+    if (autoHalted()) return;
     // chapter sweep owns this chapter right now — its commits paint arrivals
     // and its folds must stay ordered; auto jobs would duplicate work, and a
     // fresh-translate setContext would clobber the sweep's book. Manual
@@ -121,7 +124,7 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         // still beats an untranslated arrival, and arrival can force if needed
         const o = await translateRegions(bitmap, det, onStatus,
             { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled });
-        if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint });
+        if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
         onStatus('Saving…', 'render'); // headless has no paint — the cache write is the last leg
         bookAdd(hash); // folded above (translateRegions) — arrival must not refold
         if (pipeline.cacheEnabled) {
@@ -197,6 +200,7 @@ async function prefetchAhead(): Promise<void> {
         for (const url of urls) {
             if (chapterKey() !== chapter) break; // SPA story change — abort quietly
             if (lookaheadCancel) break; // user stop — drain after the in-flight page below
+            if (autoHalted()) break; // provider refused — the job that hit it already stopped us
             if (sweepActive()) break; // sweep started mid-chain — it owns these pages now (startSweep also aborts us, belt & braces)
             try {
                 if (isDebug()) console.log('[mt] prefetch lookahead:', url); // full URL — host matters (volatile CDN hosts)
@@ -255,6 +259,7 @@ export async function setAutoTranslate(on: boolean): Promise<void> {
         if (touched) renderStatus();
         return;
     }
+    resumeAuto(); // the user switched auto on again — their intent outranks a provider halt
     if (autoTimer == null) {
         autoTimer = setInterval(autoTick, 2500);
         autoTick(); // start with the page the reader is on right now

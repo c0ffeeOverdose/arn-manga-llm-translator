@@ -6,7 +6,7 @@ import type { MtStage } from './detection';
 import { initDebug, isDebug } from '../debug';
 import { pipeline, ui, mtPal, mtDot, stateFor, setDebugOn, type MtState } from './state';
 import { getPages } from './page-io';
-import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap, paintFind, paintHas, paintQueued } from './queue';
+import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap, paintFind, paintHas, paintQueued, autoHalted } from './queue';
 import { ensureDebugViews } from './ocr';
 import { applyOverlays } from './overlays';
 
@@ -62,6 +62,14 @@ export function pageCounts(): { loaded: number; translated: number; queued: numb
 }
 
 export function idleStatus(): string {
+    // a provider halt outranks the counts: nothing else will run until the user
+    // acts, and that is the one thing the pill should be saying (see haltAuto)
+    const halted = autoHalted();
+    if (halted) {
+        if (halted.kind !== 'ratelimit') return 'Auth/quota error — fix the key, then press Translate';
+        const left = halted.until > Date.now() ? ` (${Math.ceil((halted.until - Date.now()) / 1000)}s)` : '';
+        return `Rate limited${left} — stopped; press Translate to resume`;
+    }
     const { loaded, translated, queued } = pageCounts();
     // pages parked after errors — shown only while auto is on (the mode that
     // would otherwise retry them silently). Counts loaded pages only.
