@@ -67,7 +67,7 @@ test('responses maps to reasoning.effort', async () => {
   assert.deepEqual(bodies[0].reasoning, { effort: 'xhigh' });
 });
 
-test('responses: no default output cap (reasoning counts toward it); explicit caps always pass', async () => {
+test('responses: no output cap on any path — transcribe included', async () => {
   stubFetch('responses');
   await callLLM(settings('responses'), 'p', undefined, 'auto');
   assert.ok(!('max_output_tokens' in bodies[0]), 'plain calls leave the provider default');
@@ -75,16 +75,19 @@ test('responses: no default output cap (reasoning counts toward it); explicit ca
   assert.ok(!('max_output_tokens' in bodies[1]), 'thinking runs leave the provider default');
   await callLLM(settings('responses'), 'p', undefined, 'none');
   assert.ok(!('max_output_tokens' in bodies[2]), 'none = no reasoning param, but models reason anyway — no cap');
-  await callLLM(settings('responses'), 'p', undefined, 'low', undefined, null, 512);
-  assert.equal(bodies[3].max_output_tokens, 512, 'transcribe caps are explicit and still ride');
+  // transcribe shape (pinned temperature, no cap): a cap here is spent on
+  // reasoning before the answer starts — a 512/1024 one failed whole pages
+  await callLLM(settings('responses'), 'p', undefined, 'none', undefined, 0);
+  assert.ok(!('max_output_tokens' in bodies[3]), 'transcribe calls are capless too');
 });
 
 test('responses: incomplete with no output throws the reasoning-budget hint', async () => {
   stubFetch('responses');
   // live shape: HTTP 200, status incomplete, max_output_tokens, zero output items
-  queue = [{ status: 200, body: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [], usage: { output_tokens: 4096 } } }];
+  queue = [{ status: 200, body: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [], usage: { output_tokens: 4096, output_tokens_details: { reasoning_tokens: 4093 } } } }];
   await assert.rejects(() => callLLM(settings('responses'), 'p'), (e) => {
     assert.match(e.message, /incomplete/);
+    assert.match(e.message, /reasoning 4093 tokens/, 'the reasoning burn is reported — that is the whole answer to "why"');
     assert.match(e.hint ?? '', /reasoning/i);
     return true;
   });

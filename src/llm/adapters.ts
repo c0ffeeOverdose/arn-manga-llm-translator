@@ -347,7 +347,12 @@ async function responses(base: string, s: LLMSettings, prompt: string, images?: 
     // output format)", pointing at the wrong thing entirely.
     if (!answer && data.status === 'incomplete') {
         const reason = String(data.incomplete_details?.reason ?? 'unknown');
-        throw new MtError('parse', `Model response incomplete (${reason}) with no output`,
+        // how much of the budget the model burned before answering: tells the
+        // user whether it ran out while thinking (no fixed cap can fix that —
+        // the model or its Thinking level has to change)
+        const reasoning = num(data.usage?.output_tokens_details?.reasoning_tokens);
+        if (reasoning) console.warn(`[mt:bg] model ran out of output tokens while reasoning (${reasoning} reasoning tokens)`);
+        throw new MtError('parse', `Model response incomplete (${reason}) with no output${reasoning ? ` (reasoning ${reasoning} tokens)` : ''}`,
             reason === 'max_output_tokens'
                 ? 'The model ran out of output tokens before answering (reasoning counts toward the cap) — lower Thinking in Options or pick a lighter model'
                 : 'The provider cut the response short — retry, or pick another model in Options');

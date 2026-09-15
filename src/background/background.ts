@@ -119,15 +119,15 @@ function getSessionSalt(): Promise<number> {
 interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }
 // the handler owns retry/backoff (rate-limit aware) — helpers just call through
 type LlmCaller = (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }>;
-// transcribe caps: one region needs a line, not 4096 tokens — a model that
-// drifts past the format would otherwise generate for minutes at slow providers
-// (live: a drifting CF llama-3.2 call ran the full 4096 for 106s)
-const OCR_REGION_MAX_TOKENS = 512;
-const OCR_BATCH_MAX_TOKENS = 1024;
+// transcribe calls send NO output cap: the cap includes reasoning tokens on
+// reasoning models (a 512/1024 cap came back `incomplete` with an empty output
+// and failed the whole page), and a drifting generation is bounded by the
+// adapter's platform default (4096) and LLM_TIMEOUT_MS anyway — the junk it
+// produces is discarded by joinTranscription either way.
 
 async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller, temperature: number | null): Promise<TranscribeResult> {
     const prompt = buildPrompt(msg.regions, EMPTY_CONTEXT, true, { textOnly: msg.textOnly, transcribeOnly: true, chars: false });
-    const t = await call(ocr, prompt, msg.imagesB64, pipeline.ocrThinking, temperature, OCR_BATCH_MAX_TOKENS);
+    const t = await call(ocr, prompt, msg.imagesB64, pipeline.ocrThinking, temperature);
     const sources = new Map(parseResponse(t.text, msg.regions.length).regions
         .map(o => [o.index, o.translation === 'keep' ? '' : o.translation] as const));
     return { preRaw: t.text, sources, usage: t.usage ?? {}, calls: t.calls, ms: t.ms, tempDropped: t.tempDropped, thinkingDropped: t.thinkingDropped };
@@ -158,7 +158,7 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
             const crop = crops[i + j];
             if (!crop) { failures++; return; }
             try {
-                const res = await call(ocr, prompt, [crop], pipeline.ocrThinking, temperature, OCR_REGION_MAX_TOKENS);
+                const res = await call(ocr, prompt, [crop], pipeline.ocrThinking, temperature);
                 if (res.tempDropped) tempDropped = true;
                 if (res.thinkingDropped) thinkingDropped = true;
                 raws.push(`--- region ${r.index} ---\n${res.text}`);
@@ -276,7 +276,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                     textOnly: true, transcribeOnly: true, chars: false,
                 });
                 const t = (msg.thinking ?? '').trim() || 'none';
-                const r = await callLLM(msg.settings, prompt, [msg.imageB64], t, 'test', msg.temperature ?? null, OCR_REGION_MAX_TOKENS);
+                const r = await callLLM(msg.settings, prompt, [msg.imageB64], t, 'test', msg.temperature ?? null);
                 if (r.tempDropped) ocrNoTemperature.add(ocrCapKey(msg.settings));
                 if (r.thinkingDropped) ocrNoThinking.add(ocrCapKey(msg.settings));
                 const first = parseResponse(r.text, 1).regions[0];
@@ -295,7 +295,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 let multiImage: boolean | undefined = ocrSingleImage.has(capKey) ? false : undefined;
                 if (multiImage === undefined) {
                     try {
-                        await callLLM(msg.settings, prompt, [msg.imageB64, msg.imageB64], t, 'test', null, OCR_REGION_MAX_TOKENS);
+                        await callLLM(msg.settings, prompt, [msg.imageB64, msg.imageB64], t, 'test', null);
                         multiImage = true;
                         ocrSingleImage.delete(capKey);
                     } catch (e) {
