@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 12;
+export const RENDER_GEN = 13;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -649,11 +649,17 @@ export function runInterval(prof: RunProfile, p0: number, p1: number): [number, 
 // evidence says there is no bubble around this box.
 function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
     const rect = (why: string): LayoutRect => ({ ...bubbleArea(img, box), why });
-    // 0.6 per side = at most 2.2x the box per axis: a bubble hugging its text
+    // Per-axis leash. Stacking axis 0.6/side (≤2.2x): a bubble hugging its text
     // is well inside that, while a leaked fill (barely-enclosed white garment,
-    // bubble tail slipping into a same-colored drawing) cannot run away —
-    // beyond this the legacy 1.5x-capped rect takes over.
-    const fill = interiorFill(img, box, 0.6, 0.6, true);
+    // bubble tail slipping into a same-colored drawing) cannot run away.
+    // Run axis 1.2/side (≤3.4x): that is the axis a SHORT source runs along, and
+    // the bubble can sit far wider than the box there — a 5-glyph column in a
+    // round bubble measured ~1.1x its box to the outline, so a 0.6 window
+    // clipped the fill and a window-clipped end is not outline evidence
+    // (enclosed read 0 → rect → 1.5x cap → Thai wrapped into a skinny strip).
+    // 3.4x still clips the measured leak (a caption fill that ran 3.9x its box
+    // into the page margin), whose clipped ends keep the rect fallback.
+    const fill = interiorFill(img, box, vertical ? 0.6 : 1.2, vertical ? 1.2 : 0.6, true);
     const [r0, g0, b0] = fill.seed;
     let { minX, minY, maxX, maxY } = fill;
     ({ minX, maxX, minY, maxY } = clampToBorders(img.data, img.width, img.height, [r0, g0, b0], box, { minX, minY, maxX, maxY }));

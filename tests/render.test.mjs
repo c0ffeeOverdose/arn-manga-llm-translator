@@ -519,6 +519,27 @@ test('layoutArea: a vertical glyph column keeps the bubble width', () => {
   assert.ok(a.w >= 150, `vertical area spans the bubble, not the column (w=${a.w})`);
 });
 
+// live regression (short vertical column in a big round bubble): the box is
+// 127x214 (aspect 1.68 < verticalThreshold 2.2) so the layout is horizontal —
+// and the box's run axis is x, where the bubble is ~3x wider. The old window
+// (+-60% per side) stopped the fill short of the outline, and a window-clipped
+// run end counts as NO evidence, so `enclosed` read 0, the rect path took over
+// and capped the area at 1.5x the box: Thai wrapped into a skinny strip inside
+// a big empty bubble.
+test('layoutArea: a short column in a big round bubble keeps the bubble area', () => {
+  const W = 500, H = 600;
+  const img = ringPage(W, H, 250, 300, 200);
+  for (let y = 203; y <= 397; y++) for (let x = 235; x <= 265; x++) {
+    const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+  }
+  const box = { x1: 187, y1: 193, x2: 313, y2: 407, conf: 0.9 };
+  assert.equal(boxIsVertical(box), false, 'premise: 127x214 stays below the vertical threshold');
+  const a = layoutArea(img, box);
+  assert.ok(a && a.runs, 'profile path taken');
+  assert.ok(a.runs.enclosed >= ENCLOSED_MIN, `outline encloses the rows, got ${a.runs.enclosed}`);
+  assert.ok(a.w >= 300, `area spans the bubble, not the 1.5x box cap (w=${a.w})`);
+});
+
 // A block's first wrap pass starts at the area's reading-order edge, where a
 // round bubble is narrowest. A short line that fits the centered band must not
 // be skipped because it cannot fit that edge band — the size loop used to drop
