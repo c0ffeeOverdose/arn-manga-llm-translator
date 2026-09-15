@@ -599,3 +599,20 @@ test('layoutTextFit: a block that only wraps from the middle band is centered', 
   assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `block centered (top=${fit.top}, span=${span}, center=${center})`);
   assert.ok(fit.centers[0] > 100, `line 0 centered on the wide band (got ${fit.centers[0]})`);
 });
+
+// live regression (badge 6, page 8): the round bubble's narrow top band wraps
+// the text into MORE lines than the wide middle band does. The centered anchor
+// used to come from the edge pass's longer span, so the shorter final block sat
+// half a line above center (dump: ly 679, correct centered top 695, n=1 with a
+// 2-line span; badge 9 likewise 1014 vs 1051 at n=2/span 3).
+test('layoutTextFit: the centered anchor uses the block actually placed', () => {
+  const rows = 300;
+  const prof = bandProfile(rows, (p) => (p < 100 ? 70 : 220));
+  const area = { x: 0, y: 0, w: 220, h: rows, runs: prof };
+  // edge pass: band 0 (70px) fits one word → 2 lines; middle band (220px) fits
+  // both words on one line → the final block is one line tall
+  const fit = layoutTextFit(fakeCtx(), 'alpha beta', area, 20, 260);
+  assert.ok(fit && fit.lines.length === 1, `one line in the middle band, got ${fit && fit.lines.length}`);
+  const center = fit.top + fit.lineHeight / 2;
+  assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `block centered (top=${fit.top}, center=${center}, areaCenter=${area.h / 2})`);
+});

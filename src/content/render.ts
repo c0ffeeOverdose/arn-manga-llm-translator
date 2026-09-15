@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 14;
+export const RENDER_GEN = 15;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -946,19 +946,25 @@ export function layoutTextFit(
             a = c;
         }
         const fitsA = a.lines.length * lh <= stackFit + 0.5;
-        // Recenter the block and re-wrap with the shifted bands. The centered
-        // probe above decides the SIZE only — its band is one line tall at the
-        // area's middle, so using it as the block top hung every line below the
-        // middle (live: a 4-line Thai block started at the round bubble's
-        // mid-line and its last line was clipped at the bottom edge). A block
-        // that wrapped at the edge keeps the legacy overflow policy (start at
-        // the edge, clipped tail) rather than centering a block that cannot fit.
-        const span = a.lines.length * lh;
-        const anchorB = prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2;
+        // Recenter the block and re-wrap with the shifted bands. A block that
+        // wrapped at the edge keeps the legacy overflow policy (start at the
+        // edge, clipped tail) rather than centering a block that cannot fit.
+        const spanA = a.lines.length * lh;
+        const anchorB = prof.vertical ? stack0 + (stackLen + spanA) / 2 : stack0 + (stackLen - spanA) / 2;
         const b = fitsA ? wrapUnitsIntoLines(ctx, segments, widthFor(anchorB, lh)) : { lines: a.lines, failed: false };
-        const use = b.failed || b.lines.length * lh > stackFit + 0.5
-            ? { lines: a.lines, top: edgeFailed ? anchorB : anchorA }
-            : { lines: b.lines, top: anchorB };
+        const overflowUse = b.failed || b.lines.length * lh > stackFit + 0.5;
+        const lines = overflowUse ? a.lines : b.lines;
+        // The centered anchor comes from the block actually placed. The centered
+        // re-wrap can need FEWER lines than the edge pass (a round bubble's
+        // narrow top band wraps what the wide middle band fits on one line), and
+        // an anchor built from the edge pass's longer span parks the shorter
+        // block half a line above center (live: badge 6 ly 679 vs centered 695,
+        // n=1 with a 2-line span; badge 9 likewise 1014 vs 1051 at n=2/span 3).
+        const span = lines.length * lh;
+        const top = !overflowUse || edgeFailed
+            ? (prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2)
+            : anchorA;
+        const use = { lines, top };
         const centers = use.lines.map((_, j) => {
             const b0 = prof.vertical ? use.top - (j + 1) * lh : use.top + j * lh;
             const iv = runInterval(prof, b0, b0 + lh);
