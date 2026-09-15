@@ -540,6 +540,32 @@ test('layoutArea: a short column in a big round bubble keeps the bubble area', (
   assert.ok(a.w >= 300, `area spans the bubble, not the 1.5x box cap (w=${a.w})`);
 });
 
+// live regression (region 9 of a color-art page): a white bubble on a GRAY
+// page. The outline walk used to demand the bubble's own interior color right
+// behind the line, and a gray margin never resumed it, so every row scored 0
+// and the same shape that passes on a white page fell to the rect path here —
+// Thai wrapped into a skinny strip inside a big round bubble.
+test('layoutArea: a bubble outlined on a gray page still counts as enclosed', () => {
+  const W = 500, H = 500;
+  const data = new Uint8ClampedArray(W * H * 4).fill(200); // gray art page
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const d = Math.hypot(x - 250, y - 250);
+    const i = (y * W + x) * 4;
+    if (d <= 180 && d >= 176) { data[i] = data[i + 1] = data[i + 2] = 0; }   // 4px outline
+    else if (d < 176) { data[i] = data[i + 1] = data[i + 2] = 255; }         // white interior
+  }
+  for (let y = 117; y <= 383; y++) for (let x = 238; x <= 262; x++) {        // glyph column
+    const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0;
+  }
+  const img = { width: W, height: H, data };
+  const box = { x1: 227, y1: 107, x2: 273, y2: 393, conf: 0.92 }; // live region: 46x286
+  assert.equal(boxIsVertical(box), true, 'premise: a vertical column');
+  const a = layoutArea(img, box);
+  assert.ok(a && a.runs, 'profile path taken');
+  assert.ok(a.runs.enclosed >= ENCLOSED_MIN, `gray page behind the line still counts, got ${a.runs.enclosed}`);
+  assert.ok(a.w >= 220, `area spans the bubble, not the 1.5x box cap (w=${a.w})`);
+});
+
 // A block's first wrap pass starts at the area's reading-order edge, where a
 // round bubble is narrowest. A short line that fits the centered band must not
 // be skipped because it cannot fit that edge band — the size loop used to drop

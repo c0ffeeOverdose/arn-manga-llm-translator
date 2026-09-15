@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 13;
+export const RENDER_GEN = 14;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -592,8 +592,13 @@ export function widthProfile(
     // outline. The pixel merely being non-interior is not enough — artwork
     // (hair, shading, screentone) is non-interior too, and text over art must
     // not be treated as an enclosed bubble (live: a face close-up scored 1.0
-    // and blew the text over the drawing). The walk must resume interior
-    // within a few pixels and contain ink; thick or light regions fail.
+    // and blew the text over the drawing). The line itself is the evidence:
+    // walk while the pixels ARE ink and treat the surface beyond the line as
+    // unknown — a bubble outlined on colored art has gray page behind it, and
+    // a `seedLike`-only break scored every row 0 on such pages (live: gray-bg
+    // bubble fell to the rect path while the same shape on white passed). The
+    // 2px lead allowance absorbs the anti-aliased fringe the run stopped at;
+    // thick ink (hair) still walks the full 16px and fails.
     const OUTLINE_MAX = 16; // px of non-interior allowed for an outline
     const outline = (p: number, edge: number, dir: -1 | 1, winEdge: number): boolean => {
         const first = edge + dir;
@@ -602,8 +607,9 @@ export function widthProfile(
         let q = first, k = 0, dark = 0;
         while (k < OUTLINE_MAX && q >= 0 && q < lim) {
             const i = pixel(p, q);
-            if (i == null || seedLike(data, i, seed)) break; // interior resumes → thin
+            if (i == null) break;
             if (isBorderInk(data, i, seed[0], seed[1], seed[2])) dark++;
+            else if (dark > 0 || k >= 2) break; // the line ended — or never started
             q += dir; k++;
         }
         return k > 0 && k < OUTLINE_MAX && dark >= 1;
