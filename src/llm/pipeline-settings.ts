@@ -53,6 +53,7 @@ export interface PipelineSettings {
     textColor: string;         // 'auto' (contrast vs background) or '#rrggbb'
     strokeColor: string;       // 'auto' (opposite of resolved text) or '#rrggbb'
     textStroke: number;        // stroke width as fraction of font size (0 = off)
+    textScale: number;         // font ceiling vs the original text's line pitch (1 = same size)
     showToasts: boolean;       // in-page done/error popups (status pill + popup log stay)
 }
 
@@ -102,6 +103,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     textColor: 'auto',
     strokeColor: 'auto',
     textStroke: 0.1,
+    textScale: 1,
     showToasts: true,
 };
 
@@ -239,6 +241,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         if (out[k] !== 'auto' && (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(out[k]))) out[k] = 'auto';
     }
     if (typeof out.textStroke !== 'number' || !(out.textStroke >= 0 && out.textStroke <= 0.5)) out.textStroke = 0.1;
+    if (typeof out.textScale !== 'number' || !(out.textScale >= 0.6 && out.textScale <= 1.6)) out.textScale = 1;
     if (typeof out.deferLabels !== 'boolean') out.deferLabels = true;
     if (typeof out.showToasts !== 'boolean') out.showToasts = true;
     if (typeof out.transcribeSrc !== 'boolean') out.transcribeSrc = false;

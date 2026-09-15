@@ -3,7 +3,7 @@
 
 import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type MtOnStatus } from './detection';
 import { inpaint, inpaintBoxRegion } from './inpaint';
-import { renderRegion } from './render';
+import { boxIsVertical, renderRegion, sizeCapFrom } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
@@ -287,7 +287,14 @@ export function paintRegions(
         const out = outputs.find(o => o.index === i + 1);
         const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
         const placed = renderRegion(ctx, frame, box, text);
-        if (placed) layouts.push({ i: i + 1, f: placed.fontSize, n: placed.lines.length, ...(placed.overflow ? { o: 1 as const } : {}) });
+        if (placed) layouts.push({
+            i: i + 1, f: placed.fontSize, n: placed.lines.length,
+            ...(placed.overflow ? { o: 1 as const } : {}),
+            ...(isDebug() && placed.color ? { c: placed.color } : null),
+            // font ceiling from the measured source pitch (debug): f at sc
+            // with no o = the cap is doing its job, f far below sc = the area
+            ...(isDebug() ? { sc: sizeCapFrom(frame, box, boxIsVertical(box)) ?? undefined } : null),
+        });
     });
     return layouts;
 }

@@ -613,6 +613,11 @@
         <div class="hint">Floor for shrink-to-fit: smaller fits long text without clipping, but gets hard to read.</div>
       </div>
       <div class="field">
+        <div class="range-head"><label for="textScale">Text size vs original</label><span class="unit-wrap"><input type="number" id="textScaleNum" class="val-input" min="0.6" max="1.6" step="0.05"><span class="unit">×</span></span></div>
+        <input type="range" id="textScale" min="0.6" max="1.6" step="0.05">
+        <div class="hint">Ceiling for the font, measured from the original text's line pitch: 1 = same size as the source, higher reads easier, lower leaves more air. Long text still shrinks to fit.</div>
+      </div>
+      <div class="field">
         <label class="check"><input type="checkbox" id="preferHorizontal"> Prefer horizontal text</label>
         <div class="hint">Tall boxes render left-to-right first and rotate only when the text can't fit. Off = rotate tall columns as before.</div>
       </div>

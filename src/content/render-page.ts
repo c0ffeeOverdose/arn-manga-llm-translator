@@ -1,7 +1,7 @@
 // renderPage: the solo path — translate one prepared page, paint, register,
 // cache, fold into the book.
 
-import { ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
+import { boxIsVertical, ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
 import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0 } from './page-cache';
@@ -110,8 +110,12 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         // clamped at bubble borders, shrunk to ink on near-empty boxes —
         // compare against boxes to spot either failure)
         areas: det.boxes.map(b => {
-            const a = layoutArea(frame, b) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
-            return { x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h) };
+            const a = layoutArea(frame, b, boxIsVertical(b)) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
+            return {
+                x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
+                // enclosed score >0 = per-line profile layout, absent = no-frame rect
+                ...('runs' in a && a.runs ? { prof: +a.runs.enclosed.toFixed(2) } : null),
+            };
         }),
         // chosen layout per region: {i, fontSize, line count} — null layout
         // (skipped/degenerate) is simply absent

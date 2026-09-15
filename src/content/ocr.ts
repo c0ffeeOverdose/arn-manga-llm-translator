@@ -8,7 +8,7 @@ import { pipeline, context, setContext, shareContext, loadContext, saveContext, 
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources } from './page-cache';
-import { pageArea } from './render';
+import { boxIsVertical, pageArea } from './render';
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
@@ -200,8 +200,30 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
     ctx.setLineDash([font, font * 0.6]);
     ctx.strokeStyle = '#2bff88';
     for (const b of boxes) {
-        const a = pageArea(ctx, frame, b);
+        const a = pageArea(ctx, frame, b, boxIsVertical(b));
         if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
+    }
+    // measured per-line runs (enclosed bubbles): orange outline of the shape
+    // the layout actually follows — short at a round bubble's top, long in the
+    // middle. Not drawn for the no-frame fallback (rect only, as before).
+    ctx.setLineDash([font * 0.5, font * 0.4]);
+    ctx.strokeStyle = '#ffa02b';
+    for (const b of boxes) {
+        const a = pageArea(ctx, frame, b, boxIsVertical(b));
+        const prof = a?.runs;
+        if (!prof) continue;
+        const left: [number, number][] = [], right: [number, number][] = [];
+        for (let p = prof.p0; p <= prof.p1; p++) {
+            const k = p - prof.p0;
+            if (prof.i1[k] > prof.i2[k]) continue;
+            left.push(prof.vertical ? [p, prof.i1[k]] : [prof.i1[k], p]);
+            right.unshift(prof.vertical ? [p, prof.i2[k]] : [prof.i2[k], p]);
+        }
+        if (!left.length) continue;
+        ctx.beginPath();
+        [...left, ...right].forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+        ctx.closePath();
+        ctx.stroke();
     }
     ctx.restore();
     boxes.forEach((b, i) => {

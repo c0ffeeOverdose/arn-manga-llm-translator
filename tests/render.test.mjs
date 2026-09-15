@@ -11,7 +11,10 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/render.mjs', sourcemap: 'inline',
 });
 
-const { bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, isLight, layoutText, horizontalFits } = await import(new URL('../.test-build/render.mjs', import.meta.url).href);
+const {
+  bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, isLight, layoutText, horizontalFits,
+  widthProfile, runInterval, sourcePitch, sizeCapFrom, layoutTextFit, boxIsVertical, setRenderTuning, renderTuning, ENCLOSED_MIN,
+} = await import(new URL('../.test-build/render.mjs', import.meta.url).href);
 
 // white W×H page, optional dark vertical borders (bubble edges)
 function page(W, H, borders = []) {
@@ -268,4 +271,218 @@ test('horizontalFits: short text in a tall strip fits; long text does not', () =
   assert.equal(horizontalFits(fakeCtx(), 'short line here', strip), true);
   const novel = 'word '.repeat(60).trim();
   assert.equal(horizontalFits(fakeCtx(), novel, strip), false);
+});
+
+// ---- width profile / source pitch (enclosed-bubble measurement) ----
+
+// white page with a dark ring of radius r (a bubble outline, interior stays
+// white — the real B&W case where the fill must be stopped by the outline)
+function ringPage(W, H, cx, cy, r, ring = 4) {
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const d = Math.hypot(x - cx, y - cy);
+    if (d <= r && d >= r - ring) {
+      const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0;
+    }
+  }
+  return { width: W, height: H, data };
+}
+
+// horizontal ink bars inside a box (stand-in for the source glyph lines)
+function barsInto(img, W, xs, xLen, ys, yLen) {
+  for (const y0 of ys) for (let y = y0; y < y0 + yLen; y++) {
+    for (let x = xs; x < xs + xLen; x++) {
+      const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+    }
+  }
+  return img;
+}
+
+test('widthProfile: round bubble runs follow the outline, enclosure is high', () => {
+  const W = 200, H = 200;
+  const img = ringPage(W, H, 100, 100, 70);
+  const box = { x1: 70, y1: 85, x2: 130, y2: 115, conf: 0.9 };
+  const prof = widthProfile(img, box, false, [255, 255, 255], { x1: 34, y1: 34, x2: 166, y2: 166 }, { loX: 10, loY: 10, hiX: 190, hiY: 190 });
+  assert.ok(prof, 'profile measured');
+  // rows where the ring runs nearly parallel to the scan line (top/bottom of
+  // the circle) cross it too steeply to read as a thin line — they drag the
+  // score down, so the bar is the real decision threshold
+  assert.ok(prof.enclosed >= ENCLOSED_MIN + 0.2, `outline encloses the rows, got ${prof.enclosed}`);
+  const mid = runInterval(prof, 96, 106), top = runInterval(prof, 40, 50);
+  assert.ok(mid && top, 'both bands have a run');
+  assert.ok(mid[1] - mid[0] > top[1] - top[0] + 20, `middle wider than the top band (${mid[1] - mid[0]} vs ${top[1] - top[0]})`);
+  assert.ok(mid[0] >= 34 && mid[1] <= 166, 'runs stay inside the outline');
+});
+
+test('widthProfile: open white page has no boundary evidence (no-frame path)', () => {
+  const img = page(200, 200);
+  const box = { x1: 80, y1: 90, x2: 120, y2: 110, conf: 0.9 };
+  const prof = widthProfile(img, box, false, [255, 255, 255], { x1: 40, y1: 40, x2: 160, y2: 160 }, { loX: 40, loY: 40, hiX: 160, hiY: 160 });
+  assert.ok(prof, 'rows measured');
+  assert.equal(prof.enclosed, 0, 'nothing stops the fill — not a bubble');
+});
+
+test('widthProfile: vertical profile measures columns (transposed axes)', () => {
+  const W = 220, H = 200;
+  const img = ringPage(W, H, 110, 100, 80);
+  const box = { x1: 104, y1: 60, x2: 116, y2: 140, conf: 0.9 }; // tall+narrow JA column
+  assert.equal(boxIsVertical(box), true, 'premise: vertical box');
+  const prof = widthProfile(img, box, true, [255, 255, 255], { x1: 24, y1: 24, x2: 196, y2: 176 }, { loX: 0, loY: 0, hiX: 219, hiY: 199 });
+  assert.ok(prof && prof.vertical, 'vertical profile');
+  assert.ok(prof.enclosed >= ENCLOSED_MIN, `outline encloses the columns, got ${prof.enclosed}`);
+  // middle column runs further along y than the box's own column at the edge
+  const mid = runInterval(prof, 104, 116), edge = runInterval(prof, 44, 56);
+  assert.ok(mid && edge && mid[1] - mid[0] > edge[1] - edge[0], 'middle column taller than the edge column');
+});
+
+test('runInterval: min-over-band narrows to the tightest row; a hole nulls it', () => {
+  const mk = (i1, i2) => ({ vertical: false, p0: 0, p1: i1.length - 1, i1: Int32Array.from(i1), i2: Int32Array.from(i2), enclosed: 1 });
+  const prof = mk([10, 10, 10, 10, 10, 10, 10, 10], [90, 90, 50, 90, 90, 90, 90, 90]);
+  assert.deepEqual(runInterval(prof, 0, 4), [10, 50], 'narrow row 2 wins the band');
+  assert.deepEqual(runInterval(prof, 5, 8), [10, 90], 'wide rows keep their width');
+  const hole = mk([10, 10, 10], [90, 0, 90]);
+  assert.equal(runInterval(hole, 0, 3), null, 'a row with no run rejects the whole band');
+  assert.deepEqual(runInterval(hole, 0, 1), [10, 90], 'band without the hole is fine');
+});
+
+test('sourcePitch: two glyph lines give the line pitch; noisy boxes bail', () => {
+  const W = 200, H = 200;
+  const two = barsInto(page(W, H), W, 60, 30, [60, 120], 20); // lines at y 60-80 / 120-140
+  const p2 = sourcePitch(two, { x1: 60, y1: 60, x2: 140, y2: 140, conf: 0.9 }, false);
+  assert.ok(p2 && Math.abs(p2.pitch - 40) < 1, `pitch = span/lines, got ${p2 && p2.pitch}`);
+  assert.ok(p2 && Math.abs(p2.glyph - 20) < 1, `glyph = median band height, got ${p2 && p2.glyph}`);
+  const one = barsInto(page(W, H), W, 60, 30, [80], 30);
+  const p1 = sourcePitch(one, { x1: 60, y1: 80, x2: 140, y2: 110, conf: 0.9 }, false);
+  assert.ok(p1 && Math.abs(p1.pitch - 30) < 1, `single line pitch = band height, got ${p1 && p1.pitch}`);
+  assert.equal(p1.glyph, 30, 'single band: glyph = pitch');
+  // 10 stripes = texture, not text: implausible band count → no measurement
+  const tex = page(W, H);
+  for (const y of [40, 44, 48, 52, 56, 60, 64, 68, 72, 76]) barsInto(tex, W, 60, 30, [y], 1);
+  assert.equal(sourcePitch(tex, { x1: 60, y1: 40, x2: 140, y2: 80, conf: 0.9 }, false), null);
+});
+
+test('sizeCapFrom: font ceiling matches the source pitch (textScale scales it)', () => {
+  const W = 200, H = 200;
+  const img = barsInto(page(W, H), W, 60, 30, [60, 120], 20);
+  const box = { x1: 60, y1: 60, x2: 140, y2: 140, conf: 0.9 };
+  // tight source (glyph 20, pitch 40): the pitch bound (22.2) leaves a little
+  // room, the glyph height is the floor of the reference — live: matching the
+  // pitch alone rendered Thai visibly smaller than 26px source caps
+  assert.equal(sizeCapFrom(img, box, false), Math.round(Math.max(20, 40 / 1.8)), 'glyph + pitch reference');
+  setRenderTuning({ textScale: 1.5 });
+  assert.equal(sizeCapFrom(img, box, false), Math.round(Math.max(20, 40 / 1.8) * 1.5), 'slider scales the ceiling');
+  setRenderTuning({ textScale: 1 });
+  // a loose caption (10px glyphs, 40px pitch) is bounded by the pitch, not
+  // by the tiny glyphs — the spare height is allowed to grow the font
+  const loose = barsInto(page(W, H), W, 60, 30, [60, 130], 10);
+  assert.equal(sizeCapFrom(loose, { x1: 60, y1: 60, x2: 140, y2: 140, conf: 0.9 }, false), Math.round(40 / (1 + 0.55 + 0.25)), 'spare height allowed'); // same fp order as render.ts
+});
+
+test('layoutArea: enclosed bubble keeps the measured profile (wider than the 1.5x cap)', () => {
+  const W = 200, H = 200;
+  // 40px-wide text box in an 82px-wide bubble: the fill's 0.6 window still
+  // reaches the outline (a bubble hugging its text), and the profile beats
+  // the legacy 1.5x-box cap. Roomy bubbles beyond the window fall back to the
+  // capped rect instead — see the window-edge rule in widthProfile.
+  const img = barsInto(ringPage(W, H, 100, 100, 45), W, 90, 30, [92, 102], 4);
+  const box = { x1: 85, y1: 88, x2: 125, y2: 112, conf: 0.9 };
+  const a = layoutArea(img, box);
+  assert.ok(a && a.runs, 'profile path taken');
+  assert.ok(a.runs.enclosed >= ENCLOSED_MIN, `enclosed score ${a.runs.enclosed}`);
+  assert.ok(a.w > 40 * 1.5 + 1, `wider than the legacy 1.5x-box cap (got ${a.w})`);
+  assert.ok(a.x >= 55 && a.x + a.w <= 145, 'still inside the outline');
+});
+
+test('layoutArea: no-frame box (white page) stays on the legacy rectangle', () => {
+  const W = 200, H = 200;
+  const img = barsInto(page(W, H), W, 80, 40, [90, 104], 4);
+  const box = { x1: 80, y1: 90, x2: 120, y2: 112, conf: 0.9 };
+  const a = layoutArea(img, box);
+  assert.ok(a, 'area exists');
+  assert.ok(!a.runs, 'no profile for an open background');
+  assert.ok(a.w <= 40 * 1.6 + 1, `legacy box+30%/1.5x behavior, got w=${a.w}`);
+});
+
+// ---- layoutTextFit: per-line bands (fake ctx) ----
+
+function bandProfile(rows, widthAt, x1 = 0) {
+  const i1 = new Int32Array(rows), i2 = new Int32Array(rows);
+  for (let p = 0; p < rows; p++) {
+    const w = widthAt(p);
+    i1[p] = x1; i2[p] = x1 + w - 1;
+  }
+  return { vertical: false, p0: 0, p1: rows - 1, i1, i2, enclosed: 1 };
+}
+
+test('layoutTextFit: lines use their own band width (narrow top, wide middle)', () => {
+  const rows = 100;
+  const prof = bandProfile(rows, (p) => (p < 20 ? 60 : p < 80 ? 200 : 60));
+  const area = { x: 0, y: 0, w: 200, h: rows, runs: prof };
+  const text = 'word '.repeat(8).trim();
+  const fit = layoutTextFit(fakeCtx(), text, area, 20);
+  assert.ok(fit && fit.lines.length >= 3, `several lines, got ${fit && fit.lines.length}`);
+  // every line fits the interval measured at its own band
+  fit.lines.forEach((line, j) => {
+    const b0 = fit.top + j * fit.lineHeight;
+    const iv = runInterval(prof, b0, b0 + fit.lineHeight);
+    assert.ok(iv, `band ${j} has a run`);
+    assert.ok(fakeCtxMeasure(line, fit.fontSize) <= iv[1] - iv[0] + 0.51, `line ${j} fits its band`);
+    assert.ok(fit.centers[j] > iv[0] && fit.centers[j] < iv[1], `line ${j} centers on its run`);
+  });
+  const widths = fit.lines.map(l => l.length);
+  assert.ok(Math.max(...widths) > Math.min(...widths) + 3, `band widths shape the text (${widths.join(',')})`);
+});
+
+function fakeCtxMeasure(s, size, pxPerChar = 0.6) {
+  return [...s].length * size * pxPerChar;
+}
+
+test('widthProfile: text over thick artwork (hair) is not an enclosed bubble', () => {
+  // live case: box on a face, fill = the light skin region; its edges are the
+  // jaw line (thin) on one side and hair (thick) on the other, plus shading
+  // (non-ink) elsewhere. The thin-dark-line test must keep this OFF the
+  // profile path — it scored 1.0 on the non-seed test and blew the text over
+  // the drawing.
+  const W = 220, H = 220;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const ink = (x1, y1, x2, y2) => {
+    for (let y = y1; y < y2; y++) for (let x = x1; x < x2; x++) {
+      const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0;
+    }
+  };
+  ink(60, 0, 100, H);   // thick dark hair band down the middle
+  ink(100, 40, 220, 120); // thick dark art block right of it
+  const img = { width: W, height: H, data };
+  const box = { x1: 100, y1: 60, x2: 160, y2: 100, conf: 0.9 }; // on the light area
+  const prof = widthProfile(img, box, false, [255, 255, 255], { x1: 40, y1: 40, x2: 180, y2: 120 }, { loX: 0, loY: 0, hiX: 219, hiY: 219 });
+  assert.ok(prof, 'rows measured');
+  assert.ok(prof.enclosed < ENCLOSED_MIN, `art is not a bubble outline, got ${prof.enclosed}`);
+});
+
+test('widthProfile/fitArea: leaked rows trim out of the placement area', () => {
+  // caption box with a thin dark outline; above it, the same white page margin
+  // connects through a gap in the outline (leak). Those rows get runs but no
+  // outline evidence, so they must NOT stretch the area — live bug: a caption's
+  // area doubled its height into the page margin and the text drifted.
+  const W = 160, H = 200;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const img = { width: W, height: H, data };
+  const rect = (x1, y1, x2, y2, gap) => {
+    for (let x = x1; x <= x2; x++) {
+      if (gap && x >= gap[0] && x <= gap[1]) continue;
+      for (const y of [y1, y2]) { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; }
+    }
+    for (let y = y1; y <= y2; y++) for (const x of [x1, x2]) {
+      const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0;
+    }
+  };
+  rect(40, 100, 120, 160, [70, 90]); // caption outline, gap at the top = the leak
+  barsInto(img, W, 55, 50, [115, 135], 5); // two source text lines inside the box
+  const box = { x1: 45, y1: 105, x2: 115, y2: 155, conf: 0.9 }; // 70x50
+  const a = layoutArea(img, box);
+  assert.ok(a && a.runs, 'profile path taken');
+  assert.ok(a.runs.enclosed < 1, `leak drags the score below 1, got ${a.runs.enclosed}`);
+  assert.ok(a.runs.e0 >= 99, `enclosed range starts at the outline, got e0=${a.runs.e0}`);
+  assert.ok(a.h <= 70, `area stays the caption, not the leaked page margin (h=${a.h})`);
+  assert.ok(a.y >= 99, `area top follows the evidence (y=${a.y})`);
 });

@@ -161,6 +161,7 @@ export async function loadPipeline(): Promise<PipelineSettings> {
         textColor: pipeline.textColor,
         strokeColor: pipeline.strokeColor,
         textStroke: pipeline.textStroke,
+        textScale: pipeline.textScale,
     });
     // user-selected render font: fetch bytes from the background (they live in
     // the extension-origin IndexedDB), register a FontFace, and put it FIRST in

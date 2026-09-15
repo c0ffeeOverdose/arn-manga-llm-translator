@@ -141,6 +141,10 @@ test('text/stroke colors: hex kept, garbage resets to auto, stroke clamps', () =
   assert.equal(loadPipelineSettings({ textStroke: 0.2 }).textStroke, 0.2);
   assert.equal(loadPipelineSettings({ textStroke: 9 }).textStroke, 0.1);
   assert.equal(loadPipelineSettings({ textStroke: 'big' }).textStroke, 0.1);
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.textScale, 1);
+  assert.equal(loadPipelineSettings({ textScale: 1.3 }).textScale, 1.3);
+  assert.equal(loadPipelineSettings({ textScale: 9 }).textScale, 1); // out of range → default
+  assert.equal(loadPipelineSettings({ textScale: 'big' }).textScale, 1);
 });
 
 test('prefetchN: default 3, int 1-30, out-of-range resets, preset display ignores it', () => {

@@ -55,7 +55,7 @@ function syncColorUI(): void {
 
 export function syncAdvancedUI(): void {
     ($('preset') as HTMLSelectElement).value = presetsPristine ? matchingPreset(pipeline) : 'custom';
-    for (const id of ['detConf', 'detMinSize', 'panelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'minFont', 'cacheMax']) syncRange(id, id);
+    for (const id of ['detConf', 'detMinSize', 'panelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'minFont', 'textScale', 'cacheMax']) syncRange(id, id);
     syncColorUI();
     ($('deferLabels') as HTMLInputElement).checked = pipeline.deferLabels;
     ($('vlmAssisted') as HTMLInputElement).checked = pipeline.vlmAssistedDetection;
@@ -269,6 +269,7 @@ const RANGE_ABS: Record<string, { min?: number; max?: number }> = {
     contextPairs: { min: 0, max: 200 },
     parallelLlm: { min: 1, max: 10 },
     minFont: { min: 1, max: 72 },
+    textScale: { min: 0.6, max: 1.6 },
     textStroke: { min: 0, max: 0.5 },
     cacheMax: { min: 10, max: 2000 },
 };
