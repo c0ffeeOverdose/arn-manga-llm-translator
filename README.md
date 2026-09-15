@@ -43,6 +43,9 @@ page is instant and free.
 
 ## Install
 
+**Firefox (AMO):** https://addons.mozilla.org/en-US/firefox/addon/arn-manga-llm-translator/
+(works on Firefox for Android, 142+)
+
 ### From source (any OS)
 
 Prerequisites: Node.js 20+ and a Chromium or Firefox browser.
