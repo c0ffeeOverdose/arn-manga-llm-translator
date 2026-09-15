@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 11;
+export const RENDER_GEN = 12;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -920,8 +920,7 @@ export function layoutTextFit(
         const lh = size * (1 + HEADROOM + LINE_SPACING);
         const anchorA = prof.vertical ? stack0 + stackLen : stack0;
         let a = wrapUnitsIntoLines(ctx, segments, widthFor(anchorA, lh));
-        let anchorFirst = anchorA;
-        let centeredOnly = false;
+        let edgeFailed = a.failed;
         if (a.failed) {
             // The first pass starts at the area's reading-order edge, where a
             // round bubble is narrowest. A unit that cannot fit there can still
@@ -932,15 +931,22 @@ export function layoutTextFit(
             const centered = prof.vertical ? stack0 + (stackLen + lh) / 2 : stack0 + (stackLen - lh) / 2;
             const c = wrapUnitsIntoLines(ctx, segments, widthFor(centered, lh));
             if (c.failed) continue;
-            a = c; anchorFirst = centered; centeredOnly = true;
+            a = c;
         }
         const fitsA = a.lines.length * lh <= stackFit + 0.5;
-        // recenter the block and re-wrap with the shifted bands
+        // Recenter the block and re-wrap with the shifted bands. The centered
+        // probe above decides the SIZE only — its band is one line tall at the
+        // area's middle, so using it as the block top hung every line below the
+        // middle (live: a 4-line Thai block started at the round bubble's
+        // mid-line and its last line was clipped at the bottom edge). A block
+        // that wrapped at the edge keeps the legacy overflow policy (start at
+        // the edge, clipped tail) rather than centering a block that cannot fit.
         const span = a.lines.length * lh;
-        const anchorB = centeredOnly ? anchorFirst
-            : prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2;
-        const b = fitsA && !centeredOnly ? wrapUnitsIntoLines(ctx, segments, widthFor(anchorB, lh)) : { lines: a.lines, failed: false };
-        const use = b.failed || b.lines.length * lh > stackFit + 0.5 ? { lines: a.lines, top: anchorFirst } : { lines: b.lines, top: anchorB };
+        const anchorB = prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2;
+        const b = fitsA ? wrapUnitsIntoLines(ctx, segments, widthFor(anchorB, lh)) : { lines: a.lines, failed: false };
+        const use = b.failed || b.lines.length * lh > stackFit + 0.5
+            ? { lines: a.lines, top: edgeFailed ? anchorB : anchorA }
+            : { lines: b.lines, top: anchorB };
         const centers = use.lines.map((_, j) => {
             const b0 = prof.vertical ? use.top - (j + 1) * lh : use.top + j * lh;
             const iv = runInterval(prof, b0, b0 + lh);

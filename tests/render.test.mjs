@@ -536,3 +536,19 @@ test('layoutTextFit: a line too wide for the edge band still fits centered', () 
   assert.ok(laid.fontSize >= 18, `kept a usable size (got ${laid.fontSize})`);
   assert.ok(laid.lines.length * laid.lineHeight <= 67.5, `block stays inside maxStack (${laid.lines.length}x${laid.lineHeight})`);
 });
+
+// live regression (round bubble, first line wide): the pass at the top edge
+// fails, so the centered probe supplies the wrap. Painting the block from that
+// probe band hung all 4 Thai lines below the bubble's middle and clipped the
+// last one — the block must land centered on the area like any other fit.
+test('layoutTextFit: a block that only wraps from the middle band is centered', () => {
+  const rows = 300;
+  const prof = bandProfile(rows, (p) => (p < 100 ? 70 : 220));
+  const area = { x: 0, y: 0, w: 220, h: rows, runs: prof };
+  const fit = layoutTextFit(fakeCtx(), 'alphaword / betaword', area, 20, 260);
+  assert.ok(fit && fit.lines.length === 2, `two segments, got ${fit && fit.lines.length}`);
+  const span = fit.lines.length * fit.lineHeight;
+  const center = fit.top + span / 2;
+  assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `block centered (top=${fit.top}, span=${span}, center=${center})`);
+  assert.ok(fit.centers[0] > 100, `line 0 centered on the wide band (got ${fit.centers[0]})`);
+});
