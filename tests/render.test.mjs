@@ -566,6 +566,32 @@ test('layoutArea: a bubble outlined on a gray page still counts as enclosed', ()
   assert.ok(a.w >= 220, `area spans the bubble, not the 1.5x box cap (w=${a.w})`);
 });
 
+// live regression (badge 5): the bubble's lower outline runs over thick ink
+// (hair/art), the thin-line walk rejects it, and the evidenced rows stop ~37px
+// above the box's bottom. The area used to end there, so the block (which fit)
+// was centered in the truncated area — the text parked in the bubble's upper
+// half (live: area h254 vs box h309; text top 24px above the box top and 88px
+// above its bottom). The placement extent must cover the detection box.
+test('layoutArea: evidence that stops early still covers the detection box', () => {
+  const W = 500, H = 600;
+  const img = ringPage(W, H, 250, 300, 200);
+  for (let y = 371; y < H; y++) for (let x = 0; x < W; x++) {
+    if (Math.abs(Math.hypot(x - 250, y - 300) - 200) < 10) { // 20px thick lower arc
+      const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+    }
+  }
+  for (let y = 203; y <= 397; y++) for (let x = 235; x <= 265; x++) {
+    const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+  }
+  const box = { x1: 187, y1: 193, x2: 313, y2: 407, conf: 0.9 };
+  const a = layoutArea(img, box);
+  assert.ok(a && a.runs, 'profile path taken');
+  assert.ok(a.runs.enclosed < 1 && a.runs.enclosed >= ENCLOSED_MIN, `partial evidence, got ${a.runs.enclosed}`);
+  assert.ok(a.runs.e1 < box.y2, `premise: evidence stops above the box bottom (e1=${a.runs.e1}, box ${box.y2})`);
+  assert.ok(a.y <= box.y1 + 2, `area top covers the box (y=${a.y} vs ${box.y1})`);
+  assert.ok(a.y + a.h >= box.y2 - 2, `area bottom covers the box (${a.y + a.h} vs ${box.y2})`);
+});
+
 // A block's first wrap pass starts at the area's reading-order edge, where a
 // round bubble is narrowest. A short line that fits the centered band must not
 // be skipped because it cannot fit that edge band — the size loop used to drop

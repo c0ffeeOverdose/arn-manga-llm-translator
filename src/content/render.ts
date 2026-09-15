@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 15;
+export const RENDER_GEN = 16;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -684,7 +684,18 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
                 if (q2 < 0 || prof.i2[k] > q2) q2 = prof.i2[k];
             }
             if (q2 > q1) {
-                const s0 = prof.e0, s1 = prof.e1; // rows with outline evidence on both sides
+                // Extent on the stacking axis: rows with outline evidence on
+                // both sides, UNIONED with the detection box (clamped to the
+                // measured profile range). Evidence stops early where the
+                // outline runs over thick ink (hair/art: the thin-line walk
+                // rejects it — live: badge 5, evidence covered y621-875 while
+                // the box ran to 959), and a block centered in the truncated
+                // area parks in the bubble's upper half: text 24px above the
+                // box top, 88px above its bottom. The box is the source text
+                // by construction, so it cannot inflate a leak — and the
+                // evidenced rows still bound the widths.
+                const s0 = Math.max(prof.p0, Math.min(prof.e0, vertical ? Math.round(box.x1) : Math.round(box.y1)));
+                const s1 = Math.min(prof.p1, Math.max(prof.e1, vertical ? Math.round(box.x2) : Math.round(box.y2)));
                 return vertical
                     ? { x: s0, y: q1, w: s1 - s0 + 1, h: q2 - q1, runs: prof }
                     : { x: q1, y: s0, w: q2 - q1, h: s1 - s0 + 1, runs: prof };
