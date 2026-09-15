@@ -606,8 +606,14 @@ test('layoutTextFit: a line too wide for the edge band still fits centered', () 
   const area = { x: 0, y: 0, w: 100, h: 100, runs: prof };
   const laid = layoutTextFit(fakeCtx(), 'a word', area, 20, 67);
   assert.ok(laid, 'layout exists');
-  assert.ok(laid.fontSize >= 18, `kept a usable size (got ${laid.fontSize})`);
+  // The centered-fit preference (see the badge-1 regression below) can trade
+  // one size step for a centered block: f16 on one centered line instead of
+  // f18 wrapped at the edge band. The floor guards the collapse this test was
+  // written for (a bad skip took a live two-word line from 32 to 15).
+  assert.ok(laid.fontSize >= 16, `kept a usable size (got ${laid.fontSize})`);
   assert.ok(laid.lines.length * laid.lineHeight <= 67.5, `block stays inside maxStack (${laid.lines.length}x${laid.lineHeight})`);
+  const center = laid.top + laid.lines.length * laid.lineHeight / 2;
+  assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `centered (top=${laid.top}, center=${center})`);
 });
 
 // live regression (round bubble, first line wide): the pass at the top edge
@@ -639,6 +645,41 @@ test('layoutTextFit: the centered anchor uses the block actually placed', () => 
   // both words on one line → the final block is one line tall
   const fit = layoutTextFit(fakeCtx(), 'alpha beta', area, 20, 260);
   assert.ok(fit && fit.lines.length === 1, `one line in the middle band, got ${fit && fit.lines.length}`);
+  const center = fit.top + fit.lineHeight / 2;
+  assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `block centered (top=${fit.top}, center=${center}, areaCenter=${area.h / 2})`);
+});
+
+// live regression (badge 1): every profile band was narrower than the caption
+// unit even at min font, so the size loop failed outright and the last-resort
+// rect layout kicked in — and used to park the block at the area's edge, 39px
+// above its own box and over the panel's top border. A fitting block must
+// center like the no-profile rect path; only a genuine overflow keeps the
+// legacy edge anchor.
+test('layoutTextFit: last-resort rect layout centers a fitting block', () => {
+  const prof = bandProfile(300, () => 40); // every band narrower than the unit
+  const area = { x: 0, y: 0, w: 200, h: 300, runs: prof };
+  const fit = layoutTextFit(fakeCtx(), 'abcdefgh', area, 30);
+  assert.ok(fit && fit.lines.length === 1, `one line, got ${fit && fit.lines.length}`);
+  const center = fit.top + fit.lineHeight / 2;
+  assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `centered (top=${fit.top}, center=${center}, areaCenter=${area.h / 2})`);
+  // a block that truly cannot fit the area keeps the legacy edge anchor
+  const tight = { x: 0, y: 0, w: 200, h: 20, runs: bandProfile(20, () => 40) };
+  const over = layoutTextFit(fakeCtx(), 'abcdefgh', tight, 30);
+  assert.ok(over && over.lines.length === 1, 'overflow still lays out');
+  assert.equal(over.top, 0, `unavoidable overflow stays edge-anchored (top=${over.top})`);
+});
+
+// live regression (badge 1, page 11): the panel's TOP band is wide while the
+// band at the box's own rows is narrower (a leading glyph outside the box eats
+// into the run), so the centered re-wrap failed where the edge pass fit. The
+// block FITS the area, yet the old anchor rule sent it to the edge: the
+// caption sat 39px above its box, over the panel's top border. A failed
+// centered re-wrap is not an overflow — center the block.
+test('layoutTextFit: a failed centered re-wrap still centers a fitting block', () => {
+  const prof = bandProfile(200, (p) => (p < 60 ? 60 : 30)); // top band wide, box band narrow
+  const area = { x: 0, y: 0, w: 60, h: 200, runs: prof };
+  const fit = layoutTextFit(fakeCtx(), 'abcdefgh', area, 16);
+  assert.ok(fit && fit.lines.length === 1, `one line, got ${fit && fit.lines.length}`);
   const center = fit.top + fit.lineHeight / 2;
   assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `block centered (top=${fit.top}, center=${center}, areaCenter=${area.h / 2})`);
 });

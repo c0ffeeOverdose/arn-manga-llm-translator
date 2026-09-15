@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 16;
+export const RENDER_GEN = 18;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -972,7 +972,14 @@ export function layoutTextFit(
         // block half a line above center (live: badge 6 ly 679 vs centered 695,
         // n=1 with a 2-line span; badge 9 likewise 1014 vs 1051 at n=2/span 3).
         const span = lines.length * lh;
-        const top = !overflowUse || edgeFailed
+        // Anchor: keep the wrap and the placement consistent. A centered block
+        // (b) takes the centered anchor; an edge-wrapped block (a) that the
+        // centered re-wrap could not match stays at the edge — placing it
+        // centered would move its lines onto narrower bands than the ones they
+        // were wrapped for (a 'word word word' line wrapped for a 200px band
+        // landing on a 60px one). Edge anchor = the legacy overflow policy.
+        const useCentered = !overflowUse || edgeFailed;
+        const top = useCentered
             ? (prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2)
             : anchorA;
         const use = { lines, top };
@@ -982,17 +989,31 @@ export function layoutTextFit(
             return iv ? (iv[0] + iv[1]) / 2 : midCross;
         });
         const out: LaidOutFit = { lines: use.lines, fontSize: size, lineHeight: lh, top: use.top, centers };
-        if (fitsA) return out;
-        fallback = out;
+        // Return only a fitting CENTERED block; an edge-anchored one stays a
+        // fallback so a smaller size can still deliver a centered fit (live:
+        // badge 1, "1 สัปดาห์ต่อมา" fit the top band at f19 but the centered
+        // band only at f17 — returning the f19 edge solution parked the caption
+        // 39px above its box). fallback keeps the FIRST (largest-font) solution.
+        if (fitsA && useCentered) return out;
+        fallback ??= out;
     }
     if (fallback) return fallback;
-    // nothing wrapped at any size (holes under every band): last-resort rect
-    // layout, top/right-aligned and clipped — the legacy overflow policy
+    // Nothing wrapped at any size — every band is narrower than the text (a
+    // panel caption with the per-run 8% insets, or holes under each band).
+    // Last-resort rect layout, same policy as the no-profile rect path: CENTER
+    // a block that fits the area, keep the legacy edge anchor (top/right, then
+    // clipped) only for a genuine overflow. The old unconditional edge anchor
+    // parked a fitting caption at the area's top edge — 39px above its own box
+    // and over the panel's top border (live: badge 1, "1 สัปดาห์ต่อมา").
     const laid = layoutText(ctx, text, area.w, area.h, cap);
     if (!laid.lines.length) return null;
+    const total = laid.lines.length * laid.lineHeight;
+    const fits = total <= stackLen + 0.5;
     return {
         lines: laid.lines, fontSize: laid.fontSize, lineHeight: laid.lineHeight,
-        top: prof.vertical ? stack0 + stackLen : stack0,
+        top: prof.vertical
+            ? (fits ? stack0 + (stackLen + total) / 2 : stack0 + stackLen)
+            : (fits ? stack0 + (stackLen - total) / 2 : stack0),
         centers: laid.lines.map(() => midCross),
     };
 }
