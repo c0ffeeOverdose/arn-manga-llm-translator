@@ -15,8 +15,9 @@ runs locally on your machine.
   language your LLM can write (Thai rendering is battle-tested, including
   ICU dictionary word breaking and shrink-to-fit text layout).
 - **Your keys, your models:** bring your own API key (OpenAI-compatible,
-  OpenAI Responses, Anthropic, Gemini). Keys never leave your browser's local
-  storage, and page images are sent only to the endpoint you configure.
+  OpenAI Responses, Anthropic, Gemini, Cloudflare Workers AI). Keys never leave
+  your browser's local storage, and page images are sent only to the endpoint
+  you configure.
 - **All detection and OCR run in-browser** — no server, no telemetry. Works on
   most manga reader sites (image-based and canvas-based readers, including
   single-image readers with off-DOM preloading).
@@ -92,7 +93,7 @@ Run all, paste the printed endpoint + key into Options → Model. See
 src/
   content/      page orchestration: queue, cache, rendering, status UI
   iframe/       ONNX runtime host (extension-origin iframe): CTD + OCR + panel model
-  background/   service worker: LLM calls (4 protocols)
+  background/   service worker: LLM calls (5 protocols)
   llm/          prompt building, adapters, character book
   options/      settings UI (model, pipeline, character book, fonts)
   popup/        per-site control center
