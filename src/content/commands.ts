@@ -1,16 +1,17 @@
 // Commands from popup / context menu: element resolution, spread translate,
 // cancel, retranslate, toggles, cache, status poll.
 
-import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, type PageRef } from './state';
+import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, chapterKey, type PageRef } from './state';
 import { getPages, refKey } from './page-io';
-import { cacheClear, cacheCount } from './page-cache';
+import { cacheClear, cacheCount, cacheCountPrefix } from './page-cache';
 import { isDebug } from '../debug';
-import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet } from './queue';
+import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued, resumeAuto } from './queue';
 import { setStatus, idleStatus, pageCounts, makeToast, logError } from './status-ui';
 import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
 import { toggleCharsPanel, charsPanelOpen } from './chars-ui';
-import { setAutoTranslate } from './auto';
+import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
+import { startSweep, cancelSweep, sweepStatus, sweepPages } from './sweep';
 
 export function toggleOverlay(): void {
     setOverlayOn(!overlayOn);
@@ -100,6 +101,7 @@ function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => void): 
         return;
     }
     setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
+    resumeAuto(); // user intent — a provider halt (rate limit/auth) waits for exactly this
     let queued = 0, cancelled = 0, active = false;
     for (const c of fresh) {
         const r = enqueue(c.r);
@@ -162,6 +164,7 @@ export function installMessageListener(): void {
                 return;
             }
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
+            resumeAuto(); // user intent — clears a provider halt (rate limit/auth)
             const r = enqueue(ref);
             if (r === 'dup') {
                 // second click on a queued page = cancel it
@@ -176,16 +179,21 @@ export function installMessageListener(): void {
         }
         if (msg?.type === 'mt:cancel-all') {
             // drop everything queued (the in-flight page runs out — aborting mid-LLM
-            // wastes spent tokens and corrupts the book)
-            const n = queue.length;
+            // wastes spent tokens and corrupts the book). Background engines stop
+            // too: the chapter sweep (own stop otherwise) and the lookahead chain
+            // (drains after its current page — same no-mid-LLM-abort rule).
+            const n = queue.length + paintQueued();
+            const stopping = !!sweepStatus()?.active || cancelLookahead();
             clearQueue();
-            setStatus(n ? `Cancelled — dropped ${n} queued` : idleStatus(), 'idle');
+            cancelSweep();
+            setStatus(n ? `Cancelled — dropped ${n} queued` : stopping ? 'Stopping background work…' : idleStatus(), 'idle');
             sendResponse({ ok: true, dropped: n });
             return;
         }
         if (msg?.type === 'mt:retranslate') {
             // re-translate only the page the reader is on (with context rewind)
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
+            resumeAuto(); // user intent — clears a provider halt (rate limit/auth)
             const ref = imgInViewport();
             if (!ref) { sendResponse({ ok: false, error: 'no manga image in view' }); return; }
             if (pageKeyOf(ref) === activeKeyGet()) { sendResponse({ ok: false, error: 'page is rendering right now' }); return; }
@@ -224,11 +232,11 @@ export function installMessageListener(): void {
             return true;
         }
         if (msg?.type === 'mt:cache-clear') {
-            cacheClear().then(async () => sendResponse({ ok: true, count: await cacheCount(), max: pipeline.cacheMax }));
+            cacheClear().then(async () => sendResponse({ ok: true, count: await cacheCount(), mine: 0, max: pipeline.cacheMax }));
             return true;
         }
         if (msg?.type === 'mt:cache-count') {
-            cacheCount().then(count => sendResponse({ ok: true, count, max: pipeline.cacheMax }));
+            (async () => sendResponse({ ok: true, count: await cacheCount(), mine: await cacheCountPrefix(chapterKey() + '#'), max: pipeline.cacheMax }))();
             return true;
         }
         if (msg?.type === 'mt:status') {
@@ -249,6 +257,8 @@ export function installMessageListener(): void {
                 viewedTranslated: viewed ? !!stateFor(viewed)?.det : false,
                 viewedQueued: viewed ? queue.some(j => j.key === pageKeyOf(viewed)) : false,
                 viewedActive: viewed ? pageKeyOf(viewed) === activeKeyGet() : false,
+                sweep: sweepStatus(),
+                lookaheadActive: lookaheadActive(),
                 ...pageCounts(),
             });
             return;
@@ -264,6 +274,18 @@ export function installMessageListener(): void {
             setAutoTranslate(m.on === true);
             sendResponse({ ok: true });
             return;
+        }
+        if (msg?.type === 'mt:sweep-start') {
+            startSweep().then(r => sendResponse(r));
+            return true;
+        }
+        if (msg?.type === 'mt:sweep-cancel') {
+            sendResponse(cancelSweep());
+            return;
+        }
+        if (msg?.type === 'mt:sweep-count') {
+            sweepPages().then(n => sendResponse({ ok: true, count: n }));
+            return true;
         }
     });
 }

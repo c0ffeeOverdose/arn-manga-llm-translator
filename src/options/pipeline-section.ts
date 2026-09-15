@@ -55,7 +55,7 @@ function syncColorUI(): void {
 
 export function syncAdvancedUI(): void {
     ($('preset') as HTMLSelectElement).value = presetsPristine ? matchingPreset(pipeline) : 'custom';
-    for (const id of ['detConf', 'detMinSize', 'panelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'minFont', 'cacheMax']) syncRange(id, id);
+    for (const id of ['detConf', 'detMinSize', 'panelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'minFont', 'textScale', 'cacheMax']) syncRange(id, id);
     syncColorUI();
     ($('deferLabels') as HTMLInputElement).checked = pipeline.deferLabels;
     ($('vlmAssisted') as HTMLInputElement).checked = pipeline.vlmAssistedDetection;
@@ -73,10 +73,12 @@ export function syncAdvancedUI(): void {
     ($('readingDir') as HTMLSelectElement).value = pipeline.readingDir;
     ($('transcribeSrc') as HTMLInputElement).checked = pipeline.transcribeSrc === true;
     syncOcrManager();
+    syncOcrSeparateUI();
 }
 ($<HTMLSelectElement>('textSource')).onchange = () => {
     pipeline.textSource = ($<HTMLSelectElement>('textSource')).value as 'page' | 'crops' | 'ocr';
     syncOcrManager();
+    syncOcrSeparateUI();
     markCustom();
 };
 ($<HTMLSelectElement>('readingDir')).onchange = () => {
@@ -87,6 +89,19 @@ export function syncAdvancedUI(): void {
     pipeline.transcribeSrc = ($<HTMLInputElement>('transcribeSrc')).checked;
     markCustom();
 };
+
+($<HTMLInputElement>('ocrPerRegion')).onchange = () => {
+    pipeline.ocrPerRegion = ($<HTMLInputElement>('ocrPerRegion')).checked;
+    markCustom();
+};
+
+// ---- separate VLM reader: checkbox always visible, creds only when it can
+// run (vision modes — local-OCR mode never sends images anywhere)
+export function syncOcrSeparateUI(): void {
+    ($('ocrSeparate') as HTMLInputElement).checked = pipeline.useOcrModel;
+    ($('ocrPerRegion') as HTMLInputElement).checked = pipeline.ocrPerRegion;
+    $('ocrSeparateFields').style.display = pipeline.useOcrModel && pipeline.textSource !== 'ocr' ? '' : 'none';
+}
 
 // ---- OCR model manager: download/delete per language, with progress ----
 
@@ -254,6 +269,7 @@ const RANGE_ABS: Record<string, { min?: number; max?: number }> = {
     contextPairs: { min: 0, max: 200 },
     parallelLlm: { min: 1, max: 10 },
     minFont: { min: 1, max: 72 },
+    textScale: { min: 0.6, max: 1.6 },
     textStroke: { min: 0, max: 0.5 },
     cacheMax: { min: 10, max: 2000 },
 };
@@ -462,7 +478,7 @@ async function refreshCacheCount(): Promise<void> {
     // error as if it were a count — the options page is often opened standalone
     if (!resp?.ok) { row.style.display = 'none'; return; }
     row.style.display = '';
-    el.textContent = `${resp.count}/${resp.max} pages`;
+    el.textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;
 }
 ($('cacheClear') as HTMLButtonElement).onclick = async () => {
     const id = await mangaTab();
@@ -471,6 +487,6 @@ async function refreshCacheCount(): Promise<void> {
     btn.textContent = 'Clearing…';
     const resp = await chrome.tabs.sendMessage(id, { type: 'mt:cache-clear' }).catch(() => null);
     btn.textContent = 'Clear translation cache';
-    if (resp?.ok) ($('cacheCount') as HTMLElement).textContent = `${resp.count}/${resp.max} pages`;
+    if (resp?.ok) ($('cacheCount') as HTMLElement).textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;
 };
 refreshCacheCount();

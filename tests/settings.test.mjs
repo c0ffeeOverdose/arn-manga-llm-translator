@@ -21,7 +21,7 @@ test('fast preset changes tuning values', () => {
   const fast = applyPreset('fast');
   assert.equal(fast.cropSize, 360);
   assert.equal(fast.contextPairs, 15);
-  assert.equal(fast.textSource, 'page'); // unchanged from default
+  assert.equal(fast.textSource, 'crops'); // unchanged from default
   assert.equal(matchingPreset(fast), 'fast');
 });
 
@@ -44,6 +44,28 @@ test('load fills missing keys, drops unknown, resets wrong types', () => {
   assert.equal(merged.bogusKey, undefined);
 });
 
+test('temperature: null = provider default; numbers clamp to 0-1; junk resets', () => {
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.temperature, null);
+  assert.equal(loadPipelineSettings({ temperature: 0.3 }).temperature, 0.3);
+  assert.equal(loadPipelineSettings({ temperature: 0 }).temperature, 0);
+  for (const bad of [2, -1, NaN, Infinity, '0.3', true, {}]) {
+    assert.equal(loadPipelineSettings({ temperature: bad }).temperature, null, String(bad));
+  }
+  // pinned temperature is a quality knob: presets read as "custom"
+  assert.equal(matchingPreset(loadPipelineSettings({ temperature: 0.3 })), 'custom');
+});
+
+test('ocrTemperature: default 0 (sent), null = provider default, junk → 0', () => {
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.ocrTemperature, 0);
+  assert.equal(loadPipelineSettings({}).ocrTemperature, 0);
+  assert.equal(loadPipelineSettings({ ocrTemperature: null }).ocrTemperature, null);
+  assert.equal(loadPipelineSettings({ ocrTemperature: 0.7 }).ocrTemperature, 0.7);
+  for (const bad of [2, -1, NaN, Infinity, '0.3', true]) {
+    assert.equal(loadPipelineSettings({ ocrTemperature: bad }).ocrTemperature, 0, String(bad));
+  }
+  assert.equal(matchingPreset(loadPipelineSettings({ ocrTemperature: 0.5 })), 'custom');
+});
+
 test('migration: old useVision/visionMode/ocrModel map onto textSource', () => {
   // visionMode 'text' → crops
   assert.equal(loadPipelineSettings({ visionMode: 'text' }).textSource, 'crops');
@@ -53,6 +75,9 @@ test('migration: old useVision/visionMode/ocrModel map onto textSource', () => {
   assert.equal(loadPipelineSettings({ ocrModel: 'tesseract' }).textSource, 'ocr');
   // default/old vision on → page
   assert.equal(loadPipelineSettings({ useVision: true, visionMode: 'auto' }).textSource, 'page');
+  // fresh installs (no keys at all) follow the current default
+  assert.equal(loadPipelineSettings({}).textSource, DEFAULT_PIPELINE_SETTINGS.textSource);
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.textSource, 'crops');
   // explicit new value wins — no migration
   assert.equal(loadPipelineSettings({ textSource: 'ocr' }).textSource, 'ocr');
 });
@@ -116,6 +141,10 @@ test('text/stroke colors: hex kept, garbage resets to auto, stroke clamps', () =
   assert.equal(loadPipelineSettings({ textStroke: 0.2 }).textStroke, 0.2);
   assert.equal(loadPipelineSettings({ textStroke: 9 }).textStroke, 0.1);
   assert.equal(loadPipelineSettings({ textStroke: 'big' }).textStroke, 0.1);
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.textScale, 1);
+  assert.equal(loadPipelineSettings({ textScale: 1.3 }).textScale, 1.3);
+  assert.equal(loadPipelineSettings({ textScale: 9 }).textScale, 1); // out of range → default
+  assert.equal(loadPipelineSettings({ textScale: 'big' }).textScale, 1);
 });
 
 test('prefetchN: default 3, int 1-30, out-of-range resets, preset display ignores it', () => {
@@ -213,6 +242,23 @@ test('transcribeSrc defaults false, wrong types reset', () => {
   assert.equal(loadPipelineSettings({}).transcribeSrc, false);
   assert.equal(loadPipelineSettings({ transcribeSrc: true }).transcribeSrc, true);
   assert.equal(loadPipelineSettings({ transcribeSrc: 'yes' }).transcribeSrc, false);
+});
+
+test('useOcrModel defaults false, wrong types reset, never marks Custom', () => {
+  assert.equal(loadPipelineSettings({}).useOcrModel, false);
+  assert.equal(loadPipelineSettings({ useOcrModel: true }).useOcrModel, true);
+  assert.equal(loadPipelineSettings({ useOcrModel: 'yes' }).useOcrModel, false);
+  assert.equal(matchingPreset({ ...DEFAULT_PIPELINE_SETTINGS, useOcrModel: true }), 'balanced');
+});
+
+test('ocrThinking defaults none, normalizes like thinkingLevel, never marks Custom', () => {
+  assert.equal(loadPipelineSettings({}).ocrThinking, 'none');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'high' }).ocrThinking, 'high');
+  assert.equal(loadPipelineSettings({ ocrThinking: '' }).ocrThinking, 'none');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'minimal' }).ocrThinking, 'low');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'HIGH' }).ocrThinking, 'high');
+  assert.equal(loadPipelineSettings({ ocrThinking: 'turbo' }).ocrThinking, 'turbo'); // custom passes through
+  assert.equal(matchingPreset({ ...DEFAULT_PIPELINE_SETTINGS, ocrThinking: 'high' }), 'balanced');
 });
 
 test('mergePipeline: popup-owned keys survive an options save', () => {

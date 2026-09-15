@@ -19,9 +19,9 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix } =
+const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches, joinTranscription } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
-const { toMtError, LlmHttpError } =
+const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
 const { langOk, fetchWithProgress } =
   await import(new URL('../.test-build/ocr-models.mjs', import.meta.url).href);
@@ -436,6 +436,261 @@ test('toMtError: plain 400 without image keywords gets no hint', () => {
   assert.equal(m.hint, undefined);
 });
 
+// live: Cloudflare Workers AI 403 for un-agreed Meta models — the generic
+// "API key is wrong" hint sent the user to re-check a working token
+test('toMtError: CF license 403 gets the agree hint, other 403s keep the key hint', () => {
+  const license = toMtError(new LlmHttpError(403,
+    'LLM API 403: {"errors":[{"message":"AiError: Model Agreement: Prior to using this model, you must submit the prompt \'agree\'. ' +
+    'By submitting \'agree\', you hereby agree to the llama-3.2-11b-vision-instruct Community License …"}]}'));
+  assert.equal(license.kind, 'auth');
+  assert.match(license.hint ?? '', /agree/);
+  assert.doesNotMatch(license.hint ?? '', /API key is wrong/);
+  const plain = toMtError(new LlmHttpError(403, 'LLM API 403: {"errors":[{"message":"Authentication error"}]}'));
+  assert.match(plain.hint ?? '', /API key is wrong/);
+});
+
+// ---- Cloudflare Workers AI native run (live-probed shapes) ----
+
+test('cfRunUrl: model in the URL, /ai and /ai/v1 bases both accepted', () => {
+  assert.equal(cfRunUrl('https://api.cloudflare.com/client/v4/accounts/abc/ai', '@cf/meta/x'),
+    'https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/x');
+  assert.equal(cfRunUrl('https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/', '@cf/meta/x'),
+    'https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/meta/x');
+});
+
+test('dispatch: the OpenAI provider never reroutes — a Cloudflare base still posts to chat/completions', async () => {
+  // provider choice is explicit: users pick "Cloudflare Workers AI" for the
+  // native run endpoint; the OpenAI slot must not secretly switch endpoints
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return {
+      ok: true, status: 200,
+      async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); },
+    };
+  };
+  const s = { provider: 'openai', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/abc/ai/v1', model: '@cf/meta/llama-3.2-11b-vision-instruct', apiKey: 'k' };
+  try {
+    await callLLM(s, 'p', ['QUJD']);
+    assert.equal(seen[0].url, 'https://api.cloudflare.com/client/v4/accounts/abc/ai/v1/chat/completions');
+    assert.equal(seen[0].body.model, s.model);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('temperature: each protocol carries it where legal; off = parameter not sent', async () => {
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return {
+      ok: true, status: 200,
+      async text() {
+        if (String(url).includes('/v1/messages')) return JSON.stringify({ content: [{ type: 'text', text: 'ok' }], usage: {} });
+        if (String(url).includes(':generateContent')) return JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
+        return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+      },
+    };
+  };
+  const openai = { provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' };
+  const anthropic = { provider: 'anthropic', baseUrl: 'https://a.test', model: 'm', apiKey: 'k' };
+  const gemini = { provider: 'gemini', baseUrl: 'https://g.test/v1beta', model: 'm', apiKey: 'k' };
+  try {
+    await callLLM(openai, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(seen.at(-1).body.temperature, 0.25);
+    await callLLM(openai, 'p');
+    assert.equal(seen.at(-1).body.temperature, undefined, 'off = parameter not sent (provider default)');
+    await callLLM(anthropic, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(seen.at(-1).body.temperature, 0.25);
+    await callLLM(anthropic, 'p', undefined, 'low', undefined, 0.25);
+    assert.equal(seen.at(-1).body.temperature, undefined, 'Anthropic forbids temperature together with thinking');
+    await callLLM(gemini, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(seen.at(-1).body.generationConfig.temperature, 0.25);
+    await callLLM(gemini, 'p', undefined, 'high', undefined, null);
+    assert.equal(seen.at(-1).body.generationConfig.temperature, undefined);
+    assert.ok(seen.at(-1).body.generationConfig.thinkingConfig, 'thinking config survives without a temperature');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('callLLM: a rejected temperature is retried without it and reported (tempDropped)', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    if (calls === 1) {
+      return {
+        ok: false, status: 400,
+        async text() { return JSON.stringify({ error: { message: "Unsupported value: 'temperature' does not support 0 with this model" } }); },
+      };
+    }
+    return {
+      ok: true, status: 200,
+      async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); },
+    };
+  };
+  try {
+    const r = await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(calls, 2, 'rejected request + clean retry');
+    assert.equal(r.text, 'ok');
+    assert.equal(r.tempDropped, true, 'the caller can memoize the rejection');
+    calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); } };
+    };
+    const r2 = await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, 0.25);
+    assert.equal(calls, 1);
+    assert.equal(r2.tempDropped, undefined, 'accepted temperature reports nothing');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('maxTokens: transcribe caps reach every protocol, default stays 4096', async () => {
+  assert.equal(cfBody('x', ['a']).max_tokens, 4096);
+  assert.equal(cfBody('x', ['a'], null, 0, 512).max_tokens, 512);
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init?.body)), headers: init?.headers ?? {} });
+    return {
+      ok: true, status: 200,
+      async text() {
+        if (String(url).includes('/v1/messages')) return JSON.stringify({ content: [{ type: 'text', text: 'ok' }], usage: {} });
+        if (String(url).includes(':generateContent')) return JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
+        if (String(url).includes('/responses')) return JSON.stringify({ output: [], usage: {} });
+        if (String(url).includes('/ai/run/')) return JSON.stringify({ result: { response: 'ok', usage: {} }, success: true });
+        return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} });
+      },
+    };
+  };
+  try {
+    await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p', ['QUJD'], 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.max_tokens, 512);
+    await callLLM({ provider: 'cloudflare', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/a/ai', model: '@cf/meta/x', apiKey: 'k' }, 'p', ['QUJD'], 'auto', 'manga-7', null, 512);
+    assert.match(seen.at(-1).url, /\/ai\/run\//);
+    assert.equal(seen.at(-1).body.max_tokens, 512);
+    assert.equal(seen.at(-1).headers['x-session-affinity'], 'manga-7', 'prefix-cache affinity rides the conversation key');
+    await callLLM({ provider: 'anthropic', baseUrl: 'https://a.test', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.max_tokens, 512);
+    await callLLM({ provider: 'gemini', baseUrl: 'https://g.test/v1beta', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.generationConfig.maxOutputTokens, 512);
+    await callLLM({ provider: 'responses', baseUrl: 'https://r.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
+    assert.equal(seen.at(-1).body.max_output_tokens, 512);
+    await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p');
+    assert.equal(seen.at(-1).body.max_tokens, 4096, 'no cap passed = previous default');
+    assert.equal(seen.at(-1).headers['x-session-affinity'], undefined, 'affinity is a CF-only header');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('isImageCapError: compat "Unable to add image" is NOT an image-count cap (single image fails too)', () => {
+  const e = new MtError('parse', 'AiError: AiError: Unable to add image when there are no user-supplied nor system-supplied messages. (uuid)', undefined);
+  assert.equal(isImageCapError(e), false, 'the message is not a cap — the endpoint rejects this model\'s images entirely');
+});
+
+
+test('cfBody: explicit max_tokens, images as data-URL parts, no model field', () => {
+  const b = cfBody('hi', ['QUJD'], null);
+  assert.equal(b.max_tokens, 4096, 'native default is 256 — must be explicit');
+  assert.equal(b.model, undefined, 'model lives in the URL');
+  const content = b.messages[0].content;
+  assert.deepEqual(content[0], { type: 'text', text: 'hi' });
+  assert.deepEqual(content[1], { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,QUJD' } });
+  assert.equal(cfBody('x').messages[0].content.length, 1, 'text-only request carries no image parts');
+  assert.equal(cfBody('x', ['a'], 'low').reasoning_effort, 'low');
+  assert.equal(cfBody('x', ['a'], 'none').reasoning_effort, undefined, 'CF rejects the literal "none" — omit it');
+  assert.equal(cfBody('x', ['a'], null).reasoning_effort, undefined);
+});
+
+test('cfParse: result.response and result.choices both parse; usage + cached tokens map', () => {
+  assert.deepEqual(
+    cfParse({ result: { response: 'abc', usage: { prompt_tokens: 7, completion_tokens: 3 } } }),
+    { text: 'abc', usage: { inTok: 7, outTok: 3, cachedInTok: undefined } });
+  assert.equal(cfParse({ result: { choices: [{ message: { content: 'def' } }] } }).text, 'def');
+  assert.equal(cfParse({ result: {} }).text, '');
+  assert.equal(cfParse(null).text, '');
+  // Workers AI surfaces prefix-cache hits here; the dump's cachedInTok reads it
+  const hit = cfParse({ result: { response: 'x', usage: { prompt_tokens: 2000, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 1536 } } } });
+  assert.equal(hit.usage.cachedInTok, 1536);
+});
+
+test('cfError: errors[] → LlmHttpError (covers HTTP 200 + success:false) with providerCode', () => {
+  assert.equal(cfError({ errors: [] }, 200), null);
+  assert.equal(cfError(null, 200), null);
+  const e = cfError({ errors: [{ message: 'Model Agreement: …agree…' }] }, 403);
+  assert.ok(e instanceof LlmHttpError);
+  assert.equal(e.status, 403);
+  assert.equal(e.providerCode, undefined);
+  assert.match(e.message, /agree/);
+  const img = cfError({ errors: [{ message: 'AiError: Internal Server Error', code: 3030 }] }, 400);
+  assert.equal(img.providerCode, 3030);
+});
+
+test('cfImageCapHint: only CF 3030 with 2+ images (no model-name table)', () => {
+  assert.match(cfImageCapHint(3030, 3) ?? '', /OCR text/, 'multi-image rejection gets the actionable hint');
+  assert.equal(cfImageCapHint(3030, 1), undefined, 'single-image request: 3030 is not a cap problem');
+  assert.equal(cfImageCapHint(5001, 3), undefined, 'other codes stay unmapped');
+  assert.equal(cfImageCapHint(undefined, 3), undefined);
+});
+
+// ---- split-OCR auto-detect: image-count vs image-support classification ----
+
+test('isImageCapError: tagged CF cap, keyword caps, and NOT "cannot read images"', () => {
+  // tagged by cloudflareChat (CF 3030 + 2+ images)
+  assert.equal(isImageCapError(new MtError('parse', 'AiError: Internal Server Error', undefined, true)), true);
+  // keyword shapes from OpenAI-compatible providers
+  assert.equal(isImageCapError(new MtError('parse', 'You uploaded 5 images but this model supports a maximum of 1 image per request')), true);
+  assert.equal(isImageCapError(new MtError('parse', 'too many images: this model accepts only one image per message')), true);
+  // "cannot read images at all" must NOT route to per-region calls
+  assert.equal(isImageCapError(new MtError('parse', 'this model does not support images', 'switch to Local OCR')), false);
+  assert.equal(isImageCapError(new MtError('parse', 'invalid base64 in data URI at content[1]')), false);
+  // unrelated / non-MtError
+  assert.equal(isImageCapError(new MtError('auth', 'API key is wrong')), false);
+  assert.equal(isImageCapError(new Error('image cap')), false);
+  assert.equal(isImageCapError(undefined), false);
+});
+
+test('joinTranscription: multi-element answers join in order, keep/empty drop out', () => {
+  assert.equal(joinTranscription('<r n="1">ネクスト</r>\n<r n="2">ヒロイン</r>\n<r n="3" keep="true"/>'),
+    'ネクスト ヒロイン', 'line-splitting models keep every line');
+  assert.equal(joinTranscription('<r n="1">I\'M SORRY!</r>'), 'I\'M SORRY!');
+  assert.equal(joinTranscription('<r n="1" keep="true"/>'), '', 'keep-only → empty source');
+});
+
+test('joinTranscription: bare text (format drift) is used, not thrown away', () => {
+  assert.equal(joinTranscription('CLEAR!.'), 'CLEAR!.', 'live: CF llama-3.2 drifts to bare text ~1/3 of the time');
+  assert.equal(joinTranscription('I CLEARED IT WITH AN S RANK!\n\n(r n="1" keep="true")'),
+    'I CLEARED IT WITH AN S RANK!', 'dangling keep tag line dropped');
+  assert.equal(joinTranscription('```\nWOW!.\n```'), 'WOW!.', 'code fences stripped');
+  assert.equal(joinTranscription('no readable text in this crop'), '', 'refusal prose stays empty');
+  assert.equal(joinTranscription('(r n="1" keep="true")'), '', 'tag-only fallback → empty');
+  assert.equal(joinTranscription('この画像は、ワインのブドウの画像です。'), '',
+    'description of a text-less crop must not become a source (live-probed leak)');
+  assert.equal(joinTranscription('<r n="1">この画像は、ワインのブドウの画像です。</r>'), '',
+    'descriptions wrapped in the XML element are rejected too');
+  assert.equal(joinTranscription('<r n="1">写真を撮ってよ</r>'), '写真を撮ってよ',
+    'a real line that merely contains 写真 survives');
+});
+
+test('cfBody pins temperature 0 (CF default 0.6 drifts the XML format)', () => {
+  assert.equal(cfBody('x', ['a']).temperature, 0);
+  assert.equal(cfBody('x', ['a'], null, 0.3).temperature, 0.3, 'a user pin overrides the CF default');
+});
+
+test('transcribeOne prompt: one element, all lines joined, no multi-image wording', () => {
+  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false });
+  assert.match(p, /single manga region/);
+  assert.match(p, /Exactly one element/);
+  assert.doesNotMatch(p, /following images/, 'no crop-list wording — the request carries one image');
+  assert.doesNotMatch(p, /Translate the numbered/, 'pure transcription, no translation task');
+});
+
 // live: bracketed system message translated with brackets kept must render
 // (box 7 on a strip: "[WELCOME...]" -> "[ยินดีต้อนรับ...]" was parsed as keep)
 test('bracketed system message renders', () => {
@@ -539,6 +794,93 @@ test('updateContext learn=false: pairs fold, spk + mentions dropped, old book un
     false).ctx;
   assert.deepEqual(ctx.pairs, [['สวัสดี', 'hello']]);
   assert.deepEqual(ctx.characters, old);
+});
+
+// ---- book hygiene: box-type labels, honorific dedupe, eviction order ----
+
+test('book hygiene: box-type spk labels are never learned', () => {
+  const ctx = updateContext(EMPTY_CONTEXT, [
+    { index: 1, source: '', translation: 'ห้องนั่งเล่น', spk: { desc: 'ป้าย', gender: '?' } },
+    { index: 2, source: '', translation: '...และแล้ว', spk: { desc: 'narration', gender: 'M' } },
+    { index: 3, source: '', translation: 'ไปด้วยกันไหม', spk: { desc: 'boy with spiky hair', gender: 'M' } },
+  ]).ctx;
+  assert.equal(ctx.characters.length, 1, 'only the real speaker enters the book');
+  assert.equal(ctx.characters[0].desc, 'boy with spiky hair');
+});
+
+test('book hygiene: box-type mentions never enter the book', () => {
+  const ctx = updateContext(EMPTY_CONTEXT, [], [
+    { name: 'sign', gender: '?', desc: 'the room label' },
+    { name: 'ซากุระ', gender: 'F', desc: 'mentioned once' },
+  ]).ctx;
+  assert.equal(ctx.characters.length, 1);
+  assert.equal(ctx.characters[0].name, 'ซากุระ');
+});
+
+test('book hygiene: applyBookOps ignores label mentions even with ops attached', () => {
+  const book = [{ desc: 'hero girl', gender: 'F', name: 'ยามาดะ', source: 'vlm' }];
+  const { characters, ops } = applyBookOps(book, [{ name: 'narration', sameAs: 'ยามาดะ', gender: 'M', desc: 'x' }]);
+  assert.equal(ops.length, 0);
+  assert.deepEqual(characters, book);
+});
+
+test('book hygiene: polluted label rows are not sent; user rows survive the filter', () => {
+  const p = buildPrompt([{ index: 1, source: '' }],
+    { pairs: [], characters: [
+      { desc: 'narration', gender: 'M', source: 'vlm' },
+      { desc: 'sign', gender: '?', source: 'user' },
+      { desc: 'hero girl', gender: 'F', name: 'ยามาดะ', source: 'vlm' },
+    ] }, true, {});
+  assert.ok(p.includes('hero girl'), 'real character sent');
+  assert.ok(!p.includes('- narration'), 'learned label row not sent');
+  assert.ok(p.includes('- sign [gender'), 'user-added row is the user\'s call');
+});
+
+test('book hygiene: honorific forms of one name merge (คุจินาชิคุง / ฮิมุโระ-ซัง / Kuchinashi-kun)', () => {
+  let book = mergeCharacter([], { desc: 'a', gender: 'F', name: 'ฮิมุโระ', source: 'vlm' });
+  book = mergeCharacter(book, { desc: 'b', gender: '?', name: 'ฮิมุโระ-ซัง', source: 'vlm' });
+  assert.equal(book.length, 1, 'Thai honorific suffix is not a new person');
+  let en = mergeCharacter([], { desc: 'c', gender: 'M', name: 'Kuchinashi', source: 'vlm' });
+  en = mergeCharacter(en, { desc: 'd', gender: '?', name: 'Kuchinashi-kun', source: 'vlm' });
+  assert.equal(en.length, 1, 'romaji honorific suffix is not a new person');
+});
+
+test('book hygiene: cap evicts the oldest low-priority row — the new character stays', () => {
+  let book = [];
+  for (let i = 0; i < 10; i++) book = mergeCharacter(book, { desc: `alpha${i}`, gender: '?', source: 'speech' });
+  assert.equal(book.length, 10);
+  book = mergeCharacter(book, { desc: 'brand new person', gender: 'F', source: 'vlm' });
+  assert.equal(book.length, 10);
+  assert.ok(book.some(c => c.desc === 'brand new person'), 'the new row survives');
+  assert.ok(!book.some(c => c.desc === 'alpha0'), 'the oldest row was evicted');
+  // user rows are never the victim
+  let u = [{ desc: 'the user entry', gender: 'F', source: 'user' }];
+  for (let i = 0; i < 10; i++) u = mergeCharacter(u, { desc: `beta${i}`, gender: '?', source: 'vlm' });
+  assert.ok(u.some(c => c.source === 'user'), 'user row protected');
+});
+
+test('buildPrompt: box-type spk rule + credits rule ride the prompt', () => {
+  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {});
+  assert.ok(p.includes('spk is a PERSON'), 'speaker-only rule present');
+  assert.ok(p.includes('Credits, bylines'), 'credits rule present');
+});
+
+// ---- session id hashing: the reader URL must not reach a provider field ----
+
+test('sessionKey: opaque base36, no URL characters, deterministic', () => {
+  const raw = 'https://reader.test/chapter/abc?token=secret';
+  const k = sessionKey(raw);
+  assert.match(k, /^[0-9a-z]{8,16}$/, 'short base36 id');
+  assert.equal(k, sessionKey(raw), 'deterministic');
+  assert.ok(!/[\/:?&=]/.test(k), 'no URL characters survive');
+  assert.notEqual(k, sessionKey('https://reader.test/chapter/abc?token=other'));
+});
+
+test('sessionKey: per-install salt changes the id, same salt keeps it', () => {
+  const raw = 'https://reader.test/chapter/abc';
+  assert.equal(sessionKey(raw, 7), sessionKey(raw, 7));
+  assert.notEqual(sessionKey(raw, 7), sessionKey(raw, 8));
+  assert.notEqual(sessionKey(raw, 0), sessionKey(raw, 1), 'salt participates in the digest');
 });
 
 // ---- B: translation-only pairs (vision modes) + configurable depth ----
@@ -656,6 +998,30 @@ test('buildPrompt transcribeSrc: src requested + verbatim rule, ocr exempt, defa
   assert.ok(!pn.includes('src="this region'), 'default off');
 });
 
+test('buildPrompt transcribeOnly: transcribe task, no translate/book/pairs', () => {
+  const p = buildPrompt([{ index: 1, source: '' }, { index: 2, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false });
+  assert.ok(p.includes('Transcribe the text'), 'transcribe task');
+  assert.ok(!p.includes('Translate the numbered'), 'no translate task');
+  assert.ok(p.includes('Do NOT translate') || p.includes('Never translate'), 'never-translate rule');
+  assert.ok(p.includes('sound-effect'), 'SFX transcribed, not kept');
+  assert.ok(!p.includes('<names>') && !p.includes('known_characters') && !p.includes('recent_translations'), 'no book/pairs');
+  const pc = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false, textOnly: true });
+  assert.ok(pc.includes('There is no full-page image'), 'crops-only variant');
+  // same XML shape: translation field carries the transcription
+  const r = parseResponse('<r n="1">一緒に来て</r>\n<r n="2" keep="true"/>', 2);
+  assert.equal(r.regions[0].translation, '一緒に来て');
+  assert.equal(r.regions[1].translation, 'keep');
+});
+
+test('transcriptionMatches: whitespace-blind, case-strict, empty-expected never matches', () => {
+  assert.ok(transcriptionMatches('The quick brown fox', 'The quick brown fox'));
+  assert.ok(transcriptionMatches('The quick\nbrown   fox ', ' The quick brown fox'));
+  assert.ok(!transcriptionMatches('the quick brown fox', 'The quick brown fox'));
+  assert.ok(!transcriptionMatches('The quick brown cat', 'The quick brown fox'));
+  assert.ok(!transcriptionMatches('', ''));
+  assert.ok(!transcriptionMatches('anything', ''));
+});
+
 test('langOk: real tessdata codes pass, URL-steering values fail', () => {
   for (const l of ['jpn', 'eng', 'chi_sim', 'chi_tra', 'kor', 'vie']) assert.equal(langOk(l), true);
   for (const l of ['../osui', 'jpn/../../x', 'a@evil.com', 'JPN', '', 'javascript:alert(1)', 'a'.repeat(20)]) {
@@ -687,6 +1053,132 @@ test('fetchWithProgress: throws after 3 attempts', async () => {
     await assert.rejects(fetchWithProgress('https://example.com/x'), /boom/);
     assert.equal(calls, 3);
   } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+const ADOPT_REQ = {
+  cacheKey: 'manga-1', imagesB64: ['aGVsbG8='],
+  regions: [{ index: 1, source: 'Hello' }],
+  context: { pairs: [['a', 'b']], characters: [] },
+  vision: false, textOnly: true, ocr: true, split: false, pageW: 100, pageH: 100,
+};
+const ADOPT_ST = {
+  provider: 'openai', model: 'm', baseUrl: '', ocrModel: '',
+  thinkingLevel: 'low', ocrThinking: 'none',
+  temperature: null,
+  ocrTemperature: 0,
+  useOcrModel: false, stylePrompt: '', targetLang: 'Thai',
+  useCharacters: true, contextPairs: 40, transcribeSrc: false, vlmAssisted: false,
+};
+
+test('translateRequestId: stable 64-hex, sensitive to every output-shaping input', async () => {
+  const id = await translateRequestId(translateRequestParts(ADOPT_REQ, ADOPT_ST));
+  assert.match(id, /^[0-9a-f]{64}$/);
+  assert.equal(await translateRequestId(translateRequestParts(ADOPT_REQ, ADOPT_ST)), id);
+  // each of these changes what the model returns → must re-key (fresh call, never a wrong share)
+  const variants = [
+    [{ ...ADOPT_REQ, imagesB64: ['d29ybGQ='] }, ADOPT_ST, 'pixels'],
+    [{ ...ADOPT_REQ, regions: [{ index: 1, source: 'Bye' }] }, ADOPT_ST, 'regions'],
+    [{ ...ADOPT_REQ, context: { pairs: [], characters: [] } }, ADOPT_ST, 'context'],
+    [{ ...ADOPT_REQ, cacheKey: 'manga-2' }, ADOPT_ST, 'manga scope'],
+    [ADOPT_REQ, { ...ADOPT_ST, model: 'm2' }, 'model'],
+    [ADOPT_REQ, { ...ADOPT_ST, thinkingLevel: 'high' }, 'thinking'],
+    [ADOPT_REQ, { ...ADOPT_ST, temperature: 0.3 }, 'temperature'],
+    [ADOPT_REQ, { ...ADOPT_ST, ocrTemperature: 0.6 }, 'ocr temperature'],
+    [ADOPT_REQ, { ...ADOPT_ST, targetLang: 'English' }, 'target lang'],
+    [ADOPT_REQ, { ...ADOPT_ST, useCharacters: false }, 'chars flag'],
+    [{ ...ADOPT_REQ, split: true }, ADOPT_ST, 'split mode'],
+  ];
+  for (const [r, s, why] of variants) {
+    assert.notEqual(await translateRequestId(translateRequestParts(r, s)), id, `must re-key on ${why}`);
+  }
+});
+
+// ---- provider rate-limit breaker: a 429 is a refusal, not a hiccup ----
+// Live case (OpenRouter free VLM): per-call retries x page cooldown x
+// sweep/lookahead workers turned one 429 into 24 identical requests in 3min.
+
+test('429: no retry, one request only, and Retry-After arms the window', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return {
+      ok: false, status: 429,
+      headers: { get: (h) => (String(h).toLowerCase() === 'retry-after' ? '2' : null) },
+      async text() { return JSON.stringify({ error: { message: 'rate limited, slow down' } }); },
+    };
+  };
+  const s = { provider: 'openai', baseUrl: 'https://rl-a.test/v1', model: 'm', apiKey: 'k' };
+  try {
+    let first;
+    try { await callLLM(s, 'p'); } catch (e) { first = e; }
+    assert.equal(calls, 1, 'a refusal is not retried (the breaker owns the wait)');
+    const m = toMtError(first);
+    assert.equal(m.kind, 'ratelimit');
+    assert.equal(m.retryAfterMs, 2000, 'window follows the Retry-After header');
+    // inside the window: refused locally, no request goes out
+    let second;
+    try { await callLLM(s, 'p'); } catch (e) { second = e; }
+    assert.equal(calls, 1, 'no request while the provider is refusing');
+    assert.equal(second.kind, 'ratelimit');
+    assert.ok(second.retryAfterMs > 0 && second.retryAfterMs <= 2000, 'remaining time is reported');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('429 without Retry-After: the default cooldown still blocks the retry', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return { ok: false, status: 429, async text() { return '{}'; } };
+  };
+  const s = { provider: 'openai', baseUrl: 'https://rl-b.test/v1', model: 'm', apiKey: 'k' };
+  try {
+    await callLLM(s, 'p').catch(() => {});
+    await callLLM(s, 'p').catch(() => {});
+    assert.equal(calls, 1, 'default window (45s) blocks the second call too');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('429: the window is per provider|baseUrl and expires', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const realFetch = globalThis.fetch;
+  let limited = 0, other = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('rl-c.test')) {
+      limited++;
+      return {
+        ok: false, status: 429,
+        headers: { get: () => '2' },
+        async text() { return '{}'; },
+      };
+    }
+    other++;
+    return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }] }); } };
+  };
+  const a = { provider: 'openai', baseUrl: 'https://rl-c.test/v1', model: 'm', apiKey: 'k' };
+  const b = { provider: 'openai', baseUrl: 'https://rl-d.test/v1', model: 'm', apiKey: 'k' };
+  try {
+    await callLLM(a, 'p').catch(() => {});
+    assert.equal(limited, 1);
+    // another provider keeps working — a 429 on a free OCR model must not
+    // block the (separate) translation provider
+    await callLLM(b, 'p');
+    assert.equal(other, 1, 'separate provider unaffected');
+    // window still open → blocked; after it expires → request goes out again
+    await callLLM(a, 'p').catch(() => {});
+    assert.equal(limited, 1);
+    t.mock.timers.tick(2100);
+    await callLLM(a, 'p').catch(() => {});
+    assert.equal(limited, 2, 'window expired — the next call is allowed through');
+  } finally {
+    t.mock.timers.reset();
     globalThis.fetch = realFetch;
   }
 });

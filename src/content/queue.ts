@@ -6,23 +6,53 @@
 // NOTE: mutual imports with status-ui/overlays are fine — every cross-module
 // use happens inside function bodies, never at module top level.
 
-import { updateContext } from '../llm/core';
+import { updateContext, type CharacterEntry } from '../llm/core';
 import { cooldownMark, cooldownClear, type FailMark, pageHashFromBitmap } from './page-cache';
 import { isDebug } from '../debug';
 import type { MtStage } from './detection';
-import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, contextChapter, resetContextIfNewChapter, pages, overlayChoice, setOverlayOn, type PageRef, type PageState } from './state';
+import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, contextChapter, resetContextIfNewChapter, pages, uniquePages, overlayChoice, setOverlayOn, type PageRef, type PageState } from './state';
 import { refKey, getPages } from './page-io';
 import { preparePage, type Prep } from './pipeline';
 import { trySeam, type Job } from './seam';
 import { renderPage } from './render-page';
-import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logError, pillUnDismiss } from './status-ui';
+import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logError, pillUnDismiss, setStatus } from './status-ui';
 import { applyOverlays } from './overlays';
+import { bookHas } from './sweep'; // paint-lane divert decision — queue↔sweep calls stay in function bodies only, like the queue↔seam cycle
 
 export const queue: Job[] = [];
 let running = false;
+// paint lane: cache-hit jobs whose outputs are already folded (bookHas) need
+// no LLM and no book mutation, so they must not hold the serial pump — they
+// run here, up to PAINT_JOBS at once. Visible to seam/auto-twin guards:
+// queued paints resolve like queued preps, active paints like the active one.
+const paintQueue: Job[] = [];
+const paintActive = new Map<string, Job>();
+let paintRunning = 0;
+// ponytail: fixed lane — paints are local CPU (inpaint + layout + PNG
+// encode), provider limits don't apply. Raise if dense chapters paint slowly.
+const PAINT_JOBS = 3;
+export function paintFind(key: string): Job | undefined {
+    return paintQueue.find(j => j.key === key) ?? paintActive.get(key);
+}
+export function paintHas(key: string): boolean { return paintQueue.some(j => j.key === key) || paintActive.has(key); }
+export function paintQueued(): number { return paintQueue.length; }
+export function paintBusy(): boolean { return paintRunning > 0 || paintQueue.length > 0; }
 // failure cooldown per page key: a failed job parks for 60s (max 3 attempts)
 // instead of being re-enqueued every autoTick — auto-retry without token burn
 export const failMarks = new Map<string, FailMark>();
+// provider stop ("halt"): a rate-limit refusal — or an auth/quota error — cannot
+// be fixed by translating the next page, and the stacked retry layers (call
+// attempts x page cooldown x lookahead/sweep workers) are what turned one 429
+// into a request storm (live: 24 identical requests in 3 minutes). The first
+// refusal arms a window (the adapter refuses further calls to that provider)
+// and halts auto fanout; only explicit user intent resumes: Translate /
+// Retranslate, the popup auto toggle, Translate chapter, or a page reload.
+let autoHalt: { kind: string; until: number } | null = null;
+export function haltAuto(kind: string, retryAfterMs = 0): void {
+    autoHalt = { kind, until: retryAfterMs > 0 ? Date.now() + retryAfterMs : 0 };
+}
+export function autoHalted(): { kind: string; until: number } | null { return autoHalt; }
+export function resumeAuto(): void { autoHalt = null; }
 let activeRef: PageRef | null = null; // job currently rendering
 let activeKey: string | null = null; // its page key — twins on swapped elements map here
 let activePrep: Promise<Prep | null> | null = null; // its prep — seam owners await members' preps, active included
@@ -46,14 +76,26 @@ export function pageKeyOf(ref: PageRef): string {
 // this, a wrong first guess (first-wins naming) survives every re-translate.
 export async function rewindContextBefore(...targets: (PageState | undefined)[]): Promise<void> {
     await loadContext();
-    const userEntries = context.characters.filter(c => c.source === 'user');
-    let rebuilt = { pairs: [] as [string, string][], characters: [...userEntries] };
-    for (const ref of getPages()) {
-        const st = pages.get(refKey(ref));
-        if (!st || targets.includes(st) || !st.outputs?.length) continue;
-        rebuilt = updateContext(rebuilt, st.outputs, st.mentions ?? [], pipeline.useCharacters, pipeline.contextPairs).ctx;
+    // Snapshot first: the target's bookBefore/pairsBefore is the exact state
+    // before it folded, and unlike a replay it works in a fresh session (the
+    // book came from storage, so there are no page states to rebuild from —
+    // the replay silently wiped it: live-proven 10 → 3 entries, and the
+    // re-translate then swapped speakers/genders it had known).
+    const snapped = targets.find((t): t is PageState => !!t?.bookBefore);
+    if (snapped) {
+        setContext({ pairs: [...(snapped.pairsBefore ?? [])], characters: [...snapped.bookBefore!] });
+        return;
     }
-    setContext(rebuilt);
+    // No snapshot (state created before this field existed): rebuild PAIRS only
+    // from the accumulated page states and keep the characters untouched —
+    // dropping rows the replay cannot re-derive is worse than a stale row (the
+    // model's correct=/sameAs ops can fix rows; a wiped book is unrecoverable).
+    let rebuilt: { pairs: [string, string][]; characters: CharacterEntry[] } = { pairs: [], characters: [] };
+    for (const st of uniquePages()) {
+        if (targets.includes(st) || !st.outputs?.length) continue;
+        rebuilt = updateContext(rebuilt, st.outputs, [], false, pipeline.contextPairs).ctx;
+    }
+    setContext({ pairs: rebuilt.pairs, characters: context.characters });
 }
 
 // …and after the fresh translation, fold the pages that FOLLOW the target
@@ -78,6 +120,7 @@ export function enqueue(ref: PageRef, force = false, auto = false): 'queued' | '
     const key = pageKeyOf(ref);
     if (force) cooldownClear(failMarks, key); // manual retranslate retries immediately
     if (key === activeKey) return 'active';
+    if (paintHas(key)) return 'active'; // paint lane owns it — a twin would only double-render
     const twin = queue.findIndex(j => j.key === key);
     if (twin !== -1) {
         if (!force) return 'dup';
@@ -136,6 +179,41 @@ export async function pump(): Promise<void> {
         }
     } finally {
         running = false;
+    }
+}
+
+// paint pump: up to PAINT_JOBS cached repaints at once (local CPU only — no
+// LLM, no book writes). Quiet completions (no per-page Done — the counts +
+// progress bar already report); failures park + surface like normal errors.
+function pumpPaint(): void {
+    while (paintRunning < PAINT_JOBS) {
+        const job = paintQueue.shift();
+        if (!job) return;
+        paintRunning++;
+        paintActive.set(job.key, job);
+        const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
+        void (async () => {
+            try {
+                const prep = await job.prep;
+                if (!prep) { removeActivity(job.key); renderStatus(); return; } // painted while queued
+                await renderPage(job.ref, prep, st, job.force);
+                cooldownClear(failMarks, job.key);
+                removeActivity(job.key);
+                renderStatus();
+            } catch (e) {
+                const err = e as Error & { kind?: string; hint?: string };
+                cooldownMark(failMarks, job.key, Date.now());
+                removeActivity(job.key);
+                lastMsgSet({ text: 'Error: ' + err.message, phase: 'error' });
+                renderStatus();
+                void logError(err.message, err.hint, err.kind);
+            } finally {
+                paintActive.delete(job.key);
+                paintRunning--;
+                applyOverlays();
+                pumpPaint();
+            }
+        })();
     }
 }
 
@@ -198,6 +276,11 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     // 20s failed to prevent it. A held port suspends nothing.
     let keepalive: chrome.runtime.Port | null = null;
     try { keepalive = chrome.runtime.connect({ name: 'mt-keepalive' }); } catch { /* context invalidated — job fails loudly anyway */ }
+    // A held port alone does not reset the service worker's 30s idle timer in
+    // Chrome (live-proven: a port-path translate died at exactly 30s + the 5s
+    // fallback backoff, re-paying the whole OCR). A port message counts as
+    // activity — ping well under the timer while the job runs.
+    const keepalivePing = setInterval(() => { try { keepalive?.postMessage(0); } catch { /* gone */ } }, 15000);
     const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
     try {
         let prep;
@@ -216,10 +299,22 @@ export async function runJob(allowSeam: boolean): Promise<void> {
             if (isDebug()) console.log('[mt] job dropped (already translated):', job.key.slice(-14));
             removeActivity(job.key); lastMsgSet(null); renderStatus(); return;
         }
-        // ghost-drop BEFORE any LLM call (auto only — manual intent always wins)
+        // ghost-drop BEFORE any LLM call (auto only — manual intent always wins).
+        // A 2.5s pill flash (not silence): without console access this is the
+        // only trace that a page-turn orphaned the job.
         if (job.auto && (await ghostDropped(job, prep))) {
             if (isDebug()) console.log('[mt] job dropped (ghost):', job.key.slice(-14));
-            removeActivity(job.key); lastMsgSet(null); renderStatus(); return;
+            removeActivity(job.key); lastMsgSet(null); setStatus('Skipped (page changed)', 'idle'); renderStatus(); return;
+        }
+        // paint-lane divert: cached + already folded — painting it here would
+        // hold the serial pump (and its LLM ordering) for pure local CPU
+        // work. The lane stays visible to seam/auto-twin guards; completions
+        // stay quiet (counts + progress bar already report them).
+        if (prep.cached && bookHas(prep.hash)) {
+            if (isDebug()) console.log('[mt] paint lane divert:', job.key.slice(-14));
+            paintQueue.push(job);
+            pumpPaint();
+            return;
         }
         const state = (allowSeam && job.ref.kind === 'img' && !prep.cached)
             ? (await trySeam(job, prep, st).catch(e => {
@@ -230,7 +325,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if (state.det && state.det.boxes.length) {
             // auto-show only when the user hasn't pinned "Show original" mid-run
             if (overlayChoice === 'auto') setOverlayOn(true);
-            const mode = state.outputs?.length ? `LLM ${state.outputs.length}/${state.det.boxes.length} regions` : 'no regions';
+            const mode = state.outputs?.length ? `LLM ${state.outputs.length}/${state.det.boxes.length} regions` : 'no usable text';
             removeActivity(job.key);
             lastMsgSet({ text: `Done (${state.det.ep}, ${Math.round(state.det.inferMs)}ms, ${mode}, ${context.characters.length} characters)`, phase: 'done' });
             renderStatus();
@@ -247,8 +342,14 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         applyOverlays();
         cooldownClear(failMarks, job.key);
     } catch (e) {
-        const err = e as Error & { kind?: string; hint?: string };
+        const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         cooldownMark(failMarks, job.key, Date.now());
+        // a refusal stops the chapter's background work: retrying page after
+        // page cannot succeed while the provider refuses (see haltAuto)
+        if (err.kind === 'ratelimit' || err.kind === 'auth') {
+            haltAuto(err.kind, err.retryAfterMs ?? 0);
+            dropAutoQueued();
+        }
         const msg = 'Error: ' + err.message;
         removeActivity(job.key);
         lastMsgSet({ text: msg, phase: 'error' });
@@ -256,6 +357,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if (!job.auto) makeToast(msg, 'error', err.hint);
         void logError(err.message, err.hint, err.kind);
     } finally {
+        clearInterval(keepalivePing);
         try { keepalive?.disconnect(); } catch { /* already gone */ }
         activeRef = null;
         activeKey = null;
@@ -265,8 +367,25 @@ export async function runJob(allowSeam: boolean): Promise<void> {
 
 // Drop everything still queued (story change / manual cancel). The page
 // currently rendering runs to completion — aborting mid-LLM would corrupt
-// the book (and the tokens are spent already).
+// the book (and the tokens are spent already). Paint-lane backlog drops too
+// (in-flight paints are sub-second and run out on their own).
 export function clearQueue(): void {
     for (const j of queue) removeActivity(j.key);
     queue.length = 0;
+    for (const j of paintQueue) removeActivity(j.key);
+    paintQueue.length = 0;
+}
+
+// Toggle-off: drop queued AUTO work (explicit manual/force intent + the
+// in-flight page survive). Completed pages are cached — nothing repeats, the
+// unstarted backlog simply never runs.
+export function dropAutoQueued(): number {
+    let n = 0;
+    for (let i = queue.length - 1; i >= 0; i--) {
+        if (queue[i].auto && !queue[i].force) { removeActivity(queue[i].key); queue.splice(i, 1); n++; }
+    }
+    for (let i = paintQueue.length - 1; i >= 0; i--) {
+        if (paintQueue[i].auto && !paintQueue[i].force) { removeActivity(paintQueue[i].key); paintQueue.splice(i, 1); n++; }
+    }
+    return n;
 }

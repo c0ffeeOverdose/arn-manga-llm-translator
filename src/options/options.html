@@ -192,6 +192,7 @@
   .range-head .val-input { -moz-appearance: textfield; appearance: textfield; }
   .range-head .unit-wrap { display: inline-flex; align-items: baseline; gap: 3px; }
   .range-head .unit { color: var(--muted); font-size: 11px; }
+  .dim { opacity: .45; }
   fieldset { border: 0; padding: 0; margin: 0; }
   fieldset:disabled { opacity: 0.45; }
 
@@ -237,9 +238,9 @@
   #dirtyBar:has(#status.err) #status { white-space: normal; }
   /* per-action test status (under each Test button) — errors must not land
      in the save bar where they read as "Save broke" */
-  #testStatus, #cloudTestStatus { font-size: 12.5px; white-space: normal; }
-  #testStatus.ok, #cloudTestStatus.ok { color: var(--ok); }
-  #testStatus.err, #cloudTestStatus.err { color: var(--err); }
+  #testStatus, #cloudTestStatus, #ocrTestStatus { font-size: 12.5px; white-space: normal; }
+  #testStatus.ok, #cloudTestStatus.ok, #ocrTestStatus.ok { color: var(--ok); }
+  #testStatus.err, #cloudTestStatus.err, #ocrTestStatus.err { color: var(--err); }
   .btn.quiet { background: none; border-color: transparent; box-shadow: none;
                color: var(--muted); font-weight: 400; padding: 6px 4px; }
   .btn.quiet:hover { background: none; border-color: transparent; color: var(--text); text-decoration: underline; }
@@ -406,6 +407,7 @@
           <option value="responses">Responses API (OpenAI responses)</option>
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="gemini">Google Gemini</option>
+          <option value="cloudflare">Cloudflare Workers AI (Meta / Qwen / Gemma)</option>
         </select>
       </div>
 
@@ -437,6 +439,13 @@
           <div class="hint" id="thinkingHint"></div>
         </div>
       </fieldset>
+
+      <div class="field">
+        <div class="range-head"><label for="temperature">Temperature</label><span class="unit-wrap"><input type="number" id="temperatureNum" class="val-input" min="0" max="1" step="0.05" aria-label="Temperature value"></span></div>
+        <input type="range" id="temperature" min="0" max="1" step="0.05">
+        <label class="check"><input type="checkbox" id="temperatureAuto" checked> Provider default</label>
+        <div class="hint">Checked = the provider's own default (usually 1.0). Untick to pin a value — lower is more literal and deterministic, better for translation.</div>
+      </div>
 
       <button id="test" type="button" class="btn ghost" style="width:100%">Test connection</button>
       <div class="hint" id="testStatus" style="min-height:18px;margin-top:6px"></div>
@@ -509,6 +518,64 @@
         <div class="hint">The model copies each box's original text alongside the translation — richer cross-page context at roughly 2× output tokens. No effect in OCR mode.</div>
       </div>
 
+      <div class="field">
+        <label class="check"><input type="checkbox" id="ocrSeparate"> Use a separate model just for reading text</label>
+        <div class="hint">A cheap/fast vision model transcribes each box, then your main model translates text-only — 2 LLM calls per page, using the same images as above. No effect in OCR mode.</div>
+      </div>
+
+      <fieldset id="ocrSeparateFields" style="display:none">
+        <div class="field">
+          <label for="ocrProvider">OCR protocol</label>
+          <select id="ocrProvider">
+            <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, ollama…)</option>
+            <option value="responses">Responses API (OpenAI responses)</option>
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="gemini">Google Gemini</option>
+            <option value="cloudflare">Cloudflare Workers AI (Meta / Qwen / Gemma)</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="ocrModel">OCR model</label>
+          <input type="text" id="ocrModel" placeholder="e.g. gpt-5.4-nano">
+        </div>
+
+        <div class="field">
+          <label for="ocrApiKey">OCR API key</label>
+          <input type="password" id="ocrApiKey" placeholder="sk-…">
+        </div>
+
+        <div class="field">
+          <label for="ocrBaseUrl">OCR Base URL <span class="hint">(optional — custom endpoints)</span></label>
+          <input type="text" id="ocrBaseUrl" placeholder="https://api.openai.com/v1">
+        </div>
+
+        <div class="field">
+          <label for="ocrThinking">OCR thinking level</label>
+          <input type="text" id="ocrThinking" list="ocrThinkingList" placeholder="none" autocomplete="off">
+          <datalist id="ocrThinkingList"></datalist>
+          <div class="hint" id="ocrThinkingHint"></div>
+        </div>
+
+        <div class="field">
+          <div class="range-head"><label for="ocrTemperature">OCR temperature</label><span class="unit-wrap"><input type="number" id="ocrTemperatureNum" class="val-input" min="0" max="1" step="0.05" aria-label="OCR temperature value"></span></div>
+          <input type="range" id="ocrTemperature" min="0" max="1" step="0.05">
+          <label class="check"><input type="checkbox" id="ocrTemperatureAuto"> Provider default</label>
+          <div class="hint">Transcribe calls only — 0 keeps the reading literal and its output format stable. Unticked by default (0 is sent).</div>
+        </div>
+
+        <div class="field">
+          <label class="check"><input type="checkbox" id="ocrPerRegion"> Always read one region at a time</label>
+          <div class="hint">One crop per call — for models that accept a single image (e.g. Cloudflare llama-3.2-11b-vision). Leave off for auto-detect: a rejected batch falls back to per-region on its own and remembers the model.</div>
+        </div>
+
+        <div class="field" style="display:flex;gap:8px">
+          <button id="ocrCopy" type="button" class="btn ghost sm">Copy from main</button>
+          <button id="ocrTest" type="button" class="btn ghost sm">Test OCR model</button>
+        </div>
+        <div class="hint" id="ocrTestStatus" style="min-height:18px;margin-top:6px"></div>
+      </fieldset>
+
       <div id="ocrManager" style="display:none">
         <div class="field">
           <label for="ocrEngine">OCR engine</label>
@@ -544,6 +611,11 @@
         <div class="range-head"><label for="minFont">Smallest font</label><span class="unit-wrap"><input type="number" id="minFontNum" class="val-input" min="1" max="72" step="1"><span class="unit">px</span></span></div>
         <input type="range" id="minFont" min="8" max="24" step="1">
         <div class="hint">Floor for shrink-to-fit: smaller fits long text without clipping, but gets hard to read.</div>
+      </div>
+      <div class="field">
+        <div class="range-head"><label for="textScale">Text size vs original</label><span class="unit-wrap"><input type="number" id="textScaleNum" class="val-input" min="0.6" max="1.6" step="0.05"><span class="unit">×</span></span></div>
+        <input type="range" id="textScale" min="0.6" max="1.6" step="0.05">
+        <div class="hint">Ceiling for the font, measured from the original text's line pitch: 1 = same size as the source, higher reads easier, lower leaves more air. Long text still shrinks to fit.</div>
       </div>
       <div class="field">
         <label class="check"><input type="checkbox" id="preferHorizontal"> Prefer horizontal text</label>

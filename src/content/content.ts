@@ -9,6 +9,7 @@ import { makePill, loadDebug, renderStatus } from './status-ui';
 import { applyOverlays } from './overlays';
 import { installMessageListener } from './commands';
 import { initAuto } from './auto';
+import { initSweep } from './sweep';
 import { onThemeChanged } from './chars-ui';
 
 declare const __BUILD_ID__: string; // injected by build.mjs — which build is this?
@@ -29,6 +30,7 @@ chrome.storage.onChanged.addListener((ch, area) => {
 
 installMessageListener();
 initAuto();
+initSweep(); // registers the chapter-sweep waiter (preparePage attach lane)
 
 async function main() {
     console.log('[mt] build', __BUILD_ID__);

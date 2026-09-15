@@ -7,7 +7,7 @@
 // ponytail: one tiny store, LRU by access time, hard cap — no versioning,
 // no migrations, corrupt entries just miss.
 
-import type { DetBox } from './detection';
+import type { DetBox, DetectResult, MtOnStatus } from './detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
 
 export const CACHE_MAX = 200;
@@ -25,22 +25,71 @@ export function uniformPixels(d: Uint8ClampedArray): boolean {
 // Status ownership: the pill is a VIEW of live activities, not a public
 // write slot — parallel jobs / queued preps each own an entry, and this
 // picker decides which one the user sees. Priority: user intent (force) →
-// the page they're looking at (max viewport overlap) → background
-// lookahead. Pure — unit-tested below.
+// the page they're looking at (max viewport overlap) → background work
+// (lookahead, chapter sweep — tied, insertion order wins). Pure —
+// unit-tested below.
 export interface ActivityEntry {
-    key: string;          // page key, or 'lookahead'
-    kind: 'force' | 'view' | 'lookahead';
-    overlap: number;      // viewport area px² (0 for lookahead)
+    key: string;          // page key, or 'lookahead' / 'sweep'
+    kind: 'force' | 'view' | 'lookahead' | 'sweep';
+    overlap: number;      // viewport area px² (0 for background work)
 }
 export function pickActivity<T extends ActivityEntry>(entries: T[]): T | null {
     if (!entries.length) return null;
-    const rank = { force: 0, view: 1, lookahead: 2 } as const;
+    const rank = { force: 0, view: 1, lookahead: 2, sweep: 2 } as const;
     let best = entries[0];
     for (const e of entries) {
         if (rank[e.kind] < rank[best.kind]
             || (rank[e.kind] === rank[best.kind] && e.overlap > best.overlap)) best = e;
     }
     return best;
+}
+
+// ---- chapter-sweep waiter registry: neutral ground so pipeline.ts can await
+// a sweep-owned page without importing sweep.ts (which imports pipeline.ts
+// for detection — a direct edge would cycle). Registered once at load.
+let sweepWaiter: ((url: string, onStatus: MtOnStatus) => Promise<void>) | null = null;
+export function registerSweepWaiter(fn: (url: string, onStatus: MtOnStatus) => Promise<void>): void {
+    sweepWaiter = fn;
+}
+export function sweepWait(url: string, onStatus: MtOnStatus): Promise<void> {
+    return sweepWaiter ? sweepWaiter(url, onStatus) : Promise.resolve();
+}
+
+// ---- lookahead-abort registry (same neutral-ground pattern): sweep.ts must
+// not import auto.ts (one-way edge — auto imports sweep), but starting/stopping
+// a sweep must stop a lookahead chain that is warming the same pages.
+let lookaheadAbort: (() => boolean) | null = null;
+export function registerLookaheadAbort(fn: () => boolean): void {
+    lookaheadAbort = fn;
+}
+export function abortLookahead(): boolean {
+    return lookaheadAbort ? lookaheadAbort() : false;
+}
+
+// ---- ordered commit: parallel workers finish out of order, but the book
+// must fold page-by-page (updateContext is order-sensitive: pairs append,
+// names are first-wins). Buffer results by chapter index and drain only the
+// consecutive run from the head — every skipped/failed index still buffers a
+// marker, or the head stalls behind it forever. Mutates the map (consumes).
+// Pure — unit-tested below.
+export function takeOrdered<T>(ready: Map<number, T>, head: number): { items: T[]; head: number } {
+    const items: T[] = [];
+    while (ready.has(head)) {
+        items.push(ready.get(head)!);
+        ready.delete(head);
+        head++;
+    }
+    return { items, head };
+}
+
+// Sweep lifecycle phase (pure — popup/pill label + unit tests). `starting` is
+// the enumeration window before a run object exists: cancel must be possible
+// there too (it used to be a silent no-op and the run started anyway).
+export function sweepPhase(s: { cancel: boolean; dead: boolean; starting?: boolean } | null): 'idle' | 'starting' | 'running' | 'stopping' | 'dead' {
+    if (!s) return 'idle';
+    if (s.dead) return 'dead';
+    if (s.cancel) return 'stopping';
+    return s.starting ? 'starting' : 'running';
 }
 
 export interface CachedPage {
@@ -57,6 +106,16 @@ export interface CachedPage {
     // an empty mask and inpaint erases nothing (ghost source text). Optional so
     // pre-mask entries just miss once and heal on overwrite.
     mask?: { w: number; h: number; data: ArrayBuffer };
+    // detect checkpoint (no outputs yet): a page-turn kills the translating
+    // document mid-job (full-load readers) — the next load resumes at
+    // translation from this entry instead of re-paying detect. Overwritten by
+    // the full entry under the same key; never renders as Done (cache).
+    partial?: true;
+    // OCR texts aligned 1:1 with boxes (cloud path carries them at checkpoint
+    // time — local OCR runs later, inside translateRegions).
+    texts?: string[];
+    // detector EP at checkpoint time — restored so the Done line stays honest
+    ep?: string;
 }
 
 // CTD masks are full-page 1 byte/px (~MBs) — too big for IDB at 200 pages.
@@ -100,6 +159,51 @@ export function unpackMask(
         }
     }
     return out.buffer as ArrayBuffer;
+}
+
+// ---- detect checkpoints: a partial entry (boxes, no outputs) is resumable
+// when fingerprint + dims still match and it carries a mask. Full entries
+// never resume (they render from cache); stale partials re-detect. Pure.
+export function isResumable(hit: CachedPage | undefined, fp: string, w: number, h: number): hit is CachedPage {
+    return !!hit && hit.partial === true && hit.fp === fp
+        && hit.w === w && hit.h === h && hit.boxes.length > 0 && !!hit.mask;
+}
+
+// rebuild a live DetectResult from a resumable partial — ordered boxes,
+// panels, mask and texts come back as detect produced them (ordering is NOT
+// re-run: it already ran before the checkpoint). Texts ride the cloudTexts
+// slot: translateRegions treats any present texts as ready and skips local
+// OCR. Returns null on a maskless entry (callers check isResumable first).
+export function detFromPartial(hit: CachedPage, w: number, h: number): DetectResult | null {
+    if (!hit.mask) return null;
+    return {
+        boxes: hit.boxes, panels: hit.panels ?? [],
+        mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
+        inferMs: 0, ep: hit.ep ?? 'cache', dropped: [], panelDropped: [],
+        ...(hit.texts?.length ? { cloudTexts: hit.texts } : null),
+    };
+}
+
+// split-pipeline fallback: the transcribe already ran when the channel died —
+// stamp its texts onto the regions so the re-sent call is a text-only
+// translate instead of a second (billed) transcription. Short lists keep the
+// caller's own source. Pure.
+export function withSources<T extends { source: string }>(regions: T[], texts: string[]): T[] {
+    return regions.map((r, i) => ({ ...r, source: texts[i] ?? r.source }));
+}
+
+// checkpoint writer input (same key the full entry later overwrites — LRU
+// and force-overwrite need no partial awareness). Pure.
+export function partialEntry(key: string, fp: string, det: DetectResult, w: number, h: number): Omit<CachedPage, 'atime'> {
+    return {
+        key, fp, w, h,
+        boxes: det.boxes, panels: det.panels ?? [],
+        outputs: [], extras: [],
+        texts: det.cloudTexts ?? [],
+        ep: det.ep,
+        mask: packMask(det.mask),
+        partial: true as const,
+    };
 }
 
 // cyrb53 over raw gray bytes — 10 lines, no dependency, hex output
@@ -253,15 +357,68 @@ export function fetchImageBlocked(url: string, senderUrl: string): string | null
 // burns LLM on pages behind). Unit-tested below.
 export function galleryAheadUrls(manifestJson: string | null, imgHost: string, curPath: string, max: number): string[] {
     if (!manifestJson || !imgHost || !curPath || max <= 0) return [];
+    const paths = galleryPaths(manifestJson);
+    const i = paths.indexOf(curPath);
+    if (i < 0) return [];
+    return paths.slice(i + 1, i + 1 + max).map((p) => `${imgHost}/${p}`);
+}
+
+// ---- paged-chapter enumeration: paged readers virtualize the DOM (only the
+// loaded window stays — the rest are lazy <img> with no pixels yet, or absent
+// entirely), so DOM refs undercount the chapter. Paged-reader APIs return the
+// full page list; the parse + URL builder stay pure for tests, the fetch +
+// DOM walk live in page-io (untestable — document/chrome access).
+export function pagedChapterUuid(pathname: string, hostname: string): string | null {
+    if (!/(^|\.)mangadex\./.test(hostname)) return null;
+    const m = pathname.match(/^\/chapter\/([^/]+)/);
+    // charset-gated: the id is interpolated into an API URL below
+    return m && /^[0-9a-f-]{10,}$/i.test(m[1]) ? m[1] : null;
+}
+export function buildPagedUrls(baseUrl: unknown, hash: unknown, files: unknown, kind: 'data' | 'data-saver' = 'data'): string[] {
+    if (typeof baseUrl !== 'string' || typeof hash !== 'string' || !Array.isArray(files)) return [];
+    if (kind !== 'data' && kind !== 'data-saver') return [];
+    const b = baseUrl.replace(/\/+$/, '');
+    const out: string[] = [];
+    for (const f of files) {
+        if (typeof f !== 'string' || !f || f.includes('/') || f.includes('\\')) continue;
+        out.push(`${b}/${kind}/${hash}/${f}`);
+    }
+    return out;
+}
+// unloaded-but-addressable pages: lazy <img> with an http(s) src and no
+// pixels yet. Loaded ones are covered by getPages refs (element path handles
+// blob/taint); known dedupes against those + each other. data:/empty/blob:
+// srcs are unusable headless — skip.
+export function unloadedPageUrls(cands: { src: string; loaded: boolean }[], known: Set<string>): string[] {
+    const out: string[] = [];
+    for (const c of cands) {
+        if (c.loaded) continue;
+        if (!/^https?:/.test(c.src) || known.has(c.src)) continue;
+        known.add(c.src);
+        out.push(c.src);
+    }
+    return out;
+}
+
+// chapter sweep needs the WHOLE list in reading order (not just forward of
+// an anchor), plus where the current page sits in it. Same parser, same
+// bails — index -1 when the anchor matches nothing (sweep from page 0).
+export function galleryAllUrls(manifestJson: string | null, origSrc: string): { urls: string[]; index: number } {
+    const m = origSrc.match(/^(https?:\/\/[^/]+)\/(.+)$/);
+    if (!m) return { urls: [], index: -1 };
+    const paths = galleryPaths(manifestJson);
+    return { urls: paths.map((p) => `${m[1]}/${p}`), index: paths.indexOf(m[2]) };
+}
+
+function galleryPaths(manifestJson: string | null): string[] {
+    if (!manifestJson) return [];
     try {
         const inner = JSON.parse(JSON.parse(manifestJson).body);
         const pages = inner?.pages;
         if (!Array.isArray(pages)) return [];
         const paths: string[] = [];
         for (const p of pages) if (typeof p?.path === 'string') paths.push(p.path);
-        const i = paths.indexOf(curPath);
-        if (i < 0) return [];
-        return paths.slice(i + 1, i + 1 + max).map((p) => `${imgHost}/${p}`);
+        return paths;
     } catch { return []; }
 }
 
@@ -410,6 +567,36 @@ export function seamInkLinked(upper: SeamMask, lower: SeamMask): boolean {
     return ov >= 60 && ov >= narrow * 0.3;
 }
 
+// Containment of two boxes (intersection over the SMALLER area): catches a
+// near-threshold fragment inside a real box that IoU lets through (live:
+// conf 0.36 box fully inside a conf 0.95 one, IoU only 0.30 — both painted,
+// double text). Pure.
+export function boxContained(a: SeamBox, b: SeamBox): number {
+    const inter = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
+        * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+    const minA = Math.min((a.x2 - a.x1) * (a.y2 - a.y1), (b.x2 - b.x1) * (b.y2 - b.y1));
+    return minA > 0 ? inter / minA : 0;
+}
+
+// Drop near-fully-contained boxes, loser = lower conf (tie: smaller area).
+// loserCap gates the drop: detection passes 0.5 (marginal fragments only —
+// a confident nested box like a sign in a bubble survives), paint passes the
+// default (heals every old cache entry on revisit). Pure — same refs, order kept.
+export function dropContainedBoxes<T extends SeamBox & { conf: number }>(boxes: T[], ratio = 0.9, loserCap = Infinity): T[] {
+    const drop = new Set<T>();
+    for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+            const a = boxes[i], b = boxes[j];
+            if (drop.has(a) || drop.has(b) || boxContained(a, b) < ratio) continue;
+            const loser = a.conf !== b.conf
+                ? (a.conf < b.conf ? a : b)
+                : (((a.x2 - a.x1) * (a.y2 - a.y1) <= (b.x2 - b.x1) * (b.y2 - b.y1)) ? a : b);
+            if (loser.conf < loserCap) drop.add(loser);
+        }
+    }
+    return boxes.filter(b => !drop.has(b));
+}
+
 // IoU of two boxes — the stitch safety net (below) uses it to suppress solo
 // boxes the stitch detector already found. Pure.
 export function boxIoU(a: SeamBox, b: SeamBox): number {
@@ -512,17 +699,34 @@ export function cropPixels(r: { x: number; y: number; w: number; h: number }, dp
     return { sx, sy, sw, sh };
 }
 
+// Region-badge number size on the VLM-annotated page, in annotated-image px
+// (the drawn disc radius is 0.9× this). Badges exist only to map region
+// numbers to the crops — the crops carry the readable text — so they must stay
+// small: the old formula doubled the size on top of the downscale (56×scale
+// with scale ≤ 1) and drew 54px discs on a 907px-wide page (6% of the width),
+// covering corner text on dense pages (live-reported). Pure, unit-tested.
+export function annotFont(scale: number): number {
+    return Math.max(16, Math.round(28 * scale));
+}
+
 export interface FingerprintOpts {
     targetLang: string; textSource: string; ocrEngine: string;
     readingDir: string; detConf: number; panelConf: number; deferLabels: boolean;
     transcribeSrc: boolean; // changes the prompt (src attrs) → separate cache entries
+    useOcrModel: boolean; // split pipeline (VLM transcribe → LLM translate) → separate entries
+    ocrPerRegion: boolean; // per-region transcribe calls produce different OCR text → separate entries
+    temperature: number | null; // pinned main-model sampling → different output, separate entries
+    ocrTemperature: number | null; // pinned VLM-reader sampling → different OCR text, separate entries
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
     // trailing detector-generation tag: entries detected before tiled-strip
-    // CTD miss once and heal on overwrite (old entries hold fewer boxes)
+    // CTD miss once and heal on overwrite (old entries hold fewer boxes).
+    // Bumped to tile2: pre-fix entries may hold EMPTY outputs (total parse
+    // failures used to come back ok:true and get cached) — orphan them all at
+    // once instead of making the user Clear by hand.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, 'tile1'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile2'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----
@@ -582,6 +786,15 @@ export async function cachePut(entry: Omit<CachedPage, 'atime'>, max = CACHE_MAX
     } catch { /* cache stays best-effort */ }
 }
 
+// drop one entry (resume checkpoints are written even with the cache off —
+// a finished job must leave nothing behind in that mode)
+export async function cacheDelete(key: string): Promise<void> {
+    try {
+        const d = await db();
+        if (d) await req(d.transaction('pages', 'readwrite').objectStore('pages').delete(key));
+    } catch { /* best-effort */ }
+}
+
 export async function cacheClear(): Promise<void> {
     try {
         const d = await db();
@@ -595,4 +808,139 @@ export async function cacheCount(): Promise<number> {
         if (!d) return 0;
         return await req(d.transaction('pages', 'readonly').objectStore('pages').count());
     } catch { return 0; }
+}
+
+// entries for one chapter (prefix `chapter#`) — the global count above spans
+// every story ever visited, which reads as "unstable" on a 30-page chapter
+export async function cacheCountPrefix(prefix: string): Promise<number> {
+    try {
+        const d = await db();
+        if (!d) return 0;
+        const keys = await req(d.transaction('pages', 'readonly').objectStore('pages').getAllKeys()) as unknown[];
+        let n = 0;
+        for (const k of keys) if (typeof k === 'string' && k.startsWith(prefix)) n++;
+        return n;
+    } catch { return 0; }
+}
+
+// ---- host-volatile CDN identity: some image CDNs serve the same file from
+// different hosts per image (round-robin i-subdomains), so URL-keyed
+// mechanisms (warming trace, progress handoff, sweep claims) miss across
+// loads while content-hash mechanisms (cache/resume) hit fine. Match by
+// origin + path instead — generic, no per-site rules (exact match first, so
+// same-host behavior never changes). Pure — unit-tested below.
+export function samePagePath(a: string, b: string): boolean {
+    if (a === b) return true;
+    try {
+        const ua = new URL(a), ub = new URL(b);
+        if (ua.protocol !== 'https:' || ub.protocol !== 'https:') return false;
+        if (ua.hostname === ub.hostname) return false;
+        return ua.pathname === ub.pathname && ua.pathname !== '/';
+    } catch { return false; }
+}
+
+// ---- cross-load warming trace: which page key started translating, in the
+// TAB's sessionStorage (survives same-tab full loads, dies with the tab —
+// unlike every in-memory structure). Lets the next document say "warming was
+// interrupted — restarting" instead of silently redoing. The page shares this
+// storage, so the value shape is validated on read — worst case a bogus pill
+// line, never a logic decision (resume still needs a real partial entry).
+const WARM_KEY = 'mt-warming';
+export const WARM_TTL_MS = 15 * 60 * 1000;
+export function parseWarming(raw: string | null): { key: string; ts: number } | null {
+    if (!raw) return null;
+    try {
+        const o = JSON.parse(raw) as { key?: unknown; ts?: unknown };
+        return typeof o.key === 'string' && typeof o.ts === 'number' ? { key: o.key, ts: o.ts } : null;
+    } catch { return null; }
+}
+export function warmingFresh(ts: number, now = Date.now(), ttlMs = WARM_TTL_MS): boolean {
+    return now - ts >= 0 && now - ts < ttlMs;
+}
+export function readWarming(): { key: string; ts: number } | null {
+    try {
+        if (typeof sessionStorage === 'undefined') return null;
+        return parseWarming(sessionStorage.getItem(WARM_KEY));
+    } catch { return null; }
+}
+export function writeWarming(key: string): void {
+    try {
+        if (typeof sessionStorage === 'undefined') return;
+        sessionStorage.setItem(WARM_KEY, JSON.stringify({ key, ts: Date.now() }));
+    } catch { /* private mode etc — the trace just stays off */ }
+}
+
+// ---- cross-document LLM progress handoff: the pill counter dies with its
+// document on full-load readers while the SW-side call survives (adoption).
+// Writers stamp {pageKey → t0} at LLM dispatch; arrivals continue counting
+// from the earliest fresh stamp instead of restarting at 1s. Hints only —
+// readers continue only with corroboration (resumed checkpoint, or cache off
+// where no checkpoint exists), so a dead SW never inflates the counter; the
+// 5-minute TTL bounds the worst overcount to a rare race. Force-starts drop
+// the entry (fresh work counts fresh). Tab-session scoped like warming.
+const LLP_KEY = 'mt-llm-prog';
+export const LLP_TTL_MS = 5 * 60 * 1000;
+const LLP_CAP = 40;
+export function progressGetT0(map: Record<string, unknown>, key: string, now: number, ttlMs = LLP_TTL_MS): number | null {
+    const t0 = map[key];
+    return typeof t0 === 'number' && now - t0 >= 0 && now - t0 < ttlMs ? t0 : null;
+}
+export function progressPutT0(map: Record<string, unknown>, key: string, t0: number, cap = LLP_CAP): Record<string, unknown> {
+    // keep-earliest: chained arrivals must count from the true start, not
+    // from the latest arrival's dispatch
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(map)) if (typeof v === 'number') out[k] = v;
+    const prev = out[key];
+    if (typeof prev !== 'number' || t0 < prev) out[key] = t0;
+    const keys = Object.keys(out);
+    if (keys.length > cap) {
+        keys.sort((a, b) => (out[a] as number) - (out[b] as number));
+        for (const k of keys.slice(0, keys.length - cap)) delete out[k];
+    }
+    return out;
+}
+function progressMap(): Record<string, unknown> {
+    try {
+        const o = JSON.parse(sessionStorage.getItem(LLP_KEY) ?? '{}');
+        return o && typeof o === 'object' && !Array.isArray(o) ? o as Record<string, unknown> : {};
+    } catch { return {}; }
+}
+// pure core (unit-tested): earliest fresh stamp for this page across the
+// exact key AND host-volatile twins. Min, not direct-first: the caller stamps
+// its own dispatch before reading, and a fresh exact entry must not shadow
+// the older twin the fallback exists for (live-proven i4→i2: direct-first
+// counted local every time while the twin sat unused in the map).
+export function handoffRead(map: Record<string, unknown>, key: string, now: number, ttlMs = LLP_TTL_MS): number | null {
+    let best: number | null = null;
+    for (const k of Object.keys(map)) {
+        if (k !== key && !samePagePath(k, key)) continue;
+        const t0 = progressGetT0(map, k, now, ttlMs);
+        if (t0 != null && (best == null || t0 < best)) best = t0;
+    }
+    return best;
+}
+// force retranslate counts fresh — drop the exact stamp plus its volatile
+// twins (same logical page, other CDN host), else a twin inflates the recount.
+export function handoffDrop(map: Record<string, unknown>, key: string): Record<string, unknown> {
+    const out = { ...map };
+    for (const k of Object.keys(out)) if (k === key || samePagePath(k, key)) delete out[k];
+    return out;
+}
+export function readProgressT0(pageKey: string): number | null {
+    try {
+        if (typeof sessionStorage === 'undefined') return null;
+        return handoffRead(progressMap(), pageKey, Date.now());
+    } catch { return null; }
+}
+export function writeProgressT0(pageKey: string, t0: number): void {
+    try {
+        if (typeof sessionStorage === 'undefined') return;
+        sessionStorage.setItem(LLP_KEY, JSON.stringify(progressPutT0(progressMap(), pageKey, t0)));
+    } catch { /* the counter just restarts */ }
+}
+export function dropProgressT0(pageKey: string): void {
+    try {
+        if (typeof sessionStorage === 'undefined') return;
+        sessionStorage.setItem(LLP_KEY, JSON.stringify(handoffDrop(progressMap(), pageKey)));
+    } catch { /* ignore */ }
 }

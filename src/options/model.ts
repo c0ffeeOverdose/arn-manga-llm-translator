@@ -5,13 +5,14 @@ import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type 
 import { mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
 import { detModelsInstalled, detDownload } from '../llm/ocr-models';
 import { $, setDirty, setStatus, dlProgress } from './shell';
-import { pipeline, syncOcrManager } from './pipeline-section';
+import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI } from './pipeline-section';
 
 const MODEL_HINTS: Record<string, string> = {
-    openai: 'e.g. gpt-5.4-mini, gpt-5.4-nano — or qwen/qwen3.7-flash, z-ai/glm-5.3-flash via OpenRouter (vision needs image support; OCR mode takes any text model)',
+    openai: 'e.g. gpt-5.4-mini, gpt-5.4-nano — or qwen/qwen3.7-flash, z-ai/glm-5.3-flash via OpenRouter',
     responses: 'e.g. gpt-5.6-luna, muse-spark-1.3 (cheap + vision)',
     anthropic: 'e.g. claude-haiku-4-5, claude-sonnet-5',
     gemini: 'e.g. gemini-3.5-flash-lite, gemini-3.8-flash',
+    cloudflare: 'e.g. @cf/meta/llama-3.2-11b-vision-instruct (pair with OCR text mode; needs a one-time "agree")',
 };
 
 // model input placeholder follows the selected protocol (static HTML keeps
@@ -21,6 +22,7 @@ const MODEL_PLACEHOLDERS: Record<string, string> = {
     responses: 'e.g. gpt-5.6-luna',
     anthropic: 'e.g. claude-haiku-4-5',
     gemini: 'e.g. gemini-3.5-flash-lite',
+    cloudflare: 'e.g. @cf/meta/llama-4-scout-17b-16e-instruct',
 };
 
 // per-provider Base URL examples (defaults live in DEFAULT_BASES)
@@ -29,6 +31,7 @@ const BASE_HINTS: Record<string, string> = {
     responses: ' · OpenCode Go: https://opencode.ai/zen/go/v1 (use a /responses model, e.g. gpt-5.6-luna)',
     anthropic: '',
     gemini: '',
+    cloudflare: ' · replace <ACCOUNT_ID>; token needs Workers AI permission (either /ai or /ai/v1 works)',
 };
 
 export function fillModelFields(s: LLMSettings): void {
@@ -40,6 +43,7 @@ export function fillModelFields(s: LLMSettings): void {
     ($('cloudKey') as HTMLInputElement).value = s.cloudKey ?? '';
     syncInferUI();
     syncThinkingUI();
+    syncTemperatureUI();
 }
 
 export function currentSettings(): LLMSettings {
@@ -50,6 +54,29 @@ export function currentSettings(): LLMSettings {
         baseUrl: ($('baseUrl') as HTMLInputElement).value.trim(),
         cloudEndpoint: ($('cloudEndpoint') as HTMLInputElement).value.trim().replace(/\/$/, ''),
         cloudKey: ($('cloudKey') as HTMLInputElement).value.trim(),
+    };
+}
+
+// split pipeline: the VLM that only transcribes (never translates)
+export function fillOcrFields(s: LLMSettings): void {
+    ($('ocrProvider') as HTMLSelectElement).value = s.provider;
+    ($('ocrModel') as HTMLInputElement).value = s.model;
+    ($('ocrApiKey') as HTMLInputElement).value = s.apiKey;
+    ($('ocrBaseUrl') as HTMLInputElement).value = s.baseUrl ?? '';
+    ($('ocrThinking') as HTMLInputElement).value = pipeline.ocrThinking;
+    renderOcrThinkingList();
+    syncOcrThinkingHint();
+    syncOcrTemperatureUI();
+}
+
+export function currentOcrSettings(): LLMSettings {
+    return {
+        provider: ($('ocrProvider') as HTMLSelectElement).value as LLMSettings['provider'],
+        model: ($('ocrModel') as HTMLInputElement).value.trim(),
+        apiKey: ($('ocrApiKey') as HTMLInputElement).value.trim(),
+        baseUrl: ($('ocrBaseUrl') as HTMLInputElement).value.trim(),
+        cloudEndpoint: '',
+        cloudKey: '',
     };
 }
 
@@ -90,8 +117,14 @@ export async function saveAll(): Promise<void> {
         setStatus('Enter a model and API key first.', 'err');
         return;
     }
+    const o = currentOcrSettings();
+    if (pipeline.useOcrModel && pipeline.textSource !== 'ocr' && (!o.model || !o.apiKey)) {
+        setStatus('Enter the OCR model and API key first (or untick the separate reader).', 'err');
+        return;
+    }
     try {
         await ensureHostPermission(s.baseUrl ?? '', s.provider);
+        if (o.model || o.apiKey) await ensureHostPermission(o.baseUrl ?? '', o.provider);
     } catch (e) {
         setStatus(`Not saved — ${(e as Error).message}`, 'err');
         return;
@@ -101,16 +134,20 @@ export async function saveAll(): Promise<void> {
     // would silently revert them
     const { mtPipeline: stored } = await chrome.storage.local.get('mtPipeline');
     Object.assign(pipeline, mergePipeline(stored, pipeline));
-    await chrome.storage.local.set({ mtSettings: s, mtPipeline: pipeline });
+    await chrome.storage.local.set({ mtSettings: s, mtOcrSettings: o, mtPipeline: pipeline });
     setDirty(false);
     setStatus('Saved ✓', 'ok', 2000);
     syncSetupBanner();
 }
 
 export async function discardAll(fill: (s: LLMSettings) => void, syncAdvancedUI: () => void): Promise<void> {
-    const { mtSettings, mtPipeline } = await chrome.storage.local.get(['mtSettings', 'mtPipeline']);
-    void mtPipeline; // pipeline reload is the caller's business (pipeline-section)
+    const { mtSettings, mtOcrSettings, mtPipeline } = await chrome.storage.local.get(['mtSettings', 'mtOcrSettings', 'mtPipeline']);
+    // reload the pipeline too: syncAdvancedUI (and fillModelFields' thinking/
+    // temperature controls) read the in-memory object, so a Reset without this
+    // left every edited pipeline field on screen
+    loadStoredPipeline(mtPipeline as PipelineSettings | undefined);
     fill({ ...DEFAULT_SETTINGS, ...(mtSettings ?? {}) } as LLMSettings);
+    fillOcrFields({ ...DEFAULT_SETTINGS, ...(mtOcrSettings ?? {}) } as LLMSettings);
     syncAdvancedUI();
     updateHints();
     syncSetupBanner();
@@ -129,10 +166,12 @@ export async function testConnection(): Promise<void> {
         await ensureHostPermission(s.baseUrl ?? "", s.provider);
         // text-only connectivity check (key + model + reachability) — image
         // support is detected at translation time instead, where the error
-        // carries a "switch to Local OCR" hint.
-        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s });
+        // carries a "switch to Local OCR" hint. Thinking level rides along:
+        // the background probes it with a second call and reports accepted /
+        // rejected (rejected levels silently run without thinking).
+        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s, thinking: pipeline.thinkingLevel, temperature: pipeline.temperature });
         if (resp?.ok) {
-            setStatus(`OK — ${resp.reply}`, 'ok', 0, el);
+            setStatus(`OK — ${resp.reply}${thinkingSuffix(pipeline.thinkingLevel, resp)}`, 'ok', 0, el);
         } else {
             setStatus(`Failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
         }
@@ -140,6 +179,112 @@ export async function testConnection(): Promise<void> {
         setStatus(`Failed: ${(e as Error).message}`, 'err', 0, el);
     }
 }
+
+// shared Test-status tail for the thinking probe (main + OCR buttons)
+function thinkingSuffix(level: string, resp: { thinking?: string; thinkingError?: string }): string {
+    if (resp.thinking === 'accepted') return ` · thinking ${level}: accepted`;
+    if (resp.thinking === 'rejected') return ` · thinking ${level}: rejected — runs without it`;
+    if (resp.thinking === 'error') return ` · thinking check failed: ${resp.thinkingError ?? 'unknown'}`;
+    return '';
+}
+
+export async function testOcr(): Promise<void> {
+    const s = currentOcrSettings();
+    const el = $('ocrTestStatus') as HTMLElement;
+    if (!s.model || !s.apiKey) {
+        setStatus('Enter an OCR model and API key first.', 'err', 0, el);
+        return;
+    }
+    setStatus('Testing… (reads the test image)', '', 0, el);
+    const t0 = Date.now();
+    // a drifting model can take a minute per call (small output caps keep it
+    // bounded, but a cold slow provider still takes seconds) — show the clock
+    const tick = setInterval(() => setStatus(`Testing… ${Math.round((Date.now() - t0) / 1000)}s (reads the test image)`, '', 0, el), 1000);
+    try {
+        await ensureHostPermission(s.baseUrl ?? '', s.provider);
+        const imageB64 = await ocrTestImageB64();
+        const resp = await chrome.runtime.sendMessage({ type: 'mt:test-ocr', settings: s, thinking: pipeline.ocrThinking, temperature: pipeline.ocrTemperature, imageB64, expect: OCR_TEST_EXPECT });
+        const secs = ` · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+        if (resp?.ok && resp.verdict === 'exact') {
+            const cap = resp.multiImage === true ? ' · multi-image OK'
+                : resp.multiImage === false ? ' · single-image only (per-region auto)'
+                : '';
+            const tempNote = resp.tempDropped ? ' · temperature rejected → provider default' : '';
+            setStatus(`OK — reads correctly ("${resp.got}")${cap}${tempNote}${secs}`, 'ok', 0, el);
+        } else if (resp?.ok) {
+            setStatus((resp.verdict === 'miss'
+                ? `Saw no text — returned keep on a readable image (expected "${resp.expected}")`
+                : `Mismatch — returned "${resp.got}" (expected "${resp.expected}")`) + secs, 'err', 0, el);
+        } else {
+            setStatus(`Failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
+        }
+    } catch (e) {
+        setStatus(`Failed: ${(e as Error).message}`, 'err', 0, el);
+    } finally {
+        clearInterval(tick);
+    }
+}
+
+// fixed self-test crop (src/options/ocr-test.png, copied to dist by build.mjs)
+// + its known transcription, character-for-character
+const OCR_TEST_EXPECT = 'We thirst for the seven wailings. We bear the koan of Jericho.';
+
+async function ocrTestImageB64(): Promise<string> {
+    const blob = await (await fetch(chrome.runtime.getURL('options/ocr-test.png'))).blob();
+    const dataUrl: string = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
+        fr.onload = () => resolve(fr.result as string);
+        fr.readAsDataURL(blob);
+    });
+    return dataUrl.slice(dataUrl.indexOf(',') + 1);
+}
+
+// ---- separate VLM reader: behavior knob (dirty-tracked, never Custom) ----
+($('ocrSeparate') as HTMLInputElement).onchange = () => {
+    pipeline.useOcrModel = ($('ocrSeparate') as HTMLInputElement).checked;
+    syncOcrSeparateUI();
+    setDirty(true);
+};
+for (const id of ['ocrModel', 'ocrApiKey', 'ocrBaseUrl'] as const) {
+    ($<HTMLInputElement>(id)).oninput = markModelDirty;
+}
+($('ocrProvider') as HTMLSelectElement).onchange = () => { renderOcrThinkingList(); markModelDirty(); };
+// OCR thinking: native datalist (free-text allowed) — deliberately not the
+// main combo machinery; options follow the OCR provider
+function renderOcrThinkingList(): void {
+    const list = $<HTMLDataListElement>('ocrThinkingList');
+    list.innerHTML = '';
+    const provider = ($('ocrProvider') as HTMLSelectElement).value as keyof typeof THINKING_LEVELS;
+    for (const v of THINKING_LEVELS[provider] ?? THINKING_LEVELS.openai) {
+        const o = document.createElement('option');
+        o.value = v;
+        list.append(o);
+    }
+}
+function syncOcrThinkingHint(): void {
+    const v = ($('ocrThinking') as HTMLInputElement).value.trim().toLowerCase();
+    ($('ocrThinkingHint') as HTMLElement).textContent =
+        (THINKING_HINTS as Record<string, string>)[v]
+        ?? (/^\d+$/.test(v)
+            ? 'Custom token budget — sent as thinkingBudget/budget_tokens where supported.'
+            : v
+                ? 'Custom value — sent as-is; rejected values fall back to the model default.'
+                : THINKING_HINTS.none);
+}
+($('ocrThinking') as HTMLInputElement).oninput = () => {
+    pipeline.ocrThinking = ($('ocrThinking') as HTMLInputElement).value.trim() || 'none';
+    syncOcrThinkingHint();
+    setDirty(true);
+};
+$('ocrCopy').onclick = () => {
+    const s = currentSettings();
+    ($('ocrProvider') as HTMLSelectElement).value = s.provider;
+    ($('ocrModel') as HTMLInputElement).value = s.model;
+    ($('ocrApiKey') as HTMLInputElement).value = s.apiKey;
+    ($('ocrBaseUrl') as HTMLInputElement).value = s.baseUrl ?? '';
+    markModelDirty();
+};
 
 // first-run guidance: show the banner until a key exists
 export function syncSetupBanner(): void {
@@ -238,6 +383,46 @@ export async function testCloud(): Promise<void> {
     }
 }
 
+// ---- temperature: "Provider default" checkbox; slider/number drop out of
+// auto on touch (same rule as the color pickers — never disabled). One
+// implementation for the main model and the VLM reader; only the off-default
+// differs (main 0.3, unless the stored value says otherwise; OCR 0 = literal)
+function wireTemperature(autoId: string, sliderId: string, numId: string, key: 'temperature' | 'ocrTemperature', fallback: number): () => void {
+    const sync = (): void => {
+        const auto = pipeline[key] == null;
+        const shown = auto ? fallback : pipeline[key];
+        ($<HTMLInputElement>(autoId)).checked = auto;
+        ($<HTMLInputElement>(sliderId)).value = String(shown);
+        ($<HTMLInputElement>(numId)).value = String(shown);
+        ($<HTMLInputElement>(sliderId)).classList.toggle('dim', auto);
+        ($<HTMLInputElement>(numId)).classList.toggle('dim', auto);
+    };
+    ($<HTMLInputElement>(autoId)).onchange = () => {
+        pipeline[key] = ($<HTMLInputElement>(autoId)).checked
+            ? null
+            : Number(($<HTMLInputElement>(sliderId)).value);
+        sync();
+        markModelDirty();
+    };
+    ($<HTMLInputElement>(sliderId)).oninput = () => {
+        pipeline[key] = Number(($<HTMLInputElement>(sliderId)).value);
+        sync();
+        markModelDirty();
+    };
+    ($<HTMLInputElement>(numId)).onchange = () => {
+        const raw = ($<HTMLInputElement>(numId)).value.trim();
+        let v = raw === '' ? NaN : Number(raw);
+        if (!Number.isFinite(v)) v = pipeline[key] ?? fallback; // garbage → revert
+        else v = Math.min(1, Math.max(0, Math.round(v * 20) / 20)); // slider step 0.05
+        pipeline[key] = v;
+        sync();
+        markModelDirty();
+    };
+    return sync;
+}
+const syncTemperatureUI = wireTemperature('temperatureAuto', 'temperature', 'temperatureNum', 'temperature', 0.3);
+export const syncOcrTemperatureUI = wireTemperature('ocrTemperatureAuto', 'ocrTemperature', 'ocrTemperatureNum', 'ocrTemperature', 0);
+
 // ---- thinking level: searchable combobox, presets depend on provider, free-text allowed ----
 // ponytail: same .combo pattern as targetLang, duplicated —
 // extract a shared helper if a third combo appears
@@ -264,8 +449,7 @@ function syncThinkingHint(): void {
 
 export function syncThinkingUI(): void {
     thinkInput.value = pipeline.thinkingLevel;
-    syncThinkingHint();
-    closeThinkList();
+    syncThinkingHint();    closeThinkList();
 }
 
 function closeThinkList(): void {
