@@ -322,7 +322,7 @@ export interface InteriorFill {
 // the glyph only), with the center pixel as an alternate — whichever floods
 // more pixels wins. Bounded to box ± grow (growX sideways) so a white page
 // cannot be claimed as layout area.
-function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number): InteriorFill {
+function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, widen = false): InteriorFill {
     const { width: W, height: H, data } = img;
     const cx = Math.floor((box.x1 + box.x2) / 2);
     const cy = Math.floor((box.y1 + box.y2) / 2);
@@ -331,16 +331,54 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number):
     const modal = interiorSeed(data, W, H, box);
 
     const boxW = box.x2 - box.x1, boxH = box.y2 - box.y1;
-    const loX = Math.max(0, Math.floor(box.x1 - boxW * growX));
-    const hiX = Math.min(W - 1, Math.ceil(box.x2 + boxW * growX));
-    const loY = Math.max(0, Math.floor(box.y1 - boxH * grow));
-    const hiY = Math.min(H - 1, Math.ceil(box.y2 + boxH * grow));
+    const window4 = (gx: number, gy: number) => ({
+        loX: Math.max(0, Math.floor(box.x1 - boxW * gx)),
+        loY: Math.max(0, Math.floor(box.y1 - boxH * gy)),
+        hiX: Math.min(W - 1, Math.ceil(box.x2 + boxW * gx)),
+        hiY: Math.min(H - 1, Math.ceil(box.y2 + boxH * gy)),
+    });
 
-    const fillFrom = (seed: [number, number, number]) => {
-        const visited = new Uint8Array(W * H);
-        const queue = [cy * W + cx];
-        visited[cy * W + cx] = 1;
-        let minX = cx, maxX = cx, minY = cy, maxY = cy, count = 0;
+    // Start pixel for a seed = the sampled pixel nearest the box center that
+    // matches it. Flooding from the center itself is wrong when the center sits
+    // on a thick glyph: the flood may only cross seed-like pixels, so with a
+    // white seed it never leaves the glyph, and the ink blob wins the "largest
+    // flood" vote instead (live: a Japanese column box's placement area
+    // collapsed to the glyphs' width, font 34 → 13).
+    const grid: number[] = [];
+    const probes: number[] = []; // extra sample points, kept out of the nearest-to-center vote
+    {
+        const gx1 = Math.max(0, Math.floor(box.x1)), gy1 = Math.max(0, Math.floor(box.y1));
+        const gx2 = Math.min(W - 1, Math.ceil(box.x2)), gy2 = Math.min(H - 1, Math.ceil(box.y2));
+        const stepX = Math.max(1, Math.floor((gx2 - gx1) / 24)), stepY = Math.max(1, Math.floor((gy2 - gy1) / 24));
+        for (let y = gy1; y <= gy2; y += stepY) for (let x = gx1; x <= gx2; x += stepX) grid.push(y * W + x);
+        for (const [x, y] of [[gx1, gy1], [gx2, gy1], [gx1, gy2], [gx2, gy2]] as const) probes.push(y * W + x);
+        // …and just outside each edge: a box hugging its glyphs has no interior
+        // pixel of its own, and the surface the text sits on starts a few px out
+        for (const [x, y] of [
+            [Math.round(box.x1) - 3, cy], [Math.round(box.x2) + 3, cy],
+            [cx, Math.round(box.y1) - 3], [cx, Math.round(box.y2) + 3],
+        ] as const) {
+            if (x >= 0 && y >= 0 && x < W && y < H) probes.push(y * W + x);
+        }
+    }
+    const startFor = (seed: [number, number, number]): number => {
+        let best = cy * W + cx, bestD = Infinity;
+        for (const p of grid) {
+            if (!seedLike(data, p * 4, seed)) continue;
+            const d = Math.abs((p % W) - cx) + Math.abs(((p / W) | 0) - cy);
+            if (d < bestD) { bestD = d; best = p; }
+        }
+        return best;
+    };
+    const visited = new Uint8Array(W * H);
+    type Win = ReturnType<typeof window4>;
+    const fillFrom = (seed: [number, number, number], win: Win) => {
+        visited.fill(0);
+        const start = startFor(seed);
+        const sx = start % W, sy = (start / W) | 0;
+        const queue = [start];
+        visited[start] = 1;
+        let minX = sx, maxX = sx, minY = sy, maxY = sy, count = 0;
         while (queue.length) {
             const p = queue.pop()!;
             const x = p % W, y = (p / W) | 0;
@@ -349,7 +387,7 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number):
             count++;
             for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
                 const nx = x + dx, ny = y + dy;
-                if (nx < loX || ny < loY || nx > hiX || ny > hiY) continue;
+                if (nx < win.loX || ny < win.loY || nx > win.hiX || ny > win.hiY) continue;
                 const np = ny * W + nx;
                 if (visited[np]) continue;
                 if (seedLike(data, np * 4, seed)) {
@@ -360,12 +398,45 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number):
         }
         return { minX, minY, maxX, maxY, count, seed };
     };
-    let fill = fillFrom(modal);
-    if (modal[0] !== center[0] || modal[1] !== center[1] || modal[2] !== center[2]) {
-        const alt = fillFrom(center);
-        if (alt.count > fill.count) fill = alt;
+    // Candidates: the modal interior color, the center pixel, and the colors
+    // of the corner/outside probes (4-bit dedup) — whichever surface floods
+    // largest is the one the box actually sits on.
+    const key = (c: [number, number, number]) => (c[0] >> 4 << 8) | (c[1] >> 4 << 4) | (c[2] >> 4);
+    const seeds: [number, number, number][] = [modal, center];
+    for (const p of probes) seeds.push([data[p * 4], data[p * 4 + 1], data[p * 4 + 2]]);
+    const bestFor = (win: Win) => {
+        let best = fillFrom(seeds[0], win);
+        const seen = new Set<number>([key(seeds[0])]);
+        for (const seed of seeds.slice(1)) {
+            if (seen.has(key(seed))) continue;
+            seen.add(key(seed));
+            const alt = fillFrom(seed, win);
+            if (alt.count > best.count) best = alt;
+        }
+        return { fill: best, win };
+    };
+    let pick = bestFor(window4(growX, grow));
+    const { fill: f } = pick;
+    const touches = f.minX <= pick.win.loX + 1 || f.maxX >= pick.win.hiX - 1 || f.minY <= pick.win.loY + 1 || f.maxY >= pick.win.hiY - 1;
+    const shortSide = Math.min(boxW, boxH), longSide = Math.max(boxW, boxH);
+    if (widen && touches && shortSide <= longSide * 0.35) {
+        // The flood was clipped by the grow window, not stopped by ink — and
+        // this is a narrow column box (a vertical JA line), which sits several
+        // boxes of empty space away from its bubble's outline. Widen SIDEWAYS
+        // only and reject the result if the long axis grew: growth along the
+        // long axis is exactly how a fill leaks into the page margin and
+        // fabricates outline evidence from art (live: widening both axes turned
+        // a 190x217 caption into a 311x851 "profile" and halved a neighbouring
+        // font). The tight window used to fuse the column case into "the bubble
+        // is the column" (live: 38px box, area 67, font 34 → 13).
+        const wide = bestFor(boxH > boxW ? window4(4, grow) : window4(growX, 4));
+        const g = wide.fill;
+        const longStable = boxH > boxW
+            ? (g.maxY - g.minY) <= (f.maxY - f.minY) + 2
+            : (g.maxX - g.minX) <= (f.maxX - f.minX) + 2;
+        if (g.count > f.count && longStable) pick = wide;
     }
-    return { ...fill, loX, loY, hiX, hiY };
+    return { ...pick.fill, ...pick.win };
 }
 
 // Rectangle placement area — the NO-FRAME path: narration and SFX over art,
@@ -582,7 +653,7 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
     // is well inside that, while a leaked fill (barely-enclosed white garment,
     // bubble tail slipping into a same-colored drawing) cannot run away —
     // beyond this the legacy 1.5x-capped rect takes over.
-    const fill = interiorFill(img, box, 0.6, 0.6);
+    const fill = interiorFill(img, box, 0.6, 0.6, true);
     const [r0, g0, b0] = fill.seed;
     let { minX, minY, maxX, maxY } = fill;
     ({ minX, maxX, minY, maxY } = clampToBorders(img.data, img.width, img.height, [r0, g0, b0], box, { minX, minY, maxX, maxY }));
@@ -735,17 +806,27 @@ export function renderRegion(
     text: string,
 ): Placed | null {
     if (!text.trim()) return null;
-    // vertical Japanese columns are tall+narrow → render rotated 90° so Thai
-    // reads top-to-bottom along the column instead of overflowing sideways.
-    // preferHorizontal crams horizontal first and rotates only on overflow —
-    // short text fits (the common case), long strips keep the rotated path.
-    const vertical = boxIsVertical(box);
-    if (vertical && renderTuning.preferHorizontal) {
-        const probe = pageArea(ctx, img, box, true);
-        if (probe && horizontalFits(ctx, text, probe)) return renderHorizontal(ctx, img, box, text);
-    }
-    if (vertical) return renderVertical(ctx, img, box, text);
+    if (chosenOrientation(ctx, img, box, text)) return renderVertical(ctx, img, box, text);
     return renderHorizontal(ctx, img, box, text);
+}
+
+// Which way this region will actually be laid out. Tall+narrow Japanese
+// columns render rotated so Thai reads down the column; preferHorizontal crams
+// horizontal first and rotates only on overflow (short text fits — the common
+// case). Exported so the result dump and the debug overlay report the area the
+// text really got: deriving it from the box aspect alone drew the vertical
+// area under text that was laid out horizontally (live: a debug view showed a
+// narrow area while the paint used a different one).
+export function chosenOrientation(
+    ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+    img: ImageData, box: DetBox, text: string,
+): boolean {
+    if (!boxIsVertical(box)) return false;
+    if (renderTuning.preferHorizontal) {
+        const probe = pageArea(ctx, img, box, true);
+        if (probe && horizontalFits(ctx, text, probe)) return false;
+    }
+    return true;
 }
 
 export interface Placed { fontSize: number; lines: string[]; overflow?: boolean; color?: string; block?: [number, number] }
@@ -838,14 +919,28 @@ export function layoutTextFit(
         setFont(ctx, size);
         const lh = size * (1 + HEADROOM + LINE_SPACING);
         const anchorA = prof.vertical ? stack0 + stackLen : stack0;
-        const a = wrapUnitsIntoLines(ctx, segments, widthFor(anchorA, lh));
-        if (a.failed) continue;
+        let a = wrapUnitsIntoLines(ctx, segments, widthFor(anchorA, lh));
+        let anchorFirst = anchorA;
+        let centeredOnly = false;
+        if (a.failed) {
+            // The first pass starts at the area's reading-order edge, where a
+            // round bubble is narrowest. A unit that cannot fit there can still
+            // fit the centered band — a short line lives in the middle. Skipping
+            // the size outright made a round profile shrink short text far below
+            // the source size (live: a two-word line, font 32 → 15 in a 67px
+            // box; the same skip capped a JP column at 19 against a 34px source).
+            const centered = prof.vertical ? stack0 + (stackLen + lh) / 2 : stack0 + (stackLen - lh) / 2;
+            const c = wrapUnitsIntoLines(ctx, segments, widthFor(centered, lh));
+            if (c.failed) continue;
+            a = c; anchorFirst = centered; centeredOnly = true;
+        }
         const fitsA = a.lines.length * lh <= stackFit + 0.5;
         // recenter the block and re-wrap with the shifted bands
         const span = a.lines.length * lh;
-        const anchorB = prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2;
-        const b = fitsA ? wrapUnitsIntoLines(ctx, segments, widthFor(anchorB, lh)) : { lines: a.lines, failed: false };
-        const use = b.failed || b.lines.length * lh > stackFit + 0.5 ? { lines: a.lines, top: anchorA } : { lines: b.lines, top: anchorB };
+        const anchorB = centeredOnly ? anchorFirst
+            : prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2;
+        const b = fitsA && !centeredOnly ? wrapUnitsIntoLines(ctx, segments, widthFor(anchorB, lh)) : { lines: a.lines, failed: false };
+        const use = b.failed || b.lines.length * lh > stackFit + 0.5 ? { lines: a.lines, top: anchorFirst } : { lines: b.lines, top: anchorB };
         const centers = use.lines.map((_, j) => {
             const b0 = prof.vertical ? use.top - (j + 1) * lh : use.top + j * lh;
             const iv = runInterval(prof, b0, b0 + lh);

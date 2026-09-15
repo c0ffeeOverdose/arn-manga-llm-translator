@@ -486,3 +486,53 @@ test('widthProfile/fitArea: leaked rows trim out of the placement area', () => {
   assert.ok(a.h <= 70, `area stays the caption, not the leaked page margin (h=${a.h})`);
   assert.ok(a.y >= 99, `area top follows the evidence (y=${a.y})`);
 });
+
+// The flood must not start on a glyph: expansion only crosses seed-like pixels,
+// so a center buried in a thick glyph traps a white seed and the ink blob wins
+// the "largest flood" vote — the placement area then collapses to the source
+// column (live: a Japanese column box, font 34 → 13, text wrapped one glyph per
+// line). The outside/corner probes give the bubble's own surface a candidate.
+test('layoutArea: a center buried in a thick glyph still reaches the bubble', () => {
+  // a narrow column box filled mostly with one thick glyph block: the modal and
+  // center seeds are the ink, so the bubble surface has to win via the corner /
+  // outside probes, and the sideways widen has to find the bubble's sides
+  const W = 260, H = 260;
+  const img = ringPage(W, H, 130, 130, 100, 5);
+  for (let y = 140; y < 220; y++) for (let x = 135; x < 165; x++) {
+    const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+  }
+  const box = { x1: 135, y1: 105, x2: 165, y2: 225, conf: 0.9 };
+  const a = layoutArea(img, box, true);
+  assert.ok(a, 'area measured');
+  assert.ok(a.w >= 150, `area spans the bubble, not the glyph (w=${a.w})`);
+});
+
+test('layoutArea: a vertical glyph column keeps the bubble width', () => {
+  const W = 300, H = 300;
+  const img = ringPage(W, H, 150, 150, 120, 5);
+  for (const y0 of [70, 130, 190]) for (let y = y0; y < y0 + 40; y++) for (let x = 131; x < 169; x++) {
+    const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+  }
+  const box = { x1: 131, y1: 60, x2: 169, y2: 240, conf: 0.9 };
+  const a = layoutArea(img, box, true);
+  assert.ok(a, 'area measured');
+  assert.ok(a.w >= 150, `vertical area spans the bubble, not the column (w=${a.w})`);
+});
+
+// A block's first wrap pass starts at the area's reading-order edge, where a
+// round bubble is narrowest. A short line that fits the centered band must not
+// be skipped because it cannot fit that edge band — the size loop used to drop
+// the whole size, shrinking text far below a source the area could hold.
+test('layoutTextFit: a line too wide for the edge band still fits centered', () => {
+  const prof = {
+    vertical: false, p0: 0, p1: 99,
+    i1: Int32Array.from({ length: 100 }, (_, i) => (i < 20 || i >= 80 ? 30 : 0)),
+    i2: Int32Array.from({ length: 100 }, (_, i) => (i < 20 || i >= 80 ? 70 : 100)),
+    enclosed: 1, e0: 0, e1: 99,
+  };
+  const area = { x: 0, y: 0, w: 100, h: 100, runs: prof };
+  const laid = layoutTextFit(fakeCtx(), 'a word', area, 20, 67);
+  assert.ok(laid, 'layout exists');
+  assert.ok(laid.fontSize >= 18, `kept a usable size (got ${laid.fontSize})`);
+  assert.ok(laid.lines.length * laid.lineHeight <= 67.5, `block stays inside maxStack (${laid.lines.length}x${laid.lineHeight})`);
+});

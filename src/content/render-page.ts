@@ -1,7 +1,7 @@
 // renderPage: the solo path — translate one prepared page, paint, register,
 // cache, fold into the book.
 
-import { boxIsVertical, ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
+import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
 import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0 } from './page-cache';
@@ -109,8 +109,12 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         // placement areas the renderer actually used (layoutArea: flood-fill
         // clamped at bubble borders, shrunk to ink on near-empty boxes —
         // compare against boxes to spot either failure)
-        areas: det.boxes.map(b => {
-            const a = layoutArea(frame, b, boxIsVertical(b)) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
+        areas: det.boxes.map((b, i) => {
+            // same orientation the paint picked for this region (not the box
+            // aspect): the dumped area must be the area the text got
+            const out = outputs.find(o => o.index === i + 1);
+            const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
+            const a = layoutArea(frame, b, chosenOrientation(ctx, frame, b, text)) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
             return {
                 x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
                 // enclosed score >0 = per-line profile layout, absent = no-frame rect
@@ -152,11 +156,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // one on each frame so Original/Translate toggle keeps its debug boxes.
     if (debugOn && det.boxes.length) {
         const ranks = panelRanks(det.panels ?? []);
-        state.debugOrig = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped);
+        state.debugOrig = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs);
         // canvas pages reuse the kept translated bitmap (transfer is one-shot);
         // img pages transfer here as before — the canvas is dead after this
         const bmp = state.translatedBmp ?? canvas.transferToImageBitmap();
-        state.debug = await renderDebugView(bmp, det.boxes, det.panels, ranks, det.dropped, det.panelDropped);
+        state.debug = await renderDebugView(bmp, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs);
     }
     if (existing) {
         unregPage(existing);

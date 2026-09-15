@@ -8,7 +8,7 @@ import { pipeline, context, setContext, shareContext, loadContext, saveContext, 
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources } from './page-cache';
-import { boxIsVertical, pageArea } from './render';
+import { chosenOrientation, pageArea } from './render';
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
@@ -169,7 +169,7 @@ function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContex
 // (cyan, numbered in reading order), dashed green = the placement area the
 // layout actually got. Below-threshold near-misses draw dimmed gray with conf
 // and NO badge — a badge means "translated in this order".
-export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = []): Promise<string> {
+export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = []): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d')!;
     ctx.drawImage(bitmap, 0, 0);
@@ -196,22 +196,27 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
     // boxes. Recomputed from the image being drawn: exact on the original
     // view, off by an ink-frac hairline on the translated one.
     const frame = ctx.getImageData(0, 0, c.width, c.height);
+    // the orientation the layout will choose for this region's own text, not
+    // the box aspect: a tall box whose translation fits horizontally is laid
+    // out horizontally, and drawing the vertical area under it misled more
+    // than one diagnosis.
+    const textFor = (i: number) => outputs.find(o => o.index === i + 1)?.translation ?? '';
     ctx.save();
     ctx.setLineDash([font, font * 0.6]);
     ctx.strokeStyle = '#2bff88';
-    for (const b of boxes) {
-        const a = pageArea(ctx, frame, b, boxIsVertical(b));
+    boxes.forEach((b, i) => {
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
         if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
-    }
+    });
     // measured per-line runs (enclosed bubbles): orange outline of the shape
     // the layout actually follows — short at a round bubble's top, long in the
     // middle. Not drawn for the no-frame fallback (rect only, as before).
     ctx.setLineDash([font * 0.5, font * 0.4]);
     ctx.strokeStyle = '#ffa02b';
-    for (const b of boxes) {
-        const a = pageArea(ctx, frame, b, boxIsVertical(b));
+    boxes.forEach((b, i) => {
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
         const prof = a?.runs;
-        if (!prof) continue;
+        if (!prof) return; // forEach: skip boxes without a measured profile
         const left: [number, number][] = [], right: [number, number][] = [];
         for (let p = prof.p0; p <= prof.p1; p++) {
             const k = p - prof.p0;
@@ -219,12 +224,12 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
             left.push(prof.vertical ? [p, prof.i1[k]] : [prof.i1[k], p]);
             right.unshift(prof.vertical ? [p, prof.i2[k]] : [prof.i2[k], p]);
         }
-        if (!left.length) continue;
+        if (!left.length) return;
         ctx.beginPath();
         [...left, ...right].forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
         ctx.closePath();
         ctx.stroke();
-    }
+    });
     ctx.restore();
     boxes.forEach((b, i) => {
         ctx.strokeStyle = '#ff2222';
@@ -258,12 +263,12 @@ export async function ensureDebugViews(): Promise<void> {
                 if (!st.debugOrig) {
                     const orig = await canvasPaintSrc(st, 'orig');
                     if (orig) {
-                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                         pages.set(st.debugOrig, st);
                     }
                 }
                 if (!st.debug && st.translatedBmp) {
-                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                     pages.set(st.debug, st);
                 }
             } catch (e) {
@@ -275,11 +280,11 @@ export async function ensureDebugViews(): Promise<void> {
         try {
             const ranks = panelRanks(st.det.panels ?? []);
             if (!st.debugOrig) {
-                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                 pages.set(st.debugOrig, st);
             }
             if (!st.debug) {
-                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped);
+                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
                 pages.set(st.debug, st);
             }
         } catch (e) {
