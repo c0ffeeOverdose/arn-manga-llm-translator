@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 18;
+export const RENDER_GEN = 22;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -345,7 +345,12 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
     // flood" vote instead (live: a Japanese column box's placement area
     // collapsed to the glyphs' width, font 34 → 13).
     const grid: number[] = [];
-    const probes: number[] = []; // extra sample points, kept out of the nearest-to-center vote
+    const probes: number[] = []; // corner sample points, kept out of the nearest-to-center vote
+    // Just-outside-the-box samples: their flood must START on the sample itself
+    // (see fillFrom) — these are the pixels standing on the surface the text
+    // sits on, while every grid pixel is inside a box that may hold nothing but
+    // glyph pockets.
+    const outside: number[] = [];
     {
         const gx1 = Math.max(0, Math.floor(box.x1)), gy1 = Math.max(0, Math.floor(box.y1));
         const gx2 = Math.min(W - 1, Math.ceil(box.x2)), gy2 = Math.min(H - 1, Math.ceil(box.y2));
@@ -358,7 +363,7 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
             [Math.round(box.x1) - 3, cy], [Math.round(box.x2) + 3, cy],
             [cx, Math.round(box.y1) - 3], [cx, Math.round(box.y2) + 3],
         ] as const) {
-            if (x >= 0 && y >= 0 && x < W && y < H) probes.push(y * W + x);
+            if (x >= 0 && y >= 0 && x < W && y < H) outside.push(y * W + x);
         }
     }
     const startFor = (seed: [number, number, number]): number => {
@@ -372,9 +377,15 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
     };
     const visited = new Uint8Array(W * H);
     type Win = ReturnType<typeof window4>;
-    const fillFrom = (seed: [number, number, number], win: Win) => {
+    const fillFrom = (seed: [number, number, number], win: Win, at?: number) => {
         visited.fill(0);
-        const start = startFor(seed);
+        // A seed sampled just outside the box starts there: re-homing it to the
+        // nearest grid pixel lands the flood in a pocket between glyphs (a box
+        // hugging a vertical JA column has no interior pixel of its own), the
+        // pocket loses the largest-flood vote to the ink blob, and the fill
+        // collapses to the glyph column (live: badge 12, area 43x205 in a
+        // ~150px bubble, font 13).
+        const start = at != null && seedLike(data, at * 4, seed) ? at : startFor(seed);
         const sx = start % W, sy = (start / W) | 0;
         const queue = [start];
         visited[start] = 1;
@@ -402,19 +413,55 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
     // of the corner/outside probes (4-bit dedup) — whichever surface floods
     // largest is the one the box actually sits on.
     const key = (c: [number, number, number]) => (c[0] >> 4 << 8) | (c[1] >> 4 << 4) | (c[2] >> 4);
-    const seeds: [number, number, number][] = [modal, center];
-    for (const p of probes) seeds.push([data[p * 4], data[p * 4 + 1], data[p * 4 + 2]]);
-    const bestFor = (win: Win) => {
-        let best = fillFrom(seeds[0], win);
-        const seen = new Set<number>([key(seeds[0])]);
+    const seeds: { c: [number, number, number]; at?: number }[] = [{ c: modal }, { c: center }];
+    for (const p of probes) seeds.push({ c: [data[p * 4], data[p * 4 + 1], data[p * 4 + 2]] });
+    for (const p of outside) seeds.push({ c: [data[p * 4], data[p * 4 + 1], data[p * 4 + 2]], at: p });
+    const bestFor = (win: Win, skipLeaks = false) => {
+        let best = fillFrom(seeds[0].c, win, seeds[0].at);
+        if (skipLeaks && windowFilled(best, win)) best = { ...best, count: -1 };
+        const seenColor = new Set<number>([key(seeds[0].c)]);
+        const seenAt = new Set<number>();
         for (const seed of seeds.slice(1)) {
-            if (seen.has(key(seed))) continue;
-            seen.add(key(seed));
-            const alt = fillFrom(seed, win);
+            // color-only seeds dedup by colour, outside samples by pixel: a
+            // pocket and the bubble surface are the same colour, so deduping
+            // the sample away would lose the only flood that reaches the
+            // bubble (see fillFrom).
+            if (seed.at != null) {
+                if (seenAt.has(seed.at)) continue;
+                seenAt.add(seed.at);
+            } else {
+                if (seenColor.has(key(seed.c))) continue;
+                seenColor.add(key(seed.c));
+            }
+            let alt = fillFrom(seed.c, win);
+            // Rescue for a trapped sample: a box hugging a vertical JA column
+            // has no interior pixel of its own, so a white seed's nearest grid
+            // pixel sits in a glyph-gap pocket — a flood that loses the
+            // largest-surface vote to the ink blob (live: badge 12: the pocket
+            // cluster covered ~40% of the box, the fill came out as the column,
+            // area 43x205 inside a ~150px bubble, font 13). Re-flood from the
+            // sample itself when the grid flood cannot even fill the box. Only
+            // then: an outside sample may stand on the page beyond the outline,
+            // and its own flood would beat the bubble's fill (the page is
+            // bigger) — the box-containment of the winner is what makes the
+            // rescue safe.
+            if (seed.at != null && alt.count < boxW * boxH) {
+                const rescued = fillFrom(seed.c, win, seed.at);
+                if (rescued.count > alt.count) alt = rescued;
+            }
+            if (skipLeaks && windowFilled(alt, win)) continue;
             if (alt.count > best.count) best = alt;
         }
         return { fill: best, win };
     };
+    // A candidate that fills its whole window on every side is a leak, not a
+    // surface the box sits on: an outside sample standing on the page beyond
+    // the outline floods the page, which is bigger than the bubble's fill and
+    // would win the grow vote (and trip longStable), leaving the widen dead
+    // (live: badge 12, the widen never fired although the bubble was 4.6x the
+    // box). The plain first vote keeps its legacy behaviour.
+    const windowFilled = (fl: { minX: number; minY: number; maxX: number; maxY: number }, win: Win) =>
+        fl.minX <= win.loX + 1 && fl.minY <= win.loY + 1 && fl.maxX >= win.hiX - 1 && fl.maxY >= win.hiY - 1;
     let pick = bestFor(window4(growX, grow));
     const { fill: f } = pick;
     const touches = f.minX <= pick.win.loX + 1 || f.maxX >= pick.win.hiX - 1 || f.minY <= pick.win.loY + 1 || f.maxY >= pick.win.hiY - 1;
@@ -429,7 +476,7 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
         // a 190x217 caption into a 311x851 "profile" and halved a neighbouring
         // font). The tight window used to fuse the column case into "the bubble
         // is the column" (live: 38px box, area 67, font 34 → 13).
-        const wide = bestFor(boxH > boxW ? window4(4, grow) : window4(growX, 4));
+        const wide = bestFor(boxH > boxW ? window4(4, grow) : window4(growX, 4), true);
         const g = wide.fill;
         const longStable = boxH > boxW
             ? (g.maxY - g.minY) <= (f.maxY - f.minY) + 2
@@ -454,9 +501,19 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
     // face-walk guard that motivated the 0.3 cap was horizontal B&W pages).
     const vertical = boxH > boxW * renderTuning.verticalThreshold;
     const growX = vertical ? 1.0 : 0.3;
-    const fill = interiorFill(img, box, growX, 0.3);
+    // widen: a bubble on dark art/black can never pass the profile's outline
+    // evidence (the stroke and the black beyond are both ink — the walk reads a
+    // 16px-plus line and rejects it), so its bubble shape is unreachable and
+    // this rect is the whole fallback. The 1.0 sideways leash alone then stops
+    // the fill ~35px out for a 35px column, trust-but-verify sees white beyond
+    // the leash, and the 1.5x cap leaves the text a 43px strip in a ~150px
+    // bubble (live: badge 12, font 13). The widen path reaches the real border
+    // through the same sideways-only grow + long-axis-stable guard the profile
+    // path uses.
+    const fill = interiorFill(img, box, growX, 0.3, true);
     let { minX, minY, maxX, maxY } = fill;
     const [r0, g0, b0] = fill.seed;
+    const fillL = minX, fillR = maxX, fillT = minY, fillB = maxY; // pre-clamp bounds
 
     // Border-cross clamp: the fill above may have slipped through a
     // thin/anti-aliased bubble border into a neighbor bubble's white
@@ -491,12 +548,26 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
         }
         return n ? d / n : 0;
     };
-    if ((minX <= 0 ? 0 : edgeColFrac(minX - 1)) < 0.7 || (maxX >= W - 1 ? 0 : edgeColFrac(maxX + 1)) < 0.7) {
+    // A side the border-cross clamp moved sat on a spanning border — that IS
+    // the border ink the frac test below looks for, and re-measuring a
+    // hair outside the clamped bound only re-introduces threshold noise (the
+    // clamp's and the test's row ranges differ by the clamp itself: a
+    // black-page bubble missed 0.70 by a hair and got capped to 1.5x).
+    // TRUST_MIN 0.4, not 0.7: a bubble edge is curved, so the column just
+    // outside the fill's extreme bound cuts the stroke over only part of the
+    // fill's span — live: badge 12's oval gave 0.44/0.72/0.47/0.69 and the
+    // 0.7 bar capped a correct 184px-wide fill down to a 52px strip. A leak
+    // (window edge, white margin, spotty ink) measures ~0.0-0.2, so the leak
+    // protection is untouched.
+    const TRUST_MIN = 0.4;
+    const trustL = minX !== fillL, trustR = maxX !== fillR;
+    const trustT = minY !== fillT, trustB = maxY !== fillB;
+    if ((!trustL && (minX <= 0 ? 0 : edgeColFrac(minX - 1)) < TRUST_MIN) || (!trustR && (maxX >= W - 1 ? 0 : edgeColFrac(maxX + 1)) < TRUST_MIN)) {
         const w = Math.min(maxX - minX, (box.x2 - box.x1) * 1.5);
         const cxb = (box.x1 + box.x2) / 2;
         minX = Math.round(cxb - w / 2); maxX = Math.round(cxb + w / 2);
     }
-    if ((minY <= 0 ? 0 : edgeRowFrac(minY - 1)) < 0.7 || (maxY >= H - 1 ? 0 : edgeRowFrac(maxY + 1)) < 0.7) {
+    if ((!trustT && (minY <= 0 ? 0 : edgeRowFrac(minY - 1)) < TRUST_MIN) || (!trustB && (maxY >= H - 1 ? 0 : edgeRowFrac(maxY + 1)) < TRUST_MIN)) {
         const h = Math.min(maxY - minY, (box.y2 - box.y1) * 1.5);
         const cyb = (box.y1 + box.y2) / 2;
         minY = Math.round(cyb - h / 2); maxY = Math.round(cyb + h / 2);

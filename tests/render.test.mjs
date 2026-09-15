@@ -47,6 +47,38 @@ test('vertical fill stays capped when no border exists', () => {
   assert.ok(a.w > 15, 'wider than the box itself');
 });
 
+// live regression (badge 12): the bubble sits on black art, so the profile's
+// outline evidence can never pass (stroke and black beyond are both ink) and
+// this rect is the whole fallback. The 1.0 sideways leash stopped the fill
+// ~35px out for a 35px column, trust-but-verify saw white beyond the leash and
+// the 1.5x cap left a 43px strip inside a ~150px bubble (font 13). The widen
+// path reaches the real border.
+test('bubbleArea: a bubble on black art still grows to its border', () => {
+  const W = 400, H = 400;
+  const data = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) data[i * 4 + 3] = 255; // black page
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (Math.hypot(x - 200, y - 200) <= 120) { // white bubble, no stroke of its own
+      const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 255;
+    }
+  }
+  // the glyph column fills the box edge to edge (the real JA case) with a few
+  // ENCLOSED white pockets — every white seed re-homed to a grid pixel lands in
+  // one of those, loses the largest-flood vote to the ink blob and collapses
+  // the fill to the column
+  for (let y = 105; y <= 295; y++) for (let x = 185; x <= 215; x++) {
+    const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0;
+  }
+  for (const hy of [150, 200, 250]) for (let y = hy; y < hy + 6; y++) for (let x = 197; x < 203; x++) {
+    const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 255;
+  }
+  const img = { width: W, height: H, data };
+  const box = { x1: 185, y1: 105, x2: 215, y2: 295, conf: 0.95 }; // 30x190 column
+  const a = bubbleArea(img, box);
+  assert.ok(a.w >= 150, `area reaches the bubble border, not the 1.5x cap (w=${a.w})`);
+  assert.ok(a.x < 110 && a.x + a.w > 290, `spans the bubble (x=${a.x}, w=${a.w})`);
+});
+
 test('horizontal boxes keep the tight 30% cap (face-walk guard)', () => {
   const img = page(400, 200); // all white
   const box = { x1: 100, y1: 80, x2: 180, y2: 120, conf: 0.9 }; // 80x40, not vertical
