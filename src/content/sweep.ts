@@ -30,7 +30,7 @@ import { pipeline, context, setContext, shareContext, loadContext, loadPipeline,
 import { fetchBitmap, getPages, refKey, unscrambleTiles, episodeManifestSrcs, galleryManifestJson, fetchPagedUrls, collectUnloadedUrls } from './page-io';
 import { resolveHeadlessDet, preparePage } from './pipeline';
 import { translateRegions, type TranslateOutcome } from './ocr';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, abortLookahead } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, abortLookahead } from './page-cache';
 import type { DetectResult, MtOnStatus } from './detection';
 import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued } from './queue';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn } from './status-ui';
@@ -478,6 +478,8 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
             outputs: c.o.outputs, extras: c.o.extras, mentions: c.o.mentions,
             mask: packMask(c.det.mask),
         }, pipeline.cacheMax);
+    } else {
+        void cacheDelete(cacheKey(s.chapter, c.hash)); // cache off: drop the resume checkpoint this commit finished
     }
     s.done++;
     if (c.o.usage) {

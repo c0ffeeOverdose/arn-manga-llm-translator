@@ -166,6 +166,7 @@ The second form (self-closing, keep="true", NO text inside) is for regions you d
 Never put a description, brackets, or invented dialogue in a keep element. Never leave a translation empty — if there is nothing to translate, it is a keep element.
 ${chars ? `
 name is OPTIONAL: set it only when THIS page states the speaker's actual name (introduction, narration naming them, a name label) — write it in ${lang} form. Omit it when the page doesn't say.
+spk is a PERSON only: for narration boxes, signs, labels, SFX and any text that is not a person speaking, omit spk/g/name entirely — never write a box type (narration, sign, caption, SFX) as spk.
 ` : ``}
 <example>
 <r n="1"${opts.transcribeSrc && !opts.ocr ? ' src="一緒に来てくれないか"' : ''}${chars ? ' spk="boy with spiky hair" g="M" name="ยามาดะ"' : ''}>ไปด้วยกันไหมครับ</r>
@@ -178,6 +179,7 @@ After the regions, if anyone is NAMED in the dialogue or narration (the speaker,
 <m name="short name" full="full name ONLY if the page states it" g="M|F">who this is in one short phrase (role or relation, not looks)</m>
 </names>
 Omit the whole block when no one is named. full: never assemble or guess a surname — leave it out unless the page says the full name. g: only when the page makes it obvious (particles, pronouns, explicit words); otherwise leave it out. Never invent a person.
+Credits, bylines and copyright text (author/artist names on a cover or credits panel) are not story characters — never report them.
 Two entries in <known_characters> are the same person: <m name="A" sameAs="B">…</m> (both must be in the book).
 The book is wrong and THIS page proves it: <m name="A" correct="gender|name|desc|full" now="new value" why="exact quote from this page">…</m> — no quote, no change. Never touch entries marked "confirmed by user".` : ``}</output_format>\n`;
     p += `<rules>\n- ${LANG_RULES[lang] ?? GENERIC_RULE(lang)}\n`;
@@ -202,9 +204,13 @@ The book is wrong and THIS page proves it: <m name="A" correct="gender|name|desc
         p += `- Missed text (no badge): <extra n="new" x="x1,y1,x2,y2">${lang} translation</extra> (pixels on the ${opts.pageW}x${opts.pageH} first image). Dialogue only, no SFX.\n`;
     }
     p += `</rules>\n`;
-    if (chars && ctx.characters.length) {
+    // a book already polluted with box-type rows must not keep teaching them
+    // back to the model (that is what perpetuates them) — user rows stay, they
+    // are the user's call
+    const book = chars ? ctx.characters.filter(c => c.source === 'user' || !isNonPersonLabel(c.name ?? c.desc)) : [];
+    if (book.length) {
         p += '<known_characters>\n';
-        for (const c of ctx.characters) {
+        for (const c of book) {
             const label = c.fullName && c.fullName !== c.name
                 ? (c.name ? `${c.name} (${c.fullName})` : c.fullName)
                 : c.name;
@@ -385,6 +391,23 @@ function isMetaNoText(t: string): boolean {
 // ---- character book ----
 const PRIORITY: Record<CharacterEntry['source'], number> = { user: 3, vlm: 2, speech: 1, mention: 1 };
 
+// Box types the model reports as "the speaker" on regions with no person in
+// them. Learning them burns the 10-slot book and teaches the model to emit
+// spk="narration"/"sign" forever (it picks the vocabulary up from the book and
+// feeds it back — live-proven). Structural-meta class, same as isMetaNoText;
+// only generic labels, never a story-specific name.
+const NON_PERSON_LABEL = /^(?:narration|narrator|caption|subtitle|subtitle text|sfx|sound effect|sound effects|onomatopoeia|sign|signage|shop sign|text|no text|translation note|tn|บรรยาย|บรรยายภาพ|คำบรรยาย|ผู้บรรยาย|ป้าย|ป้ายข้อความ|ข้อความ|เสียง|เสียงประกอบ|ไม่มีข้อความ)$/i;
+const isNonPersonLabel = (s: string | undefined): boolean => !!s && NON_PERSON_LABEL.test(s.trim());
+
+// Address suffixes are not part of a name: "คุจินาชิคุง" is คุจินาชิ,
+// "ฮิมุโระ-ซัง" is ฮิมุโระ. Without this the book grows one row per form of
+// address (live: three rows for one heroine — ฮิมุโระ / ฮิมุโร / ฮิมุโระ-ซัง).
+const HONORIFIC = /[-・\s]?(?:คุง|คุน|จัง|จัน|ซัง|ซามะ|เซ็นเซย์|senpai|sensei|kun|chan|san|sama)$/i;
+function stripHonorific(s: string): string {
+    const t = s.replace(HONORIFIC, '').trim();
+    return t || s;
+}
+
 function similar(a: string, b: string): boolean {
     const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9ก-๙ ]/g, ' ').replace(/\s+/g, ' ').trim();
     const wa = new Set(norm(a).split(' ').filter(w => w.length > 2));
@@ -400,8 +423,9 @@ function similar(a: string, b: string): boolean {
 // different characters are possible; the user override is the escape hatch.
 function samePerson(a: string | undefined, b: string | undefined): boolean {
     if (!a || !b) return false;
-    const na = a.toLowerCase().trim(), nb = b.toLowerCase().trim();
-    if (!na || !nb || na === nb) return na === nb;
+    const na = stripHonorific(a.toLowerCase().trim()), nb = stripHonorific(b.toLowerCase().trim());
+    if (!na || !nb) return false;
+    if (na === nb) return true;
     const ta = new Set(na.split(/\s+/)), tb = new Set(nb.split(/\s+/));
     const [shorter, longer] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
     for (const t of shorter) if (!longer.has(t)) return false;
@@ -423,9 +447,18 @@ export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry): Cha
     if (i === -1) {
         const next = [...book, obs];
         if (next.length > MAX_CHARACTERS) {
-            // evict lowest-priority, oldest
-            next.sort((a, b) => PRIORITY[b.source] - PRIORITY[a.source]);
-            next.length = MAX_CHARACTERS;
+            // Evict the OLDEST lowest-priority row, not the newest: the book is
+            // append-ordered, and dropping the tail let a full book of stale
+            // junk (narration/sign/credits rows) silently refuse every new
+            // character forever — live-proven. User rows never evict (top
+            // priority); ties go to the earlier (older) row.
+            while (next.length > MAX_CHARACTERS) {
+                let victim = 0;
+                for (let j = 1; j < next.length; j++) {
+                    if (PRIORITY[next[j].source] < PRIORITY[next[victim].source]) victim = j;
+                }
+                next.splice(victim, 1);
+            }
         }
         return next;
     }
@@ -486,7 +519,7 @@ export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
     const ops: BookOp[] = [];
     const done: number[] = [];
     mentions.forEach((m, i) => {
-        if (!m.name || (!m.sameAs && !m.correct)) return;
+        if (!m.name || isNonPersonLabel(m.name) || (!m.sameAs && !m.correct)) return;
         if (m.sameAs) {
             // resolve the target first — the main entry often matches BOTH refs
             // (name + fullName), so the source is searched outside the target
@@ -560,7 +593,8 @@ export function updateContext(
     let bookOps: BookOp[] = [];
     if (learn) {
         for (const o of outputs) {
-            if (o.spk && o.spk.desc && o.translation !== 'keep') {
+            if (o.spk && o.spk.desc && o.translation !== 'keep'
+                && !isNonPersonLabel(o.spk.desc) && !isNonPersonLabel(o.spk.name)) {
                 characters = mergeCharacter(characters, { ...o.spk, source: o.spk.desc.includes('guess') ? 'speech' : 'vlm' });
             }
         }
@@ -568,7 +602,7 @@ export function updateContext(
         characters = applied.characters;
         bookOps = applied.ops;
         mentions.forEach((m, idx) => {
-            if (!m.name || applied.done.includes(idx)) return;
+            if (!m.name || applied.done.includes(idx) || isNonPersonLabel(m.name) || isNonPersonLabel(m.desc)) return;
             characters = mergeCharacter(characters, {
                 desc: m.desc || m.name, name: m.name, fullName: m.fullName, gender: m.gender, source: 'mention',
             });

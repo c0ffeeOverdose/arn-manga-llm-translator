@@ -7,12 +7,12 @@
 // concurrent owners could interleave slice writes). Any failure → null → the
 // caller falls back to the solo path; members render solo as if seamless.
 
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, seamLinked, seamInkLinked, seamTruncated, boxIoU, bandSpan, seamRowsMatch } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, seamLinked, seamInkLinked, seamTruncated, boxIoU, bandSpan, seamRowsMatch } from './page-cache';
 import { ensureFont, renderTuning, RENDER_GEN } from './render';
 import { updateContext, type Mention, type RegionOutput } from '../llm/core';
 import { isDebug } from '../debug';
 import { type DetectResult, type DetBox, type MtOnStatus } from './detection';
-import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, type PageRef, type PageState } from './state';
+import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, loadContext, type PageRef, type PageState } from './state';
 import { getPages, fetchBitmap, writePage, ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { detectPage, orderDetection, paintRegions, paintExtras, type Prep } from './pipeline';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
@@ -301,6 +301,12 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             if (olds.length) await rewindContextBefore(...olds);
             for (const o of olds) if (o.hash) bookDrop(o.hash); // rebuilt book excludes them — refold below re-registers
         }
+        // pre-chain snapshot for every member state — a later re-translate of
+        // any slice restores this instead of replaying states it may not have
+        // (load first: the context is lazy and translateRegions folds later)
+        await loadContext();
+        const bookBefore = context.characters;
+        const pairsBefore = context.pairs;
         const outcome = await translateRegions(stitchBmp, det, onStatus);
         if (outcome.error) { prune(); return null; } // members fall back to solo (parked normally)
         for (const m of chain) bookAdd(m.hash); // folded above (whole-stitch context) — arrivals skip refold
@@ -366,6 +372,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 det: localDet,
                 outputs: memberOutputs,
                 mentions: i === 0 ? mentions : [], // page-level list — top member only, folds once
+                bookBefore,
+                pairsBefore,
                 hash: m.hash,
             };
             // blob-origin reader: extension-owned original copy per member (see ownOriginalUrl)
@@ -394,6 +402,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     outputs: memberOutputs, extras: memberExtras, mentions: state.mentions ?? [],
                     mask: packMask(localDet.mask),
                 }, pipeline.cacheMax);
+            } else {
+                void cacheDelete(cacheKey(chapterKey(), m.hash)); // cache off: drop the member's resume checkpoint
             }
             writePage(m.ref, state);
             if (!top) top = state;

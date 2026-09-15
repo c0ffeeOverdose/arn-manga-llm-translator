@@ -3,6 +3,11 @@
 
 import { splitStablePrefix, type ContextState, type RegionInput } from './core';
 
+// a page can legitimately think for minutes (responses models reason internally,
+// and the output cap is user-set) — 120s used to abort mid-generation, which the
+// content then re-ran via the fallback channel (billed twice)
+const LLM_TIMEOUT_MS = 240_000;
+
 export interface LLMSettings {
     provider: 'openai' | 'responses' | 'anthropic' | 'gemini' | 'cloudflare';
     model: string;
@@ -58,12 +63,12 @@ export async function callLLM(
             console.warn('[mt:bg] model rejected thinking level, retrying without');
             try {
                 const r = await dispatch(base, s, prompt, imgs, null, cacheKey, temp, maxTokens);
-                return { ...r, ms: Date.now() - t0 };
+                return { ...r, ms: Date.now() - t0, thinkingDropped: true };
             } catch (e2) {
                 if (!(temp != null && e2 instanceof LlmHttpError && /temperature/i.test(e2.message))) throw e2;
                 console.warn('[mt:bg] model rejected pinned temperature, retrying without');
                 const r = await dispatch(base, s, prompt, imgs, null, cacheKey, null, maxTokens);
-                return { ...r, ms: Date.now() - t0, tempDropped: true };
+                return { ...r, ms: Date.now() - t0, tempDropped: true, thinkingDropped: true };
             }
         }
         // reasoning-first models (GPT-5/o-series chat) may reject any non-default
@@ -85,6 +90,24 @@ function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] |
         case 'gemini': return gemini(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
         case 'cloudflare': return cloudflareChat(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
     }
+}
+
+// provider-visible session id: an opaque digest, never the raw reader URL.
+// The chapter key is origin+path+query (query strings can carry tokens) — a
+// provider field like prompt_cache_key/x-opencode-session must not be a
+// browsable URL, and the salt (per install, background-owned) keeps the same
+// chapter from hashing to the same id on another install. Same cyrb53 family
+// as page-cache.hashPixels (byte domain, unseeded — cache keys stay as they are).
+export function sessionKey(raw: string, salt = 0): string {
+    let h1 = 0xdeadbeef ^ salt, h2 = 0x41c6ce57 ^ salt;
+    for (let i = 0; i < raw.length; i++) {
+        const c = raw.charCodeAt(i);
+        h1 = Math.imul(h1 ^ c, 2654435761);
+        h2 = Math.imul(h2 ^ c, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 }
 
 // ---- error taxonomy: every failure the user can hit, with an actionable hint
@@ -115,6 +138,7 @@ export interface LlmUsage { inTok?: number; outTok?: number; cachedInTok?: numbe
 export interface LlmResult {
     text: string; usage?: LlmUsage; ms: number;
     tempDropped?: boolean; // the model rejected the pinned temperature; retried without it (OCR memoizes this per model)
+    thinkingDropped?: boolean; // the model rejected the thinking param; retried without (OCR memoizes this per model)
 }
 
 // provider JSON is untrusted (BYOK baseUrl can be http:// or a MITM'd proxy):
@@ -224,10 +248,10 @@ async function openaiChat(base: string, s: LLMSettings, prompt: string, images?:
         headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${s.apiKey}`,
-            ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}` } : {}), // opencode Go session affinity; harmless elsewhere
+            ...(cacheKey ? { 'x-opencode-session': cacheKey } : {}), // opencode Go session affinity; harmless elsewhere
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
     });
     const text = await checkOk(resp);
     const data = JSON.parse(text);
@@ -244,6 +268,12 @@ async function responses(base: string, s: LLMSettings, prompt: string, images?: 
     const body: Record<string, unknown> = { model: s.model, input: [{ role: 'user', content }] };
     if (thinking) body.reasoning = { effort: thinking };
     if (temperature != null) body.temperature = temperature;
+    // max_output_tokens rides only when explicitly set (transcribe/Test caps,
+    // user-configured max) — never as a main-translate default: this cap
+    // INCLUDES reasoning tokens and these models reason even without a
+    // `reasoning` param, so a 4096 default came back `status: incomplete` with
+    // an EMPTY output (reasoning_tokens 4093/4096 — live: 6 of 11 calls on one
+    // page), which read downstream as "the model ignored the output format".
     if (maxTokens != null) body.max_output_tokens = maxTokens;
     if (cacheKey) body.prompt_cache_key = cacheKey;
     const resp = await fetch(`${base}/responses`, {
@@ -251,10 +281,10 @@ async function responses(base: string, s: LLMSettings, prompt: string, images?: 
         headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${s.apiKey}`,
-            ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}` } : {}), // required for opencode Go caching; 09/06+ requests without it may error
+            ...(cacheKey ? { 'x-opencode-session': cacheKey } : {}), // required for opencode Go caching; 09/06+ requests without it may error
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
     });
     const text = await checkOk(resp);
     const data = JSON.parse(text);
@@ -264,8 +294,21 @@ async function responses(base: string, s: LLMSettings, prompt: string, images?: 
             for (const c of item.content ?? []) if (c.type === 'output_text') out.push(c.text);
         }
     }
+    const answer = out.join('\n');
+    // truncated before the message item even started: the whole budget went to
+    // reasoning (incomplete_details.reason === 'max_output_tokens' when the cap
+    // is explicit — a provider-side default otherwise). An empty string would
+    // die downstream as "No usable text regions parsed (the model ignored the
+    // output format)", pointing at the wrong thing entirely.
+    if (!answer && data.status === 'incomplete') {
+        const reason = String(data.incomplete_details?.reason ?? 'unknown');
+        throw new MtError('parse', `Model response incomplete (${reason}) with no output`,
+            reason === 'max_output_tokens'
+                ? 'The model ran out of output tokens before answering (reasoning counts toward the cap) — lower Thinking in Options or pick a lighter model'
+                : 'The provider cut the response short — retry, or pick another model in Options');
+    }
     return {
-        text: out.join('\n'),
+        text: answer,
         usage: { inTok: num(data.usage?.input_tokens), outTok: num(data.usage?.output_tokens), cachedInTok: num(data.usage?.input_tokens_details?.cached_tokens) },
     };
 }
@@ -303,10 +346,10 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
                 'x-api-key': s.apiKey,
                 'anthropic-version': '2023-06-01',
                 'anthropic-dangerous-direct-browser-access': 'true',
-                ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}` } : {}),
+                ...(cacheKey ? { 'x-opencode-session': cacheKey } : {}),
             },
             body: JSON.stringify(body),
-            signal: AbortSignal.timeout(120_000),
+            signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
         });
         const text = await checkOk(resp);
         const data = JSON.parse(text);
@@ -358,10 +401,10 @@ async function gemini(base: string, s: LLMSettings, prompt: string, images?: str
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}` } : {}),
+                ...(cacheKey ? { 'x-opencode-session': cacheKey } : {}),
             },
             body: JSON.stringify(body),
-            signal: AbortSignal.timeout(120_000),
+            signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
         });
         const text = await checkOk(resp);
         const data = JSON.parse(text);
@@ -464,10 +507,10 @@ async function cloudflareChat(base: string, s: LLMSettings, prompt: string, imag
             // caching only hit when requests route to the same instance; the
             // session id is stable per conversation (vision models report 0
             // cached tokens — live-probed — text models do use it)
-            ...(cacheKey ? { 'x-opencode-session': `mt-${cacheKey}`, 'x-session-affinity': `mt-${cacheKey}` } : {}),
+            ...(cacheKey ? { 'x-opencode-session': cacheKey, 'x-session-affinity': cacheKey } : {}),
         },
         body: JSON.stringify(cfBody(prompt, images, thinking, temperature, maxTokens)),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
     });
     // read the body FIRST: CF signals model errors as errors[] on both 2xx
     // (success:false) and 4xx — checkOk would throw before the code-based hint

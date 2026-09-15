@@ -12,7 +12,7 @@ import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter,
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; resumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
 
 // cached entry → render-ready det (shared by preparePage and arrival paint —
 // one construction, one gate set: full entry + fp + dims + mask, partials
@@ -36,19 +36,22 @@ export async function resolveHeadlessDet(
 ): Promise<{ det: DetectResult | null; resumed: boolean }> {
     const key = cacheKey(chapterKey(), hash);
     const fp = settingsFingerprint(pipeline);
-    if (pipeline.cacheEnabled) {
+    {
+        // full entries are the translation cache (cacheEnabled gates them);
+        // resume checkpoints are in-flight work and always ride (a retry after
+        // a failed LLM must never re-pay detection/OCR, cache or not)
         const hit = await cacheGet(key);
-        if (hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+        if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
             return { det: null, resumed: false };
         }
         if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
-            onStatus('Resuming saved detection…', 'llm');
+            onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
             return { det: detFromPartial(hit, bitmap.width, bitmap.height)!, resumed: true };
         }
     }
     const det = await detectPage(bitmap, onStatus);
     await orderDetection(det, bitmap);
-    if (pipeline.cacheEnabled && det.boxes.length) {
+    if (det.boxes.length) {
         void cachePut(partialEntry(key, fp, det, bitmap.width, bitmap.height), pipeline.cacheMax);
     }
     return { det, resumed: false };
@@ -199,12 +202,12 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     // miss-reason instrument: a revisit that SHOULD hit but misses needs a
     // verdict in one dump (absent | fp | dims | mask | disabled) — no guessing
     let cacheMiss: string | undefined = pipeline.cacheEnabled ? 'absent' : 'disabled';
-    if (!force && pipeline.cacheEnabled) {
+    if (!force) {
         const hit = await cacheGet(cacheKey(chapterKey(), hash));
         const fp = settingsFingerprint(pipeline);
         // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite
         // partial entries never render as Done (cache) — they resume below
-        if (hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+        if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
             cacheMiss = undefined;
             onStatus('Cache hit…');
             const det = detFromCacheEntry(hit, bitmap.width, bitmap.height)!;
@@ -213,15 +216,16 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                 // show our drawing after this (re-translate reads the stash, §readPage)
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
-        if (hit) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : 'mask';
+        if (hit && pipeline.cacheEnabled) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : 'mask';
         // detect checkpoint resume: the previous load finished detect (boxes +
         // panels + mask on disk) but died before translating — continue at
         // translateRegions, skipping detect entirely. The pill jumps read→llm,
         // which reads as "continuing" instead of "restarting".
         if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
             cacheMiss = undefined;
-            onStatus('Resuming saved detection…', 'llm');
-            return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, resumed: true as const, prepMs: prepMs(),
+            onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
+            return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, resumed: true as const,
+                ...(hit.texts?.length ? { ocrResumed: true as const } : null), prepMs: prepMs(),
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
         if (!hit) {
@@ -237,7 +241,9 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     // detect checkpoint: a page-turn kills this document mid-job — the next
     // load resumes from this entry (same key the full entry will overwrite).
     // Zero-box pages skip it (nothing to resume; the full entry covers them).
-    if (!force && pipeline.cacheEnabled && det.boxes.length) {
+    // Written even with the cache off (in-flight work, not a cached
+    // translation): the successful job deletes it again in that mode.
+    if (!force && det.boxes.length) {
         void cachePut(partialEntry(cacheKey(chapterKey(), hash), settingsFingerprint(pipeline), det, bitmap.width, bitmap.height), pipeline.cacheMax);
     }
     // canvas pages: stash the original bytes (the canvas will show our drawing

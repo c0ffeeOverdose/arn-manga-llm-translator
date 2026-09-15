@@ -21,7 +21,7 @@ await build({
 
 const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches, joinTranscription } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
-const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError } =
+const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
 const { langOk, fetchWithProgress } =
   await import(new URL('../.test-build/ocr-models.mjs', import.meta.url).href);
@@ -574,7 +574,7 @@ test('maxTokens: transcribe caps reach every protocol, default stays 4096', asyn
     await callLLM({ provider: 'cloudflare', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/a/ai', model: '@cf/meta/x', apiKey: 'k' }, 'p', ['QUJD'], 'auto', 'manga-7', null, 512);
     assert.match(seen.at(-1).url, /\/ai\/run\//);
     assert.equal(seen.at(-1).body.max_tokens, 512);
-    assert.equal(seen.at(-1).headers['x-session-affinity'], 'mt-manga-7', 'prefix-cache affinity rides the conversation key');
+    assert.equal(seen.at(-1).headers['x-session-affinity'], 'manga-7', 'prefix-cache affinity rides the conversation key');
     await callLLM({ provider: 'anthropic', baseUrl: 'https://a.test', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
     assert.equal(seen.at(-1).body.max_tokens, 512);
     await callLLM({ provider: 'gemini', baseUrl: 'https://g.test/v1beta', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
@@ -794,6 +794,93 @@ test('updateContext learn=false: pairs fold, spk + mentions dropped, old book un
     false).ctx;
   assert.deepEqual(ctx.pairs, [['สวัสดี', 'hello']]);
   assert.deepEqual(ctx.characters, old);
+});
+
+// ---- book hygiene: box-type labels, honorific dedupe, eviction order ----
+
+test('book hygiene: box-type spk labels are never learned', () => {
+  const ctx = updateContext(EMPTY_CONTEXT, [
+    { index: 1, source: '', translation: 'ห้องนั่งเล่น', spk: { desc: 'ป้าย', gender: '?' } },
+    { index: 2, source: '', translation: '...และแล้ว', spk: { desc: 'narration', gender: 'M' } },
+    { index: 3, source: '', translation: 'ไปด้วยกันไหม', spk: { desc: 'boy with spiky hair', gender: 'M' } },
+  ]).ctx;
+  assert.equal(ctx.characters.length, 1, 'only the real speaker enters the book');
+  assert.equal(ctx.characters[0].desc, 'boy with spiky hair');
+});
+
+test('book hygiene: box-type mentions never enter the book', () => {
+  const ctx = updateContext(EMPTY_CONTEXT, [], [
+    { name: 'sign', gender: '?', desc: 'the room label' },
+    { name: 'ซากุระ', gender: 'F', desc: 'mentioned once' },
+  ]).ctx;
+  assert.equal(ctx.characters.length, 1);
+  assert.equal(ctx.characters[0].name, 'ซากุระ');
+});
+
+test('book hygiene: applyBookOps ignores label mentions even with ops attached', () => {
+  const book = [{ desc: 'hero girl', gender: 'F', name: 'ยามาดะ', source: 'vlm' }];
+  const { characters, ops } = applyBookOps(book, [{ name: 'narration', sameAs: 'ยามาดะ', gender: 'M', desc: 'x' }]);
+  assert.equal(ops.length, 0);
+  assert.deepEqual(characters, book);
+});
+
+test('book hygiene: polluted label rows are not sent; user rows survive the filter', () => {
+  const p = buildPrompt([{ index: 1, source: '' }],
+    { pairs: [], characters: [
+      { desc: 'narration', gender: 'M', source: 'vlm' },
+      { desc: 'sign', gender: '?', source: 'user' },
+      { desc: 'hero girl', gender: 'F', name: 'ยามาดะ', source: 'vlm' },
+    ] }, true, {});
+  assert.ok(p.includes('hero girl'), 'real character sent');
+  assert.ok(!p.includes('- narration'), 'learned label row not sent');
+  assert.ok(p.includes('- sign [gender'), 'user-added row is the user\'s call');
+});
+
+test('book hygiene: honorific forms of one name merge (คุจินาชิคุง / ฮิมุโระ-ซัง / Kuchinashi-kun)', () => {
+  let book = mergeCharacter([], { desc: 'a', gender: 'F', name: 'ฮิมุโระ', source: 'vlm' });
+  book = mergeCharacter(book, { desc: 'b', gender: '?', name: 'ฮิมุโระ-ซัง', source: 'vlm' });
+  assert.equal(book.length, 1, 'Thai honorific suffix is not a new person');
+  let en = mergeCharacter([], { desc: 'c', gender: 'M', name: 'Kuchinashi', source: 'vlm' });
+  en = mergeCharacter(en, { desc: 'd', gender: '?', name: 'Kuchinashi-kun', source: 'vlm' });
+  assert.equal(en.length, 1, 'romaji honorific suffix is not a new person');
+});
+
+test('book hygiene: cap evicts the oldest low-priority row — the new character stays', () => {
+  let book = [];
+  for (let i = 0; i < 10; i++) book = mergeCharacter(book, { desc: `alpha${i}`, gender: '?', source: 'speech' });
+  assert.equal(book.length, 10);
+  book = mergeCharacter(book, { desc: 'brand new person', gender: 'F', source: 'vlm' });
+  assert.equal(book.length, 10);
+  assert.ok(book.some(c => c.desc === 'brand new person'), 'the new row survives');
+  assert.ok(!book.some(c => c.desc === 'alpha0'), 'the oldest row was evicted');
+  // user rows are never the victim
+  let u = [{ desc: 'the user entry', gender: 'F', source: 'user' }];
+  for (let i = 0; i < 10; i++) u = mergeCharacter(u, { desc: `beta${i}`, gender: '?', source: 'vlm' });
+  assert.ok(u.some(c => c.source === 'user'), 'user row protected');
+});
+
+test('buildPrompt: box-type spk rule + credits rule ride the prompt', () => {
+  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {});
+  assert.ok(p.includes('spk is a PERSON'), 'speaker-only rule present');
+  assert.ok(p.includes('Credits, bylines'), 'credits rule present');
+});
+
+// ---- session id hashing: the reader URL must not reach a provider field ----
+
+test('sessionKey: opaque base36, no URL characters, deterministic', () => {
+  const raw = 'https://reader.test/chapter/abc?token=secret';
+  const k = sessionKey(raw);
+  assert.match(k, /^[0-9a-z]{8,16}$/, 'short base36 id');
+  assert.equal(k, sessionKey(raw), 'deterministic');
+  assert.ok(!/[\/:?&=]/.test(k), 'no URL characters survive');
+  assert.notEqual(k, sessionKey('https://reader.test/chapter/abc?token=other'));
+});
+
+test('sessionKey: per-install salt changes the id, same salt keeps it', () => {
+  const raw = 'https://reader.test/chapter/abc';
+  assert.equal(sessionKey(raw, 7), sessionKey(raw, 7));
+  assert.notEqual(sessionKey(raw, 7), sessionKey(raw, 8));
+  assert.notEqual(sessionKey(raw, 0), sessionKey(raw, 1), 'salt participates in the digest');
 });
 
 // ---- B: translation-only pairs (vision modes) + configurable depth ----

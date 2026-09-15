@@ -4,9 +4,9 @@
 import { ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
-import { cacheKey, settingsFingerprint, cachePut, packMask, dropProgressT0 } from './page-cache';
+import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0 } from './page-cache';
 import { type MtOnStatus } from './detection';
-import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, type PageRef, type PageState } from './state';
+import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep } from './pipeline';
 import { ownCopyNeeded, ownOriginalUrl } from './page-io';
@@ -28,13 +28,21 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // Same for the progress stamp: a force retranslate counts fresh.
     if (existing?.hash) bookDrop(existing.hash);
     if (existing) dropProgressT0(srcUrl);
+    // the book as it was just before THIS page folds (after any rewind above):
+    // a later re-translate restores it instead of replaying page states it may
+    // not have (single-page readers keep one <img> — the replay wiped the book
+    // down to user entries, live-proven). MUST load first: translateRegions
+    // loads lazily, and a snapshot taken before that captures the empty default.
+    await loadContext();
+    const bookBefore = context.characters;
+    const pairsBefore = context.pairs;
     let outputs: RegionOutput[], extras: ExtraRegion[], usedLLM: boolean;
     let mentions: Mention[] = [];
     let bookOps: BookOp[] | undefined;
     let error: string | undefined, errorKind: string | undefined, errorHint: string | undefined;
     let annWCache: number, annHCache: number, rawLLM: string | undefined;
     let usage: { inTok?: number; outTok?: number; cachedInTok?: number } | undefined;
-    let llmCalls: number | undefined, llmMs: number | undefined, ocrStatus: ('ok' | 'empty')[] | undefined, ocrMs: number | undefined, ocrLockWaitMs: number | undefined;
+    let llmCalls: number | undefined, llmMs: number | undefined, ocrStatus: ('ok' | 'empty')[] | undefined, ocrMs: number | undefined, ocrLockWaitMs: number | undefined, badgeR: number | undefined;
     if (prep.cached) {
         // persistent cache hit: identical image bytes + identical settings — the
         // LLM is not called. Outputs still fold into the book (fresh session).
@@ -49,7 +57,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         if (shareContext && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
     } else {
         onStatus('Translating…');
-        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, annW: annWCache, annH: annHCache, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
+        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
             { progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled }));
 
         if (error) {
@@ -81,9 +89,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     if (isDebug()) console.log('[mt] page result', JSON.stringify({
         page: `${bitmap.width}x${bitmap.height}`,
         ann: `${annWCache}x${annHCache}`,
+        ...(badgeR != null ? { badgeR } : null), // drawn region-badge radius (ann px): a mis-mapping report shows the mark size without decoding the JPEG
         hash: prep.hash, // content hash — same visual page, different hash = read-path pixels differ
         ...(prep.cacheMiss ? { cacheMiss: prep.cacheMiss } : null), // why a revisit re-translated: absent|fp|dims|mask|disabled
         ...(prep.resumed ? { resumed: true } : null), // continued from a detect checkpoint, not from zero
+        ...(prep.ocrResumed ? { ocrResumed: true } : null), // …and the OCR text came back too (OCR did not run)
         ...(prep.prepMs != null ? { prepMs: prep.prepMs } : null), // read + hash + cache-gate ms (excludes queue wait)
         renderMs, // paint ms (excludes PNG encode + overlays)
         minFont: renderTuning.minFont, // effective floor — stale options look identical to a render bug
@@ -118,6 +128,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         det,
         outputs,
         mentions,
+        bookBefore,
+        pairsBefore,
         hash: prep.hash,
         // canvas pages have no URL to re-read — carry the original bytes forward
         // (and a decoded translated bitmap for write-back) with the state
@@ -163,6 +175,10 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             outputs, extras, mentions,
             mask: packMask(det.mask),
         }, pipeline.cacheMax);
+    } else if (!prep.cached) {
+        // cache off: the resume checkpoint this job may have resumed from is
+        // in-flight work, and the job is done — leave nothing behind
+        void cacheDelete(cacheKey(chapterKey(), prep.hash));
     }
     if (force && shareContext) {
         replayPagesAfter(state);

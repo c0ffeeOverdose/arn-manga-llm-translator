@@ -1,7 +1,7 @@
 // Background service worker: LLM translation (BYOK). Detection runs in the
 // content script's iframe (src/iframe) — this worker owns LLM calls only.
 
-import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, type LLMSettings, type LlmUsage } from '../llm/adapters';
+import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
 import { buildPrompt, parseResponse, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 
@@ -21,6 +21,7 @@ interface TranslateMsg {
     pageW: number;            // px — for validating VLM-reported extra regions
     pageH: number;
     cacheKey?: string;        // stable per manga — routes provider-side prompt caching
+    interim?: boolean;        // caller understands {type:'mt:ocr-texts'} mid-flight messages (new content only — an old listener would read the interim as the final reply and fail the job)
 }
 interface TestLlmMsg {
     type: 'mt:test-llm';
@@ -87,11 +88,37 @@ const ocrSingleImage = new Set<string>();
 // per call. callLLM still performs the retry-without; this only stops the next
 // call from repeating it.
 const ocrNoTemperature = new Set<string>();
+// same idea for a rejected thinking level: without the memo every transcribe
+// call pays the failed attempt first (callLLM retries without it internally,
+// so the failure is invisible except as 2x requests)
+const ocrNoThinking = new Set<string>();
 function ocrCapKey(s: LLMSettings): string { return `${s.provider}|${s.baseUrl ?? ''}|${s.model}`; }
 
-interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage: LlmUsage; calls: number; ms: number; tempDropped?: boolean }
+// provider-visible session ids are hashed + salted per install: the raw
+// chapter key (origin+path+query — query strings can carry tokens) must never
+// ride a provider field, and the salt keeps two installs reading the same
+// chapter from producing the same id. Cached for the SW lifetime (one storage
+// read per wake); storage failure degrades to salt 0 — affinity stays stable,
+// just unsalted.
+let sessionSalt: Promise<number> | null = null;
+function getSessionSalt(): Promise<number> {
+    sessionSalt ??= (async () => {
+        try {
+            const { mtSessionSalt } = await chrome.storage.local.get('mtSessionSalt');
+            if (typeof mtSessionSalt === 'number' && Number.isFinite(mtSessionSalt)) return mtSessionSalt;
+            const fresh = crypto.getRandomValues(new Uint32Array(1))[0];
+            await chrome.storage.local.set({ mtSessionSalt: fresh });
+            return fresh;
+        } catch {
+            return 0;
+        }
+    })();
+    return sessionSalt;
+}
+
+interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }
 // the handler owns retry/backoff (rate-limit aware) — helpers just call through
-type LlmCaller = (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean }>;
+type LlmCaller = (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }>;
 // transcribe caps: one region needs a line, not 4096 tokens — a model that
 // drifts past the format would otherwise generate for minutes at slow providers
 // (live: a drifting CF llama-3.2 call ran the full 4096 for 106s)
@@ -103,7 +130,7 @@ async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: 
     const t = await call(ocr, prompt, msg.imagesB64, pipeline.ocrThinking, temperature, OCR_BATCH_MAX_TOKENS);
     const sources = new Map(parseResponse(t.text, msg.regions.length).regions
         .map(o => [o.index, o.translation === 'keep' ? '' : o.translation] as const));
-    return { preRaw: t.text, sources, usage: t.usage ?? {}, calls: t.calls, ms: t.ms, tempDropped: t.tempDropped };
+    return { preRaw: t.text, sources, usage: t.usage ?? {}, calls: t.calls, ms: t.ms, tempDropped: t.tempDropped, thinkingDropped: t.thinkingDropped };
 }
 
 // per-region: one crop per request (the annotated full page is dropped), run
@@ -118,6 +145,7 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
     const usage: LlmUsage = {};
     let calls = 0, failures = 0;
     let tempDropped = false;
+    let thinkingDropped = false;
     let firstErr: unknown;
     const t0 = performance.now();
     const width = Math.max(1, Math.min(6, pipeline.parallelLlm || 3));
@@ -128,6 +156,7 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
             try {
                 const res = await call(ocr, prompt, [crop], pipeline.ocrThinking, temperature, OCR_REGION_MAX_TOKENS);
                 if (res.tempDropped) tempDropped = true;
+                if (res.thinkingDropped) thinkingDropped = true;
                 raws.push(`--- region ${r.index} ---\n${res.text}`);
                 sources.set(r.index, joinTranscription(res.text));
                 usage.inTok = (usage.inTok ?? 0) + (res.usage?.inTok ?? 0);
@@ -141,7 +170,7 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
         }));
     }
     if (msg.regions.length && failures === msg.regions.length && firstErr) throw firstErr;
-    return { preRaw: raws.join('\n'), sources, usage, calls, ms: Math.round(performance.now() - t0), tempDropped };
+    return { preRaw: raws.join('\n'), sources, usage, calls, ms: Math.round(performance.now() - t0), tempDropped, thinkingDropped };
 }
 
 // ArrayBuffer → base64 for MV3 message passing (JSON-serializes the channel)
@@ -240,6 +269,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 const t = (msg.thinking ?? '').trim() || 'none';
                 const r = await callLLM(msg.settings, prompt, [msg.imageB64], t, 'test', msg.temperature ?? null, OCR_REGION_MAX_TOKENS);
                 if (r.tempDropped) ocrNoTemperature.add(ocrCapKey(msg.settings));
+                if (r.thinkingDropped) ocrNoThinking.add(ocrCapKey(msg.settings));
                 const first = parseResponse(r.text, 1).regions[0];
                 if (!first) { sendResponse({ ok: false, error: 'format error — no <r> region parsed (the model ignored the output format)' }); return; }
                 const got = first.translation === 'keep' ? '' : first.translation;
@@ -466,7 +496,7 @@ function flightRecentPut(id: string, resp: unknown): void {
     if (flightRecent.size > FLIGHT_RECENT_MAX) flightRecent.delete(flightRecent.keys().next().value!);
 }
 
-function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
+function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (r: unknown) => void) {
     // settles waiters when assigned (post-adoption); pre-adoption failures
     // (settings reads) answer the caller directly — nothing was claimed.
     let settle: ((resp: unknown) => void) | null = null;
@@ -477,6 +507,9 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             // user gender overrides from the options page are law
             const { mtCharOverrides, mtDebug } = await chrome.storage.local.get(['mtCharOverrides', 'mtDebug']);
             const dbg = mtDebug === true; // one read per call — always fresh, no SW sleep/wake staleness
+            // provider-visible session id: opaque digest of the chapter key, salted
+            // per install (the raw reader URL never leaves the extension)
+            const session = msg.cacheKey ? sessionKey(msg.cacheKey, await getSessionSalt()) : undefined;
             // guard: a corrupt/absent context must not crash the pipeline
             const msgCtx = (msg.context && Array.isArray(msg.context.characters) && Array.isArray(msg.context.pairs))
                 ? msg.context : EMPTY_CONTEXT;
@@ -485,17 +518,19 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             // LLM call with strategic retry: 429/5xx/network get backoff retries
             // (a page costing 2 retries still beats failing the whole job);
             // auth/quota errors fail fast — retrying can't fix them.
-            const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean }> => {
+            const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }> => {
                 let calls = 0;
                 let ms = 0;
                 let tempDropped = false;
+                let thinkingDropped = false;
                 for (let attempt = 0; ; attempt++) {
                     calls++;
                     try {
-                        const r = await callLLM(s, p, imgs, thinking ?? pipeline.thinkingLevel, msg.cacheKey, temperature, maxTokens);
+                        const r = await callLLM(s, p, imgs, thinking ?? pipeline.thinkingLevel, session, temperature, maxTokens);
                         ms += r.ms;
                         if (r.tempDropped) tempDropped = true;
-                        return { text: r.text, usage: r.usage, calls, ms, tempDropped };
+                        if (r.thinkingDropped) thinkingDropped = true;
+                        return { text: r.text, usage: r.usage, calls, ms, tempDropped, thinkingDropped };
                     } catch (e) {
                         const m = toMtError(e);
                         const retryable = m.kind === 'ratelimit' || m.kind === 'server' || m.kind === 'network';
@@ -510,7 +545,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
             // two identical calls racing each other must not both become owner)
             const reqId = await translateRequestId(translateRequestParts(
                 {
-                    cacheKey: msg.cacheKey ?? '', imagesB64: msg.imagesB64 ?? [],
+                    cacheKey: session ?? '', imagesB64: msg.imagesB64 ?? [],
                     regions: msg.regions, context: msgCtx,
                     vision, textOnly: !!msg.textOnly, ocr: !!msg.ocr, split,
                     pageW: msg.pageW, pageH: msg.pageH,
@@ -571,18 +606,22 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                 // a model that rejected a pinned temperature once keeps its
                 // provider default from then on (SW lifetime)
                 const ocrTemp = ocrNoTemperature.has(key) ? null : pipeline.ocrTemperature;
+                // a model that rejected the thinking level once runs without it
+                // from then on (SW lifetime — same tradeoff as the temperature memo)
+                const ocrPl: PipelineSettings = ocrNoThinking.has(key) ? { ...pipeline, ocrThinking: 'auto' } : pipeline;
                 // per-region when forced, when this model already rejected a
                 // batch once, or when the batch fails with an image-count error
                 // (auto-detect — the failed request is not billed by CF)
                 const t = pipeline.ocrPerRegion || ocrSingleImage.has(key)
-                    ? await transcribePerRegion(ocr, msg, pipeline, callWithRetry, ocrTemp)
-                    : await transcribeBatched(ocr, msg, pipeline, callWithRetry, ocrTemp).catch(async (e) => {
+                    ? await transcribePerRegion(ocr, msg, ocrPl, callWithRetry, ocrTemp)
+                    : await transcribeBatched(ocr, msg, ocrPl, callWithRetry, ocrTemp).catch(async (e) => {
                         if (!isImageCapError(e)) throw e;
                         if (dbg) console.log('[mt:bg] ocr image cap → per-region fallback');
                         ocrSingleImage.add(key);
-                        return await transcribePerRegion(ocr, msg, pipeline, callWithRetry, ocrTemp);
+                        return await transcribePerRegion(ocr, msg, ocrPl, callWithRetry, ocrTemp);
                     });
                 if (t.tempDropped) ocrNoTemperature.add(key);
+                if (t.thinkingDropped) ocrNoThinking.add(key);
                 // zero parsed regions = the OCR model answered nothing usable
                 // (empty response or format drift), NOT "this page has no text"
                 // — an all-keep page still parses one element per region. Without
@@ -601,6 +640,13 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
                 regions2 = msg.regions.map(r => ({ index: r.index, source: t.sources.get(r.index) ?? '' }));
                 ocrStatus = regions2.map(r => r.source ? 'ok' : 'empty');
                 ocrMs = t.ms;
+                // hand the transcripts over before the translate call: the
+                // content script checkpoints them (partial entry) so a reload or
+                // a retry mid-translate never re-pays the OCR stage. Port
+                // channel only, and only when the caller advertises it — a
+                // sendResponse caller (or an older content script that settles
+                // on the first message) would read this as the final reply.
+                if (msg.interim) interim?.({ type: 'mt:ocr-texts', texts: regions2.map(r => r.source) });
             }
             const vision2 = split ? false : vision;
             const prompt = buildPrompt(regions2, ctx, vision2, {
@@ -714,7 +760,12 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void) {
 
 // ---- context menu (right-click an image → translate just that page) ----
 chrome.runtime.onConnect.addListener((port) => {
-    if (port.name === 'mt-keepalive') return; // held open by content runJob — see there
+    if (port.name === 'mt-keepalive') {
+        // held open by content runJob while a job runs; its pings are pure
+        // service-worker activity, nothing to answer
+        port.onMessage.addListener(() => { /* keepalive ping */ });
+        return;
+    }
     if (port.name === 'mt-rpc') {
         // per-message port-RPC: port.postMessage({type:'mt:translate',...}) is
         // answered with port.postMessage(result) — same runTranslate as the
@@ -725,6 +776,10 @@ chrome.runtime.onConnect.addListener((port) => {
                 return;
             }
             runTranslate(msg as TranslateMsg, (r: unknown) => {
+                try { port.postMessage(r); } catch { /* peer gone */ }
+            }, (r: unknown) => {
+                // split-pipeline interim (transcripts) — same channel, filtered
+                // by the content script before it settles its promise
                 try { port.postMessage(r); } catch { /* peer gone */ }
             });
         });

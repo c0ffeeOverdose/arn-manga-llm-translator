@@ -184,6 +184,14 @@ export function detFromPartial(hit: CachedPage, w: number, h: number): DetectRes
     };
 }
 
+// split-pipeline fallback: the transcribe already ran when the channel died —
+// stamp its texts onto the regions so the re-sent call is a text-only
+// translate instead of a second (billed) transcription. Short lists keep the
+// caller's own source. Pure.
+export function withSources<T extends { source: string }>(regions: T[], texts: string[]): T[] {
+    return regions.map((r, i) => ({ ...r, source: texts[i] ?? r.source }));
+}
+
 // checkpoint writer input (same key the full entry later overwrites — LRU
 // and force-overwrite need no partial awareness). Pure.
 export function partialEntry(key: string, fp: string, det: DetectResult, w: number, h: number): Omit<CachedPage, 'atime'> {
@@ -691,6 +699,16 @@ export function cropPixels(r: { x: number; y: number; w: number; h: number }, dp
     return { sx, sy, sw, sh };
 }
 
+// Region-badge number size on the VLM-annotated page, in annotated-image px
+// (the drawn disc radius is 0.9× this). Badges exist only to map region
+// numbers to the crops — the crops carry the readable text — so they must stay
+// small: the old formula doubled the size on top of the downscale (56×scale
+// with scale ≤ 1) and drew 54px discs on a 907px-wide page (6% of the width),
+// covering corner text on dense pages (live-reported). Pure, unit-tested.
+export function annotFont(scale: number): number {
+    return Math.max(16, Math.round(28 * scale));
+}
+
 export interface FingerprintOpts {
     targetLang: string; textSource: string; ocrEngine: string;
     readingDir: string; detConf: number; panelConf: number; deferLabels: boolean;
@@ -766,6 +784,15 @@ export async function cachePut(entry: Omit<CachedPage, 'atime'>, max = CACHE_MAX
             for (const k of all.slice(0, n - max)) store.delete(k);
         }
     } catch { /* cache stays best-effort */ }
+}
+
+// drop one entry (resume checkpoints are written even with the cache off —
+// a finished job must leave nothing behind in that mode)
+export async function cacheDelete(key: string): Promise<void> {
+    try {
+        const d = await db();
+        if (d) await req(d.transaction('pages', 'readwrite').objectStore('pages').delete(key));
+    } catch { /* best-effort */ }
 }
 
 export async function cacheClear(): Promise<void> {

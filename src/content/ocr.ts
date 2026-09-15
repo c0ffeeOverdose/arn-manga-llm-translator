@@ -7,7 +7,7 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
-import { readProgressT0, writeProgressT0 } from './page-cache';
+import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources } from './page-cache';
 import { pageArea } from './render';
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
@@ -118,10 +118,15 @@ export function pageIsGrayscale(bitmap: ImageBitmap): boolean {
 function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, x: number, y: number, num: number, r: number, W: number, H: number): void {
     x = Math.min(Math.max(x, r), W - r);
     y = Math.min(Math.max(y, r), H - r);
-    ctx.fillStyle = '#ff2222';
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff2222';
     ctx.fill();
+    // thin white rim: separates the red disc from red/busy artwork (cheap,
+    // grows the mark by half a line width only)
+    ctx.lineWidth = Math.max(1.5, r * 0.16);
+    ctx.strokeStyle = '#fff';
+    ctx.stroke();
     ctx.fillStyle = '#fff';
     ctx.font = `bold ${r / 0.9}px sans-serif`;
     ctx.textAlign = 'center';
@@ -129,16 +134,21 @@ function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingConte
     ctx.fillText(String(num), x, y + r * 0.055);
 }
 
-// Draw numbered badges over each region so the VLM can map them, downscale.
+// Badge size comes from page-cache's annotFont (pure + unit-tested); draw a
+// numbered badge over each region so the VLM can map them, downscale.
 async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: boolean): Promise<string> {
     const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
     const c = new OffscreenCanvas(Math.round(bitmap.width * scale), Math.round(bitmap.height * scale));
     const ctx = c.getContext('2d')!;
     if (grayscale) ctx.filter = 'grayscale(1)';
     ctx.drawImage(bitmap, 0, 0, c.width, c.height);
-    const font = Math.max(18, Math.round(28 * scale * 2));
+    // canvas filters stick to every later draw: without this reset the badges
+    // come out gray whenever the page was grayscale-stripped, while the prompt
+    // tells the model to look for "red number badges" (live-proven mismatch)
+    ctx.filter = 'none';
+    const font = annotFont(scale);
     boxes.forEach((b, i) => drawBadge(ctx, b.x1 * scale, b.y1 * scale, i + 1, font * 0.9, c.width, c.height));
-    return toJpegB64(c, pipeline.jpegQuality); // keep badges red
+    return toJpegB64(c, pipeline.jpegQuality);
 }
 
 // dark pill with exact conf in threshold units (0.xx) — answers directly
@@ -305,6 +315,7 @@ export interface TranslateOutcome {
     errorHint?: string;      // actionable hint for the toast
     annW: number; // annotated image dims (LLM coordinate space for extras)
     annH: number;
+    badgeR?: number; // drawn badge radius in that space (absent: no annotated page sent)
     raw?: string;            // present unless the background is stale
     usage?: { inTok?: number; outTok?: number; cachedInTok?: number };
     llmCalls?: number;
@@ -342,6 +353,20 @@ export async function translateRegions(
         index: i + 1,
         source: '',           // vision mode: the model reads from the annotated image
     }));
+    // post-OCR checkpoint: the OCR text is the paid half of the split pipeline —
+    // persist it onto the same partial entry detect wrote, so a reload or a
+    // retry after a failed LLM resumes at the translation instead of paying the
+    // OCR again (detFromPartial restores the texts as cloudTexts, which the ocr
+    // gate above accepts). Cloud texts are already in that entry; the 150-region
+    // cap keeps boxes and texts aligned by prefix. Written even with the cache
+    // off (in-flight work, not a cached translation): the finished job deletes
+    // it again in that mode (render-page/seam/sweep).
+    const checkpointOcr = (texts: string[]) => {
+        if (det.cloudTexts || !texts.some(t => t)) return;
+        const boxes = det.boxes.length === texts.length ? det.boxes : det.boxes.slice(0, texts.length);
+        void cachePut(partialEntry(cacheKey(chapterKey(), pageHashFromBitmap(bitmap)), settingsFingerprint(pipeline),
+            { ...det, boxes, cloudTexts: texts }, bitmap.width, bitmap.height), pipeline.cacheMax);
+    };
     try {
         // unified text-source axis: 'page'/'crops' = VLM reads images, 'ocr' =
         // Tesseract reads locally and the LLM gets text only. Split pipeline
@@ -357,12 +382,13 @@ export async function translateRegions(
         // dims of the annotated image the model actually sees (extras coords come
         // back in THIS space — the model can't know the full-resolution page)
         let annW = bitmap.width, annH = bitmap.height;
+        let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
         if (ocr) {
             const tOcr = performance.now();
             onStatus('OCR…', 'ocr');
             if (det.cloudTexts) {
                 // cloud path: texts arrived with detection — no local OCR models needed
-                det.cloudTexts.forEach((t, i) => { regions[i].source = t; });
+                det.cloudTexts.forEach((t, i) => { if (regions[i]) regions[i].source = t; });
             } else if (pipeline.ocrEngine === 'baberu') {
                 if (!(await baberuInstalled())) {
                     throw Object.assign(
@@ -393,6 +419,7 @@ export async function translateRegions(
             ocrMs = det.cloudTexts && det.cloudMs
                 ? det.cloudMs.ocr
                 : Math.round(performance.now() - tOcr);
+            checkpointOcr(regions.map(r => r.source));
         } else {
             const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
             if (cropsOnly) {
@@ -402,6 +429,7 @@ export async function translateRegions(
                 const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
                 annW = Math.round(bitmap.width * scale);
                 annH = Math.round(bitmap.height * scale);
+                badgeR = Math.round(annotFont(scale) * 0.9);
                 imagesB64 = [await annotateForVLM(bitmap, det.boxes, gs)];
                 for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs));
             }
@@ -431,6 +459,10 @@ export async function translateRegions(
             onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
         }, 1000);
         let resp: any;
+        // transcripts seen on the interim message — if the RPC channel dies
+        // mid-translate (service worker killed / reloaded), the fallback below
+        // re-sends them so the new worker translates instead of re-transcribing
+        let interimTexts: string[] | null = null;
         const payload = {
             type: 'mt:translate',
             imagesB64,
@@ -442,6 +474,7 @@ export async function translateRegions(
             pageW: annW,
             pageH: annH,
             cacheKey: await resolveMangaId() ?? chapterKey(), // stable per manga → prompt-cache affinity
+            interim: true, // this version handles the mid-flight transcripts message (see portSend)
         };
         // suspend-proof channel: an open runtime port pins the background
         // page alive AND its replies always arrive (Firefox drops a pending
@@ -451,8 +484,16 @@ export async function translateRegions(
         const portSend = () => new Promise<unknown>((resolve, reject) => {
             let port: chrome.runtime.Port;
             try { port = chrome.runtime.connect({ name: 'mt-rpc' }); } catch (e) { reject(e); return; }
-            const to = setTimeout(() => { try { port.disconnect(); } catch { /* gone */ } reject(new Error('translate RPC timeout')); }, 180000);
-            port.onMessage.addListener((r: unknown) => { clearTimeout(to); try { port.disconnect(); } catch { /* gone */ } resolve(r); });
+            const to = setTimeout(() => { try { port.disconnect(); } catch { /* gone */ } reject(new Error('translate RPC timeout')); }, 260000);
+            port.onMessage.addListener((r: unknown) => {
+                // interim: the split pipeline's transcribe finished while the
+                // translate call runs — checkpoint the transcripts now, or a
+                // reload mid-translate re-pays the OCR (the final reply settles
+                // this promise)
+                const m = r as { type?: string; texts?: string[] };
+                if (m?.type === 'mt:ocr-texts' && Array.isArray(m.texts)) { interimTexts = m.texts; checkpointOcr(m.texts); return; }
+                clearTimeout(to); try { port.disconnect(); } catch { /* gone */ } resolve(r);
+            });
             port.onDisconnect.addListener(() => { clearTimeout(to); reject(new Error('background disconnected')); });
             try { port.postMessage(payload); } catch (e) { clearTimeout(to); reject(e); }
         });
@@ -467,7 +508,13 @@ export async function translateRegions(
                 for (const wait of [5000, 20000, 60000]) {
                     await new Promise(r => setTimeout(r, wait));
                     try {
-                        resp = await chrome.runtime.sendMessage(payload);
+                        // transcripts already paid for: the re-send is the same
+                        // text-only translate stage the split pipeline would have
+                        // run, not a re-transcription (images dropped too)
+                        const retryPayload = interimTexts
+                            ? { ...payload, imagesB64: undefined, regions: withSources(payload.regions, interimTexts), vision: false, textOnly: true, ocr: true }
+                            : payload;
+                        resp = await chrome.runtime.sendMessage(retryPayload);
                         lastErr = null;
                         break;
                     } catch (e2) {
@@ -504,6 +551,7 @@ export async function translateRegions(
         }
         return {
             outputs: resp.outputs as RegionOutput[], extras, usedLLM: true, annW, annH,
+            ...(badgeR != null ? { badgeR } : null),
             mentions: (resp.mentions ?? []) as Mention[],
             bookOps: (resp.bookOps ?? []) as BookOp[],
             raw: resp.raw as string | undefined,

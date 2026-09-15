@@ -24,6 +24,12 @@ export interface PageState {
     det?: DetectResult;
     outputs?: RegionOutput[];
     mentions?: Mention[]; // page-level named people (folded into the book with outputs)
+    // book/pairs exactly as they were BEFORE this page folded (references to
+    // the immutable context arrays). rewindContextBefore restores the snapshot
+    // on re-translate: it is exact and survives a fresh session, where the
+    // loaded book cannot be re-derived from page states at all.
+    bookBefore?: CharacterEntry[];
+    pairsBefore?: [string, string][];
     hash?: string; // content hash of the ORIGINAL pixels — element-identity fallback
     // canvas pages only: the page has no URL to re-read, so the first read is
     // stashed (original bytes for re-translate, translated bitmap for write-back)

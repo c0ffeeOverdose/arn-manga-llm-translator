@@ -1,7 +1,7 @@
 // Auto-translate: follow the reader's scroll, pre-translate ahead, off-DOM
 // lookahead for single-img and canvas-manifest readers.
 
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, packMask, autoBudget, galleryLookaheadUrls, manifestAheadUrls, readWarming, warmingFresh, writeWarming, samePagePath, registerLookaheadAbort } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, autoBudget, galleryLookaheadUrls, manifestAheadUrls, readWarming, warmingFresh, writeWarming, samePagePath, registerLookaheadAbort } from './page-cache';
 import { isAutoSite } from '../llm/pipeline-settings';
 import { isDebug } from '../debug';
 import type { MtOnStatus } from './detection';
@@ -133,6 +133,8 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
                 outputs: o.outputs, extras: o.extras, mentions: o.mentions,
                 mask: packMask(det.mask),
             }, pipeline.cacheMax);
+        } else {
+            void cacheDelete(key); // cache off: drop the resume checkpoint this headless job finished
         }
         if (o.usage) {
             sessionUsage.pages++;

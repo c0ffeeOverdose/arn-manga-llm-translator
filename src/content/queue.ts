@@ -6,11 +6,11 @@
 // NOTE: mutual imports with status-ui/overlays are fine — every cross-module
 // use happens inside function bodies, never at module top level.
 
-import { updateContext } from '../llm/core';
+import { updateContext, type CharacterEntry } from '../llm/core';
 import { cooldownMark, cooldownClear, type FailMark, pageHashFromBitmap } from './page-cache';
 import { isDebug } from '../debug';
 import type { MtStage } from './detection';
-import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, contextChapter, resetContextIfNewChapter, pages, overlayChoice, setOverlayOn, type PageRef, type PageState } from './state';
+import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, contextChapter, resetContextIfNewChapter, pages, uniquePages, overlayChoice, setOverlayOn, type PageRef, type PageState } from './state';
 import { refKey, getPages } from './page-io';
 import { preparePage, type Prep } from './pipeline';
 import { trySeam, type Job } from './seam';
@@ -63,14 +63,26 @@ export function pageKeyOf(ref: PageRef): string {
 // this, a wrong first guess (first-wins naming) survives every re-translate.
 export async function rewindContextBefore(...targets: (PageState | undefined)[]): Promise<void> {
     await loadContext();
-    const userEntries = context.characters.filter(c => c.source === 'user');
-    let rebuilt = { pairs: [] as [string, string][], characters: [...userEntries] };
-    for (const ref of getPages()) {
-        const st = pages.get(refKey(ref));
-        if (!st || targets.includes(st) || !st.outputs?.length) continue;
-        rebuilt = updateContext(rebuilt, st.outputs, st.mentions ?? [], pipeline.useCharacters, pipeline.contextPairs).ctx;
+    // Snapshot first: the target's bookBefore/pairsBefore is the exact state
+    // before it folded, and unlike a replay it works in a fresh session (the
+    // book came from storage, so there are no page states to rebuild from —
+    // the replay silently wiped it: live-proven 10 → 3 entries, and the
+    // re-translate then swapped speakers/genders it had known).
+    const snapped = targets.find((t): t is PageState => !!t?.bookBefore);
+    if (snapped) {
+        setContext({ pairs: [...(snapped.pairsBefore ?? [])], characters: [...snapped.bookBefore!] });
+        return;
     }
-    setContext(rebuilt);
+    // No snapshot (state created before this field existed): rebuild PAIRS only
+    // from the accumulated page states and keep the characters untouched —
+    // dropping rows the replay cannot re-derive is worse than a stale row (the
+    // model's correct=/sameAs ops can fix rows; a wiped book is unrecoverable).
+    let rebuilt: { pairs: [string, string][]; characters: CharacterEntry[] } = { pairs: [], characters: [] };
+    for (const st of uniquePages()) {
+        if (targets.includes(st) || !st.outputs?.length) continue;
+        rebuilt = updateContext(rebuilt, st.outputs, [], false, pipeline.contextPairs).ctx;
+    }
+    setContext({ pairs: rebuilt.pairs, characters: context.characters });
 }
 
 // …and after the fresh translation, fold the pages that FOLLOW the target
@@ -251,6 +263,11 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     // 20s failed to prevent it. A held port suspends nothing.
     let keepalive: chrome.runtime.Port | null = null;
     try { keepalive = chrome.runtime.connect({ name: 'mt-keepalive' }); } catch { /* context invalidated — job fails loudly anyway */ }
+    // A held port alone does not reset the service worker's 30s idle timer in
+    // Chrome (live-proven: a port-path translate died at exactly 30s + the 5s
+    // fallback backoff, re-paying the whole OCR). A port message counts as
+    // activity — ping well under the timer while the job runs.
+    const keepalivePing = setInterval(() => { try { keepalive?.postMessage(0); } catch { /* gone */ } }, 15000);
     const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
     try {
         let prep;
@@ -321,6 +338,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if (!job.auto) makeToast(msg, 'error', err.hint);
         void logError(err.message, err.hint, err.kind);
     } finally {
+        clearInterval(keepalivePing);
         try { keepalive?.disconnect(); } catch { /* already gone */ }
         activeRef = null;
         activeKey = null;

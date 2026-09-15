@@ -10,9 +10,15 @@ await build({
   entryPoints: ['src/content/page-cache.ts'],
   bundle: true, format: 'esm', outfile: '.test-build/page-cache.mjs', sourcemap: 'inline',
 });
+// separate outfile (node runs test files in parallel — never share a build target)
+await build({
+  entryPoints: ['src/llm/adapters.ts'],
+  bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
+});
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, registerLookaheadAbort, abortLookahead } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, registerLookaheadAbort, abortLookahead, annotFont, withSources } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
+const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
 const FP = {
   targetLang: 'Thai', textSource: 'page', ocrEngine: 'tesseract',
@@ -178,6 +184,38 @@ test('normalizeChapterKey: page-turns share a key, story changes do not', () => 
   // origins and trailing slashes
   assert.notEqual(K('https://a.com/manga/x'), K('https://b.com/manga/x'));
   assert.equal(K('https://site.com/manga/x/'), K('https://site.com/manga/x'));
+});
+
+test('sessionKey over normalizeChapterKey: one provider session per chapter, no URL survives', () => {
+  const K = (u) => {
+    const { origin, pathname, search, hash } = new URL(u);
+    return normalizeChapterKey(origin, pathname, search, hash);
+  };
+  const sk = (u, salt = 0) => sessionKey(K(u), salt);
+  // page turns share the provider session id (prompt-cache affinity continuity)
+  assert.equal(sk('https://mangadex.org/chapter/abc/3'), sk('https://mangadex.org/chapter/abc/7'));
+  assert.equal(sk('https://gallery.example.org/g/679368/6/'), sk('https://gallery.example.org/g/679368/7/'));
+  // another chapter/story differs
+  assert.notEqual(sk('https://mangadex.org/chapter/abc/3'), sk('https://mangadex.org/chapter/def/3'));
+  // query strings (potential tokens) never reach the provider field in any form
+  const k = sk('https://site.com/r?chapter=5&token=sekrit');
+  assert.ok(!k.includes('sekrit') && !k.includes('chapter') && !/[\/:?&=]/.test(k));
+  // per-install salt: same chapter, different salt = different id; same salt = same id
+  assert.equal(sk('https://mangadex.org/chapter/abc/3', 42), sk('https://mangadex.org/chapter/abc/7', 42));
+  assert.notEqual(sk('https://mangadex.org/chapter/abc/3', 42), sk('https://mangadex.org/chapter/abc/3', 43));
+});
+
+test('annotFont: region badges stay clear of the page text (no doubled mark)', () => {
+  // the report this guard comes from: 1700x2400 page, fullPageSize 1280 →
+  // scale 0.533 → the old formula drew 54px discs (6% of the 907px width)
+  const scale = 1280 / 2400;
+  const r = annotFont(scale) * 0.9;
+  assert.ok(r * 2 / (1700 * scale) < 0.04, `badge ${Math.round(r * 2)}px is >4% of the annotated width`);
+  // legible floor on heavily downscaled / tiny annotated pages
+  assert.equal(annotFont(0.1), 16);
+  // full-res annotation (fullPageSize 2560, scale 1): 28px number, r 25 —
+  // the old doubling produced r 50 here
+  assert.equal(annotFont(1), 28);
 });
 
 test('autoBudget: refill only up to ahead auto jobs waiting', () => {
@@ -567,6 +605,20 @@ test('partialEntry: checkpoint shape the full write later overwrites', () => {
   assert.deepEqual(e2.texts, []);
 });
 
+test('post-OCR checkpoint: local OCR texts survive a resume (retry skips OCR)', () => {
+  // translateRegions writes this after the OCR stage — same writer the detect
+  // checkpoint uses, texts added. A reload/retry then resumes at the LLM call:
+  // detFromPartial hands the texts back as cloudTexts, which is the flag the
+  // OCR gate accepts as "texts are ready".
+  const det = {
+    boxes: [{ x1: 1, y1: 1, x2: 2, y2: 2, conf: 0.5 }, { x1: 2, y1: 2, x2: 3, y2: 3, conf: 0.4 }],
+    panels: [], ep: 'webgpu', mask: { width: 4, height: 4, data: new Uint8Array(16).buffer }, inferMs: 9,
+  };
+  const e = partialEntry('ch#ff00', RESUME_FP, { ...det, cloudTexts: ['あ', ''] }, 4, 4);
+  assert.ok(isResumable(e, RESUME_FP, 4, 4));
+  assert.deepEqual(detFromPartial(e, 4, 4).cloudTexts, ['あ', '']);
+});
+
 test('parseWarming/warmingFresh: validated trace with a 15-minute life', () => {
   assert.equal(WARM_TTL_MS, 15 * 60 * 1000);
   assert.deepEqual(parseWarming(JSON.stringify({ key: 'u', ts: 7 })), { key: 'u', ts: 7 });
@@ -732,4 +784,13 @@ test('buildPagedUrls kinds: data default, data-saver on request, junk kind rejec
     buildPagedUrls('https://svc.example.org', 'h1', ['p1.png', 'p2.png'], 'data-saver'),
     ['https://svc.example.org/data-saver/h1/p1.png', 'https://svc.example.org/data-saver/h1/p2.png']);
   assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', ['p1.png'], 'orig'), []);
+});
+
+test('withSources: fallback re-send carries the paid transcripts per region', () => {
+  const regions = [{ index: 1, source: '' }, { index: 2, source: '' }, { index: 3, source: '' }];
+  const out = withSources(regions, ['a', 'b']);
+  assert.deepEqual(out.map(r => r.source), ['a', 'b', '']);
+  // short list keeps the caller's own source; originals untouched
+  assert.deepEqual(withSources([{ index: 1, source: 'kept' }], []).map(r => r.source), ['kept']);
+  assert.deepEqual(regions.map(r => r.source), ['', '', '']);
 });

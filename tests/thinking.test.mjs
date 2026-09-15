@@ -37,7 +37,7 @@ function stubFetch(provider) {
     if (next.status !== 200) {
       return { ok: false, status: next.status, text: async () => next.msg };
     }
-    return { ok: true, status: 200, text: async () => JSON.stringify(okBody[provider]) };
+    return { ok: true, status: 200, text: async () => JSON.stringify(next.body ?? okBody[provider]) };
   };
 }
 
@@ -65,6 +65,43 @@ test('responses maps to reasoning.effort', async () => {
   stubFetch('responses');
   await callLLM(settings('responses'), 'p', undefined, 'xhigh');
   assert.deepEqual(bodies[0].reasoning, { effort: 'xhigh' });
+});
+
+test('responses: no default output cap (reasoning counts toward it); explicit caps always pass', async () => {
+  stubFetch('responses');
+  await callLLM(settings('responses'), 'p', undefined, 'auto');
+  assert.ok(!('max_output_tokens' in bodies[0]), 'plain calls leave the provider default');
+  await callLLM(settings('responses'), 'p', undefined, 'low');
+  assert.ok(!('max_output_tokens' in bodies[1]), 'thinking runs leave the provider default');
+  await callLLM(settings('responses'), 'p', undefined, 'none');
+  assert.ok(!('max_output_tokens' in bodies[2]), 'none = no reasoning param, but models reason anyway — no cap');
+  await callLLM(settings('responses'), 'p', undefined, 'low', undefined, null, 512);
+  assert.equal(bodies[3].max_output_tokens, 512, 'transcribe caps are explicit and still ride');
+});
+
+test('responses: incomplete with no output throws the reasoning-budget hint', async () => {
+  stubFetch('responses');
+  // live shape: HTTP 200, status incomplete, max_output_tokens, zero output items
+  queue = [{ status: 200, body: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [], usage: { output_tokens: 4096 } } }];
+  await assert.rejects(() => callLLM(settings('responses'), 'p'), (e) => {
+    assert.match(e.message, /incomplete/);
+    assert.match(e.hint ?? '', /reasoning/i);
+    return true;
+  });
+  // a partial answer still comes back (missing-region retry handles the holes)
+  stubFetch('responses');
+  queue = [{ status: 200, body: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [{ type: 'message', content: [{ type: 'output_text', text: '<r n="1">x</r>' }] }], usage: {} } }];
+  const r = await callLLM(settings('responses'), 'p');
+  assert.equal(r.text, '<r n="1">x</r>');
+});
+
+test('callLLM reports thinkingDropped when the model rejects the level', async () => {
+  stubFetch('responses');
+  queue = [{ status: 400, msg: 'reasoning: unsupported value for this model' }];
+  const r = await callLLM(settings('responses'), 'p', undefined, 'low');
+  assert.equal(bodies.length, 2);
+  assert.ok(!('reasoning' in bodies[1]), 'retry went without the param');
+  assert.equal(r.thinkingDropped, true, 'memo hook sees the rejection');
 });
 
 // ---- Anthropic: adaptive first, legacy budget fallback, omit last ----
@@ -186,7 +223,7 @@ test('checkThinking passes non-thinking errors through unclassified', async () =
 test('checkThinking forwards the session header (missing-session proxies)', async () => {
   stubFetch('responses');
   await checkThinking(settings('responses'), 'high', 'test');
-  assert.equal(headers[0]['x-opencode-session'], 'mt-test');
+  assert.equal(headers[0]['x-opencode-session'], 'test');
   await checkThinking(settings('responses'), 'high');
   assert.ok(!('x-opencode-session' in headers[1]));
 });
