@@ -115,6 +115,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
                 // enclosed score >0 = per-line profile layout, absent = no-frame rect
                 ...('runs' in a && a.runs ? { prof: +a.runs.enclosed.toFixed(2) } : null),
+                ...('why' in a && a.why ? { why: a.why } : null), // rect path reason (debug)
             };
         }),
         // chosen layout per region: {i, fontSize, line count} — null layout

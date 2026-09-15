@@ -291,6 +291,7 @@ export function paintRegions(
             i: i + 1, f: placed.fontSize, n: placed.lines.length,
             ...(placed.overflow ? { o: 1 as const } : {}),
             ...(isDebug() && placed.color ? { c: placed.color } : null),
+            ...(isDebug() && placed.block ? { ly: placed.block.map(Math.round) } : null),
             // font ceiling from the measured source pitch (debug): f at sc
             // with no o = the cap is doing its job, f far below sc = the area
             ...(isDebug() ? { sc: sizeCapFrom(frame, box, boxIsVertical(box)) ?? undefined } : null),

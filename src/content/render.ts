@@ -577,6 +577,7 @@ export function runInterval(prof: RunProfile, p0: number, p1: number): [number, 
 // Enclosed-bubble path: profile measurement, or the legacy rectangle when the
 // evidence says there is no bubble around this box.
 function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
+    const rect = (why: string): LayoutRect => ({ ...bubbleArea(img, box), why });
     // 0.6 per side = at most 2.2x the box per axis: a bubble hugging its text
     // is well inside that, while a leaked fill (barely-enclosed white garment,
     // bubble tail slipping into a same-colored drawing) cannot run away —
@@ -588,7 +589,10 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
     const boxW = box.x2 - box.x1, boxH = box.y2 - box.y1;
     if ((maxX - minX) * (maxY - minY) >= boxW * boxH * 0.25) {
         const prof = widthProfile(img, box, vertical, fill.seed, { x1: minX, y1: minY, x2: maxX, y2: maxY }, fill);
-        if (prof && prof.enclosed >= ENCLOSED_MIN && prof.e1 > prof.e0) {
+        if (!prof) return rect('norows');
+        if (prof.enclosed < ENCLOSED_MIN) return rect(`enclose ${prof.enclosed.toFixed(2)}`);
+        if (prof.e1 <= prof.e0) return rect('no-evidence-rows');
+        {
             const ks = Math.max(0, prof.e0 - prof.p0), ke = Math.min(prof.i1.length - 1, prof.e1 - prof.p0);
             let q1 = -1, q2 = -1;
             for (let k = ks; k <= ke; k++) {
@@ -604,7 +608,7 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
             }
         }
     }
-    return bubbleArea(img, box);
+    return rect('fill<25%');
 }
 
 // Original typesetting, measured from the ink bands inside the detection box:
@@ -676,6 +680,7 @@ export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxI
         return {
             x: Math.max(0, ink.x1 - pad), y: Math.max(0, ink.y1 - pad),
             w: ink.x2 - ink.x1 + 2 * pad, h: ink.y2 - ink.y1 + 2 * pad,
+            why: 'ink-bbox',
         };
     }
     return fitArea(img, box, vertical);
@@ -743,13 +748,13 @@ export function renderRegion(
     return renderHorizontal(ctx, img, box, text);
 }
 
-export interface Placed { fontSize: number; lines: string[]; overflow?: boolean; color?: string }
+export interface Placed { fontSize: number; lines: string[]; overflow?: boolean; color?: string; block?: [number, number] }
 
 interface Area { x: number; y: number; w: number; h: number }
 
 // Placement rect, optionally carrying the measured per-line profile (see
 // widthProfile) for enclosed bubbles.
-export interface LayoutRect extends Area { runs?: RunProfile }
+export interface LayoutRect extends Area { runs?: RunProfile; why?: string }
 
 // Shared placement-area resolution (layoutArea + canvas clamp + 20px floor).
 // Both orientations and the horizontal-fit probe use it, so the probe can
@@ -921,7 +926,8 @@ function renderHorizontal(
             ctx.fillText(line, cx, y);
         });
         ctx.restore();
-        return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color };
+        const b0 = laid.top, b1 = laid.top + laid.lines.length * laid.lineHeight;
+        return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color, block: [b0, b1] };
     }
 
     const laid = layoutText(ctx, text, area.w, area.h, cap);
@@ -940,6 +946,7 @@ function renderHorizontal(
         ? area.y + laid.lineHeight / 2
         : area.y + (area.h - totalH) / 2 + laid.lineHeight / 2;
 
+    const y0 = y; // first line's center — the block runs [y0 - lh/2, y0 - lh/2 + totalH]
     ctx.save();
     ctx.beginPath();
     ctx.rect(area.x, area.y, area.w, area.h);
@@ -956,7 +963,7 @@ function renderHorizontal(
         y += laid.lineHeight;
     }
     ctx.restore();
-    return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color };
+    return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color, block: [y0 - laid.lineHeight / 2, y0 - laid.lineHeight / 2 + totalH] };
 }
 
 // Left edge of the first (rightmost) column in a vertical stack. Columns
@@ -1056,5 +1063,6 @@ function renderVertical(
         colX -= colW;
     }
     ctx.restore();
-    return { fontSize, lines, overflow: overflow || undefined, color };
+    const b0 = fit ? fit.top - lines.length * lineHeight : colX + lineHeight;
+    return { fontSize, lines, overflow: overflow || undefined, color, block: [b0, fit ? fit.top : colX + lineHeight + lines.length * lineHeight] };
 }
