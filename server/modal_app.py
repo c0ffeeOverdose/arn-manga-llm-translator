@@ -11,16 +11,7 @@ sys.path.insert(0, os.environ.get("PKG_DIR", os.path.dirname(os.path.abspath(__f
 # NOTE: top-level sibling import — resolved locally at deploy parse time
 # (needs the full deps installed where you deploy from), baked copy used remotely.
 from app import app as fastapi_app
-
-CTD_URL = ("https://huggingface.co/lemondouble/lemon-manga-translator"
-           "/resolve/main/onnx/comic-text-detector/ctd.onnx?download=true")
-BABERU = "https://huggingface.co/genshiai-daichi/baberu-ocr/resolve/main"
-BABERU_FILES = [
-    ("onnx/vision_int4.onnx", "vision-int4.onnx"),
-    ("onnx/decoder_prefill_int8.onnx", "baberu-prefill.onnx"),
-    ("onnx/decoder_step_int8.onnx", "baberu-step.onnx"),
-    ("tokenizer/vocab.json", "vocab.json"),
-]
+from models_manifest import CTD_URL, BABERU, BABERU_FILES
 
 dl = [f"mkdir -p /models",
       f'curl -fL -o /models/ctd.onnx "{CTD_URL}"']
@@ -29,11 +20,13 @@ dl += [f'curl -fL -o /models/{dst} "{BABERU}/{src}?download=true"'
 
 image = (
     # nvidia runtime base: onnxruntime-gpu needs CUDA 13 + cuDNN 9 system
-    # libs (libcublasLt.so.13) that debian_slim lacks — plain pip is not enough
+    # libs (libcublasLt.so.13) that debian_slim lacks — plain pip is not enough.
+    # onnxruntime-gpu stays pinned: a future wheel requiring a newer CUDA would
+    # fail the CUDA provider and silently fall back to CPU on a GPU bill.
     modal.Image.from_registry("nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04",
                               add_python="3.12")
     .apt_install("curl")
-    .pip_install("fastapi", "uvicorn[standard]", "onnxruntime-gpu",
+    .pip_install("fastapi", "uvicorn[standard]", "onnxruntime-gpu==1.30.0",
                  "numpy", "pillow", "opencv-python-headless")
     .env({"ORT_PROVIDERS": "CUDAExecutionProvider,CPUExecutionProvider",
           "ORT_DEVICE": "cuda", "PKG_DIR": "/pkg"})
@@ -41,6 +34,8 @@ image = (
     # single file, not add_local_dir("."): deploy sources like Colab's /content
     # hold mutating internal files (.config/gce) that abort the build mid-snapshot
     .add_local_file("app.py", remote_path="/pkg/app.py")
+    # the container re-imports modal_app.py, which imports this
+    .add_local_file("models_manifest.py", remote_path="/pkg/models_manifest.py")
 )
 
 app = modal.App("arn-manga")
