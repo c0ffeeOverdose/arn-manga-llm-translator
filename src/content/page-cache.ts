@@ -772,8 +772,11 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // Bumped to tile7: the render's leak guard (RUN_JUMP) clamps runs/rects
     // where a flood escaped an open bubble outline — placement areas change,
     // so cached pages must re-render.
+    // Bumped to tile8: split child boxes are seeded by the strict comps but
+    // keep adjacent loose clusters (SPLIT_CORE_LEASH) — strict-only boxes
+    // drifted sideways off the balloon text.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile7'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile8'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

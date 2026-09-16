@@ -216,3 +216,26 @@ test('strict comps keep a texture patch out of the child box', () => {
     [90, 224, 234, 388],
   ]);
 });
+
+// Soft glyph edges fall below the strict probability and leave the strict-only
+// child box — which then (and with it the layout area floored by it) drifts
+// sideways off the balloon text. The child box is core-SEEDED: a loose cluster
+// hugging the strict core still extends it.
+test('strict core seeds the child box: an adjacent loose comp stays inside', () => {
+  const parent = box(968, 843, 1274, 1113, 0.88);
+  const loose = box4Comps.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  // strict set misses one edge line of the lower block ([972,948,1039,980])
+  const strict = loose.filter(c => !(c.x1 === 972 && c.y1 === 948));
+  const parts = splitMergedBoxes([parent], loose, GAP, strict);
+  assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
+    [968, 939, 1143, 1113], // unchanged: the dropped comp sits inside the leash
+    [1144, 844, 1274, 1025],
+  ]);
+  // a loose comp FAR from the core must not extend it (the page-4 patch rule)
+  const far = [...loose, { x1: 700, y1: 950, x2: 760, y2: 990 }];
+  const parts2 = splitMergedBoxes([parent], far, GAP, strict);
+  assert.deepEqual(parts2.map(p => [p.x1, p.y1, p.x2, p.y2]), [
+    [968, 939, 1143, 1113],
+    [1144, 844, 1274, 1025],
+  ]);
+});

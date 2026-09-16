@@ -211,7 +211,12 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null },
         llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
         ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
-        boxes: det.boxes.map(b => ({ x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2) })),
+        boxes: det.boxes.map(b => ({
+            x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2),
+            // split children carry their side of the cut — the tell for
+            // "two frames shifted next to each other" reports
+            ...(b.clip ? { clip: [Math.round(b.clip.x1), Math.round(b.clip.y1), Math.round(b.clip.x2), Math.round(b.clip.y2)] } : null),
+        })),
         panels: (det.panels ?? []).map(p => ({ x1: Math.round(p.x1), y1: Math.round(p.y1), x2: Math.round(p.x2), y2: Math.round(p.y2), conf: +p.conf.toFixed(2) })),
         ...(det.panelSkipped ? { panelSkipped: det.panelSkipped } : null),
         // placement areas the renderer actually used (layoutArea: flood-fill
@@ -222,9 +227,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             // aspect): the dumped area must be the area the text got
             const out = outputs.find(o => o.index === i + 1);
             const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
-            const a = layoutArea(frame, b, chosenOrientation(ctx, frame, b, text, det.mask), det.mask) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
+            const vertical = chosenOrientation(ctx, frame, b, text, det.mask);
+            const a = layoutArea(frame, b, vertical, det.mask) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
             return {
                 x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
+                ...(vertical ? { v: 1 } : null), // orientation the layout/paint picked (1 = vertical columns)
                 // enclosed score >0 = per-line profile layout, absent = no-frame rect
                 ...('runs' in a && a.runs ? { prof: +a.runs.enclosed.toFixed(2) } : null),
                 ...('why' in a && a.why ? { why: a.why } : null), // rect path reason (debug)

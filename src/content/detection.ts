@@ -168,7 +168,13 @@ type SplitGroup = { x1: number; y1: number; x2: number; y2: number };
 // (live: a balloon pair's areas merged 145px past the cut and the translation
 // sprawled across the panel border). Pure.
 export const SPLIT_CLIP_SLACK = 12; // px — max leash past the cut toward the sibling
-function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | 'y', boxComps: SplitComp[]): T[] {
+// How far a loose cluster may sit from the strict text core and still extend
+// the child box (see emitSplit). Strict-only boxes drift sideways when soft
+// glyph edges fall below the strict probability (live: a merged balloon pair
+// split into two children, both frames shifted left/right of their balloon);
+// 16px re-admits them while a texture patch 41px away stays out (page 4).
+export const SPLIT_CORE_LEASH = 16; // px
+function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | 'y', loose: SplitComp[], boxComps: SplitComp[]): T[] {
     const lo = (g: SplitGroup) => (axis === 'y' ? g.y1 : g.x1);
     const hi = (g: SplitGroup) => (axis === 'y' ? g.y2 : g.x2);
     const gapBefore = (i: number) => i <= 0 || i >= groups.length
@@ -179,20 +185,36 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
     });
     return groups.map((g, i) => {
         const pad = Math.min(SPLIT_PAD_CAP, Math.floor(Math.min(gapBefore(i), gapBefore(i + 1)) / 2));
-        // Child box = the group's TEXT clusters (strict comps), not the whole
-        // (possibly texture-polluted) group bbox. The cut positions, pads and
+        // Child box = the group's text clusters, seeded by the strict comps so
+        // a texture patch the box head corroborated stays out (page 4: a
+        // screentone comp dragged the caption box 109px over the hatch), but
+        // not limited to them: soft glyph edges drop out of the strict set and
+        // a strict-only box (plus the layout area it floors) drifts sideways
+        // off the balloon's text block. Keep every loose comp within
+        // SPLIT_CORE_LEASH of the strict core; the cut positions, pads and
         // clips still come from the loose groups, so the split decision and the
-        // sibling leash are unchanged; only the box hugs the text. Fall back to
-        // the group bbox when the strict set has nothing usable in this group.
-        const own = boxComps.filter(c =>
+        // sibling leash are unchanged. Fall back to the whole group bbox when
+        // the strict set has nothing usable in this group.
+        const inGroup = (c: SplitComp) =>
             (c.x1 + c.x2) / 2 >= g.x1 && (c.x1 + c.x2) / 2 <= g.x2 &&
-            (c.y1 + c.y2) / 2 >= g.y1 && (c.y1 + c.y2) / 2 <= g.y2);
-        const ext = own.length
-            ? {
+            (c.y1 + c.y2) / 2 >= g.y1 && (c.y1 + c.y2) / 2 <= g.y2;
+        const own = boxComps.filter(inGroup);
+        let ext = g;
+        if (own.length) {
+            const core = {
                 x1: Math.min(...own.map(c => c.x1)), y1: Math.min(...own.map(c => c.y1)),
                 x2: Math.max(...own.map(c => c.x2)), y2: Math.max(...own.map(c => c.y2)),
+            };
+            const near = loose.filter(c => inGroup(c) &&
+                c.x1 <= core.x2 + SPLIT_CORE_LEASH && c.x2 >= core.x1 - SPLIT_CORE_LEASH &&
+                c.y1 <= core.y2 + SPLIT_CORE_LEASH && c.y2 >= core.y1 - SPLIT_CORE_LEASH);
+            if (near.length) {
+                ext = {
+                    x1: Math.min(...near.map(c => c.x1)), y1: Math.min(...near.map(c => c.y1)),
+                    x2: Math.max(...near.map(c => c.x2)), y2: Math.max(...near.map(c => c.y2)),
+                };
             }
-            : g;
+        }
         const clip = { x1: box.x1, y1: box.y1, x2: box.x2, y2: box.y2 };
         const before = i > 0 ? cuts[i - 1] : null;
         const after = i < groups.length - 1 ? cuts[i] : null;
@@ -264,7 +286,7 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
             groups.splice(k + 1, 1);
         }
         if (groups.length < 2) continue;
-        return emitSplit(box, groups, axis, boxComps);
+        return emitSplit(box, groups, axis, cs, boxComps);
     }
     return null;
 }
@@ -322,7 +344,7 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
                 prev.x2 = Math.max(prev.x2, g.x2); prev.y2 = Math.max(prev.y2, g.y2);
             }
         }
-        if (merged.length >= 2) return emitSplit(box, merged, axis, boxComps);
+        if (merged.length >= 2) return emitSplit(box, merged, axis, cs, boxComps);
     }
     return null;
 }
