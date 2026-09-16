@@ -65,3 +65,38 @@ test('bitmapToJpegB64: grayscale pass still returns the payload', async () => {
   assert.equal(out, '//8A');
   assert.equal(calls.arrayBuffer, 0);
 });
+
+test('bitmapToJpegB64: concurrent full-page encodes never overlap (encode lock)', async () => {
+  let active = 0, maxActive = 0;
+  const blob = { arrayBuffer() { throw new Error('unused'); } };
+  globalThis.OffscreenCanvas = class {
+    constructor(w, h) { this.width = w; this.height = h; }
+    getContext() {
+      return {
+        drawImage() {},
+        getImageData: (_x, _y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
+        putImageData() {},
+      };
+    }
+    async convertToBlob() {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(r => setTimeout(r, 25));
+      active--;
+      return blob;
+    }
+  };
+  globalThis.FileReader = class {
+    readAsDataURL() {
+      this.result = 'data:image/jpeg;base64,AAA=';
+      queueMicrotask(() => this.onload?.());
+    }
+  };
+  const [a, b] = await Promise.all([
+    bitmapToJpegB64({ width: 4, height: 2 }, 0.8, false),
+    bitmapToJpegB64({ width: 4, height: 2 }, 0.8, false),
+  ]);
+  assert.equal(a, 'AAA=');
+  assert.equal(b, 'AAA=');
+  assert.equal(maxActive, 1, 'the encode lock must serialize the canvas work');
+});

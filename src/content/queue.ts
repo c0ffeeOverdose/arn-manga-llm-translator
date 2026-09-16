@@ -7,7 +7,7 @@
 // use happens inside function bodies, never at module top level.
 
 import { updateContext, type CharacterEntry } from '../llm/core';
-import { cooldownMark, cooldownClear, type FailMark, pageHashFromBitmap } from './page-cache';
+import { cooldownMark, cooldownClear, paintLaneSize, type FailMark, pageHashFromBitmap } from './page-cache';
 import { isDebug } from '../debug';
 import type { MtStage } from './detection';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, contextChapter, resetContextIfNewChapter, pages, uniquePages, overlayChoice, setOverlayOn, type PageRef, type PageState } from './state';
@@ -23,14 +23,13 @@ export const queue: Job[] = [];
 let running = false;
 // paint lane: cache-hit jobs whose outputs are already folded (bookHas) need
 // no LLM and no book mutation, so they must not hold the serial pump — they
-// run here, up to PAINT_JOBS at once. Visible to seam/auto-twin guards:
+// run here, up to paintLaneSize at once. Visible to seam/auto-twin guards:
 // queued paints resolve like queued preps, active paints like the active one.
 const paintQueue: Job[] = [];
 const paintActive = new Map<string, Job>();
 let paintRunning = 0;
-// ponytail: fixed lane — paints are local CPU (inpaint + layout + PNG
-// encode), provider limits don't apply. Raise if dense chapters paint slowly.
-const PAINT_JOBS = 3;
+// parallel paint lanes: GPU boxes run three; a WebGPU-less machine paints one
+// page at a time (see paintLaneSize — paints are main-thread canvas work)
 export function paintFind(key: string): Job | undefined {
     return paintQueue.find(j => j.key === key) ?? paintActive.get(key);
 }
@@ -56,6 +55,22 @@ export function resumeAuto(): void { autoHalt = null; }
 let activeRef: PageRef | null = null; // job currently rendering
 let activeKey: string | null = null; // its page key — twins on swapped elements map here
 let activePrep: Promise<Prep | null> | null = null; // its prep — seam owners await members' preps, active included
+
+// background keepalive: an open runtime Port + periodic messages is the
+// documented way to stop a MV3 event page (Firefox) / service worker (Chrome)
+// suspending mid-job. Firefox kills the page ~30s into a long async handler
+// even with the response still pending — live-proven: the LLM send died at
+// exactly ~29s with "Receiving end does not exist", and again for every sweep
+// worker (a 200s translate died at the idle window and surfaced as
+// "Could not establish connection" — sweep had no keepalive at all). A held
+// port alone does not reset Chrome's 30s idle timer; port messages do, so ping
+// well under it. Returns the closer.
+export function keepaliveOpen(): () => void {
+    let port: chrome.runtime.Port | null = null;
+    try { port = chrome.runtime.connect({ name: 'mt-keepalive' }); } catch { /* context invalidated — job fails loudly anyway */ }
+    const timer = setInterval(() => { try { port?.postMessage(0); } catch { /* gone */ } }, 15000);
+    return () => { clearInterval(timer); try { port?.disconnect(); } catch { /* already gone */ } };
+}
 
 export function activeKeyGet(): string | null { return activeKey; }
 export function activePrepGet(): Promise<Prep | null> | null { return activePrep; }
@@ -129,7 +144,7 @@ export function enqueue(ref: PageRef, force = false, auto = false): 'queued' | '
     // detection kicks off NOW — it overlaps whatever LLM call is in flight.
     // Status goes to the activity registry (priority picks the winner), never
     // straight to the pill — a queued prep must not cover the running job.
-    const prep = preparePage(ref, force, (s, stage) => setActivity(key, s, force ? 'force' : 'view', stage))
+    const prep = preparePage(ref, force, (s, stage) => setActivity(key, s, force ? 'force' : 'view', stage), false, auto)
         .catch(e => { throw e; }); // surface prepare errors in runJob
     // orphan suppressor: dropped twins (dequeue/clearQueue/force-splice) never
     // get awaited — without this their late rejections surface as pageerror
@@ -182,11 +197,11 @@ export async function pump(): Promise<void> {
     }
 }
 
-// paint pump: up to PAINT_JOBS cached repaints at once (local CPU only — no
+// paint pump: up to paintLaneSize cached repaints at once (local CPU only — no
 // LLM, no book writes). Quiet completions (no per-page Done — the counts +
 // progress bar already report); failures park + surface like normal errors.
 function pumpPaint(): void {
-    while (paintRunning < PAINT_JOBS) {
+    while (paintRunning < paintLaneSize('gpu' in navigator)) {
         const job = paintQueue.shift();
         if (!job) return;
         paintRunning++;
@@ -268,19 +283,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     activeRef = job.ref;
     activeKey = job.key;
     activePrep = job.prep;
-    // background keepalive: an open runtime Port is the documented way to
-    // stop a MV3 event page (Firefox) / service worker (Chrome) suspending
-    // mid-job. Firefox kills the page ~30s into a long async handler even
-    // with the response still pending — live-proven: the LLM send died at
-    // exactly ~29s with "Receiving end does not exist" while pings every
-    // 20s failed to prevent it. A held port suspends nothing.
-    let keepalive: chrome.runtime.Port | null = null;
-    try { keepalive = chrome.runtime.connect({ name: 'mt-keepalive' }); } catch { /* context invalidated — job fails loudly anyway */ }
-    // A held port alone does not reset the service worker's 30s idle timer in
-    // Chrome (live-proven: a port-path translate died at exactly 30s + the 5s
-    // fallback backoff, re-paying the whole OCR). A port message counts as
-    // activity — ping well under the timer while the job runs.
-    const keepalivePing = setInterval(() => { try { keepalive?.postMessage(0); } catch { /* gone */ } }, 15000);
+    const endKeepalive = keepaliveOpen();
     const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
     try {
         let prep;
@@ -357,8 +360,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if (!job.auto) makeToast(msg, 'error', err.hint);
         void logError(err.message, err.hint, err.kind);
     } finally {
-        clearInterval(keepalivePing);
-        try { keepalive?.disconnect(); } catch { /* already gone */ }
+        endKeepalive();
         activeRef = null;
         activeKey = null;
         activePrep = null;

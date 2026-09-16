@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, registerLookaheadAbort, abortLookahead, annotFont, withSources } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -673,6 +673,20 @@ test('sweepPhase: idle/starting/running/stopping/dead (popup + pill labels)', ()
   assert.equal(sweepPhase({ cancel: true, dead: false }), 'stopping');
   // dead (chapter moved on) wins over stopping — quiet abort, no message
   assert.equal(sweepPhase({ cancel: true, dead: true }), 'dead');
+});
+
+test('pool sizing: cloud keeps 3, CPU-only local inference drops to 2, paint lane 3→1', () => {
+  // cloud: the endpoint serves requests in parallel (live-probed) — keep the pool
+  assert.equal(sweepPoolSize(true, false, false), 3);
+  // local + WebGPU: unchanged
+  assert.equal(sweepPoolSize(false, true, false), 3);
+  // no GPU (Firefox) or forced wasm: ORT-lock-serial inference, so extra
+  // workers only spike the renderer thread — halve the pool
+  assert.equal(sweepPoolSize(false, false, false), 2);
+  assert.equal(sweepPoolSize(false, true, true), 2);
+  // paints are main-thread canvas work everywhere: one lane without a GPU
+  assert.equal(paintLaneSize(true), 3);
+  assert.equal(paintLaneSize(false), 1);
 });
 
 test('lookahead-abort registry: sweep start/stop reaches the auto chain', () => {

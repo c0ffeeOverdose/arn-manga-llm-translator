@@ -54,7 +54,7 @@ interface FontGetMsg {
     type: 'mt:font-get';
     id: string;               // font-store id
 }
-type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string };
+type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string } | { type: 'mt:cloud-warm'; endpoint: string; key: string };
 interface CharBookMsg {
     type: 'mt:char-book';
     book: { desc: string; gender: 'M' | 'F' | '?'; source: 'user' | 'vlm' | 'speech'; name?: string }[];
@@ -335,6 +335,29 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
             } catch (e) {
                 const m = e instanceof Error && e.name === 'AbortError' ? 'timed out (endpoint may be waking — retry in a minute)' : String((e as Error)?.message ?? e);
                 sendResponse({ ok: false, error: m });
+            }
+        })();
+        return true;
+    }
+    if (msg?.type === 'mt:cloud-warm') {
+        // scale-to-zero boot + model load can outlive the per-page 90s cap:
+        // warming gets its own longer one, and the reply carries the boot ms
+        // back for the status pill
+        (async () => {
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort(), 180000);
+            const t0 = Date.now();
+            try {
+                const base = String(msg.endpoint ?? '').replace(/\/$/, '');
+                if (!/^https?:\/\//.test(base)) { sendResponse({ ok: false, error: 'Endpoint URL must start with http(s)://' }); return; }
+                const r = await fetch(`${base}/health`, { signal: ctrl.signal });
+                if (!r.ok) { sendResponse({ ok: false, error: `cloud warm HTTP ${r.status}` }); return; }
+                sendResponse({ ok: true, ms: Date.now() - t0 });
+            } catch (e) {
+                const m = e instanceof Error && e.name === 'AbortError' ? 'cloud warm timed out after 180s' : String((e as Error)?.message ?? e);
+                sendResponse({ ok: false, error: m });
+            } finally {
+                clearTimeout(to);
             }
         })();
         return true;

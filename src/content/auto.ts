@@ -9,8 +9,8 @@ import { pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, sessionUs
 import { fetchBitmap, getPages, unscrambleTiles, episodeManifestSrcs, galleryManifestJson } from './page-io';
 import { resolveHeadlessDet } from './pipeline';
 import { sweepHas, sweepActive, bookAdd } from './sweep';
-import { translateRegions } from './ocr';
-import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto } from './queue';
+import { translateRegions, type TranslateOutcome } from './ocr';
+import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto, keepaliveOpen } from './queue';
 import { cooldownMark, cooldownParked } from './page-cache';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, registerAutoTranslateFlag } from './status-ui';
 
@@ -122,8 +122,14 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         const det = r.det;
         // solo only: seam needs DOM siblings (unknown off-DOM) — a solo result
         // still beats an untranslated arrival, and arrival can force if needed
-        const o = await translateRegions(bitmap, det, onStatus,
-            { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled });
+        const endKeepalive = keepaliveOpen(); // FF event page drops cold-start LLM calls (see keepaliveOpen)
+        let o: TranslateOutcome;
+        try {
+            o = await translateRegions(bitmap, det, onStatus,
+                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled });
+        } finally {
+            endKeepalive();
+        }
         if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
         onStatus('Saving…', 'render'); // headless has no paint — the cache write is the last leg
         bookAdd(hash); // folded above (translateRegions) — arrival must not refold
