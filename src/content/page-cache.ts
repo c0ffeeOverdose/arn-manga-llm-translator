@@ -739,8 +739,11 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // Bumped to tile2: pre-fix entries may hold EMPTY outputs (total parse
     // failures used to come back ok:true and get cached) — orphan them all at
     // once instead of making the user Clear by hand.
+    // Bumped to tile3: splitMergedBoxes now splits a CTD box that covered two
+    // balloons — pre-split entries hold one merged region (one translation
+    // spread across both balloons) and must re-detect + re-translate.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile2'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile3'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

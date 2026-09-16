@@ -22,6 +22,9 @@ export interface DetectResult {
     panelSkipped?: string;  // why panel ordering was skipped (strip aspect / gate) — page-result log only
     dropped?: DetBox[];     // CTD near-misses below threshold — debug overlay only
     panelDropped?: DetBox[]; // YOLO panels below threshold — debug overlay only
+    // regions that keep their source text (SFX, contained dups) — inpaint must
+    // not erase their glyphs while expanding a neighbour's erase region
+    keepBoxes?: DetBox[];
 }
 
 // ---- strip tiling: CTD letterboxes the long side to 1024, so an 800×13650
@@ -97,6 +100,100 @@ export function mergeTileBoxes(tiled: { tile: Tile; boxes: DetBox[] }[]): DetBox
         }
     }
     return all.map(({ x1, y1, x2, y2, conf }) => ({ x1, y1, x2, y2, conf }));
+}
+
+// CTD sometimes puts ONE box over two balloons whose text clusters sit close
+// in its receptive field (box-head conf stays high, so no gate drops it) —
+// the text mask still separates them: clusters divided by a gap the
+// same-block merge (worker GAP) would never bridge are two regions. Split at
+// each qualifying gap so every balloon gets its own crop, translation and
+// render area. A cut must clear BOTH a multiple of the same-block gap and a
+// multiple of the box's median cluster extent (reader scale drifts); children
+// are the cluster extents padded by half the adjacent gap, clamped to the
+// parent (the fill/render stage then finds each balloon interior on its own).
+// Pure geometry — unit tested.
+export const SPLIT_GAP_FACTOR = 2;  // × same-block gap — a cut is never tighter
+export const SPLIT_GAP_RATIO = 0.8; // × median cluster extent along the cut axis
+                                    // (line gaps run ~0.5–0.6× glyph height, a
+                                    // balloon boundary ≥1×; live merge measured
+                                    // gap 63px vs in-block max 33px)
+export const SPLIT_PAD_CAP = 40;    // px — max half-gap padding of a child box
+
+export interface SplitComp { x1: number; y1: number; x2: number; y2: number }
+
+export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number): T[] {
+    if (comps.length < 2) return [...boxes];
+    const out: T[] = [];
+    for (const b of boxes) {
+        const cs = comps.filter(c =>
+            (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
+            (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2);
+        const parts = splitBox(b, cs, sameBlockGap);
+        out.push(...(parts ?? [b]));
+    }
+    return out;
+}
+
+// null = no axis has a qualifying gap; otherwise that axis' children in order.
+// y first (horizontal text), x second (vertical columns) — one axis per box,
+// a child is never re-split.
+function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number): T[] | null {
+    if (cs.length < 2) return null;
+    for (const axis of ['y', 'x'] as const) {
+        const lo = (c: SplitComp) => (axis === 'y' ? c.y1 : c.x1);
+        const hi = (c: SplitComp) => (axis === 'y' ? c.y2 : c.x2);
+        const cLo = (c: SplitComp) => (axis === 'y' ? c.x1 : c.y1);
+        const cHi = (c: SplitComp) => (axis === 'y' ? c.x2 : c.y2);
+        const sorted = [...cs].sort((a, b) => lo(a) - lo(b));
+        const exts = sorted.map(c => hi(c) - lo(c)).sort((a, b) => a - b);
+        const thr = Math.max(SPLIT_GAP_FACTOR * sameBlockGap, SPLIT_GAP_RATIO * exts[Math.floor(exts.length / 2)]);
+        // cluster runs: gap measured from the running max, so words on one
+        // line / columns of vertical text (overlapping on the axis) never cut
+        type Group = { x1: number; y1: number; x2: number; y2: number };
+        const groups: Group[] = [];
+        for (const c of sorted) {
+            const g = groups[groups.length - 1];
+            const gap = g ? lo(c) - (axis === 'y' ? g.y2 : g.x2) : 0;
+            if (g && gap >= thr) groups.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 });
+            else if (g) {
+                g.x1 = Math.min(g.x1, c.x1); g.y1 = Math.min(g.y1, c.y1);
+                g.x2 = Math.max(g.x2, c.x2); g.y2 = Math.max(g.y2, c.y2);
+            } else {
+                groups.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 });
+            }
+        }
+        if (groups.length < 2) continue;
+        // Two runs sharing cross-axis space are one text block: a paragraph's
+        // lines share a span, and a partially-dropped mask invents fake gaps
+        // inside it (live: a bold last line 72px under its own block split off
+        // as "หา!?" while the block stayed put; the dropped-line case split a
+        // region whose middle line the mask missed). Only diagonal runs split —
+        // the overlapping-balloon pair is x-disjoint with a 25px margin.
+        for (;;) {
+            const k = groups.findIndex((g, i) => i + 1 < groups.length && Math.min(cHi(g), cHi(groups[i + 1])) > Math.max(cLo(g), cLo(groups[i + 1])));
+            if (k < 0) break;
+            const b = groups[k + 1];
+            groups[k] = {
+                x1: Math.min(groups[k].x1, b.x1), y1: Math.min(groups[k].y1, b.y1),
+                x2: Math.max(groups[k].x2, b.x2), y2: Math.max(groups[k].y2, b.y2),
+            };
+            groups.splice(k + 1, 1);
+        }
+        if (groups.length < 2) continue;
+        const gapBefore = (i: number) => i <= 0 || i >= groups.length
+            ? Infinity : lo(groups[i]) - (axis === 'y' ? groups[i - 1].y2 : groups[i - 1].x2);
+        return groups.map((g, i) => {
+            const pad = Math.min(SPLIT_PAD_CAP, Math.floor(Math.min(gapBefore(i), gapBefore(i + 1)) / 2));
+            return {
+                ...box,
+                x1: Math.max(box.x1, g.x1 - pad),
+                y1: Math.max(box.y1, g.y1 - pad),
+                x2: Math.min(box.x2, g.x2 + pad),
+                y2: Math.min(box.y2, g.y2 + pad),
+            };
+        });
+    }
+    return null;
 }
 
 // Region numbering order: the detector emits confidence order, so sort into

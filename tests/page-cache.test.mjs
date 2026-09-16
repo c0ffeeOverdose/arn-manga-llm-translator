@@ -552,7 +552,7 @@ test('fetchImageBlocked: redirect-era bypass vectors all blocked', () => {
   assert.equal(fetchImageBlocked('http://[::ffff:127.0.0.1]/x', 'http://[::ffff:127.0.0.1]/reader'), null);
 });
 
-const RESUME_FP = 'Thai|crops|baberu|rtl|0.35|0.2|1|0|0|tile2';
+const RESUME_FP = 'Thai|crops|baberu|rtl|0.35|0.2|1|0|0|tile3';
 function partialFixture(over = {}) {
   const raw = new Uint8Array(16); raw[5] = 255;
   const packed = packMask({ width: 4, height: 4, data: raw.buffer });

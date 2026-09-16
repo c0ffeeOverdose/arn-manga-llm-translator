@@ -361,6 +361,21 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         });
     // pass 1: collect components (count + mask-prob sum for the quality gate)
     type Comp = { x1: number; y1: number; x2: number; y2: number; count: number; probSum: number };
+    // Same text-likelihood definition everywhere a mask component must claim
+    // to be text: mean raw mask prob, corroborated by any low-confidence
+    // box-head prediction overlapping it (FREE — evidence: 8-page sweep — p4
+    // handwriting 4/4 survive, p7 window false-positives 0/12 pass, junk cut 70%).
+    const compBoxConf = (c: Comp): number => {
+        let boxConf = 0;
+        const cArea = (c.x2 - c.x1) * (c.y2 - c.y1);
+        for (let i = 0; i < lowBoxes.length; i++) {
+            const bx = lowBoxes[i];
+            const ix = Math.max(0, Math.min(bx[2], c.x2) - Math.max(bx[0], c.x1));
+            const iy = Math.max(0, Math.min(bx[3], c.y2) - Math.max(bx[1], c.y1));
+            if (ix * iy > 0.1 * cArea && lowConfs[i] > boxConf) boxConf = lowConfs[i];
+        }
+        return boxConf;
+    };
     const comps: Comp[] = [];
     const seen = new Uint8Array(packed.length);
     const stack: number[] = [];
@@ -380,6 +395,26 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
             if (y < h - 1 && packed[q + w] && !seen[q + w]) { seen[q + w] = 1; stack.push(q + w); }
         }
         if (maxX - minX + 1 >= 8 && maxY - minY + 1 >= 8) comps.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1, count, probSum });
+    }
+    // Split-input comps: raw text clusters snapshotted BEFORE pass 2 merges (a
+    // merged bbox would hide the gap between two balloons) and filtered by the
+    // same text-likelihood gate pass 3 uses. A box-head box can cover two
+    // balloons when their clusters sit close in the model's receptive field —
+    // these clusters are the evidence that splits it (splitMergedBoxes).
+    const textyComps: SplitComp[] = [];
+    for (const c of comps) {
+        const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
+        if (bw < 14 || bh < 14) continue;
+        // pass 3's fill upper bound (solid blocks like windows) is wrong for
+        // raw per-line clusters: bold lines (white-on-black dialogue, the "EM"
+        // in an overlapping pair) fill their tight bbox past 0.6 and would be
+        // dropped — a dropped middle line turns its bubble's real line spacing
+        // into a fake 60px+ gap and splits the bubble in half (live). Dust
+        // stays out via the floor, solid impostors via the prob/corroboration
+        // gate below.
+        if (c.count / (bw * bh) < 0.02) continue;
+        if (c.probSum / c.count < 0.75 && compBoxConf(c) < 0.20) continue;
+        textyComps.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 });
     }
     // pass 2: merge components whose boxes touch when padded (line spacing)
     const GAP = 28;
@@ -417,27 +452,18 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         if (bw < 14 || bh < 14 || fill < 0.02 || fill > 0.6) continue;
         if (bw * bh > 0.2 * pageArea) continue;
         if (overlap(c)) continue;
-        // FREE text-likelihood gate (evidence: 8-page sweep — p4 handwriting
-        // 4/4 survive, p7 window false-positives 0/12 pass, junk cut 70%):
-        // mean raw mask prob inside the component, corroborated by any
-        // low-confidence box-head prediction overlapping it
         const maskProb = c.probSum / c.count;
-        let boxConf = 0;
-        const cArea = bw * bh;
-        for (let i = 0; i < lowBoxes.length; i++) {
-            const bx = lowBoxes[i];
-            const ix = Math.max(0, Math.min(bx[2], c.x2) - Math.max(bx[0], c.x1));
-            const iy = Math.max(0, Math.min(bx[3], c.y2) - Math.max(bx[1], c.y1));
-            if (ix * iy > 0.1 * cArea && lowConfs[i] > boxConf) boxConf = lowConfs[i];
-        }
-        if (maskProb < 0.75 && boxConf < 0.20) continue;
+        if (maskProb < 0.75 && compBoxConf(c) < 0.20) continue; // text-likelihood gate — same definition as the split-input filter
         maskBoxes.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: 0.5 });
     }
 
     const initMs = sessionInitMs; // reported once — reset so later pages show steady-state 0
     sessionInitMs = 0;
     return {
-        boxes: [...outBoxes, ...maskBoxes],
+        // split AFTER the mask-only pass: a merged box's generous coverage must
+        // still suppress mask clusters it swallowed (pre-split list feeds the
+        // overlap gate), and only then does each balloon become its own box.
+        boxes: splitMergedBoxes([...outBoxes, ...maskBoxes], textyComps, GAP),
         dropped: nearMisses(lowBoxes, lowConfs, outBoxes, confThr, minSize, w, h),
         mask: { width: w, height: h, data: packed.buffer },
         inferMs,
@@ -515,7 +541,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // scripts in extension pages; only the language data is user-managed,
 // downloaded from CDN on demand and cached in IndexedDB via ocr-models.ts) ----
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL } from '../llm/ocr-models';
-import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, type Tile } from '../content/detection';
+import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, type SplitComp, type Tile } from '../content/detection';
 import { initDebug, isDebug } from '../debug';
 
 await initDebug();
