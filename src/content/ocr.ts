@@ -7,8 +7,35 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
-import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources } from './page-cache';
+import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, INPAINT_PATCH_GEN } from './page-cache';
 import { chosenOrientation, pageArea, type TextMask } from './render';
+import { erasePlan, computeAiPatches } from './inpaint';
+import { type InpaintPatch } from './detection';
+import { inpaintMode } from '../llm/pipeline-settings';
+
+// Warm-path AI cleanup: compute the cleanup patches for a freshly translated
+// page and hand them to the caller's cache entry — arrival then paints with
+// the model's output instead of paying it while the user waits (the headless
+// prefetch/sweep entries otherwise carry no patches). Gated on cache-on +
+// local mode; `noDownload` keeps a background warm from starting the 112MB
+// model download (the worker checks model DB / dev bundle only). Lo-priority
+// ORT — background work must never delay the viewed page. Failures return
+// null — arrival regenerates or falls back to fill.
+export async function warmPatches(
+    bitmap: ImageBitmap, det: DetectResult, outputs: RegionOutput[],
+): Promise<{ patches: InpaintPatch[]; patchesGen: number } | null> {
+    if (!pipeline.cacheEnabled || inpaintMode(pipeline) !== 'local') return null;
+    const plan = erasePlan(det, outputs);
+    if (!plan.boxesToErase.length) return null;
+    try {
+        const r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes, { lo: true, noDownload: true });
+        if (isDebug()) console.log('[mt] warm patches', JSON.stringify({ erase: plan.boxesToErase.length, patches: r?.patches.length ?? 0 }));
+        return r?.patches.length ? { patches: r.patches, patchesGen: INPAINT_PATCH_GEN } : null;
+    } catch (e) {
+        if (isDebug()) console.log('[mt] warm patches failed:', String((e as Error)?.message ?? e).slice(0, 140));
+        return null;
+    }
+}
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
@@ -61,7 +88,7 @@ async function baberuCrop(bitmap: ImageBitmap, box: DetBox): Promise<ArrayBuffer
 // still queues behind the in-flight decode step — the win is hiding PNG
 // crop/encode + message latency, not parallel inference (OCR ~40s → ~15s/page
 // measured). Per-box lock waits sum into lockWaitMs for the page-result dump.
-export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void): Promise<{ texts: string[]; lockWaitMs: number }> {
+export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void, opts?: { lo?: boolean }): Promise<{ texts: string[]; lockWaitMs: number }> {
     const results: string[] = [];
     let lockWaitMs = 0;
     let next = 0;
@@ -69,7 +96,7 @@ export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgr
         const i = next++;
         if (i >= boxes.length) return '';
         const png = await baberuCrop(bitmap, boxes[i]);
-        const { text, lockWaitMs: w } = await baberuOcr(png);
+        const { text, lockWaitMs: w } = await baberuOcr(png, { lo: opts?.lo });
         lockWaitMs += w;
         return text;
     };
@@ -368,7 +395,10 @@ export async function translateRegions(
     // needs caller corroboration (resumed checkpoint, or no cache to resume
     // from) so a dead call never inflates the counter; force callers drop the
     // entry first (fresh work counts fresh).
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean },
+    // afterOcr: OCR finished and the ORT queue just drained — lets the
+    // caller start infer-lock work (AI cleanup warm) while the LLM is in
+    // flight; on the critical path from here is only the network wait.
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void },
 ): Promise<TranslateOutcome> {
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
     // ponytail: region cap 150 — dense art pages can drown a single LLM call;
@@ -426,7 +456,7 @@ export async function translateRegions(
                 }
                 const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, (done, total) => {
                     if (done % 4 === 0 || done === total) onStatus(`OCR ${done}/${total}…`, 'ocr');
-                });
+                }, { lo: opts?.lo });
                 ocrLockWaitMs = lockWaitMs;
                 texts.forEach((t, i) => { regions[i].source = t; });
             } else {
@@ -486,6 +516,7 @@ export async function translateRegions(
             llmSeconds = Math.max(llmSeconds + 1, Math.round((Date.now() - tickBase) / 1000));
             onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
         }, 1000);
+        opts?.afterOcr?.();
         let resp: any;
         // transcripts seen on the interim message — if the RPC channel dies
         // mid-translate (service worker killed / reloaded), the fallback below

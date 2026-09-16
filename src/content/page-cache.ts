@@ -10,6 +10,14 @@
 import type { DetBox, DetectResult, MtOnStatus } from './detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
 
+// ORT inference-queue picker (worker-side, pure): first hi-priority task
+// (0), else the oldest — used by the iframe scheduler so background
+// lookahead/sweep inference yields to the page the user is waiting on.
+export function pickInferIndex(q: { prio: 0 | 1 }[]): number {
+    const i = q.findIndex(t => t.prio === 0);
+    return i < 0 ? 0 : i;
+}
+
 export const CACHE_MAX = 200;
 const HASH_SIZE = 48;
 

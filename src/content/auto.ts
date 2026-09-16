@@ -9,7 +9,7 @@ import { pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, sessionUs
 import { fetchBitmap, getPages, unscrambleTiles, episodeManifestSrcs, galleryManifestJson } from './page-io';
 import { resolveHeadlessDet } from './pipeline';
 import { sweepHas, sweepActive, bookAdd } from './sweep';
-import { translateRegions, type TranslateOutcome } from './ocr';
+import { translateRegions, warmPatches, type TranslateOutcome } from './ocr';
 import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto, keepaliveOpen } from './queue';
 import { cooldownMark, cooldownParked } from './page-cache';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, registerAutoTranslateFlag } from './status-ui';
@@ -126,7 +126,7 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         let o: TranslateOutcome;
         try {
             o = await translateRegions(bitmap, det, onStatus,
-                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled });
+                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled, lo: true });
         } finally {
             endKeepalive();
         }
@@ -134,6 +134,9 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         onStatus('Saving…', 'render'); // headless has no paint — the cache write is the last leg
         bookAdd(hash); // folded above (translateRegions) — arrival must not refold
         if (pipeline.cacheEnabled) {
+            // AI cleanup precompute: arrival paints with the model's patches
+            // instead of running it while the user waits (lo-priority ORT)
+            const ai = await warmPatches(bitmap, det, o.outputs);
             void cachePut({
                 key,
                 fp,
@@ -141,6 +144,7 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
                 boxes: det.boxes, panels: det.panels ?? [],
                 outputs: o.outputs, extras: o.extras, mentions: o.mentions,
                 mask: packMask(det.mask),
+                ...(ai ? { patches: ai.patches, patchesGen: ai.patchesGen } : null),
             }, pipeline.cacheMax);
         } else {
             void cacheDelete(key); // cache off: drop the resume checkpoint this headless job finished

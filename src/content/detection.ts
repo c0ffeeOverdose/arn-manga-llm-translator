@@ -595,7 +595,7 @@ export function withEncodeLock<T>(fn: () => Promise<T>): Promise<T> {
 export async function detect(
     img: ImageBitmap | HTMLImageElement,
     onStatus?: MtOnStatus,
-    thresholds?: { confThr?: number; minSize?: number; forceWasm?: boolean },
+    thresholds?: { confThr?: number; minSize?: number; forceWasm?: boolean; lo?: boolean },
     attempt = 0, // page can tear the iframe down on every mt:ready — cap rebuilds
 ): Promise<DetectResult> {
     // alive-check BEFORE the PNG encode: a hostile remove-loop must not earn
@@ -630,7 +630,7 @@ export async function detect(
         }, 180000);
     });
     cw.postMessage(
-        { type: 'mt:detect', id, png, confThr: thresholds?.confThr, minSize: thresholds?.minSize, forceWasm: thresholds?.forceWasm === true, token: workerToken },
+        { type: 'mt:detect', id, png, confThr: thresholds?.confThr, minSize: thresholds?.minSize, forceWasm: thresholds?.forceWasm === true, lo: thresholds?.lo === true, token: workerToken },
         '*', [png],
     );
     return p;
@@ -659,9 +659,9 @@ export async function baberuInstalled(): Promise<boolean> {
 
 // Baberu reads vertical text and dirty backgrounds natively — no rotation,
 // no binarization, tighter padding than Tesseract needs
-export async function baberuOcr(png: ArrayBuffer): Promise<{ text: string; lockWaitMs: number }> {
+export async function baberuOcr(png: ArrayBuffer, opts?: { lo?: boolean }): Promise<{ text: string; lockWaitMs: number }> {
     await ensureIframe();
-    const resp = await iframeRpc({ type: 'mt:baberu-ocr', png }, [png]) as { ok: boolean; text?: string; lockWait?: number; error?: string };
+    const resp = await iframeRpc({ type: 'mt:baberu-ocr', png, lo: opts?.lo === true }, [png]) as { ok: boolean; text?: string; lockWait?: number; error?: string };
     if (!resp?.ok) throw new Error(resp?.error ?? 'Baberu OCR failed');
     return { text: (resp.text ?? '').replace(/\s+/g, ' ').trim(), lockWaitMs: resp.lockWait ?? 0 };
 }
@@ -692,27 +692,30 @@ export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_TH
 // The worker windows the page per erase box and returns one PNG crop per box;
 // callers draw the crops in place of the built-in fill. Boxes are the ones
 // already expanded by eraseBox (mask-led walk), so clipped glyphs are covered.
-export interface InpaintPatch { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }
+export interface InpaintPatch { i?: number; x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }
 
 export async function inpaintPage(
     bitmap: ImageBitmap, boxes: { x1: number; y1: number; x2: number; y2: number }[],
     mask: { width: number; height: number; data: ArrayBuffer | Uint8Array }, padRatio = 0.5,
-): Promise<{ patches: InpaintPatch[]; windows: number; ms: number; lockWaitMs: number }> {
+    opts?: { lo?: boolean; noDownload?: boolean },
+): Promise<{ patches: InpaintPatch[]; windows: number; ms: number; lockWaitMs: number; encodeMs: number }> {
     await ensureIframe();
+    const tEnc = performance.now();
     const png = await withEncodeLock(async () => {
         const c = new OffscreenCanvas(bitmap.width, bitmap.height);
         c.getContext('2d')!.drawImage(bitmap, 0, 0);
         return (await c.convertToBlob({ type: 'image/png' })).arrayBuffer();
     });
+    const encodeMs = Math.round(performance.now() - tEnc);
     const resp = await iframeRpc({
         type: 'mt:inpaint', png,
         mask: new Uint8Array(mask.data).slice(), // copy: the caller still needs det.mask (fill path, debug view, cache)
         boxes: boxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 })),
-        padRatio,
+        padRatio, lo: opts?.lo === true, noDownload: opts?.noDownload === true,
     }, [png]) as { ok: boolean; patches?: InpaintPatch[]; windows?: number; ms?: number; lockWait?: number; error?: string };
     if (!resp?.ok) throw new Error(resp?.error ?? 'inpaint failed');
-    const patches = (resp.patches ?? []).map(p => ({ x1: +p.x1, y1: +p.y1, x2: +p.x2, y2: +p.y2, png: p.png as ArrayBuffer }));
-    return { patches, windows: resp.windows ?? patches.length, ms: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0 };
+    const patches = (resp.patches ?? []).map(p => ({ i: p.i, x1: +p.x1, y1: +p.y1, x2: +p.x2, y2: +p.y2, png: p.png as ArrayBuffer }));
+    return { patches, windows: resp.windows ?? patches.length, ms: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0, encodeMs };
 }
 
 // AI cleanup on the user's own endpoint (cloud engine): the client sends the

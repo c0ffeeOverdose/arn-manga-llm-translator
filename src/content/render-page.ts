@@ -9,7 +9,7 @@ import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep, type PaintPatch } from './pipeline';
-import { eraseBox, erasePlan, aiCleanupMask } from './inpaint';
+import { eraseBoxesAndMask, erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { inpaintMode } from '../llm/pipeline-settings';
 import { ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
@@ -53,6 +53,10 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     let annWCache: number, annHCache: number, rawLLM: string | undefined;
     let usage: { inTok?: number; outTok?: number; cachedInTok?: number } | undefined;
     let llmCalls: number | undefined, llmMs: number | undefined, ocrStatus: ('ok' | 'empty')[] | undefined, ocrMs: number | undefined, ocrLockWaitMs: number | undefined, badgeR: number | undefined;
+    // AI cleanup rides the LLM wait: the mask and the model windows depend only
+    // on detection, not on the translation, so compute patches for every box
+    // while the LLM is in flight and drop the 'keep' ones once outputs land.
+    let aiWarm: Promise<AiPatches | null> | null = null;
     if (prep.cached) {
         // persistent cache hit: identical image bytes + identical settings — the
         // LLM is not called. Outputs still fold into the book (fresh session).
@@ -68,7 +72,15 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     } else {
         onStatus('Translating…');
         ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, errorRetryAfterMs, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
-            { progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled }));
+            {
+                progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled,
+                // AI cleanup warm: starts the moment OCR ends (the infer lock
+                // is about to go idle) and runs through the LLM's network
+                // wait — a cold inpaint session uploads 112MB here too
+                afterOcr: inpaintMode(pipeline) === 'local'
+                    ? () => { aiWarm = computeAiPatches(bitmap, det, det.boxes, []).catch(() => null); }
+                    : undefined,
+            }));
 
         if (error) {
             const e = new Error(`LLM failed: ${error}`) as Error & { kind?: string; hint?: string; retryAfterMs?: number };
@@ -88,7 +100,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // a page must never fail here. Cloud mode rides the same shape (P6).
     const aiMode = inpaintMode(pipeline);
     let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
-    let aiGenerated = false, aiMs = 0, aiWindows = 0, aiError: string | undefined;
+    let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiError: string | undefined;
+    let aiMaskMs = 0, aiLockWaitMs = 0, aiEncodeMs = 0;
     if (aiMode !== 'fill') {
         const cached = prep.cached?.patches?.length && prep.cached.patchesGen === INPAINT_PATCH_GEN
             ? prep.cached.patches : null;
@@ -97,14 +110,29 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             const plan = erasePlan(det, outputs);
             if (plan.boxesToErase.length) {
                 onStatus('Cleaning text…', 'render');
-                const rawMask = new Uint8Array(det.mask.data);
-                const boxes = plan.boxesToErase.map(b => eraseBox(rawMask, bitmap.width, bitmap.height, b,
-                    Math.max(8, Math.round((b.x2 - b.x1) * 0.08), Math.round((b.y2 - b.y1) * 0.08))));
-                const mask = aiCleanupMask(det, boxes, plan.keepBoxes);
                 if (aiMode === 'local') {
+                    // Warm patches (computed while the LLM was in flight) cover
+                    // every box with no keep clearing — usable only when no keep
+                    // box sits inside an erase window, else the model would have
+                    // eaten glyphs that must stay. Patch `i` indexes det.boxes.
+                    const warm: AiPatches | null = aiWarm ? await (aiWarm as Promise<AiPatches | null>) : null;
+                    let r: AiPatches | null = null;
+                    if (warm) {
+                        const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
+                            a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+                        if (!plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
+                            const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
+                            const patches = warm.patches.filter(p => idx.has(p.i ?? -1));
+                            if (patches.length) { r = { ...warm, patches }; aiWarmUsed = true; }
+                        }
+                    }
                     try {
-                        const r = await inpaintPage(bitmap, boxes, mask);
-                        if (r.patches.length) { aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows; }
+                        if (!r) r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes);
+                        if (r) {
+                            aiPatches = r.patches; aiGenerated = true;
+                            aiMs = r.ms; aiWindows = r.windows; aiMaskMs = r.maskMs;
+                            aiLockWaitMs = r.lockWaitMs; aiEncodeMs = r.encodeMs;
+                        }
                     } catch (e) {
                         aiError = String((e as Error)?.message ?? e).slice(0, 120);
                         if (isDebug()) console.log('[mt] AI cleanup unavailable — using built-in fill:', aiError);
@@ -113,6 +141,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                     // cloud engine: same client-side mask rides along, so local and
                     // cloud erase the same pixels (the server falls back to its own
                     // CTD pass for old clients)
+                    const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes);
+                    aiMaskMs = maskMs;
                     const cfg = await cloudConfig();
                     if (cfg.endpoint && cfg.key) {
                         try {
@@ -167,6 +197,10 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             inpaint: {
                 mode: aiMode, ms: aiMs, windows: aiWindows, patches: aiPatches?.length ?? 0,
                 cached: !!aiPatches && !aiGenerated,
+                // breakdown: mask build (main thread) / PNG encode + transfer /
+                // worker ORT queue wait; warm = patches rode the LLM wait
+                ...(aiGenerated ? { maskMs: aiMaskMs, encodeMs: aiEncodeMs, lockWaitMs: aiLockWaitMs } : null),
+                ...(aiWarmUsed ? { warm: true } : null),
                 ...(aiError ? { error: aiError } : null),
             },
         } : null),

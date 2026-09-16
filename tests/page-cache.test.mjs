@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -807,4 +807,11 @@ test('withSources: fallback re-send carries the paid transcripts per region', ()
   // short list keeps the caller's own source; originals untouched
   assert.deepEqual(withSources([{ index: 1, source: 'kept' }], []).map(r => r.source), ['kept']);
   assert.deepEqual(regions.map(r => r.source), ['', '', '']);
+});
+
+test('pickInferIndex: hi-priority first, else oldest; never idle on lo-only queues', () => {
+  const q = [{ prio: 1 }, { prio: 1 }, { prio: 0 }, { prio: 1 }];
+  assert.equal(pickInferIndex(q), 2, 'the hi task jumps the background queue');
+  assert.equal(pickInferIndex([{ prio: 1 }, { prio: 1 }]), 0, 'lo-only queue runs the oldest');
+  assert.equal(pickInferIndex([{ prio: 1 }, { prio: 0 }, { prio: 0 }]), 1, 'ties keep FIFO');
 });

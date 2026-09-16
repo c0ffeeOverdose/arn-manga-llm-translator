@@ -3,6 +3,7 @@
 // The raw mask is conservative (anti-aliased glyph edges survive) — dilate it
 // a few px instead of color-distance heuristics (those eat bubble outlines).
 import type { DetBox, DetectResult } from './detection';
+import { inpaintPage, type InpaintPatch } from './detection';
 import { dropContainedBoxes } from './page-cache';
 import type { RegionOutput } from '../llm/core';
 
@@ -79,21 +80,83 @@ export function aiCleanupMask(
     const W = det.mask.width, H = det.mask.height;
     const raw = new Uint8Array(det.mask.data);
     const out = new Uint8Array(W * H);
+    const r = aiCleanupDilate(W, H);
+    // Dilation only changes pixels within `r` px of box ink, so bound the
+    // passes to the boxes' union bbox (grown by the radius): the full-page
+    // walk was ~5 passes of 3MP x 9 neighbours of pure main-thread work per
+    // page. A union covering most of the page keeps the full-page extent —
+    // same output either way, just no savings.
+    let ux1 = W, uy1 = H, ux2 = 0, uy2 = 0;
     for (const b of boxes) {
-        const x1 = Math.max(0, Math.floor(b.x1)), y1 = Math.max(0, Math.floor(b.y1));
-        const x2 = Math.min(W - 1, Math.ceil(b.x2)), y2 = Math.min(H - 1, Math.ceil(b.y2));
-        for (let y = y1; y <= y2; y++) {
+        ux1 = Math.min(ux1, Math.floor(b.x1)); uy1 = Math.min(uy1, Math.floor(b.y1));
+        ux2 = Math.max(ux2, Math.ceil(b.x2)); uy2 = Math.max(uy2, Math.ceil(b.y2));
+    }
+    let x1 = 0, y1 = 0, x2 = W - 1, y2 = H - 1;
+    if (boxes.length && (ux2 - ux1 + 1) * (uy2 - uy1 + 1) < W * H * 0.6) {
+        x1 = Math.max(0, ux1 - r - 1); y1 = Math.max(0, uy1 - r - 1);
+        x2 = Math.min(W - 1, ux2 + r + 1); y2 = Math.min(H - 1, uy2 + r + 1);
+    }
+    const bw = x2 - x1 + 1, bh = y2 - y1 + 1;
+    const sub = new Uint8Array(bw * bh);
+    for (const b of boxes) {
+        const bx1 = Math.max(x1, Math.floor(b.x1)), by1 = Math.max(y1, Math.floor(b.y1));
+        const bx2 = Math.min(x2, Math.ceil(b.x2)), by2 = Math.min(y2, Math.ceil(b.y2));
+        for (let y = by1; y <= by2; y++) {
             const row = y * W;
-            for (let x = x1; x <= x2; x++) if (raw[row + x] > 127) out[row + x] = 255;
+            for (let x = bx1; x <= bx2; x++) if (raw[row + x] > 127) sub[(y - y1) * bw + (x - x1)] = 255;
         }
     }
-    const grown = dilate(out, W, H, aiCleanupDilate(W, H));
+    const gro = dilate(sub, bw, bh, r);
+    for (let y = y1; y <= y2; y++) out.set(gro.subarray((y - y1) * bw, (y - y1) * bw + bw), y * W + x1);
     for (const k of keep) {
-        const x1 = Math.max(0, Math.floor(k.x1) - 2), y1 = Math.max(0, Math.floor(k.y1) - 2);
-        const x2 = Math.min(W - 1, Math.ceil(k.x2) + 2), y2 = Math.min(H - 1, Math.ceil(k.y2) + 2);
-        for (let y = y1; y <= y2; y++) grown.fill(0, y * W + x1, y * W + x2 + 1);
+        const kx1 = Math.max(0, Math.floor(k.x1) - 2), ky1 = Math.max(0, Math.floor(k.y1) - 2);
+        const kx2 = Math.min(W - 1, Math.ceil(k.x2) + 2), ky2 = Math.min(H - 1, Math.ceil(k.y2) + 2);
+        for (let y = ky1; y <= ky2; y++) out.fill(0, y * W + kx1, y * W + kx2 + 1);
     }
-    return { width: W, height: H, data: grown };
+    return { width: W, height: H, data: out };
+}
+
+// One AI-cleanup pass over the original page: erase boxes → mask → worker
+// windows → patch PNGs. Shared by the render path and the warm paths
+// (lookahead / chapter sweep precompute the patches into the cache entry, so
+// arrival paints without paying the model). Patch `i` indexes the `erase`
+// array, so a warm run over ALL boxes can be filtered to the erase set once
+// the LLM has marked the 'keep' regions.
+export interface AiPatches { patches: InpaintPatch[]; windows: number; ms: number; maskMs: number; lockWaitMs: number; encodeMs: number }
+// Erase boxes (mask-led walk per region) + the dilated cleanup mask — the
+// pixels the cleaner is allowed to touch. Shared by the local worker call and
+// the cloud endpoint (both erase the same pixels by design).
+export function eraseBoxesAndMask(
+    bitmap: { width: number; height: number },
+    det: DetectResult,
+    erase: { x1: number; y1: number; x2: number; y2: number }[],
+    keep: { x1: number; y1: number; x2: number; y2: number }[],
+): { boxes: { x1: number; y1: number; x2: number; y2: number }[]; mask: { width: number; height: number; data: Uint8Array }; maskMs: number } {
+    const t0 = performance.now();
+    const rawMask = new Uint8Array(det.mask.data);
+    const boxes = erase.map(b => eraseBox(rawMask, bitmap.width, bitmap.height, b,
+        Math.max(8, Math.round((b.x2 - b.x1) * 0.08), Math.round((b.y2 - b.y1) * 0.08))));
+    const mask = aiCleanupMask(det, boxes, keep);
+    return { boxes, mask, maskMs: Math.round(performance.now() - t0) };
+}
+
+// Throws on model/worker failure — callers fall back to the built-in fill
+// (render) or skip (warm). `noDownload`: availability comes from the model
+// DB / dev bundle only — a background warm must not start a surprise 112MB
+// download (the worker enforces it; a content-side IDB peek cannot see the
+// extension-origin model DB).
+export async function computeAiPatches(
+    bitmap: ImageBitmap,
+    det: DetectResult,
+    erase: { x1: number; y1: number; x2: number; y2: number }[],
+    keep: { x1: number; y1: number; x2: number; y2: number }[],
+    opts?: { lo?: boolean; noDownload?: boolean },
+): Promise<AiPatches | null> {
+    if (!erase.length) return null;
+    const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, erase, keep);
+    const r = await inpaintPage(bitmap, boxes, mask, 0.5, { lo: opts?.lo, noDownload: opts?.noDownload });
+    if (!r.patches.length) return null;
+    return { patches: r.patches, windows: r.windows, ms: r.ms, maskMs, lockWaitMs: r.lockWaitMs, encodeMs: r.encodeMs };
 }
 
 // Page pixel -> its index inside a cleanup window at page resolution.

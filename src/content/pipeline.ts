@@ -49,7 +49,7 @@ export async function resolveHeadlessDet(
             return { det: detFromPartial(hit, bitmap.width, bitmap.height)!, resumed: true };
         }
     }
-    const det = await detectPage(bitmap, onStatus);
+    const det = await detectPage(bitmap, onStatus, { lo: true }); // lookahead/sweep headless — background
     await orderDetection(det, bitmap);
     if (det.boxes.length) {
         void cachePut(partialEntry(key, fp, det, bitmap.width, bitmap.height), pipeline.cacheMax);
@@ -59,7 +59,7 @@ export async function resolveHeadlessDet(
 
 // Detection for one bitmap (local or cloud), no ordering — shared by the
 // solo path (preparePage) and the seam path (stitched bitmap, same call).
-export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus): Promise<DetectResult> {
+export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts?: { lo?: boolean }): Promise<DetectResult> {
     // cloud engine: one POST returns boxes+texts. No silent fallback — a cloud
     // failure is an error (cloud-only users run nothing on-device), and cloud
     // mode without endpoint/key is a config error, not a cue to go local.
@@ -86,7 +86,7 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus): Pro
             );
         }
     }
-    return detect(bitmap, onStatus, { confThr: pipeline.detConf, minSize: pipeline.detMinSize, forceWasm: pipeline.detEp === 'wasm' });
+    return detect(bitmap, onStatus, { confThr: pipeline.detConf, minSize: pipeline.detMinSize, forceWasm: pipeline.detEp === 'wasm', lo: opts?.lo === true });
 }
 
 // Box ordering for one detection (panel-guided, strip-banding, or cloud
@@ -239,7 +239,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
             if (w && samePagePath(w.key, refKey(ref)) && warmingFresh(w.ts)) onStatus('Warming was interrupted — restarting…', 'read');
         }
     }
-    const det = await detectPage(bitmap, onStatus);
+    const det = await detectPage(bitmap, onStatus, { lo: fromSweep });
     await orderDetection(det, bitmap);
     // detect checkpoint: a page-turn kills this document mid-job — the next
     // load resumes from this entry (same key the full entry will overwrite).

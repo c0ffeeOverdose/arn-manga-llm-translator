@@ -31,10 +31,10 @@ import { fetchBitmap, getPages, refKey, unscrambleTiles, episodeManifestSrcs, ga
 import { renderPage } from './render-page';
 import { applyOverlays } from './overlays';
 import { resolveHeadlessDet, preparePage } from './pipeline';
-import { translateRegions, type TranslateOutcome } from './ocr';
+import { translateRegions, warmPatches, type TranslateOutcome } from './ocr';
 import type { Prep } from './pipeline';
 import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, sweepPoolSize, abortLookahead } from './page-cache';
-import { cloudConfig, cloudWarm, type DetectResult, type MtOnStatus } from './detection';
+import { cloudConfig, cloudWarm, type DetectResult, type InpaintPatch, type MtOnStatus } from './detection';
 import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued, autoHalted, resumeAuto, keepaliveOpen } from './queue';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn } from './status-ui';
 import { isDebug } from '../debug';
@@ -54,7 +54,7 @@ interface SweepItem {
 }
 interface SweepRun { cancel: boolean; dead: boolean; failed: boolean; done: number; total: number; errors: number; skipped: number; firstErr: string; chapter: string }
 type Commit =
-    | { i: number; url: string; hash: string; w: number; h: number; det: DetectResult; o: TranslateOutcome; ref?: PageRef }
+    | { i: number; url: string; hash: string; w: number; h: number; det: DetectResult; o: TranslateOutcome; ref?: PageRef; ai?: { patches: InpaintPatch[]; patchesGen: number } | null }
     | { i: number; url: string; hash?: string; cached: true; ref?: PageRef }
     | { i: number; url: string; skip: true } // blank canvas (translating it poisons) — head advances, counts neither done nor error
     | { i: number; url: string; error: true; msg?: string };
@@ -416,13 +416,14 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
             let o: TranslateOutcome;
             try {
                 // fold:false — the commit folds in chapter order (rebase), never here
-                o = await translateRegions(bitmap, r.det, st, { fold: false, progressKey: job.url, continued: r.resumed || !pipeline.cacheEnabled });
+                o = await translateRegions(bitmap, r.det, st, { fold: false, progressKey: job.url, continued: r.resumed || !pipeline.cacheEnabled, lo: true });
             } finally {
                 translating--;
             }
             if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
-            await paintVisibleNow(job, hash, r.det, o, bitmap);
-            return { i: job.i, url: job.url, hash, w, h, det: r.det, o };
+            const ai = await warmPatches(bitmap, r.det, o.outputs);
+            await paintVisibleNow(job, hash, r.det, o, bitmap, undefined, ai);
+            return { i: job.i, url: job.url, hash, w, h, det: r.det, o, ai };
         } finally {
             try { bitmap.close(); } catch { /* already closed */ }
         }
@@ -456,14 +457,20 @@ async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter
         translating++;
         let o: TranslateOutcome;
         try {
-            o = await translateRegions(prep.bitmap, prep.det, st, { fold: false, progressKey: job.url, continued: !!prep.resumed || !pipeline.cacheEnabled });
+            o = await translateRegions(prep.bitmap, prep.det, st, { fold: false, progressKey: job.url, continued: !!prep.resumed || !pipeline.cacheEnabled, lo: true });
         } finally {
             translating--;
-            try { prep.bitmap.close(); } catch { /* already closed */ }
         }
-        if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
-        await paintVisibleNow(job, prep.hash, prep.det, o, prep.bitmap, prep.origBytes);
-        return { i: job.i, url: job.url, hash: prep.hash, w, h, det: prep.det, o, ref: job.ref };
+        if (o.error) {
+            try { prep.bitmap.close(); } catch { /* already closed */ }
+            throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
+        }
+        // warm AI cleanup + early paint need the original pixels: keep the
+        // bitmap alive until both resolve (paintVisibleNow's contract)
+        const ai = await warmPatches(prep.bitmap, prep.det, o.outputs);
+        await paintVisibleNow(job, prep.hash, prep.det, o, prep.bitmap, prep.origBytes, ai);
+        try { prep.bitmap.close(); } catch { /* already closed */ }
+        return { i: job.i, url: job.url, hash: prep.hash, w, h, det: prep.det, o, ref: job.ref, ai };
     } catch (e) {
         cooldownMark(failMarks, job.url, Date.now());
         const msg = (e as Error)?.message ?? String(e);
@@ -507,6 +514,7 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
             w: c.w, h: c.h,
             boxes: c.det.boxes, panels: c.det.panels ?? [],
             outputs: c.o.outputs, extras: c.o.extras, mentions: c.o.mentions,
+            ...(c.ai ? { patches: c.ai.patches, patchesGen: c.ai.patchesGen } : null),
             mask: packMask(c.det.mask),
         }, pipeline.cacheMax);
     } else {
@@ -531,14 +539,18 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
 // Caller keeps the bitmap alive until this resolves (the worker awaits it
 // before its finally-close).
 let earlyPaintChain: Promise<unknown> = Promise.resolve();
-async function paintVisibleNow(job: SweepItem, hash: string, det: DetectResult, o: TranslateOutcome, bitmap: ImageBitmap, origBytes?: ArrayBuffer): Promise<void> {
+async function paintVisibleNow(job: SweepItem, hash: string, det: DetectResult, o: TranslateOutcome, bitmap: ImageBitmap, origBytes?: ArrayBuffer,
+    ai?: { patches: InpaintPatch[]; patchesGen: number } | null): Promise<void> {
     const ref = await resolvePaintRef(job.url, hash, job.ref);
     if (!ref || stateFor(ref) || viewportOverlap(ref) <= 0) return;
     const chain = earlyPaintChain.then(async () => {
         if (stateFor(ref)) return;
         const prep: Prep = {
             srcUrl: refKey(ref), bitmap, det, hash, origBytes,
-            cached: { outputs: o.outputs, extras: o.extras, mentions: o.mentions },
+            cached: {
+                outputs: o.outputs, extras: o.extras, mentions: o.mentions,
+                ...(ai ? { patches: ai.patches, patchesGen: ai.patchesGen } : null),
+            },
         };
         await renderPage(ref, prep, () => {}, false, { paintOnly: true });
         // the paint only reaches the element once shownSrc says "translated" —

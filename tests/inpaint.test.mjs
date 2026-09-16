@@ -137,3 +137,37 @@ test('windowIndex: regression — side > 512 windows must not sample 512-space',
   assert.equal(windowIndex(599, -20, 600), 600 - 1, 'origin past the page edge still clamps');
 });
 
+
+// The bounded cleanup-mask dilate must be pixel-identical to the old full-page
+// walk: the passes only ever touch pixels within `r` px of box ink, so the
+// union bbox grown by r is a lossless window.
+test('aiCleanupMask: bounded dilate matches the full-page reference', () => {
+  const W = 220, H = 160;
+  const fill = [[4, 4], [5, 4], [6, 4], [4, 5], [60, 20], [61, 20], [62, 20], [200, 150], [201, 150], [150, 80], [151, 80], [152, 80]];
+  const m = mask(W, H, fill);
+  const det = { mask: { width: W, height: H, data: m.buffer } };
+  const boxes = [{ x1: 55, y1: 18, x2: 70, y2: 26 }, { x1: 145, y1: 76, x2: 158, y2: 86 }];
+  const keep = [{ x1: 148, y1: 78, x2: 156, y2: 84 }];
+  const got = aiCleanupMask(det, boxes, keep);
+  const r = aiCleanupDilate(W, H);
+  let cur = new Uint8Array(W * H);
+  for (const b of boxes) {
+    for (let y = b.y1; y <= b.y2; y++) for (let x = b.x1; x <= b.x2; x++) if (m[y * W + x] > 127) cur[y * W + x] = 255;
+  }
+  for (let p = 0; p < r; p++) {
+    const next = new Uint8Array(cur.length);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      let on = false;
+      for (let dy = -1; dy <= 1 && !on; dy++) for (let dx = -1; dx <= 1 && !on; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < W && ny < H && cur[ny * W + nx]) on = true;
+      }
+      if (on) next[y * W + x] = 255;
+    }
+    cur = next;
+  }
+  for (const k of keep) for (let y = k.y1 - 2; y <= k.y2 + 2; y++) cur.fill(0, y * W + (k.x1 - 2), y * W + k.x2 + 3);
+  assert.deepEqual(got.data, cur, 'bounded window dilate is lossless');
+  // edge glyphs (outside every box) must not appear — the mask is box-scoped
+  assert.equal(got.data[4 * W + 4], 0);
+});

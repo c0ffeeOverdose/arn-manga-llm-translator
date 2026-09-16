@@ -54,7 +54,7 @@ async function openModelsDb(): Promise<IDBDatabase> {
 // on fresh bytes means a corrupt download (evict so the next retry re-fetches
 // instead of re-reading poison); on cached bytes it means an environment
 // problem (keep the cache, retrying must not re-download 40MB).
-async function loadModelFile(key: string, bundlePath: string, hfFile: string, label: string): Promise<{ buf: ArrayBuffer; fresh: boolean }> {
+async function loadModelFile(key: string, bundlePath: string, hfFile: string, label: string, noDownload = false): Promise<{ buf: ArrayBuffer; fresh: boolean }> {
     const db = await openModelsDb();
     const cached = await new Promise<ArrayBuffer | undefined>(res => {
         const q = idbStore(db, 'readonly').get(key);
@@ -70,6 +70,10 @@ async function loadModelFile(key: string, bundlePath: string, hfFile: string, la
         buf = await dl(chrome.runtime.getURL(bundlePath));
     } catch { /* production dist ships no models — fall through to HF */ }
     if (!buf) {
+        // warm/background callers must never start a surprise download: the
+        // dev bundle above covers local testing, release users get the model
+        // from the options download (or their first real page, which may)
+        if (noDownload) throw new Error(`${label} not downloaded yet`);
         if (isDebug()) console.log(`[mt] downloading ${label} (once per install)…`);
         try {
             buf = await dl(DET_URL(hfFile));
@@ -171,18 +175,33 @@ function nms(boxes: number[][], confs: number[]): number[] {
 // (live-proven twice: wasm-create vs wasm-run, then gpu-vision vs
 // gpu-prefill on separate chains). ONE chain for everything ORT. The
 // pipeline overlap lives on the CPU side (crops, preprocess, LLM calls).
-const chains = new Map<string, Promise<void>>();
+//
+// Scheduling: FIFO with a background lane — RPCs tagged prio 1 (lookahead /
+// chapter sweep, which now precompute AI cleanup too) yield to the page the
+// user is waiting on (prio 0), which would otherwise queue behind a
+// multi-second background OCR. A running task is never preempted; ties keep
+// FIFO.
+type InferPrio = 0 | 1;
+interface InferTask { fn: () => Promise<unknown>; prio: InferPrio; t0: number; ok: (v: unknown) => void; fail: (e: unknown) => void }
+const inferQ: InferTask[] = [];
+let inferBusy = false;
 // lock contention meter: cumulative ms ORT runs spent queued on the infer
 // lock behind other models' runs. Handlers snapshot per-RPC deltas into
 // their replies — the page-result dump shows whether detect/panel/ocr
 // actually blocked on each other (0 = the lock was free).
 let lockWaitMs = 0;
-function withInferLock<T>(fn: () => Promise<T>, chainId = 'ort'): Promise<T> {
-    const t0 = performance.now();
-    const chain = chains.get(chainId) ?? Promise.resolve();
-    const run = chain.then(async () => { lockWaitMs += performance.now() - t0; return fn(); });
-    chains.set(chainId, run.then(() => {}, () => {}));
-    return run;
+function pumpInfer(): void {
+    if (inferBusy || !inferQ.length) return;
+    const task = inferQ.splice(pickInferIndex(inferQ), 1)[0];
+    inferBusy = true;
+    lockWaitMs += performance.now() - task.t0;
+    task.fn().then(task.ok, task.fail).finally(() => { inferBusy = false; pumpInfer(); });
+}
+function withInferLock<T>(fn: () => Promise<T>, prio: InferPrio = 0): Promise<T> {
+    return new Promise<T>((ok, fail) => {
+        inferQ.push({ fn: fn as () => Promise<unknown>, prio, t0: performance.now(), ok: v => ok(v as T), fail });
+        pumpInfer();
+    });
 }
 async function metered<T>(fn: () => Promise<T>): Promise<{ v: T; lockWait: number }> {
     const w0 = lockWaitMs;
@@ -194,7 +213,7 @@ async function metered<T>(fn: () => Promise<T>): Promise<{ v: T; lockWait: numbe
 // predictions in REGION coords + the raw text-probability mask at region size.
 // Extracted verbatim from the old monolithic runDetect — same pixels in,
 // same numbers out; tiling just calls it N times.
-async function inferOnce(bmp: ImageBitmap, confThr: number): Promise<{  boxes: number[][]; confs: number[]; lowBoxes: number[][]; lowConfs: number[];
+async function inferOnce(bmp: ImageBitmap, confThr: number, prio: InferPrio = 0): Promise<{  boxes: number[][]; confs: number[]; lowBoxes: number[][]; lowConfs: number[];
     prob: Float32Array; inferMs: number;
 }> {
     const w = bmp.width, h = bmp.height;
@@ -220,7 +239,7 @@ async function inferOnce(bmp: ImageBitmap, confThr: number): Promise<{  boxes: n
     // with (the evict's release waits on the infer lock this run holds)
     const sess = session;
     if (!sess) throw new Error('CTD session unavailable');
-    const res: any = await withInferLock(() => sess.run({ image: new ort.Tensor('float32', x, [1, 3, INPUT, INPUT]) }));
+    const res: any = await withInferLock(() => sess.run({ image: new ort.Tensor('float32', x, [1, 3, INPUT, INPUT]) }), prio);
     const inferMs = performance.now() - t0;
 
     const raw = res.bbox_preds.data as Float32Array;
@@ -264,7 +283,7 @@ async function inferOnce(bmp: ImageBitmap, confThr: number): Promise<{  boxes: n
     return { boxes, confs, lowBoxes, lowConfs, prob, inferMs };
 }
 
-async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, forceWasm = false): Promise<unknown> {
+async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, forceWasm = false, prio: InferPrio = 0): Promise<unknown> {
     await ensureSession(forceWasm);
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     const w = bitmap.width, h = bitmap.height;
@@ -551,6 +570,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
 import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, type SplitComp, type Tile } from '../content/detection';
 import { windowIndex } from '../content/inpaint';
+import { pickInferIndex } from '../content/page-cache';
 import { initDebug, isDebug } from '../debug';
 
 await initDebug();
@@ -656,7 +676,7 @@ async function ensureBaberu(): Promise<void> {
 }
 
 // one bubble crop → text. Ported 1:1 from BaberuOnnxOCR.__call__
-async function runBaberu(png: ArrayBuffer): Promise<string> {
+async function runBaberu(png: ArrayBuffer, prio: InferPrio = 0): Promise<string> {
     await ensureBaberu();
     const v = baberuVocab!;
     const { vis, pre, stp } = baberuSessions!;
@@ -675,7 +695,7 @@ async function runBaberu(png: ArrayBuffer): Promise<string> {
         x[i + 2 * N] = (d[i * 4 + 2] / 255 - BABERU_MEAN[2]) / BABERU_STD[2];
     }
     const t0 = performance.now();
-    const visOut = await withInferLock(async () => vis.run({ pixel_values: new ort.Tensor('float32', x, [1, 3, 224, 224]) })) as Record<string, any>;
+    const visOut = await withInferLock(async () => vis.run({ pixel_values: new ort.Tensor('float32', x, [1, 3, 224, 224]) }), prio) as Record<string, any>;
     const rawEmbeds = visOut.vision_embeds;
     // GPU→CPU bridge: when vision ran on webgpu the tensor is gpu-resident;
     // feeding it to the wasm prefill produced all-NaN logits (empty OCR for
@@ -693,7 +713,7 @@ async function runBaberu(png: ArrayBuffer): Promise<string> {
     const preOut = await withInferLock(async () => pre.run({
         vision_embeds: embeds,
         input_ids: new ort.Tensor('int64', BigInt64Array.from([BigInt(v.bos)]), [1, 1]),
-    })) as Record<string, any>;
+    }), prio) as Record<string, any>;
     // outputs: logits [1,seq,V] (use last position) + present_k/v caches
     let logits = baberuLastLogits(preOut);
     let present = BABERU_PRESENT_OUT.map(n => preOut[n]);
@@ -727,7 +747,7 @@ async function runBaberu(png: ArrayBuffer): Promise<string> {
             position_ids: new ort.Tensor('int64', BigInt64Array.from([BigInt(pos)]), [1, 1]),
         };
         BABERU_PAST_IN.forEach((nm, i) => { feed[nm] = present[i]; });
-        const out = await withInferLock(async () => stp.run(feed)) as Record<string, any>;
+        const out = await withInferLock(async () => stp.run(feed), prio) as Record<string, any>;
         logits = baberuLastLogits(out);
         present = BABERU_PRESENT_OUT.map(n => out[n]);
         pos++;
@@ -796,12 +816,12 @@ let inpaintSession: any = null;
 let inpaintCreating: Promise<void> | null = null;
 let inpaintNoGpu = false;
 
-async function ensureInpaintSession(): Promise<void> {
+async function ensureInpaintSession(noDownload = false): Promise<void> {
     if (inpaintSession) return;
     if (inpaintNoGpu) throw new Error('inpainting needs WebGPU');
     if (!inpaintCreating) {
         inpaintCreating = (async () => {
-            const { buf } = await loadModelFile(INPAINT_KEY, `models/${INPAINT_FILE}`, INPAINT_FILE, 'inpaint model (~112MB)');
+            const { buf } = await loadModelFile(INPAINT_KEY, `models/${INPAINT_FILE}`, INPAINT_FILE, 'inpaint model (~112MB)', noDownload);
             try {
                 inpaintSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }));
             } catch (e) {
@@ -816,11 +836,11 @@ async function ensureInpaintSession(): Promise<void> {
     await inpaintCreating;
 }
 
-async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[], padRatio: number): Promise<{
-    patches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
+async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[], padRatio: number, prio: InferPrio = 0, noDownload = false): Promise<{
+    patches: { i: number; x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
     windows: number; inferMs: number;
 }> {
-    await ensureInpaintSession();
+    await ensureInpaintSession(noDownload);
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     const W = bitmap.width, H = bitmap.height;
     const src = new OffscreenCanvas(W, H);
@@ -918,10 +938,11 @@ async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[
     }
     // patches: one crop per box (+4px bleed so the caller can draw them under
     // the translated text without seams) — same shape the cache stores
-    const patches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] = [];
+    const patches: { i: number; x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] = [];
     const pc = new OffscreenCanvas(1, 1);
     const pctx = pc.getContext('2d', { willReadFrequently: true })!;
-    for (const b of boxes) {
+    for (let bi = 0; bi < boxes.length; bi++) {
+        const b = boxes[bi];
         const px1 = Math.max(0, Math.floor(b.x1) - 4), py1 = Math.max(0, Math.floor(b.y1) - 4);
         const px2 = Math.min(W, Math.ceil(b.x2) + 4), py2 = Math.min(H, Math.ceil(b.y2) + 4);
         if (px2 <= px1 || py2 <= py1) continue;
@@ -929,7 +950,7 @@ async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[
         pc.height = py2 - py1;
         pctx.putImageData(out, -px1, -py1);
         const blob = await pc.convertToBlob({ type: 'image/png' });
-        patches.push({ x1: px1, y1: py1, x2: px2, y2: py2, png: await blob.arrayBuffer() });
+        patches.push({ i: bi, x1: px1, y1: py1, x2: px2, y2: py2, png: await blob.arrayBuffer() });
     }
     return { patches, windows, inferMs };
 }
@@ -958,13 +979,14 @@ window.addEventListener('message', async (ev: MessageEvent) => {
         && msg?.type !== 'mt:ocr-download' && msg?.type !== 'mt:ocr-delete' && msg?.type !== 'mt:ocr-list'
         && msg?.type !== 'mt:panels' && msg?.type !== 'mt:baberu-ocr' && msg?.type !== 'mt:baberu-status'
         && msg?.type !== 'mt:inpaint') return;
+    const prio: InferPrio = msg.lo === true ? 1 : 0; // background warm work yields to the viewed page
     try {
         if (msg.type === 'mt:ocr-status' || msg.type === 'mt:ocr-list') {
             reply({ ok: true, installed: await ocrInstalled() });
         } else if (msg.type === 'mt:baberu-status') {
             reply({ ok: true, installed: await baberuInstalled() });
         } else if (msg.type === 'mt:baberu-ocr') {
-            const { v: text, lockWait } = await metered(() => runBaberu(msg.png));
+            const { v: text, lockWait } = await metered(() => runBaberu(msg.png, prio));
             reply({ ok: true, text, ms: Math.round(baberuMs), lockWait });
         } else if (msg.type === 'mt:ocr-download') {
             await ocrDownload(msg.lang); // download + cache (throws on failure)
@@ -981,12 +1003,12 @@ window.addEventListener('message', async (ev: MessageEvent) => {
         } else if (msg.type === 'mt:inpaint') {
             const { v: r, lockWait } = await metered(() => runInpaint(
                 msg.png, new Uint8Array(msg.mask), msg.boxes ?? [],
-                typeof msg.padRatio === 'number' ? msg.padRatio : 0.5,
+                typeof msg.padRatio === 'number' ? msg.padRatio : 0.5, prio, msg.noDownload === true,
             ));
             reply({ ok: true, patches: r.patches, windows: r.windows, ms: Math.round(r.inferMs), lockWait },
                 r.patches.map(p => p.png));
         } else {
-            const { v: result, lockWait } = await metered(() => runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true));
+            const { v: result, lockWait } = await metered(() => runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true, prio));
             (result as any).lockWaitMs = lockWait;
             (ev.source as Window | null)?.postMessage(
                 { type: 'mt:detect-result', id: msg.id, ok: true, result },
