@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 24;
+export const RENDER_GEN = 25;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -1087,7 +1087,14 @@ export function chosenOrientation(
     if (!boxIsVertical(box)) return false;
     if (renderTuning.preferHorizontal) {
         const probe = pageArea(ctx, img, box, true, mask);
-        if (probe && horizontalFits(ctx, text, probe)) return false;
+        // …but only while the bubble is not much wider than the text block: a
+        // thin column inside a wide oval is a vertical source line (the JP
+        // glyphs run down it), and laying the Thai horizontally across the
+        // bubble reads wrong and sticks out of its own box (live: thin columns
+        // 21-47px wide inside ~75-100px bubbles — 3/4 on the user's page).
+        // Region 2-style blocks (wide caption/paragraph in a same-sized
+        // bubble, ratio ~1.1) keep the horizontal preference.
+        if (probe && probe.w <= (box.x2 - box.x1) * 1.5 && horizontalFits(ctx, text, probe)) return false;
     }
     return true;
 }
