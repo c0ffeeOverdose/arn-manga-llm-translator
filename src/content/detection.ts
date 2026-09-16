@@ -184,7 +184,14 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
         return { at: (hi(groups[i]) + lo(g)) / 2, slack: Math.min(SPLIT_CLIP_SLACK, Math.max(4, Math.floor(gap / 2))) };
     });
     return groups.map((g, i) => {
-        const pad = Math.min(SPLIT_PAD_CAP, Math.floor(Math.min(gapBefore(i), gapBefore(i + 1)) / 2));
+        // Pad faces only the CUT (the sibling side): half the gap we split in,
+        // capped. Padding the cross axis too dragged the box to the parent's
+        // edge — asymmetric on whichever side the clamp bit (live: a merged
+        // balloon pair, upper frame 456..542 for a 486..539 text block, lower
+        // 438..525 for 441..495; the frames looked shifted left/right).
+        const padTo = (gap: number) => gap > 0 && Number.isFinite(gap) ? Math.min(SPLIT_PAD_CAP, Math.floor(gap / 2)) : 0;
+        const padBefore = padTo(gapBefore(i));
+        const padAfter = padTo(gapBefore(i + 1));
         // Child box = the group's text clusters, seeded by the strict comps so
         // a texture patch the box head corroborated stays out (page 4: a
         // screentone comp dragged the caption box 109px over the hatch), but
@@ -227,10 +234,9 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
         }
         return {
             ...box,
-            x1: Math.max(box.x1, ext.x1 - pad),
-            y1: Math.max(box.y1, ext.y1 - pad),
-            x2: Math.min(box.x2, ext.x2 + pad),
-            y2: Math.min(box.y2, ext.y2 + pad),
+            ...(axis === 'y'
+                ? { x1: Math.max(box.x1, ext.x1), y1: Math.max(box.y1, ext.y1 - padBefore), x2: Math.min(box.x2, ext.x2), y2: Math.min(box.y2, ext.y2 + padAfter) }
+                : { x1: Math.max(box.x1, ext.x1 - padBefore), y1: Math.max(box.y1, ext.y1), x2: Math.min(box.x2, ext.x2 + padAfter), y2: Math.min(box.y2, ext.y2) }),
             clip,
         };
     });

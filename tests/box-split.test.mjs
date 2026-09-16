@@ -29,8 +29,8 @@ test('live two-balloon box splits at the cluster gap, children clamped to parent
     box(1074, 777, 1148, 826), box(1161, 783, 1266, 827),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
-    { x1: 1279, y1: 362, x2: 1413, y2: 535, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 547 } }, // 1312-33 .. 502+33
-    { x1: 1061, y1: 535, x2: 1320, y2: 825, conf: 0.92, clip: { x1: 1061, y1: 523, x2: 1413, y2: 825 } }, // 1062-33 .. 826+33
+    { x1: 1312, y1: 376, x2: 1408, y2: 535, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 547 } }, // x tight to the comps, y padded 33 toward the cut
+    { x1: 1062, y1: 535, x2: 1287, y2: 825, conf: 0.92, clip: { x1: 1061, y1: 523, x2: 1413, y2: 825 } },
   ]);
 });
 
@@ -73,8 +73,8 @@ test('median cluster extent raises the cut threshold on large scales', () => {
   assert.equal(splitMergedBoxes([b], near, GAP).length, 1);
   const far = [box(0, 0, 100, 100), box(140, 240, 200, 340)];  // gap 140 ≥ 80
   assert.deepEqual(splitMergedBoxes([b], far, GAP), [
-    { x1: 0, y1: 0, x2: 140, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 200, y2: 182 } },   // pad 70→cap 40
-    { x1: 100, y1: 200, x2: 200, y2: 380, conf: 0.9, clip: { x1: 0, y1: 158, x2: 200, y2: 400 } },
+    { x1: 0, y1: 0, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 200, y2: 182 } },   // pad 70→cap 40 toward the cut only
+    { x1: 140, y1: 200, x2: 200, y2: 340, conf: 0.9, clip: { x1: 0, y1: 158, x2: 200, y2: 400 } },
   ]);
 });
 
@@ -82,8 +82,8 @@ test('vertical text columns split along x when the y scan finds no gap', () => {
   const b = box(0, 0, 200, 300);
   const comps = [box(20, 20, 60, 140), box(140, 180, 180, 300)];
   assert.deepEqual(splitMergedBoxes([b], comps, GAP), [
-    { x1: 0, y1: 0, x2: 100, y2: 180, conf: 0.9, clip: { x1: 0, y1: 0, x2: 112, y2: 300 } },
-    { x1: 100, y1: 140, x2: 200, y2: 300, conf: 0.9, clip: { x1: 88, y1: 0, x2: 200, y2: 300 } },
+    { x1: 20, y1: 20, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 112, y2: 300 } },
+    { x1: 100, y1: 180, x2: 180, y2: 300, conf: 0.9, clip: { x1: 88, y1: 0, x2: 200, y2: 300 } },
   ]);
 });
 
@@ -91,9 +91,9 @@ test('three diagonal clusters cut twice', () => {
   const b = box(0, 0, 270, 240);
   const comps = [box(10, 0, 90, 40), box(100, 100, 180, 140), box(190, 200, 270, 240)];
   assert.deepEqual(splitMergedBoxes([b], comps, GAP), [
-    { x1: 0, y1: 0, x2: 120, y2: 70, conf: 0.9, clip: { x1: 0, y1: 0, x2: 270, y2: 82 } },
-    { x1: 70, y1: 70, x2: 210, y2: 170, conf: 0.9, clip: { x1: 0, y1: 58, x2: 270, y2: 182 } },
-    { x1: 160, y1: 170, x2: 270, y2: 240, conf: 0.9, clip: { x1: 0, y1: 158, x2: 270, y2: 240 } },
+    { x1: 10, y1: 0, x2: 90, y2: 70, conf: 0.9, clip: { x1: 0, y1: 0, x2: 270, y2: 82 } },
+    { x1: 100, y1: 70, x2: 180, y2: 170, conf: 0.9, clip: { x1: 0, y1: 58, x2: 270, y2: 182 } },
+    { x1: 190, y1: 170, x2: 270, y2: 240, conf: 0.9, clip: { x1: 0, y1: 158, x2: 270, y2: 240 } },
   ]);
 });
 
@@ -119,8 +119,8 @@ test('lane 2: side-by-side balloons split on a 27px gap with cross overlap', () 
   const parent = box(594, 118, 887, 362, 0.95);
   const parts = splitMergedBoxes([parent], box2Comps.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 })), GAP);
   assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
-    [594, 187, 745, 362], // lower-left balloon ("You must never go near…")
-    [746, 118, 887, 235], // upper-right balloon ("Hinata, Kaoru—")
+    [594, 200, 745, 360], // lower-left balloon ("You must never go near…") — tight, the 1px cut gap leaves no pad
+    [746, 120, 884, 222], // upper-right balloon ("Hinata, Kaoru—")
   ]);
 });
 
@@ -132,8 +132,8 @@ test('lane 2: stacked caption blocks split on a 37px gap (span widened by textur
   const parent = box(90, 152, 296, 388, 0.84);
   const parts = splitMergedBoxes([parent], box3Comps.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 })), GAP);
   assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
-    [90, 152, 296, 223],  // "LONG AGO"
-    [90, 224, 234, 388],  // "THERE WAS SAID TO BE A SETTLEMENT THERE."
+    [93, 152, 290, 223],  // "LONG AGO" (loose: includes the texture comps)
+    [90, 224, 216, 388],  // "THERE WAS SAID TO BE A SETTLEMENT THERE."
   ]);
 });
 
@@ -147,8 +147,8 @@ test('lane 2: balloons 15px apart split (72px of cross overlap)', () => {
   const parent = box(968, 843, 1274, 1113, 0.88);
   const parts = splitMergedBoxes([parent], box4Comps.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 })), GAP);
   assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
-    [968, 939, 1143, 1113], // "Only those who serve them…"
-    [1144, 844, 1274, 1025], // "That place is the land of the gods."
+    [972, 946, 1143, 1108], // "Only those who serve them…"
+    [1144, 851, 1274, 1018], // "That place is the land of the gods."
   ]);
 });
 
@@ -176,8 +176,8 @@ test('lane 2: diagonal two-line groups are two blocks and split', () => {
     box(1062, 534, 1287, 575), box(1062, 600, 1287, 640),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
-    { x1: 1290, y1: 362, x2: 1413, y2: 519, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 531 } },
-    { x1: 1061, y1: 519, x2: 1302, y2: 655, conf: 0.92, clip: { x1: 1061, y1: 507, x2: 1413, y2: 825 } },
+    { x1: 1305, y1: 369, x2: 1413, y2: 519, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 531 } },
+    { x1: 1062, y1: 519, x2: 1287, y2: 640, conf: 0.92, clip: { x1: 1061, y1: 507, x2: 1413, y2: 825 } },
   ]);
 });
 
@@ -207,13 +207,13 @@ test('strict comps keep a texture patch out of the child box', () => {
   const strict = loose.filter(c => c.x1 > 200 || c.y1 > 210); // drop the two patch comps (x 93-158, y 152-192)
   const parts = splitMergedBoxes([parent], loose, GAP, strict);
   assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
-    [199, 152, 296, 223], // hugs “LONG AGO” (was 90 without the strict set)
-    [90, 224, 234, 388],
+    [217, 156, 290, 223], // hugs the “LONG AGO” glyphs (was 93 with the patch comps in)
+    [90, 224, 216, 388],
   ]);
-  // same call without the strict set: the loose group still widens the box
+  // same call without the strict set: the loose group (patch comps included) widens the box
   assert.deepEqual(splitMergedBoxes([parent], loose, GAP).map(p => [p.x1, p.y1, p.x2, p.y2]), [
-    [90, 152, 296, 223],
-    [90, 224, 234, 388],
+    [93, 152, 290, 223],
+    [90, 224, 216, 388],
   ]);
 });
 
@@ -228,14 +228,32 @@ test('strict core seeds the child box: an adjacent loose comp stays inside', () 
   const strict = loose.filter(c => !(c.x1 === 972 && c.y1 === 948));
   const parts = splitMergedBoxes([parent], loose, GAP, strict);
   assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
-    [968, 939, 1143, 1113], // unchanged: the dropped comp sits inside the leash
-    [1144, 844, 1274, 1025],
+    [972, 946, 1143, 1108], // unchanged: the dropped comp sits inside the leash
+    [1144, 851, 1274, 1018],
   ]);
   // a loose comp FAR from the core must not extend it (the page-4 patch rule)
   const far = [...loose, { x1: 700, y1: 950, x2: 760, y2: 990 }];
   const parts2 = splitMergedBoxes([parent], far, GAP, strict);
   assert.deepEqual(parts2.map(p => [p.x1, p.y1, p.x2, p.y2]), [
-    [968, 939, 1143, 1113],
-    [1144, 844, 1274, 1025],
+    [972, 946, 1143, 1108],
+    [1144, 851, 1274, 1018],
+  ]);
+});
+
+// Live nhentai case (g/681658 page 9, comps verbatim): one CTD box over two
+// stacked balloons. The half-cut gap (61/2 = 30) must pad the cut axis only —
+// padding the cross axis too stretched the upper child to 456..542 (text is
+// 486..539) and the lower to 438..525 (text 441..495), frames looking shifted.
+test('split pad faces the cut axis only (live stacked balloons)', () => {
+  const parent = box(438, 918, 542, 1144, 0.94);
+  const comps = [
+    box(515, 916, 539, 940), box(486, 918, 509, 941), box(520, 946, 539, 961),
+    box(441, 1022, 466, 1048), box(471, 1023, 495, 1047), box(473, 1050, 495, 1070),
+    box(442, 1052, 465, 1069), box(442, 1073, 465, 1096), box(443, 1097, 466, 1121),
+    box(445, 1123, 463, 1145),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP).map(p => [p.x1, p.y1, p.x2, p.y2]), [
+    [486, 918, 539, 991], // text-hugging x, 30px leash toward the cut
+    [441, 992, 495, 1144],
   ]);
 });

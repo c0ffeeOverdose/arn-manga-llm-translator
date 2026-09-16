@@ -775,8 +775,10 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // Bumped to tile8: split child boxes are seeded by the strict comps but
     // keep adjacent loose clusters (SPLIT_CORE_LEASH) — strict-only boxes
     // drifted sideways off the balloon text.
+    // Bumped to tile9: split padding faces the cut axis only (cross-axis pad
+    // stretched child boxes to the parent's edges — shifted frames).
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile8'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile9'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----
