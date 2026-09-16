@@ -382,8 +382,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 if (isDebug() && state.origOwn) console.log('[mt] orig copy (seam)', JSON.stringify({ src: m.srcUrl.slice(-14) }));
             }
             if (debugOn && boxes.length) {
-                state.debugOrig = await renderDebugView(m.bitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? []);
-                state.debug = await renderDebugView(await createImageBitmap(sc), boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? []);
+                state.debugOrig = await renderDebugView(m.bitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask);
+                state.debug = await renderDebugView(await createImageBitmap(sc), boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask);
             }
             const existing = pages.get(m.key);
             if (existing) {

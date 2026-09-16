@@ -278,10 +278,11 @@ export function paintRegions(
     const keptBoxes = new Set(dropContainedBoxes(det.boxes));
     const dupIdx = new Set(det.boxes.map((b, i) => keptBoxes.has(b) ? -1 : i + 1).filter(i => i > 0));
     const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && !dupIdx.has(i + 1));
+    const keepBoxes = det.boxes.filter((_, i) => keepIdx.has(i + 1) || dupIdx.has(i + 1));
     const missedIdx = det.boxes.map((_, i) => i + 1).filter(i => !translatedIdx.has(i) && !keepIdx.has(i));
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
     if (dupIdx.size && isDebug()) console.log('[mt] contained-duplicate boxes kept as-is:', [...dupIdx].join(','));
-    inpaint(canvas, { ...det, boxes: boxesToErase });
+    inpaint(canvas, { ...det, boxes: boxesToErase, keepBoxes });
 
     // chosen layout per rendered region — diagnoses shrink/clip issues live
     const layouts: { i: number; f: number; n: number }[] = [];
@@ -289,7 +290,7 @@ export function paintRegions(
         if (keepIdx.has(i + 1) || dupIdx.has(i + 1)) return; // untouched
         const out = outputs.find(o => o.index === i + 1);
         const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
-        const placed = renderRegion(ctx, frame, box, text);
+        const placed = renderRegion(ctx, frame, box, text, det.mask);
         if (placed) layouts.push({
             i: i + 1, f: placed.fontSize, n: placed.lines.length,
             ...(placed.overflow ? { o: 1 as const } : {}),
@@ -357,6 +358,6 @@ export function paintExtras(canvas: OffscreenCanvas, frame: ImageData, det: Dete
         extraCount++;
         const box: DetBox = { x1: inkBox.x1, y1: inkBox.y1, x2: inkBox.x2, y2: inkBox.y2, conf: 1 };
         usedExtras.push(box);
-        renderRegion(ctx, frame, box, ex.translation);
+        renderRegion(ctx, frame, box, ex.translation, det.mask);
     }
 }

@@ -122,7 +122,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             // aspect): the dumped area must be the area the text got
             const out = outputs.find(o => o.index === i + 1);
             const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
-            const a = layoutArea(frame, b, chosenOrientation(ctx, frame, b, text)) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
+            const a = layoutArea(frame, b, chosenOrientation(ctx, frame, b, text, det.mask), det.mask) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
             return {
                 x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
                 // enclosed score >0 = per-line profile layout, absent = no-frame rect
@@ -164,11 +164,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // one on each frame so Original/Translate toggle keeps its debug boxes.
     if (debugOn && det.boxes.length) {
         const ranks = panelRanks(det.panels ?? []);
-        state.debugOrig = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs);
+        state.debugOrig = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs, det.mask);
         // canvas pages reuse the kept translated bitmap (transfer is one-shot);
         // img pages transfer here as before — the canvas is dead after this
         const bmp = state.translatedBmp ?? canvas.transferToImageBitmap();
-        state.debug = await renderDebugView(bmp, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs);
+        state.debug = await renderDebugView(bmp, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs, det.mask);
     }
     if (existing) {
         unregPage(existing);

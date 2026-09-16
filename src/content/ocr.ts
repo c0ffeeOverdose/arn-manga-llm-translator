@@ -8,7 +8,7 @@ import { pipeline, context, setContext, shareContext, loadContext, saveContext, 
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources } from './page-cache';
-import { chosenOrientation, pageArea } from './render';
+import { chosenOrientation, pageArea, type TextMask } from './render';
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
@@ -169,7 +169,7 @@ function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContex
 // (cyan, numbered in reading order), dashed green = the placement area the
 // layout actually got. Below-threshold near-misses draw dimmed gray with conf
 // and NO badge — a badge means "translated in this order".
-export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = []): Promise<string> {
+export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = [], mask?: TextMask): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d')!;
     ctx.drawImage(bitmap, 0, 0);
@@ -205,7 +205,7 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
     ctx.setLineDash([font, font * 0.6]);
     ctx.strokeStyle = '#2bff88';
     boxes.forEach((b, i) => {
-        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i), mask), mask);
         if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
     });
     // measured per-line runs (enclosed bubbles): orange outline of the shape
@@ -214,7 +214,7 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
     ctx.setLineDash([font * 0.5, font * 0.4]);
     ctx.strokeStyle = '#ffa02b';
     boxes.forEach((b, i) => {
-        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i), mask), mask);
         const prof = a?.runs;
         if (!prof) return; // forEach: skip boxes without a measured profile
         const left: [number, number][] = [], right: [number, number][] = [];
@@ -263,12 +263,12 @@ export async function ensureDebugViews(): Promise<void> {
                 if (!st.debugOrig) {
                     const orig = await canvasPaintSrc(st, 'orig');
                     if (orig) {
-                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                         pages.set(st.debugOrig, st);
                     }
                 }
                 if (!st.debug && st.translatedBmp) {
-                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                     pages.set(st.debug, st);
                 }
             } catch (e) {
@@ -280,11 +280,11 @@ export async function ensureDebugViews(): Promise<void> {
         try {
             const ranks = panelRanks(st.det.panels ?? []);
             if (!st.debugOrig) {
-                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                 pages.set(st.debugOrig, st);
             }
             if (!st.debug) {
-                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                 pages.set(st.debug, st);
             }
         } catch (e) {

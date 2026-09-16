@@ -26,6 +26,35 @@ function dilate(mask: Uint8Array, w: number, h: number): Uint8Array {
     return cur;
 }
 
+// Erase box for one region: the CTD box plus mask ink that touches it from
+// outside. CTD boxes can stop a few px short of the glyphs (live: a narration
+// box cut the last line in half, leaving "SAO…" visible under the translation
+// — the box bottom crossed the glyphs at y2077 while the ink ran to y2102).
+// The mask says where text really is, so follow it out with a gap allowance
+// (glyphs have inter-row gaps) up to `pad`. Sides perpendicular to the scan
+// stay inside the side's span, so the walk cannot wander sideways into a
+// neighbour's text. Pure-ish (mask reads only) — exported for tests.
+export function eraseBox(m: Uint8Array, W: number, H: number, box: { x1: number; y1: number; x2: number; y2: number }, pad: number): { x1: number; y1: number; x2: number; y2: number } {
+    const x1 = Math.max(0, Math.floor(box.x1)), y1 = Math.max(0, Math.floor(box.y1));
+    const x2 = Math.min(W - 1, Math.ceil(box.x2)), y2 = Math.min(H - 1, Math.ceil(box.y2));
+    const gapOK = 3; // consecutive empty rows/cols a glyph gap may span
+    const rowInk = (y: number): boolean => { for (let x = x1; x <= x2; x++) if (m[y * W + x]) return true; return false; };
+    const colInk = (x: number): boolean => { for (let y = y1; y <= y2; y++) if (m[y * W + x]) return true; return false; };
+    const walk = (from: number, to: number, step: 1 | -1, ink: (i: number) => boolean): number => {
+        let best = from, gap = 0;
+        for (let i = from + step; step > 0 ? i <= to : i >= to; i += step) {
+            if (ink(i)) { best = i; gap = 0; } else if (++gap > gapOK) break;
+        }
+        return best;
+    };
+    return {
+        x1: walk(x1, Math.max(0, x1 - pad), -1, colInk),
+        x2: walk(x2, Math.min(W - 1, x2 + pad), 1, colInk),
+        y1: walk(y1, Math.max(0, y1 - pad), -1, rowInk),
+        y2: walk(y2, Math.min(H - 1, y2 + pad), 1, rowInk),
+    };
+}
+
 export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -33,9 +62,17 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
     const { width: W, height: H } = canvas;
     const m = new Uint8Array(det.mask.data);
     const md = dilate(m, W, H);
+    // regions that keep their source text (SFX, contained dups): the erase
+    // walk must not eat their glyphs when a neighbouring box expands into them
+    const skip = (det.keepBoxes ?? []).map(k => ({
+        x1: Math.floor(Math.max(0, k.x1)) - 2, y1: Math.floor(Math.max(0, k.y1)) - 2,
+        x2: Math.ceil(Math.min(W - 1, k.x2)) + 2, y2: Math.ceil(Math.min(H - 1, k.y2)) + 2,
+    }));
+    const inSkip = (x: number, y: number): boolean => skip.some(s => x >= s.x1 && x <= s.x2 && y >= s.y1 && y <= s.y2);
 
     // per-box background color from a ring just outside the box
     for (const b of det.boxes) {
+        const ex = eraseBox(m, W, H, b, Math.max(8, Math.round((b.x2 - b.x1) * 0.08), Math.round((b.y2 - b.y1) * 0.08)));
         const x1 = Math.floor(Math.max(0, b.x1)), y1 = Math.floor(Math.max(0, b.y1));
         const x2 = Math.ceil(Math.min(W - 1, b.x2)), y2 = Math.ceil(Math.min(H - 1, b.y2));
         const ring: number[] = [];
@@ -81,16 +118,19 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
 
         // fill strategy: masked pixels + connected faint text the mask missed.
         // Scan each row: rows with meaningful mask coverage are text rows —
-        // fill the WHOLE row span across the box (long disclaimers render tiny
-        // faint glyphs the network under-masks, leaving smears otherwise).
-        for (let y = y1; y <= y2; y++) {
+        // fill the WHOLE row span across the erase region (long disclaimers
+        // render tiny faint glyphs the network under-masks, leaving smears
+        // otherwise). Runs over the EXPANDED region (see eraseBox) so glyphs
+        // the CTD box clipped are erased too; keep-box interiors are skipped.
+        for (let y = ex.y1; y <= ex.y2; y++) {
             const rowStart = y * W;
             let maskCount = 0;
-            for (let x = x1; x <= x2; x++) if (md[rowStart + x]) maskCount++;
-            const rowLen = x2 - x1 + 1;
+            for (let x = ex.x1; x <= ex.x2; x++) if (md[rowStart + x]) maskCount++;
+            const rowLen = ex.x2 - ex.x1 + 1;
             const rowIsText = maskCount > rowLen * 0.04 && maskCount >= 4;
-            for (let x = x1; x <= x2; x++) {
+            for (let x = ex.x1; x <= ex.x2; x++) {
                 const p = rowStart + x;
+                if (inSkip(x, y)) continue;
                 if (md[p] || (rowIsText && isFaintText(d, p, bg))) {
                     const i = p * 4;
                     d[i] = bg[0]; d[i + 1] = bg[1]; d[i + 2] = bg[2]; d[i + 3] = 255;

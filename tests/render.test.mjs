@@ -452,7 +452,10 @@ test('layoutTextFit: lines use their own band width (narrow top, wide middle)', 
   const area = { x: 0, y: 0, w: 200, h: rows, runs: prof };
   const text = 'word '.repeat(8).trim();
   const fit = layoutTextFit(fakeCtx(), text, area, 20);
-  assert.ok(fit && fit.lines.length >= 3, `several lines, got ${fit && fit.lines.length}`);
+  assert.ok(fit && fit.lines.length >= 2, `several lines, got ${fit && fit.lines.length}`);
+  // the block is places inside the wide middle band it was wrapped for, not
+  // against the narrow reading-order edge
+  assert.ok(fit.top >= 19.5 && fit.top + fit.lines.length * fit.lineHeight <= 80.5, `centered in the wide band, top=${fit.top}`);
   // every line fits the interval measured at its own band
   fit.lines.forEach((line, j) => {
     const b0 = fit.top + j * fit.lineHeight;
@@ -461,8 +464,16 @@ test('layoutTextFit: lines use their own band width (narrow top, wide middle)', 
     assert.ok(fakeCtxMeasure(line, fit.fontSize) <= iv[1] - iv[0] + 0.51, `line ${j} fits its band`);
     assert.ok(fit.centers[j] > iv[0] && fit.centers[j] < iv[1], `line ${j} centers on its run`);
   });
-  const widths = fit.lines.map(l => l.length);
-  assert.ok(Math.max(...widths) > Math.min(...widths) + 3, `band widths shape the text (${widths.join(',')})`);
+});
+
+test('runInterval: edge sliver/hole rows are trimmed, an interior hole still nulls', () => {
+  const rows = 20;
+  const prof = bandProfile(rows, () => 100, 10);
+  prof.i1[0] = 1; prof.i2[0] = 0;       // hole at the top edge
+  prof.i1[19] = 50; prof.i2[19] = 53;   // 4px sliver at the bottom edge
+  assert.deepEqual(runInterval(prof, 0, 20), [10, 109]);
+  prof.i1[10] = 1; prof.i2[10] = 0;     // interior gap: a line must not cross it
+  assert.equal(runInterval(prof, 0, 20), null);
 });
 
 function fakeCtxMeasure(s, size, pxPerChar = 0.6) {
