@@ -479,7 +479,7 @@
       <fieldset id="cloudFields" style="display:none">
         <div class="field">
           <label for="cloudEndpoint">Endpoint URL</label>
-          <input type="text" id="cloudEndpoint" placeholder="https://you--arn-manga-api.modal.run">
+          <input type="text" id="cloudEndpoint" placeholder="https://xxxx.trycloudflare.com">
         </div>
 
         <div class="field">
@@ -489,7 +489,10 @@
 
         <button id="testCloud" type="button" class="btn ghost" style="width:100%">Test cloud &amp; prewarm</button>
         <div class="hint" id="cloudTestStatus" style="min-height:18px;margin-top:6px"></div>
-        <div class="hint">No endpoint yet? Open <b>server/cloud-setup.ipynb</b> in <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Google Colab</a> → Run all → paste the 2 values it prints (link works once the repo is public). Testing also wakes a sleeping endpoint, so run it before reading — pages fall back to on-device automatically if cloud fails. Pages go to YOUR endpoint only.</div>
+        <div class="hint">No endpoint yet? Run the server yourself:
+          <br>• <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/colab-server.ipynb" target="_blank" rel="noopener">Run it on Colab</a> — free GPU; needs only a Google sign-in (no card, no other account). URL changes each session; VM ends after ~90 min idle (12 h max).
+          <br>• <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Deploy it to Modal</a> — stable URL; Starter is free ($30/mo credit, no card to start). Sleeps when idle — first page may wait ~1–2 min.
+          <br>Both print the endpoint + key to paste above; press <b>Test</b> before reading. Pages go to YOUR endpoint only.</div>
       </fieldset>
     </div>
 
