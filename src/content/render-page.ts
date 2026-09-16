@@ -5,7 +5,7 @@ import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea } f
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
 import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0 } from './page-cache';
-import { type MtOnStatus } from './detection';
+import { withEncodeLock, type MtOnStatus } from './detection';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep } from './pipeline';
@@ -15,7 +15,15 @@ import { rewindContextBefore, replayPagesAfter } from './queue';
 import { bookHas, bookAdd, bookDrop } from './sweep';
 import { saveContext } from './state';
 
-export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean): Promise<PageState> {
+// paintOnly: paint + register a page WITHOUT folding it into the book — the
+// sweep paints the page the user is looking at the moment its worker finishes,
+// while the ordered commit still folds it later (the commit's own
+// !bookHas guard makes the eventual double-visit harmless). The book snapshot
+// is skipped too: context is still mid-chapter at paint time, and a stale
+// snapshot would poison a later re-translate's rewind.
+export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean,
+    opts: { paintOnly?: boolean } = {}): Promise<PageState> {
+    const paintOnly = opts.paintOnly === true;
 
     const { srcUrl, bitmap, det } = prep;
     const existing = stateFor(ref) ?? pages.get(srcUrl);
@@ -34,8 +42,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // down to user entries, live-proven). MUST load first: translateRegions
     // loads lazily, and a snapshot taken before that captures the empty default.
     await loadContext();
-    const bookBefore = context.characters;
-    const pairsBefore = context.pairs;
+    const bookBefore = paintOnly ? undefined : context.characters;
+    const pairsBefore = paintOnly ? undefined : context.pairs;
     let outputs: RegionOutput[], extras: ExtraRegion[], usedLLM: boolean;
     let mentions: Mention[] = [];
     let bookOps: BookOp[] | undefined;
@@ -54,7 +62,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         // already folded by whoever produced this entry (sweep commit, an
         // earlier visit, prefetch) — refolding would duplicate its pairs.
         // Otherwise fold + register (later arrivals skip via the divert lane).
-        if (shareContext && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
+        if (shareContext && !paintOnly && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
     } else {
         onStatus('Translating…');
         ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, errorRetryAfterMs, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
@@ -130,7 +138,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         ...(bookOps?.length ? { bookOps } : null),
     }));
     if (rawLLM == null) console.warn('[mt] llm raw unavailable — stale service worker? reload the extension');
-    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    const blob = await withEncodeLock(() => canvas.convertToBlob({ type: 'image/png' }));
     const state: PageState = {
         orig: srcUrl,
         translated: URL.createObjectURL(blob),

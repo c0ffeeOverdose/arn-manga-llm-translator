@@ -92,6 +92,20 @@ export function sweepPhase(s: { cancel: boolean; dead: boolean; starting?: boole
     return s.starting ? 'starting' : 'running';
 }
 
+// ---- pool sizing: canvas work is bound by the page's renderer thread, not by
+// the provider. Cloud mode keeps the sweep pool (the endpoint serves requests
+// in parallel — live-probed); local CPU inference is serialized behind the
+// worker's ORT lock anyway, so extra workers only multiply main-thread decode/
+// encode spikes on machines that can least afford them. Painting is local CPU
+// everywhere: parallel lanes are pure jank without a GPU. Pure — unit-tested.
+export function sweepPoolSize(cloud: boolean, gpu: boolean, detEpWasm: boolean): number {
+    if (cloud) return 3;
+    return !gpu || detEpWasm ? 2 : 3;
+}
+export function paintLaneSize(gpu: boolean): number {
+    return gpu ? 3 : 1;
+}
+
 export interface CachedPage {
     key: string;      // chapter#contentHash
     fp: string;       // settings fingerprint at translate time

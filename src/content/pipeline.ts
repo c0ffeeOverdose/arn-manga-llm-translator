@@ -12,7 +12,7 @@ import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter,
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: CachedPage; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
 
 // cached entry → render-ready det (shared by preparePage and arrival paint —
 // one construction, one gate set: full entry + fp + dims + mask, partials
@@ -137,7 +137,10 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
 // Returns null when the page is already translated (cache hit, no-op job).
 // fromSweep: the caller IS the sweep (already claimed) — skip the sweep-wait
 // or the worker waits on its own claim until timeout.
-export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false): Promise<Prep | null> {
+// waitSweep=false for user-driven jobs: an explicit Translate press must not
+// sit behind a slow CPU sweep's claim for up to 150s (auto prefetch still
+// waits — its work would duplicate the sweep).
+export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false, waitSweep = true): Promise<Prep | null> {
     const existing = stateFor(ref);
     if (existing && !force) return null;
     // prepMs: read + hash + cache-gate cost (excludes queue wait — the prep
@@ -195,7 +198,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     // chapter sweep owns this page right now — wait for its commit instead of
     // paying a duplicate detect + LLM (falls through on cancel/timeout, then
     // the normal flow finds the fresh cache entry)
-    if (!force && !fromSweep && pipeline.cacheEnabled) {
+    if (waitSweep && !force && !fromSweep && pipeline.cacheEnabled) {
         await Promise.race([sweepWait(refKey(ref), onStatus), new Promise(r => setTimeout(r, 150000))]);
     }
     const hash = pageHashFromBitmap(bitmap);

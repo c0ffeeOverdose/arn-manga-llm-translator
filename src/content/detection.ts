@@ -353,6 +353,17 @@ export async function ensureDetector(onStatus?: MtOnStatus): Promise<void> {
     await ensureIframe();
 }
 
+// Full-page canvas encodes are the heaviest main-thread work in a page job
+// (multi-MP draw + encode on the page's renderer). Sweep/paint jobs run up to
+// three at once; without this they spike together and jank the reader. No
+// throughput is lost — inference itself is already serialized in the worker.
+let encodeChain: Promise<unknown> = Promise.resolve();
+export function withEncodeLock<T>(fn: () => Promise<T>): Promise<T> {
+    const p = encodeChain.then(fn, fn);
+    encodeChain = p.catch(() => { /* chain survives failures */ });
+    return p;
+}
+
 export async function detect(
     img: ImageBitmap | HTMLImageElement,
     onStatus?: MtOnStatus,
@@ -365,10 +376,12 @@ export async function detect(
     const w = 'naturalWidth' in img ? img.naturalWidth : img.width;
     const h = 'naturalHeight' in img ? img.naturalHeight : img.height;
     if (w < 10 || h < 10) throw new Error(`image too small: ${w}x${h}`);
-    const c = new OffscreenCanvas(w, h);
-    c.getContext('2d')!.drawImage(img, 0, 0);
-    const blob = await c.convertToBlob({ type: 'image/png' });
-    const png = await blob.arrayBuffer();
+    const png = await withEncodeLock(async () => {
+        const c = new OffscreenCanvas(w, h);
+        c.getContext('2d')!.drawImage(img, 0, 0);
+        const blob = await c.convertToBlob({ type: 'image/png' });
+        return blob.arrayBuffer();
+    });
 
     onStatus?.('Detecting text…', 'detect');
     if (workerToken === null) throw new Error('worker auth token missing — reload the page');
@@ -457,27 +470,50 @@ export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_TH
 // property constructor" (Xray wrapper on canvas blobs; same trap ocr.ts's
 // toJpegB64 documents, live-proven there). Returns the payload after the comma.
 export async function bitmapToJpegB64(bitmap: ImageBitmap, quality: number, gray: boolean): Promise<string> {
-    const c = new OffscreenCanvas(bitmap.width, bitmap.height);
-    const ctx = c.getContext('2d', { willReadFrequently: true })!;
-    ctx.drawImage(bitmap, 0, 0);
-    if (gray) {
-        const img = ctx.getImageData(0, 0, c.width, c.height);
-        const d = img.data;
-        for (let i = 0; i < d.length; i += 4) {
-            const y = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
-            d[i] = d[i + 1] = d[i + 2] = y;
+    return withEncodeLock(async () => {
+        const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const ctx = c.getContext('2d', { willReadFrequently: true })!;
+        ctx.drawImage(bitmap, 0, 0);
+        if (gray) {
+            const img = ctx.getImageData(0, 0, c.width, c.height);
+            const d = img.data;
+            for (let i = 0; i < d.length; i += 4) {
+                const y = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
+                d[i] = d[i + 1] = d[i + 2] = y;
+            }
+            ctx.putImageData(img, 0, 0);
         }
-        ctx.putImageData(img, 0, 0);
-    }
-    const blob = await c.convertToBlob({ type: 'image/jpeg', quality });
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-        const fr = new FileReader();
-        fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
-        fr.onload = () => resolve(fr.result as string);
-        fr.readAsDataURL(blob);
+        const blob = await c.convertToBlob({ type: 'image/jpeg', quality });
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
+            fr.onload = () => resolve(fr.result as string);
+            fr.readAsDataURL(blob);
+        });
+        const comma = dataUrl.indexOf(',');
+        return comma < 0 ? '' : dataUrl.slice(comma + 1);
     });
-    const comma = dataUrl.indexOf(',');
-    return comma < 0 ? '' : dataUrl.slice(comma + 1);
+}
+
+// Cloud endpoint/key live in mtSettings (llm/adapters), same place detectPage
+// reads them; sweep prewarms from here too.
+export async function cloudConfig(): Promise<{ endpoint: string; key: string }> {
+    const { mtSettings } = await chrome.storage.local.get('mtSettings');
+    const s = mtSettings as { cloudEndpoint?: unknown; cloudKey?: unknown } | undefined;
+    return {
+        endpoint: String(s?.cloudEndpoint ?? '').trim(),
+        key: String(s?.cloudKey ?? '').trim(),
+    };
+}
+
+// Modal scales to zero: the first request after idle pays the container boot +
+// model load (tens of seconds). A sweep should pay that ONCE up front (with a
+// long cap of its own) instead of letting the first 90s-capped page calls race
+// the boot. /health is auth-exempt and returns only after the models are up.
+export async function cloudWarm(endpoint: string, key: string): Promise<number> {
+    const r = await chrome.runtime.sendMessage({ type: 'mt:cloud-warm', endpoint, key }) as { ok: boolean; ms?: number; error?: string };
+    if (!r?.ok) throw new Error(r?.error ?? 'cloud warm failed');
+    return r.ms ?? 0;
 }
 
 export async function cloudDetect(

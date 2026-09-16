@@ -26,19 +26,19 @@
 // FROM here — never the other way.
 
 import { updateContext } from '../llm/core';
-import { pipeline, context, setContext, shareContext, loadContext, loadPipeline, resetContextIfNewChapter, saveContext, chapterKey, sessionUsage, setLastPageUsage, stateFor, type PageRef } from './state';
+import { pipeline, context, setContext, shareContext, loadContext, loadPipeline, resetContextIfNewChapter, saveContext, chapterKey, sessionUsage, setLastPageUsage, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
 import { fetchBitmap, getPages, refKey, unscrambleTiles, episodeManifestSrcs, galleryManifestJson, fetchPagedUrls, collectUnloadedUrls } from './page-io';
+import { renderPage } from './render-page';
+import { applyOverlays } from './overlays';
 import { resolveHeadlessDet, preparePage } from './pipeline';
 import { translateRegions, type TranslateOutcome } from './ocr';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, abortLookahead } from './page-cache';
-import type { DetectResult, MtOnStatus } from './detection';
-import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued, autoHalted, resumeAuto } from './queue';
+import type { Prep } from './pipeline';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, sweepPoolSize, abortLookahead } from './page-cache';
+import { cloudConfig, cloudWarm, type DetectResult, type MtOnStatus } from './detection';
+import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued, autoHalted, resumeAuto, keepaliveOpen } from './queue';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn } from './status-ui';
 import { isDebug } from '../debug';
 
-// ponytail: fixed pool + warm-up, no settings — provider rate limits (not
-// CPU) bind sweep throughput. Settings if real chapters prove otherwise.
-const SWEEP_JOBS = 3;
 const SWEEP_WARMUP = 2;
 const SWEEP_MAX_CONSECUTIVE_ERRORS = 3;
 // run watchdog: no dispatch/commit progress for this long = a hung fetch/infer
@@ -184,6 +184,18 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         resetContextIfNewChapter();
         await loadPipeline();
         await loadContext();
+        // cloud engines scale to zero: pay the boot once here (with its own
+        // long cap) instead of letting the first 90s-capped page calls race it
+        if (pipeline.inferEngine === 'cloud') {
+            const { endpoint, key } = await cloudConfig();
+            if (endpoint && key) {
+                setActivity('sweep', 'Waking cloud GPU…', 'sweep', 'detect');
+                try { await cloudWarm(endpoint, key); } catch (e) {
+                    if (isDebug()) console.log('[mt] cloud warm failed:', (e as Error)?.message);
+                }
+                if (startCancel) return { ok: true, cancelled: true }; // Stop pressed while warming
+            }
+        }
         const now = Date.now();
         const items = await sweepItems();
         if (startCancel) return { ok: true, cancelled: true }; // Stop pressed mid-enumeration
@@ -269,6 +281,10 @@ async function sweepItems(): Promise<SweepItem[]> {
 // blocked Stop, new starts and auto forever until reload).
 async function runSweep(items: SweepItem[]): Promise<void> {
     const chapter = sweep!.chapter;
+    // pool sized by the machine, not a constant: cloud endpoints serve calls
+    // in parallel (keep 3), a local CPU detector is ORT-lock-serial anyway and
+    // extra workers only multiply main-thread spikes (see sweepPoolSize)
+    const pool = sweepPoolSize(pipeline.inferEngine === 'cloud', 'gpu' in navigator, pipeline.detEp === 'wasm');
     let next = 0, head = 0, streak = 0;
     const ready = new Map<number, Commit>();
     // drain the consecutive run from the head (atomic: sync take + head move,
@@ -312,7 +328,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
                 if (!s.firstErr) s.firstErr = 'provider refused requests (rate limit / auth) — see the error log';
                 return;
             }
-            if (inflight.size >= (s.done >= SWEEP_WARMUP ? SWEEP_JOBS : 1)) { await sleep(400); continue; }
+            if (inflight.size >= (s.done >= SWEEP_WARMUP ? pool : 1)) { await sleep(400); continue; }
             const k = next++;
             const job = items[k];
             if (!job) return;
@@ -337,8 +353,11 @@ async function runSweep(items: SweepItem[]): Promise<void> {
             }
         }
     };
+    // the run holds the background alive (FF event page / MV3 SW idle-kill would
+    // otherwise drop every worker's LLM call mid-flight — see keepaliveOpen)
+    const endKeepalive = keepaliveOpen();
     try {
-        await Promise.all(Array.from({ length: Math.min(SWEEP_JOBS, items.length) }, () => worker()));
+        await Promise.all(Array.from({ length: Math.min(pool, items.length) }, () => worker()));
         await commitAhead(); // final drain (usually a no-op)
     } catch (e) {
         // workers/commitAhead are internally caught — anything landing here is
@@ -350,6 +369,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
         }
         console.warn('[mt] sweep run crashed:', e);
     } finally {
+        endKeepalive();
         finishSweep();
     }
 }
@@ -401,6 +421,7 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
                 translating--;
             }
             if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
+            await paintVisibleNow(job, hash, r.det, o, bitmap);
             return { i: job.i, url: job.url, hash, w, h, det: r.det, o };
         } finally {
             try { bitmap.close(); } catch { /* already closed */ }
@@ -441,6 +462,7 @@ async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter
             try { prep.bitmap.close(); } catch { /* already closed */ }
         }
         if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
+        await paintVisibleNow(job, prep.hash, prep.det, o, prep.bitmap, prep.origBytes);
         return { i: job.i, url: job.url, hash: prep.hash, w, h, det: prep.det, o, ref: job.ref };
     } catch (e) {
         cooldownMark(failMarks, job.url, Date.now());
@@ -471,7 +493,7 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
         await paintIfLoaded(c.url, c.hash, c.ref);
         return;
     }
-    if (shareContext) {
+    if (shareContext && !bookHas(c.hash)) {
         const u = updateContext(context, c.o.outputs, c.o.mentions, pipeline.useCharacters, pipeline.contextPairs);
         setContext(u.ctx);
         await saveContext();
@@ -501,6 +523,34 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     await paintIfLoaded(c.url, c.hash, c.ref);
 }
 
+// The page the user is LOOKING AT must not wait for the ordered commit: on a
+// CPU-only machine the prefix pages can be minutes of inference away, and the
+// commit only paints when the whole run up to that index has folded. Paint it
+// now (paintOnly — no fold, no cache write), let the ordered commit fold it
+// later. Serialized through one chain: parallel early paints are pure jank.
+// Caller keeps the bitmap alive until this resolves (the worker awaits it
+// before its finally-close).
+let earlyPaintChain: Promise<unknown> = Promise.resolve();
+async function paintVisibleNow(job: SweepItem, hash: string, det: DetectResult, o: TranslateOutcome, bitmap: ImageBitmap, origBytes?: ArrayBuffer): Promise<void> {
+    const ref = await resolvePaintRef(job.url, hash, job.ref);
+    if (!ref || stateFor(ref) || viewportOverlap(ref) <= 0) return;
+    const chain = earlyPaintChain.then(async () => {
+        if (stateFor(ref)) return;
+        const prep: Prep = {
+            srcUrl: refKey(ref), bitmap, det, hash, origBytes,
+            cached: { outputs: o.outputs, extras: o.extras, mentions: o.mentions },
+        };
+        await renderPage(ref, prep, () => {}, false, { paintOnly: true });
+        // the paint only reaches the element once shownSrc says "translated" —
+        // same flip the solo/arrival paths do for choice=auto
+        if (overlayChoice === 'auto') setOverlayOn(true);
+        applyOverlays();
+        if (isDebug()) console.log('[mt] sweep early paint', job.url.slice(-14));
+    });
+    earlyPaintChain = chain.catch(() => { /* one bad paint must not stall the chain */ });
+    return chain;
+}
+
 // a commit must paint every copy the user can see — arrival only paints via
 // a DOM job, and headless commits create no state, so without this the user
 // stares at finished pages until they click each one (or enable auto).
@@ -511,12 +561,16 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
 // for opaque-src readers (blob: elements never match any URL — verify the top
 // visible candidates by exact bytes, never paint blind: recycled nodes
 // mismatch and fall through; quality variants correctly miss like before).
-async function paintIfLoaded(url: string, hash: string | undefined, direct?: PageRef): Promise<void> {
-    if (!sweep) return;
-    const ref = (direct && direct.el.isConnected && !stateFor(direct) ? direct : undefined)
+async function resolvePaintRef(url: string, hash: string | undefined, direct?: PageRef): Promise<PageRef | undefined> {
+    return (direct && direct.el.isConnected && !stateFor(direct) ? direct : undefined)
         ?? getPages().find(r => pageKeyOf(r) === url && !stateFor(r))
         ?? getPages().find(r => !stateFor(r) && samePagePath(pageKeyOf(r), url))
         ?? (hash ? await viewedByHash(url, hash) : undefined);
+}
+
+async function paintIfLoaded(url: string, hash: string | undefined, direct?: PageRef): Promise<void> {
+    if (!sweep) return;
+    const ref = await resolvePaintRef(url, hash, direct);
     if (!ref) { if (isDebug()) console.log('[mt] sweep paint miss: no ref', url.slice(-24)); return; }
     if (stateFor(ref)) return; // painted while resolving
     // zero-rect only (hidden placeholders arrive-paint when the reader shows
@@ -613,3 +667,4 @@ function finishSweep(): void {
 }
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
