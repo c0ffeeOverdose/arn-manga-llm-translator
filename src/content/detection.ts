@@ -452,7 +452,11 @@ export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_TH
 // client-side. The mask is synthesized from boxes (inpaint + cache work;
 // mask-only SFX recovery is local-only).
 
-async function bitmapToJpeg(bitmap: ImageBitmap, quality: number, gray: boolean): Promise<ArrayBuffer> {
+// base64 straight out of a data URL — canvas JPEG blobs must NOT be read via
+// blob.arrayBuffer(): on Firefox that throws "Permission denied to access
+// property constructor" (Xray wrapper on canvas blobs; same trap ocr.ts's
+// toJpegB64 documents, live-proven there). Returns the payload after the comma.
+export async function bitmapToJpegB64(bitmap: ImageBitmap, quality: number, gray: boolean): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
     ctx.drawImage(bitmap, 0, 0);
@@ -465,7 +469,15 @@ async function bitmapToJpeg(bitmap: ImageBitmap, quality: number, gray: boolean)
         }
         ctx.putImageData(img, 0, 0);
     }
-    return (await c.convertToBlob({ type: 'image/jpeg', quality })).arrayBuffer();
+    const blob = await c.convertToBlob({ type: 'image/jpeg', quality });
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
+        fr.onload = () => resolve(fr.result as string);
+        fr.readAsDataURL(blob);
+    });
+    const comma = dataUrl.indexOf(',');
+    return comma < 0 ? '' : dataUrl.slice(comma + 1);
 }
 
 export async function cloudDetect(
@@ -473,16 +485,14 @@ export async function cloudDetect(
     endpoint: string, key: string,
     opts: { confThr: number; minSize: number; quality: number; gray: boolean },
 ): Promise<DetectResult> {
-    const jpeg = new Uint8Array(await bitmapToJpeg(bitmap, opts.quality, opts.gray));
-    // base64, not raw bytes: MV3 message passing JSON-serializes the channel
-    // (an ArrayBuffer arrives as {} — proven live by a 15-byte "[object…]" body)
-    let bin = '';
-    for (let i = 0; i < jpeg.length; i += 32768) bin += String.fromCharCode(...jpeg.subarray(i, i + 32768));
+    const jpegB64 = await bitmapToJpegB64(bitmap, opts.quality, opts.gray);
     // via the SW: content-script fetch is CORS-gated on the page origin
-    // (host permissions don't lift it — same trap as image fetch)
+    // (host permissions don't lift it — same trap as image fetch). The
+    // channel JSON-serializes, so the JPEG rides as base64 (an ArrayBuffer
+    // arrives as {} — proven live by a 15-byte "[object…]" body)
     const resp = await chrome.runtime.sendMessage({
         type: 'mt:cloud-page', endpoint, key,
-        confThr: opts.confThr, minSize: opts.minSize, jpegB64: btoa(bin),
+        confThr: opts.confThr, minSize: opts.minSize, jpegB64,
     }) as { ok: boolean; page?: any; error?: string };
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud failed');
     {
