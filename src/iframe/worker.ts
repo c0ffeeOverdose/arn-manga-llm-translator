@@ -402,6 +402,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     // balloons when their clusters sit close in the model's receptive field —
     // these clusters are the evidence that splits it (splitMergedBoxes).
     const textyComps: SplitComp[] = [];
+    const boxComps: SplitComp[] = [];
     for (const c of comps) {
         const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
         if (bw < 14 || bh < 14) continue;
@@ -414,7 +415,14 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         // gate below.
         if (c.count / (bw * bh) < 0.02) continue;
         if (c.probSum / c.count < 0.75 && compBoxConf(c) < 0.20) continue;
-        textyComps.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 });
+        const comp = { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 };
+        textyComps.push(comp);
+        // …and the stricter set the child BOXES are measured from: the
+        // corroboration rescue is free for the cut decision, but a texture
+        // patch the box head also boxed (a screentone area: mean prob ~0.35-0.4
+        // against 0.8+ for text) must not widen a child box into the artwork
+        // (live page 4: caption box 4 grew 109px over the hatch).
+        if (c.probSum / c.count >= 0.75) boxComps.push(comp);
     }
     // pass 2: merge components whose boxes touch when padded (line spacing)
     const GAP = 28;
@@ -463,7 +471,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         // split AFTER the mask-only pass: a merged box's generous coverage must
         // still suppress mask clusters it swallowed (pre-split list feeds the
         // overlap gate), and only then does each balloon become its own box.
-        boxes: splitMergedBoxes([...outBoxes, ...maskBoxes], textyComps, GAP),
+        boxes: splitMergedBoxes([...outBoxes, ...maskBoxes], textyComps, GAP, boxComps),
         dropped: nearMisses(lowBoxes, lowConfs, outBoxes, confThr, minSize, w, h),
         mask: { width: w, height: h, data: packed.buffer },
         inferMs,
@@ -540,8 +548,9 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
 // scripts in extension pages; only the language data is user-managed,
 // downloaded from CDN on demand and cached in IndexedDB via ocr-models.ts) ----
-import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL } from '../llm/ocr-models';
+import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
 import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, type SplitComp, type Tile } from '../content/detection';
+import { windowIndex } from '../content/inpaint';
 import { initDebug, isDebug } from '../debug';
 
 await initDebug();
@@ -775,6 +784,156 @@ async function runOcr(png: ArrayBuffer, langs: string[]): Promise<string> {
     return data?.text ?? '';
 }
 
+// ---- text-cleanup inpainting (manga-LaMa, fp16 weights, fixed 512) --------
+// Per-region windows are cut from the ORIGINAL page (never from a neighbour's
+// fresh paint), edge-extended to a square, resized to 512, and composited
+// back only where the caller's mask says text was. WebGPU only: the wasm
+// fallback measures ~22s/window, so a machine without a working WebGPU
+// session is reported unavailable and the caller keeps the built-in fill.
+type InpaintBox = { x1: number; y1: number; x2: number; y2: number };
+const INPAINT_SIZE = 512;
+let inpaintSession: any = null;
+let inpaintCreating: Promise<void> | null = null;
+let inpaintNoGpu = false;
+
+async function ensureInpaintSession(): Promise<void> {
+    if (inpaintSession) return;
+    if (inpaintNoGpu) throw new Error('inpainting needs WebGPU');
+    if (!inpaintCreating) {
+        inpaintCreating = (async () => {
+            const { buf } = await loadModelFile(INPAINT_KEY, `models/${INPAINT_FILE}`, INPAINT_FILE, 'inpaint model (~112MB)');
+            try {
+                inpaintSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }));
+            } catch (e) {
+                // EP-level failure: retrying on every page would only re-pay the
+                // upload before failing again. Download errors above are NOT
+                // sticky (a flaky network must be retryable).
+                inpaintNoGpu = true;
+                throw e;
+            }
+        })().finally(() => { inpaintCreating = null; });
+    }
+    await inpaintCreating;
+}
+
+async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[], padRatio: number): Promise<{
+    patches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
+    windows: number; inferMs: number;
+}> {
+    await ensureInpaintSession();
+    const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
+    const W = bitmap.width, H = bitmap.height;
+    const src = new OffscreenCanvas(W, H);
+    const sctx = src.getContext('2d', { willReadFrequently: true })!;
+    sctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const out = new ImageData(new Uint8ClampedArray(sctx.getImageData(0, 0, W, H).data), W, H);
+    const sq = new OffscreenCanvas(1, 1);
+    const sqc = sq.getContext('2d', { willReadFrequently: true })!;
+    const img512 = new OffscreenCanvas(INPAINT_SIZE, INPAINT_SIZE);
+    const i512 = img512.getContext('2d', { willReadFrequently: true })!;
+    const out512 = new OffscreenCanvas(INPAINT_SIZE, INPAINT_SIZE);
+    const o512 = out512.getContext('2d', { willReadFrequently: true })!;
+    const back = new OffscreenCanvas(1, 1);
+    const bctx = back.getContext('2d', { willReadFrequently: true })!;
+    const inferBuf = new Float32Array(4 * INPAINT_SIZE * INPAINT_SIZE);
+    const N512 = INPAINT_SIZE * INPAINT_SIZE;
+    let inferMs = 0, windows = 0;
+    for (const b of boxes) {
+        const bw = b.x2 - b.x1, bh = b.y2 - b.y1;
+        const pad = Math.max(8, Math.round(Math.max(bw, bh) * padRatio));
+        const side = Math.round(Math.max(bw, bh) + pad * 2);
+        const sx = Math.round(b.x1 + bw / 2 - side / 2), sy = Math.round(b.y1 + bh / 2 - side / 2);
+        sq.width = sq.height = side; // resize clears the canvas
+        sqc.imageSmoothingEnabled = false;
+        const ox = Math.max(0, -sx), oy = Math.max(0, -sy);
+        const px = Math.max(0, sx), py = Math.max(0, sy);
+        const pw = Math.min(W, sx + side) - px, ph = Math.min(H, sy + side) - py;
+        if (pw > 0 && ph > 0) sqc.drawImage(src, px, py, pw, ph, ox, oy, pw, ph);
+        if (ox > 0 && ph > 0) sqc.drawImage(src, px, py, 1, ph, 0, oy, ox, ph);
+        if (ox + pw < side && ph > 0) sqc.drawImage(src, px + pw - 1, py, 1, ph, ox + pw, oy, side - ox - pw, ph);
+        if (oy > 0 && pw > 0) sqc.drawImage(src, px, py, pw, 1, ox, 0, pw, oy);
+        if (oy + ph < side && pw > 0) sqc.drawImage(src, px, py + ph - 1, pw, 1, ox, oy + ph, pw, side - oy - ph);
+        if (ox > 0 && oy > 0) sqc.drawImage(src, px, py, 1, 1, 0, 0, ox, oy);
+        if (ox + pw < side && oy > 0 && pw > 0) sqc.drawImage(src, px + pw - 1, py, 1, 1, ox + pw, 0, side - ox - pw, oy);
+        if (ox > 0 && oy + ph < side && ph > 0) sqc.drawImage(src, px, py + ph - 1, 1, 1, 0, oy + ph, ox, side - oy - ph);
+        if (ox + pw < side && oy + ph < side && pw > 0 && ph > 0) {
+            sqc.drawImage(src, px + pw - 1, py + ph - 1, 1, 1, ox + pw, oy + ph, side - ox - pw, side - oy - ph);
+        }
+        i512.imageSmoothingEnabled = true;
+        i512.imageSmoothingQuality = 'high';
+        i512.clearRect(0, 0, INPAINT_SIZE, INPAINT_SIZE);
+        i512.drawImage(sq, 0, 0, INPAINT_SIZE, INPAINT_SIZE);
+        const imgData = i512.getImageData(0, 0, INPAINT_SIZE, INPAINT_SIZE).data;
+        // nearest-sample the caller's full-res binary mask through the same
+        // square geometry — smoothed mask edges would invent half-covered pixels
+        const scale = side / INPAINT_SIZE;
+        for (let y = 0; y < INPAINT_SIZE; y++) {
+            const my = Math.min(H - 1, Math.max(0, Math.floor(sy + (y + 0.5) * scale)));
+            for (let x = 0; x < INPAINT_SIZE; x++) {
+                const mx = Math.min(W - 1, Math.max(0, Math.floor(sx + (x + 0.5) * scale)));
+                const i = y * INPAINT_SIZE + x, j = i * 4;
+                const m = mask[my * W + mx] > 127 ? 1 : 0;
+                inferBuf[i] = (imgData[j] / 255) * (1 - m);
+                inferBuf[N512 + i] = (imgData[j + 1] / 255) * (1 - m);
+                inferBuf[2 * N512 + i] = (imgData[j + 2] / 255) * (1 - m);
+                inferBuf[3 * N512 + i] = m;
+            }
+        }
+        const t0 = performance.now();
+        const res = await withInferLock(() => inpaintSession.run({
+            input: new ort.Tensor('float32', inferBuf, [1, 4, INPAINT_SIZE, INPAINT_SIZE]),
+        })) as Record<string, any>;
+        inferMs += performance.now() - t0;
+        windows++;
+        const o = res.output.data as Float32Array;
+        const outImg = o512.createImageData(INPAINT_SIZE, INPAINT_SIZE);
+        for (let i = 0; i < N512; i++) {
+            outImg.data[i * 4] = Math.max(0, Math.min(255, Math.round(o[i] * 255)));
+            outImg.data[i * 4 + 1] = Math.max(0, Math.min(255, Math.round(o[N512 + i] * 255)));
+            outImg.data[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(o[2 * N512 + i] * 255)));
+            outImg.data[i * 4 + 3] = 255;
+        }
+        o512.putImageData(outImg, 0, 0);
+        back.width = back.height = side;
+        bctx.imageSmoothingEnabled = true;
+        bctx.imageSmoothingQuality = 'high';
+        bctx.drawImage(out512, 0, 0, side, side);
+        const backData = bctx.getImageData(0, 0, side, side).data;
+        // composite only where the caller's mask had text (page resolution)
+        const cx1 = Math.max(0, Math.floor(b.x1) - 2), cy1 = Math.max(0, Math.floor(b.y1) - 2);
+        const cx2 = Math.min(W, Math.ceil(b.x2) + 2), cy2 = Math.min(H, Math.ceil(b.y2) + 2);
+        for (let yy = cy1; yy < cy2; yy++) {
+            const vy = windowIndex(yy, sy, side);
+            for (let xx = cx1; xx < cx2; xx++) {
+                if (mask[yy * W + xx] <= 127) continue;
+                const vx = windowIndex(xx, sx, side);
+                const si = (vy * side + vx) * 4, di = (yy * W + xx) * 4;
+                out.data[di] = backData[si];
+                out.data[di + 1] = backData[si + 1];
+                out.data[di + 2] = backData[si + 2];
+                out.data[di + 3] = 255;
+            }
+        }
+    }
+    // patches: one crop per box (+4px bleed so the caller can draw them under
+    // the translated text without seams) — same shape the cache stores
+    const patches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] = [];
+    const pc = new OffscreenCanvas(1, 1);
+    const pctx = pc.getContext('2d', { willReadFrequently: true })!;
+    for (const b of boxes) {
+        const px1 = Math.max(0, Math.floor(b.x1) - 4), py1 = Math.max(0, Math.floor(b.y1) - 4);
+        const px2 = Math.min(W, Math.ceil(b.x2) + 4), py2 = Math.min(H, Math.ceil(b.y2) + 4);
+        if (px2 <= px1 || py2 <= py1) continue;
+        pc.width = px2 - px1;
+        pc.height = py2 - py1;
+        pctx.putImageData(out, -px1, -py1);
+        const blob = await pc.convertToBlob({ type: 'image/png' });
+        patches.push({ x1: px1, y1: py1, x2: px2, y2: py2, png: await blob.arrayBuffer() });
+    }
+    return { patches, windows, inferMs };
+}
+
 // Handshake token: postMessage into this iframe carries the PAGE origin (the
 // content script shares it), so origin checks can't separate our content
 // script from hostile page JS — and worker.html is web-accessible, meaning
@@ -797,7 +956,8 @@ window.addEventListener('message', async (ev: MessageEvent) => {
         (ev.source as Window | null)?.postMessage({ type: 'mt:rpc-result', ...payload, id: msg?.id }, '*', transfer);
     if (msg?.type !== 'mt:detect' && msg?.type !== 'mt:ocr' && msg?.type !== 'mt:ocr-status'
         && msg?.type !== 'mt:ocr-download' && msg?.type !== 'mt:ocr-delete' && msg?.type !== 'mt:ocr-list'
-        && msg?.type !== 'mt:panels' && msg?.type !== 'mt:baberu-ocr' && msg?.type !== 'mt:baberu-status') return;
+        && msg?.type !== 'mt:panels' && msg?.type !== 'mt:baberu-ocr' && msg?.type !== 'mt:baberu-status'
+        && msg?.type !== 'mt:inpaint') return;
     try {
         if (msg.type === 'mt:ocr-status' || msg.type === 'mt:ocr-list') {
             reply({ ok: true, installed: await ocrInstalled() });
@@ -818,6 +978,13 @@ window.addEventListener('message', async (ev: MessageEvent) => {
         } else if (msg.type === 'mt:panels') {
             const { v: r, lockWait } = await metered(() => runPanels(msg.png, typeof msg.thr === 'number' ? msg.thr : PANEL_CONF_THR));
             reply({ ok: true, panels: r.panels, dropped: r.dropped, ms: Math.round(r.inferMs), lockWait });
+        } else if (msg.type === 'mt:inpaint') {
+            const { v: r, lockWait } = await metered(() => runInpaint(
+                msg.png, new Uint8Array(msg.mask), msg.boxes ?? [],
+                typeof msg.padRatio === 'number' ? msg.padRatio : 0.5,
+            ));
+            reply({ ok: true, patches: r.patches, windows: r.windows, ms: Math.round(r.inferMs), lockWait },
+                r.patches.map(p => p.png));
         } else {
             const { v: result, lockWait } = await metered(() => runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true));
             (result as any).lockWaitMs = lockWait;

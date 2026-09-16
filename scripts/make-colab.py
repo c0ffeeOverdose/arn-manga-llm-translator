@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODAL_VERSION = "1.5.5"  # pinned: this is the client the deploy was proven with
 
 sys.path.insert(0, os.path.join(ROOT, "server"))
-from models_manifest import CTD_URL, BABERU, BABERU_FILES  # noqa: E402
+from models_manifest import CTD_URL, BABERU, BABERU_FILES, INPAINT_URL  # noqa: E402
 
 
 def read(name):
@@ -225,7 +225,7 @@ def code_text(text):
 # cloudflared quick tunnel = public https URL, no account needed; the URL is
 # new every session and dies with the VM — the notebook says so where it
 # matters.
-_models = [("ctd.onnx", CTD_URL)] + [(dst, f"{BABERU}/{src}?download=true")
+_models = [("ctd.onnx", CTD_URL), ("lama-manga-512-fp16w.onnx", INPAINT_URL)] + [(dst, f"{BABERU}/{src}?download=true")
                                     for src, dst in BABERU_FILES]
 _FILES = textwrap.indent("FILES = [\n" + "".join(
     f"    ({json.dumps(n)}, {json.dumps(u)}),\n" for n, u in _models) + "]", " " * 8)

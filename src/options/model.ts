@@ -2,8 +2,8 @@
 // engine (local vs cloud), detection pre-download.
 
 import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type LLMSettings } from '../llm/adapters';
-import { mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
-import { detModelsInstalled, detDownload } from '../llm/ocr-models';
+import { inpaintMode, mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
+import { detModelsInstalled, detDownload, inpaintInstalled, inpaintDownload } from '../llm/ocr-models';
 import { $, setDirty, setStatus, dlProgress } from './shell';
 import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI } from './pipeline-section';
 
@@ -313,7 +313,64 @@ export function syncInferUI(): void {
     $('detEpField').style.display = cloud ? 'none' : 'block';
     ($('forceWasm') as HTMLInputElement).checked = pipeline.detEp === 'wasm';
     if (!cloud) renderDetRow();
+    syncAiCleanupUI();
 }
+
+// AI text cleanup follows the engine above (no separate backend picker): cloud
+// users get it automatically (nothing to download there), on-device users stay
+// on the built-in fill until they tick the box and download the model. The
+// download row only appears when it is actually needed.
+export function syncAiCleanupUI(): void {
+    const cb = $('aiCleanup') as HTMLInputElement;
+    const hint = $('aiCleanupHint') as HTMLElement;
+    const cloud = pipeline.inferEngine === 'cloud';
+    cb.checked = inpaintMode(pipeline) !== 'fill';
+    if (pipeline.inpaint === 'off') {
+        hint.textContent = 'Built-in code cleanup — fast and predictable.';
+    } else if (cloud) {
+        hint.textContent = 'Runs on your cloud GPU — no download. Uses a little more GPU time per page.';
+    } else if (cb.checked) {
+        hint.textContent = 'Runs on this device (needs WebGPU + the model below). Until it is ready, pages keep the built-in cleanup.';
+    } else {
+        hint.textContent = 'Built-in code cleanup. Tick to run the AI model on this device — one 112MB download.';
+    }
+    const showRow = !cloud && cb.checked;
+    $('aiCleanupRow').style.display = showRow ? '' : 'none';
+    if (showRow) void renderAiCleanupRow();
+}
+
+async function renderAiCleanupRow(): Promise<void> {
+    const have = await inpaintInstalled().catch(() => false);
+    ($('aiCleanupLabel') as HTMLSpanElement).innerHTML =
+        `Text cleanup model (112MB)${have ? ' <span class="ok-mark">✓</span>' : ''}`;
+}
+
+$('aiCleanupBtn').onclick = async () => {
+    const btn = $('aiCleanupBtn') as HTMLButtonElement;
+    const bar = $('aiCleanupBar') as HTMLElement;
+    const row = bar.parentElement!;
+    btn.disabled = true;
+    row.classList.add('busy');
+    try {
+        await inpaintDownload((loaded, total) => {
+            (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = 'text cleanup model';
+            dlProgress(bar, loaded, total);
+        });
+        await renderAiCleanupRow();
+        row.classList.remove('busy');
+    } catch (e) {
+        (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = String((e as Error).message).slice(0, 60);
+        // keep .busy so the error message stays visible
+    } finally {
+        btn.disabled = false;
+    }
+};
+
+($('aiCleanup') as HTMLInputElement).onchange = () => {
+    pipeline.inpaint = ($('aiCleanup') as HTMLInputElement).checked ? 'on' : 'off';
+    syncAiCleanupUI();
+    setDirty(true);
+};
 
 // pre-download so the first on-device page doesn't pay it mid-chapter.
 // Download-only (no Delete — deleting would just break the next translate).

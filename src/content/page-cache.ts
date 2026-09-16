@@ -130,7 +130,20 @@ export interface CachedPage {
     texts?: string[];
     // detector EP at checkpoint time — restored so the Done line stays honest
     ep?: string;
+    // AI text cleanup output: one erased-background crop per erase box, drawn
+    // in place of the built-in fill. patchesGen tags the pipeline version so
+    // old crops are ignored (regenerated) instead of painting stale pixels.
+    patches?: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
+    patchesGen?: number;
 }
+
+// Bump when the AI-cleanup crop pipeline changes (window geometry, model,
+// mask recipe, composite) — cached patches with a different generation are
+// regenerated. v2: page-scaled mask dilation (v1's glyph-tight mask made the
+// model paint paper white over the leftover white glyphs). v3: composite
+// window indices fixed (v2 sampled the upscaled output in 512-space and
+// smeared neighbouring art over the erased text).
+export const INPAINT_PATCH_GEN = 3;
 
 // CTD masks are full-page 1 byte/px (~MBs) — too big for IDB at 200 pages.
 // packMask block-maxes it to ≤maxSide (~45KB/page); unpackMask nearest-
@@ -742,8 +755,17 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // Bumped to tile3: splitMergedBoxes now splits a CTD box that covered two
     // balloons — pre-split entries hold one merged region (one translation
     // spread across both balloons) and must re-detect + re-translate.
+    // Bumped to tile4: splitMergedBoxes lane 2 splits tightly packed pairs
+    // (side-by-side balloons, stacked caption blocks) that tile3 kept merged.
+    // Bumped to tile5: split children carry a render clip (their side of the
+    // cut) — entries whose boxes lack it keep rendering leaked areas.
+    // Bumped to tile6: split child boxes are measured from the strict
+    // text-likelihood comps, so a texture patch no longer widens them.
+    // Bumped to tile7: the render's leak guard (RUN_JUMP) clamps runs/rects
+    // where a flood escaped an open bubble outline — placement areas change,
+    // so cached pages must re-render.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile3'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile7'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

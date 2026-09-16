@@ -14,6 +14,8 @@ await build({
 const {
   bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, isLight, layoutText, horizontalFits,
   widthProfile, runInterval, sourcePitch, sizeCapFrom, layoutTextFit, boxIsVertical, setRenderTuning, renderTuning, ENCLOSED_MIN,
+  clampRunEnd, RUN_JUMP,
+  clipArea,
 } = await import(new URL('../.test-build/render.mjs', import.meta.url).href);
 
 // white W×H page, optional dark vertical borders (bubble edges)
@@ -352,6 +354,52 @@ test('widthProfile: open white page has no boundary evidence (no-frame path)', (
   const prof = widthProfile(img, box, false, [255, 255, 255], { x1: 40, y1: 40, x2: 160, y2: 160 }, { loX: 40, loY: 40, hiX: 160, hiY: 160 });
   assert.ok(prof, 'rows measured');
   assert.equal(prof.enclosed, 0, 'nothing stops the fill — not a bubble');
+});
+
+test('clampRunEnd: an outward jump clamps to the last supported end', () => {
+  assert.deepEqual(clampRunEnd(null, 100, 1), { value: 100, leaked: false }, 'first row seeds the support');
+  assert.deepEqual(clampRunEnd(100, 96, 1), { value: 96, leaked: false }, 'min side: small moves are a curve');
+  assert.deepEqual(clampRunEnd(100, 60, 1), { value: 100, leaked: true }, 'min side: 40px jump outward is a leak');
+  assert.deepEqual(clampRunEnd(100, 130, -1), { value: 130, leaked: false }, 'max side: 30px move is a curve');
+  assert.deepEqual(clampRunEnd(100, 160, -1), { value: 100, leaked: true }, 'max side: 60px jump outward is a leak');
+  assert.deepEqual(clampRunEnd(100, 80, -1), { value: 80, leaked: false }, 'max side: inward moves always pass');
+});
+
+// Live page 5 (scaled): a bubble whose outline is open below a screen-tone
+// patch, sitting on a page-white field that runs to a far dark line. The fill
+// escapes the bubble, follows the field, and the far line passes the
+// thin-line test — pre-guard the layout area started 66px left of the box.
+// The run-continuity rule clamps the leaked rows at the bubble's last
+// supported edge, so the area stays on the box's side of the field.
+test('layoutArea: open-field leak below a tone patch stays on the bubble edge', () => {
+  const W = 240, H = 200;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const dark = (x, y) => { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; };
+  for (let y = 40; y <= 95; y++) { dark(95, y); dark(96, y); }   // bubble's left edge (thin), open below
+  for (let y = 96; y <= 190; y++) { dark(41, y); dark(42, y); }  // far art line across the open field
+  for (const gx of [115, 130, 145, 160]) for (let y = 90; y < 130; y++) dark(gx, y); // glyphs
+  const img = { width: W, height: H, data };
+  const box = { x1: 110, y1: 80, x2: 180, y2: 140, conf: 0.9 };
+  const a = layoutArea(img, box);
+  assert.ok(a, 'area');
+  assert.ok(a.x > 90, `area does not follow the leaked field to the far line (x=${a.x})`);
+  assert.ok(a.x + a.w >= 180, `and still holds the box width (x2=${a.x + a.w})`);
+});
+
+// The rect path gets the same trim: a fill whose right bound jumped past the
+// bubble's edge (a thin line that only spans the top rows) must not measure
+// the field beyond it — the guard clamps the leaked rows first.
+test('bubbleArea: a jumped right bound is trimmed to the supported edge', () => {
+  const W = 440, H = 160;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const dark = (x, y) => { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; };
+  for (let y = 40; y <= 70; y++) { dark(330, y); dark(331, y); } // bubble edge, top rows only
+  for (const gx of [130, 180, 230, 280]) for (let y = 70; y < 100; y++) dark(gx, y);
+  const img = { width: W, height: H, data };
+  const box = { x1: 100, y1: 60, x2: 320, y2: 110, conf: 0.9 };
+  const a = bubbleArea(img, box);
+  assert.ok(a.leakR > 0, `right-side rows were clamped (leakR=${a.leakR})`);
+  assert.ok(a.x + a.w <= 340, `area stops near the supported edge, not the window (x2=${a.x + a.w})`);
 });
 
 test('widthProfile: vertical profile measures columns (transposed axes)', () => {
@@ -725,4 +773,55 @@ test('layoutTextFit: a failed centered re-wrap still centers a fitting block', (
   assert.ok(fit && fit.lines.length === 1, `one line, got ${fit && fit.lines.length}`);
   const center = fit.top + fit.lineHeight / 2;
   assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `block centered (top=${fit.top}, center=${center}, areaCenter=${area.h / 2})`);
+});
+
+// ---- split-child clip: the fill must not cross into the sibling region ------
+// Live: a balloon pair's areas merged 145px past the split cut (the interiors
+// connect through the touching outlines) and the translation laid out across
+// both bubbles and the panel border. Split children carry their side of the
+// cut; the flood window and the final area clamp to it.
+
+test('clipArea: intersects, and a missing clip is a no-op', () => {
+  const a = { x: 10, y: 20, w: 100, h: 50 };
+  assert.deepEqual(clipArea(a, undefined), a);
+  assert.deepEqual(clipArea(a, { x1: 0, y1: 0, x2: 60, y2: 100 }), { x: 10, y: 20, w: 50, h: 50 });
+  assert.deepEqual(clipArea(a, { x1: 50, y1: 0, x2: 60, y2: 30 }), { x: 50, y: 20, w: 10, h: 10 });
+  assert.deepEqual(clipArea(a, { x1: 200, y1: 200, x2: 300, y2: 300 }), { x: 200, y: 200, w: 0, h: 0 });
+});
+
+// Two white fields split by a wide gap in a dark divider inside one outlined
+// "bubble" (the balloon-tangent shape): the fill escapes through the hole into
+// the right field's white. The run-continuity guard (RUN_JUMP) clamps the
+// leaked runs at the divider, so enclosure drops below the bar and the rect
+// fallback caps at 1.5x the box; the child's clip remains the hard stop.
+test('layoutArea: divider-hole leak — the guard holds, the clip clamps harder', () => {
+  const W = 300, H = 160;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const dark = (x, y) => { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; };
+  for (let x = 40; x <= 230; x++) { dark(x, 50); dark(x, 110); }        // outlined bubble, top/bottom
+  for (let y = 50; y <= 110; y++) { dark(40, y); dark(230, y); }        // left/right
+  for (let y = 50; y <= 110; y++) for (let x = 140; x <= 144; x++) if (y < 70 || y > 100) dark(x, y); // divider with a hole
+  for (const gx of [70, 85, 100, 115, 130]) for (let y = 65; y < 95; y++) dark(gx, y); // glyphs (layoutArea needs ink in the box)
+  const img = { width: W, height: H, data };
+  const box = { x1: 60, y1: 60, x2: 139, y2: 100, conf: 0.9 };
+  const leak = layoutArea(img, box);
+  assert.ok(leak && leak.x + leak.w > 141, `guard still spills past the cut (1.5x cap, got x2=${leak && leak.x + leak.w})`);
+  assert.ok(leak && leak.x + leak.w <= 165, `…but stays on the capped box, got x2=${leak && leak.x + leak.w}`);
+  const held = layoutArea(img, { ...box, clip: { x1: 0, y1: 0, x2: 141, y2: H } });
+  assert.ok(held && held.x + held.w <= 141, `clip holds the area on its side (got x2=${held && held.x + held.w})`);
+  assert.ok(held.w >= 60, `and keeps the box width (got w=${held.w})`);
+});
+
+test('layoutArea: the clip also bounds the ink-bbox fallback', () => {
+  const W = 120, H = 80;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  // a 3x3 speck: ink.frac ≈ 0.014 < 0.03 -> ink-bbox path (pad 6 around it)
+  for (let y = 30; y < 33; y++) for (let x = 50; x < 53; x++) { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; }
+  const img = { width: W, height: H, data };
+  const box = { x1: 20, y1: 25, x2: 60, y2: 40, conf: 0.9 };
+  const unclipped = layoutArea(img, box);
+  assert.equal(unclipped.why, 'ink-bbox', `ink-bbox path (got ${unclipped.why})`);
+  assert.ok(unclipped.x + unclipped.w > 53, `bbox pad crosses the clip line without it (got x2=${unclipped.x + unclipped.w})`);
+  const a = layoutArea(img, { ...box, clip: { x1: 0, y1: 0, x2: 53, y2: H } });
+  assert.ok(a && a.x + a.w <= 53, `area clamped to the clip (got x2=${a.x + a.w})`);
 });

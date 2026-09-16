@@ -9,6 +9,7 @@
 # Panels: v1 returns [] — the client falls back to banding ordering, the same
 # path it takes when the panel model file is missing. No fidelity risk.
 import asyncio
+import base64
 import io
 import json
 import os
@@ -47,6 +48,7 @@ app = FastAPI(title="arn-manga")
 lock = asyncio.Lock()  # one inference at a time (2 vCPU, no oversubscription)
 ctd = None
 baberu = None  # {vis, pre, stp, bos, eos, id2ch, contentIds}
+inpaint = None  # manga-LaMa fp16w; missing file only disables POST /v1/inpaint
 EPS = {}  # session -> provider chain (proves GPU placement in prod logs)
 
 
@@ -68,7 +70,7 @@ def _sess(path, providers):
 
 
 def load_models():
-    global ctd, baberu
+    global ctd, baberu, inpaint
     print("onnxruntime:", ort.__version__,
           "available:", ort.get_available_providers(), flush=True)
     t_all = time.perf_counter()
@@ -94,8 +96,18 @@ def load_models():
             content.add(i)
     baberu = {"vis": vis, "pre": pre, "stp": stp, "bos": 1, "eos": 2,
               "id2ch": id2ch, "contentIds": content}
+    # optionally loadable: a server without the 112MB cleanup model still
+    # serves detection/OCR, /v1/inpaint answers 503
+    try:
+        inpaint = _sess(f"{MODEL_DIR}/lama-manga-512-fp16w.onnx", ORT_PROVIDERS)
+    except Exception as e:
+        inpaint = None
+        print(f"inpaint model not loaded: {e}", flush=True)
     EPS.update({n: s.get_providers() for n, s in
-                {"ctd": ctd, "vis": vis, "pre": pre, "stp": stp}.items()})
+                {"ctd": ctd, "vis": vis, "pre": pre, "stp": stp}.items()
+                if n != "inpaint"})
+    if inpaint is not None:
+        EPS["inpaint"] = inpaint.get_providers()
     print("ORT providers:", EPS, flush=True)
 
 
@@ -112,7 +124,8 @@ def health():
 
 @app.get("/")
 def root():
-    return {"service": "arn-manga", "endpoints": ["/health", "POST /v1/page"]}
+    return {"service": "arn-manga",
+            "endpoints": ["/health", "POST /v1/page", "POST /v1/inpaint"]}
 
 
 def nms(boxes, confs):
@@ -392,6 +405,129 @@ def baberu_crop(pil, b):
     w = min(pil.width - x, int(np.ceil(b["x2"] - b["x1"] + 2 * pad)))
     h = min(pil.height - y, int(np.ceil(b["y2"] - b["y1"] + 2 * pad)))
     return pil.crop((x, y, x + w, y + h))
+
+
+INPAINT_SIZE = 512
+INPAINT_PAD_RATIO = 0.5
+
+
+def inpaint_dilate_radius(w, h):
+    """Mirror of aiCleanupDilate() in src/content/inpaint.ts — big scans have
+    bigger glyph gaps, and a tight mask makes the model paint the leftover white
+    glyphs over the whole window."""
+    return min(10, max(4, round(4 * max(w, h) / 1600)))
+
+
+def run_inpaint(pil, boxes, pad_ratio, mask=None):
+    """Erase the given boxes with the manga-LaMa model (fp16 weights, 512x512).
+
+    The client sends the prepared binary erase mask (restricted to the erase
+    boxes and dilated — thin glyph strokes and the gaps between them drop out of
+    the 512px window resize and the model then paints the leftover white glyphs'
+    background over the whole window). Without one the mask is rebuilt from CTD
+    here, restricted to the boxes and dilated with the same recipe. Windows are
+    cut from the original image, edge-padded to a square, run at 512x512, and
+    composited back only where the mask says text was. Returns per-box PNG
+    patches (the same shape the on-device worker produces).
+    """
+    det_ms = 0.0
+    if mask is None:
+        _, _, _, _, prob, det_ms = infer_once(pil, CONF_THR)
+        raw = prob > MASK_THR
+        mask = np.zeros_like(raw)
+        for b in boxes:
+            x1 = max(0, int(np.floor(b["x1"]))); y1 = max(0, int(np.floor(b["y1"])))
+            x2 = min(pil.width, int(np.ceil(b["x2"]))); y2 = min(pil.height, int(np.ceil(b["y2"])))
+            mask[y1:y2, x1:x2] = raw[y1:y2, x1:x2]
+        mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8),
+                          iterations=inpaint_dilate_radius(pil.width, pil.height)) > 0
+    rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
+    H, W = rgb.shape[:2]
+    out = rgb.copy()
+    t0 = time.perf_counter()
+    windows = 0
+    for b in boxes:
+        x1 = max(0, min(W - 1, int(np.floor(b["x1"]))))
+        y1 = max(0, min(H - 1, int(np.floor(b["y1"]))))
+        x2 = max(x1 + 1, min(W, int(np.ceil(b["x2"]))))
+        y2 = max(y1 + 1, min(H, int(np.ceil(b["y2"]))))
+        bw, bh = x2 - x1, y2 - y1
+        pad = max(8, round(max(bw, bh) * pad_ratio))
+        side = round(max(bw, bh) + 2 * pad)
+        sx = round(x1 + bw / 2 - side / 2)
+        sy = round(y1 + bh / 2 - side / 2)
+        cx1, cy1 = max(0, sx), max(0, sy)
+        cx2, cy2 = min(W, sx + side), min(H, sy + side)
+        top, left = cy1 - sy, cx1 - sx
+        bottom = side - (cy2 - cy1) - top
+        right = side - (cx2 - cx1) - left
+        crop = rgb[cy1:cy2, cx1:cx2]
+        mcrop = mask[cy1:cy2, cx1:cx2].astype(np.uint8) * 255
+        # edge padding (not reflect): always valid however wide the margin is
+        crop_sq = np.pad(crop, ((top, bottom), (left, right), (0, 0)), mode="edge")
+        mask_sq = np.pad(mcrop, ((top, bottom), (left, right)), mode="edge")
+        img512 = np.asarray(Image.fromarray(crop_sq).resize(
+            (INPAINT_SIZE, INPAINT_SIZE), Image.LANCZOS), dtype=np.float32) / 255.0
+        m512 = np.asarray(Image.fromarray(mask_sq).resize(
+            (INPAINT_SIZE, INPAINT_SIZE), Image.NEAREST)) > 127
+        inp = np.concatenate([img512 * (1 - m512[..., None]),
+                              m512[..., None].astype(np.float32)], axis=2)
+        pred = inpaint.run(None, {"input": np.transpose(inp, (2, 0, 1))[None].astype(np.float32)})[0][0]
+        pred = np.transpose(np.clip(pred, 0.0, 1.0), (1, 2, 0))
+        win = np.asarray(Image.fromarray((pred * 255).astype(np.uint8)).resize(
+            (side, side), Image.LANCZOS))
+        mwin = np.asarray(Image.fromarray(mask_sq).resize(
+            (side, side), Image.NEAREST)) > 127
+        ox, oy = max(0, -sx), max(0, -sy)
+        sub_out = out[cy1:cy2, cx1:cx2]
+        sub_win = win[oy:oy + (cy2 - cy1), ox:ox + (cx2 - cx1)]
+        sub_mask = mwin[oy:oy + (cy2 - cy1), ox:ox + (cx2 - cx1)]
+        sub_out[sub_mask] = sub_win[sub_mask]
+        windows += 1
+    patches = []
+    for b in boxes:
+        px1 = max(0, int(np.floor(b["x1"])) - 4)
+        py1 = max(0, int(np.floor(b["y1"])) - 4)
+        px2 = min(W, int(np.ceil(b["x2"])) + 4)
+        py2 = min(H, int(np.ceil(b["y2"])) + 4)
+        crop = out[py1:py2, px1:px2]
+        if crop.size == 0:
+            continue
+        buf = io.BytesIO()
+        Image.fromarray(crop).save(buf, format="PNG")
+        patches.append({"x1": px1, "y1": py1, "x2": px2, "y2": py2,
+                        "png": base64.b64encode(buf.getvalue()).decode("ascii")})
+    ms = (time.perf_counter() - t0) * 1000
+    return patches, windows, ms, det_ms
+
+
+@app.post("/v1/inpaint")
+async def inpaint_page(req: Request, pad_ratio: float = Query(INPAINT_PAD_RATIO)):
+    if inpaint is None:
+        return JSONResponse({"ok": False, "error": "inpaint model not loaded on the server"}, 503)
+    t0 = time.perf_counter()
+    mask = None
+    try:
+        body = await req.json()
+        raw = base64.b64decode(body.get("image") or "")
+        boxes = body.get("boxes") or []
+        pil = Image.open(io.BytesIO(raw)).convert("RGB")
+        mask_b64 = body.get("mask")
+        if mask_b64:
+            m = Image.open(io.BytesIO(base64.b64decode(mask_b64))).convert("L")
+            if m.size != pil.size:
+                return JSONResponse({"ok": False, "error": f"mask size {m.size} != image {pil.size}"}, 400)
+            mask = np.asarray(m) > 127
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"bad request: {e}"}, 400)
+    async with lock:
+        try:
+            patches, windows, ms, det_ms = run_inpaint(pil, boxes, pad_ratio, mask)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"inpaint failed: {e}"}, 500)
+    return {"ok": True, "patches": patches, "windows": windows,
+            "ms": {"detect": round(det_ms, 1), "inpaint": round(ms, 1),
+                   "total": round((time.perf_counter() - t0) * 1000, 1)}}
 
 
 @app.post("/v1/page")

@@ -5,6 +5,13 @@
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
     conf: number;
+    // Split children only: the side of the cut this child owns. The render's
+    // flood-fill area finder can cross into a sibling region through an outline
+    // hole (two balloons touch, an anti-aliased border has a gap, a caption
+    // block shares one connected white field) — the area bbox then spans both
+    // regions and the text lays out across them. The renderer clamps its fill
+    // window/runs/area to this rect. Absent on unsplit boxes.
+    clip?: { x1: number; y1: number; x2: number; y2: number };
 }
 
 export interface DetectResult {
@@ -107,10 +114,12 @@ export function mergeTileBoxes(tiled: { tile: Tile; boxes: DetBox[] }[]): DetBox
 // the text mask still separates them: clusters divided by a gap the
 // same-block merge (worker GAP) would never bridge are two regions. Split at
 // each qualifying gap so every balloon gets its own crop, translation and
-// render area. A cut must clear BOTH a multiple of the same-block gap and a
-// multiple of the box's median cluster extent (reader scale drifts); children
-// are the cluster extents padded by half the adjacent gap, clamped to the
-// parent (the fill/render stage then finds each balloon interior on its own).
+// render area. Two lanes: lane 1 (diagonal balloons, wide gaps) needs BOTH a
+// gap multiple and cross-axis disjointness; lane 2 (tightly packed balloons
+// and slash-separated caption blocks) cuts on cluster evidence with a
+// glyph-scaled floor — see splitBoxLane2. Children of either lane are the
+// cluster extents padded by half the adjacent gap and clamped to the parent
+// (the fill/render stage then finds each balloon interior on its own).
 // Pure geometry — unit tested.
 export const SPLIT_GAP_FACTOR = 2;  // × same-block gap — a cut is never tighter
 export const SPLIT_GAP_RATIO = 0.8; // × median cluster extent along the cut axis
@@ -118,27 +127,102 @@ export const SPLIT_GAP_RATIO = 0.8; // × median cluster extent along the cut ax
                                     // balloon boundary ≥1×; live merge measured
                                     // gap 63px vs in-block max 33px)
 export const SPLIT_PAD_CAP = 40;    // px — max half-gap padding of a child box
+// Lane 2 (live: two side-by-side balloons 27px apart with a 22px y-overlap;
+// two balloons 15px apart with a 72px y-overlap; two caption blocks 37px
+// apart whose x-spans overlapped only through a texture false-positive).
+export const SPLIT2_FLOOR_RATIO = 0.5; // × median cluster minor extent (glyph size)
+export const SPLIT2_FLOOR_MIN = 8;     // px — absolute floor on small pages
+export const SPLIT2_OVERLAP_MAX = 0.5; // cross-span overlap / smaller span
+export const SPLIT2_STRONG_FACTOR = 2; // × floor — cuts despite cross overlap
 
 export interface SplitComp { x1: number; y1: number; x2: number; y2: number }
 
-export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number): T[] {
+export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number, boxComps: SplitComp[] = comps): T[] {
     if (comps.length < 2) return [...boxes];
     const out: T[] = [];
     for (const b of boxes) {
         const cs = comps.filter(c =>
             (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
             (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2);
-        const parts = splitBox(b, cs, sameBlockGap);
+        // Strict set (higher text likelihood): the cut evidence may include a
+        // texture false positive (the box head corroborates it), but the child
+        // BOX must hug the text — a screentone patch merged into a caption
+        // group dragged its box 109px over the hatch and the translation laid
+        // out across it (live page 4, region 4).
+        const bs = boxComps === comps ? cs : boxComps.filter(c =>
+            (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
+            (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2);
+        const parts = splitBox(b, cs, sameBlockGap, bs);
         out.push(...(parts ?? [b]));
     }
     return out;
 }
 
+type SplitGroup = { x1: number; y1: number; x2: number; y2: number };
+
+// children = group extents padded by half the adjacent gap, clamped to the
+// parent box (siblings then never overlap on the cut axis). Each child also
+// gets a `clip` = its own side of the cut axis (slack on the cut side so the
+// child's outline stays reachable): the render's fill flood may cross into a
+// sibling region through an outline hole and lay the text out over both
+// (live: a balloon pair's areas merged 145px past the cut and the translation
+// sprawled across the panel border). Pure.
+export const SPLIT_CLIP_SLACK = 12; // px — max leash past the cut toward the sibling
+function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | 'y', boxComps: SplitComp[]): T[] {
+    const lo = (g: SplitGroup) => (axis === 'y' ? g.y1 : g.x1);
+    const hi = (g: SplitGroup) => (axis === 'y' ? g.y2 : g.x2);
+    const gapBefore = (i: number) => i <= 0 || i >= groups.length
+        ? Infinity : lo(groups[i]) - hi(groups[i - 1]);
+    const cuts = groups.slice(1).map((g, i) => {
+        const gap = lo(g) - hi(groups[i]);
+        return { at: (hi(groups[i]) + lo(g)) / 2, slack: Math.min(SPLIT_CLIP_SLACK, Math.max(4, Math.floor(gap / 2))) };
+    });
+    return groups.map((g, i) => {
+        const pad = Math.min(SPLIT_PAD_CAP, Math.floor(Math.min(gapBefore(i), gapBefore(i + 1)) / 2));
+        // Child box = the group's TEXT clusters (strict comps), not the whole
+        // (possibly texture-polluted) group bbox. The cut positions, pads and
+        // clips still come from the loose groups, so the split decision and the
+        // sibling leash are unchanged; only the box hugs the text. Fall back to
+        // the group bbox when the strict set has nothing usable in this group.
+        const own = boxComps.filter(c =>
+            (c.x1 + c.x2) / 2 >= g.x1 && (c.x1 + c.x2) / 2 <= g.x2 &&
+            (c.y1 + c.y2) / 2 >= g.y1 && (c.y1 + c.y2) / 2 <= g.y2);
+        const ext = own.length
+            ? {
+                x1: Math.min(...own.map(c => c.x1)), y1: Math.min(...own.map(c => c.y1)),
+                x2: Math.max(...own.map(c => c.x2)), y2: Math.max(...own.map(c => c.y2)),
+            }
+            : g;
+        const clip = { x1: box.x1, y1: box.y1, x2: box.x2, y2: box.y2 };
+        const before = i > 0 ? cuts[i - 1] : null;
+        const after = i < groups.length - 1 ? cuts[i] : null;
+        if (axis === 'y') {
+            if (before) clip.y1 = Math.round(before.at - before.slack);
+            if (after) clip.y2 = Math.round(after.at + after.slack);
+        } else {
+            if (before) clip.x1 = Math.round(before.at - before.slack);
+            if (after) clip.x2 = Math.round(after.at + after.slack);
+        }
+        return {
+            ...box,
+            x1: Math.max(box.x1, ext.x1 - pad),
+            y1: Math.max(box.y1, ext.y1 - pad),
+            x2: Math.min(box.x2, ext.x2 + pad),
+            y2: Math.min(box.y2, ext.y2 + pad),
+            clip,
+        };
+    });
+}
+
 // null = no axis has a qualifying gap; otherwise that axis' children in order.
 // y first (horizontal text), x second (vertical columns) — one axis per box,
 // a child is never re-split.
-function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number): T[] | null {
+function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number, boxComps: SplitComp[]): T[] | null {
     if (cs.length < 2) return null;
+    return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps);
+}
+
+function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number, boxComps: SplitComp[]): T[] | null {
     for (const axis of ['y', 'x'] as const) {
         const lo = (c: SplitComp) => (axis === 'y' ? c.y1 : c.x1);
         const hi = (c: SplitComp) => (axis === 'y' ? c.y2 : c.x2);
@@ -180,18 +264,65 @@ function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: numbe
             groups.splice(k + 1, 1);
         }
         if (groups.length < 2) continue;
-        const gapBefore = (i: number) => i <= 0 || i >= groups.length
-            ? Infinity : lo(groups[i]) - (axis === 'y' ? groups[i - 1].y2 : groups[i - 1].x2);
-        return groups.map((g, i) => {
-            const pad = Math.min(SPLIT_PAD_CAP, Math.floor(Math.min(gapBefore(i), gapBefore(i + 1)) / 2));
-            return {
-                ...box,
-                x1: Math.max(box.x1, g.x1 - pad),
-                y1: Math.max(box.y1, g.y1 - pad),
-                x2: Math.min(box.x2, g.x2 + pad),
-                y2: Math.min(box.y2, g.y2 + pad),
-            };
-        });
+        return emitSplit(box, groups, axis, boxComps);
+    }
+    return null;
+}
+
+// Lane 2: same two-balloon problem on tightly packed pages — the clusters sit
+// only ~15–40px apart (under lane 1's gap floor) and side-by-side balloons
+// share cross-axis space, so lane 1's disjointness guard rejects them too.
+// Cut on cluster evidence: the floor gap scales with the box's glyph size
+// (median cluster minor extent) and a cut needs EITHER strongly disjoint cross
+// spans OR twice the floor with the cross spans not nested in each other. The
+// nested guard is what keeps a paragraph's separated last line fused (it sits
+// inside the block's span) while the caption-block case passes (a texture
+// false-positive merged into the upper cluster widened its span past the
+// lower block's edge). Same-span lines of one block merge through the overlap
+// ratio; a diagonal pair of two-line groups is a real cut (live page: two
+// balloons 27px apart sharing 22px of y; 15px apart sharing 72px; caption
+// blocks 37px apart). Pure — unit tested on live comps.
+function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
+    if (cs.length < 2) return null;
+    const dims = cs.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
+    const unit = dims[Math.floor(dims.length / 2)];
+    const floor = Math.max(SPLIT2_FLOOR_MIN, Math.round(SPLIT2_FLOOR_RATIO * unit));
+    for (const axis of ['y', 'x'] as const) {
+        const lo = (g: SplitGroup) => (axis === 'y' ? g.y1 : g.x1);
+        const hi = (g: SplitGroup) => (axis === 'y' ? g.y2 : g.x2);
+        const cLo = (g: SplitGroup) => (axis === 'y' ? g.x1 : g.y1);
+        const cHi = (g: SplitGroup) => (axis === 'y' ? g.x2 : g.y2);
+        const sorted = [...cs].sort((a, b) => lo(a) - lo(b));
+        const groups: SplitGroup[] = [];
+        for (const c of sorted) {
+            const g = groups[groups.length - 1];
+            const gap = g ? lo(c) - hi(g) : 0;
+            if (g && gap >= floor) groups.push({ ...c });
+            else if (g) {
+                g.x1 = Math.min(g.x1, c.x1); g.y1 = Math.min(g.y1, c.y1);
+                g.x2 = Math.max(g.x2, c.x2); g.y2 = Math.max(g.y2, c.y2);
+            } else {
+                groups.push({ ...c });
+            }
+        }
+        if (groups.length < 2) continue;
+        const merged: SplitGroup[] = [groups[0]];
+        for (let i = 1; i < groups.length; i++) {
+            const prev = merged[merged.length - 1], g = groups[i];
+            const gap = lo(g) - hi(prev);
+            const ov = Math.min(cHi(prev), cHi(g)) - Math.max(cLo(prev), cLo(g));
+            const ratio = ov <= 0 ? 0 : ov / Math.min(cHi(prev) - cLo(prev), cHi(g) - cLo(g));
+            const nested = (cLo(prev) >= cLo(g) && cHi(prev) <= cHi(g))
+                || (cLo(g) >= cLo(prev) && cHi(g) <= cHi(prev));
+            if (gap >= floor && (ratio < SPLIT2_OVERLAP_MAX
+                || (gap >= SPLIT2_STRONG_FACTOR * floor && !nested))) {
+                merged.push(g);
+            } else {
+                prev.x1 = Math.min(prev.x1, g.x1); prev.y1 = Math.min(prev.y1, g.y1);
+                prev.x2 = Math.max(prev.x2, g.x2); prev.y2 = Math.max(prev.y2, g.y2);
+            }
+        }
+        if (merged.length >= 2) return emitSplit(box, merged, axis, boxComps);
     }
     return null;
 }
@@ -557,10 +688,92 @@ export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_TH
     return { panels: resp.panels ?? [], dropped: resp.dropped ?? [], inferMs: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0 };
 }
 
+// ---- AI text cleanup (manga-LaMa in the iframe worker, WebGPU only) -------
+// The worker windows the page per erase box and returns one PNG crop per box;
+// callers draw the crops in place of the built-in fill. Boxes are the ones
+// already expanded by eraseBox (mask-led walk), so clipped glyphs are covered.
+export interface InpaintPatch { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }
+
+export async function inpaintPage(
+    bitmap: ImageBitmap, boxes: { x1: number; y1: number; x2: number; y2: number }[],
+    mask: { width: number; height: number; data: ArrayBuffer | Uint8Array }, padRatio = 0.5,
+): Promise<{ patches: InpaintPatch[]; windows: number; ms: number; lockWaitMs: number }> {
+    await ensureIframe();
+    const png = await withEncodeLock(async () => {
+        const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+        c.getContext('2d')!.drawImage(bitmap, 0, 0);
+        return (await c.convertToBlob({ type: 'image/png' })).arrayBuffer();
+    });
+    const resp = await iframeRpc({
+        type: 'mt:inpaint', png,
+        mask: new Uint8Array(mask.data).slice(), // copy: the caller still needs det.mask (fill path, debug view, cache)
+        boxes: boxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 })),
+        padRatio,
+    }, [png]) as { ok: boolean; patches?: InpaintPatch[]; windows?: number; ms?: number; lockWait?: number; error?: string };
+    if (!resp?.ok) throw new Error(resp?.error ?? 'inpaint failed');
+    const patches = (resp.patches ?? []).map(p => ({ x1: +p.x1, y1: +p.y1, x2: +p.x2, y2: +p.y2, png: p.png as ArrayBuffer }));
+    return { patches, windows: resp.windows ?? patches.length, ms: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0 };
+}
+
+// AI cleanup on the user's own endpoint (cloud engine): the client sends the
+// page as base64 JPEG plus the prepared erase mask as base64 PNG (1 byte/px
+// binary, compresses to a few KB), and gets back the same per-box PNG patches
+// the local worker produces, so the paint/cache path is shared. Bodies ride as
+// base64 through the SW (content-script fetch is CORS-gated on the page origin;
+// the server falls back to its own CTD pass when no mask is sent).
+export async function cloudInpaint(
+    bitmap: ImageBitmap, boxes: { x1: number; y1: number; x2: number; y2: number }[],
+    opts: { quality: number; gray: boolean; endpoint: string; key: string; mask: { width: number; height: number; data: Uint8Array } },
+): Promise<{ patches: InpaintPatch[]; windows: number; ms: number }> {
+    const jpegB64 = await bitmapToJpegB64(bitmap, opts.quality, opts.gray);
+    const maskB64 = await maskToPngB64(opts.mask);
+    const resp = await chrome.runtime.sendMessage({
+        type: 'mt:cloud-inpaint', endpoint: opts.endpoint, key: opts.key, jpegB64, boxes, maskB64,
+    }) as { ok: boolean; page?: any; error?: string };
+    if (!resp?.ok) throw new Error(resp?.error ?? 'cloud inpaint failed');
+    const j = resp.page;
+    if (!j?.ok) throw new Error(String(j?.error ?? 'cloud inpaint failed'));
+    const b64buf = (s: string): ArrayBuffer => {
+        const bin = atob(s);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out.buffer;
+    };
+    const patches = (j.patches ?? []).map((p: any) => ({
+        x1: +p.x1, y1: +p.y1, x2: +p.x2, y2: +p.y2, png: b64buf(String(p.png ?? '')),
+    }));
+    return { patches, windows: +(j.windows ?? patches.length), ms: +(j.ms?.total ?? 0) };
+}
+
 // ---- Cloud: panel+detect+OCR on your own endpoint (opt-in, Modal).
 // Same boxes+texts the local pipeline produces; ordering/rendering stay
 // client-side. The mask is synthesized from boxes (inpaint + cache work;
 // mask-only SFX recovery is local-only).
+
+// Binary erase mask -> base64 PNG for the cloud call (a 1600x1126 mask rides as
+// 1 byte/px; PNG squeezes it to tens of KB, where raw base64 would be ~2.4MB).
+// FileReader, not blob.arrayBuffer() — Firefox Xray trap (see the note below).
+async function maskToPngB64(mask: { width: number; height: number; data: Uint8Array }): Promise<string> {
+    return withEncodeLock(async () => {
+        const c = new OffscreenCanvas(mask.width, mask.height);
+        const ctx = c.getContext('2d')!;
+        const img = ctx.createImageData(mask.width, mask.height);
+        for (let i = 0, p = 0; i < mask.data.length; i++, p += 4) {
+            const v = mask.data[i] > 127 ? 255 : 0;
+            img.data[p] = v; img.data[p + 1] = v; img.data[p + 2] = v; img.data[p + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        const blob = await c.convertToBlob({ type: 'image/png' });
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
+            fr.onload = () => resolve(fr.result as string);
+            fr.readAsDataURL(blob);
+        });
+        const comma = dataUrl.indexOf(',');
+        return comma < 0 ? '' : dataUrl.slice(comma + 1);
+    });
+}
 
 // base64 straight out of a data URL — canvas JPEG blobs must NOT be read via
 // blob.arrayBuffer(): on Firefox that throws "Permission denied to access

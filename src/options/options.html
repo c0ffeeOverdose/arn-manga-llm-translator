@@ -494,6 +494,21 @@
           <br>• <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Deploy it to Modal</a> — stable URL; Starter is free ($30/mo credit, no card to start). Sleeps when idle — first page may wait ~1–2 min.
           <br>Both print the endpoint + key to paste above; press <b>Test</b> before reading. Pages go to YOUR endpoint only.</div>
       </fieldset>
+
+      <div class="field">
+        <label class="check"><input type="checkbox" id="aiCleanup"> AI text cleanup</label>
+        <div class="hint" id="aiCleanupHint"></div>
+      </div>
+
+      <div id="aiCleanupRow" style="display:none">
+        <div class="dl-row">
+          <span class="name" id="aiCleanupLabel">Text cleanup model (112MB)</span>
+          <span class="dl-text"></span>
+          <span class="dl-bar" id="aiCleanupBar"><span class="fill"></span></span>
+          <button id="aiCleanupBtn" type="button" class="btn ghost sm">Download</button>
+        </div>
+        <div class="hint" style="margin-top:8px">Erases the original text with a manga-trained model instead of a flat fill — noticeably cleaner over artwork and screentones. Runs on the GPU (WebGPU); without one, pages keep the built-in cleanup.</div>
+      </div>
     </div>
 
     <div class="card">

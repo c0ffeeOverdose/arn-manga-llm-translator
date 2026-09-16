@@ -11,12 +11,13 @@ sys.path.insert(0, os.environ.get("PKG_DIR", os.path.dirname(os.path.abspath(__f
 # NOTE: top-level sibling import — resolved locally at deploy parse time
 # (needs the full deps installed where you deploy from), baked copy used remotely.
 from app import app as fastapi_app
-from models_manifest import CTD_URL, BABERU, BABERU_FILES
+from models_manifest import CTD_URL, BABERU, BABERU_FILES, INPAINT_URL
 
 dl = [f"mkdir -p /models",
       f'curl -fL -o /models/ctd.onnx "{CTD_URL}"']
 dl += [f'curl -fL -o /models/{dst} "{BABERU}/{src}?download=true"'
        for src, dst in BABERU_FILES]
+dl.append(f'curl -fL -o /models/lama-manga-512-fp16w.onnx "{INPAINT_URL}"')
 
 image = (
     # nvidia runtime base: onnxruntime-gpu needs CUDA 13 + cuDNN 9 system

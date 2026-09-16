@@ -2,7 +2,7 @@
 // banding), preparePage (read + cache gate), paintRegions/paintExtras.
 
 import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type MtOnStatus } from './detection';
-import { inpaint, inpaintBoxRegion } from './inpaint';
+import { inpaint, inpaintBoxRegion, erasePlan } from './inpaint';
 import { boxIsVertical, renderRegion, sizeCapFrom } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
@@ -12,7 +12,7 @@ import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter,
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
 
 // cached entry → render-ready det (shared by preparePage and arrival paint —
 // one construction, one gate set: full entry + fp + dims + mask, partials
@@ -258,31 +258,25 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
 // Paint translated regions onto a canvas (inpaint source text, draw the
 // translation per box) — shared by the solo path and the seam path (which
 // paints the whole stitch, then slices). Returns the per-region layouts.
+// `patches` (AI cleanup output) replace the built-in fill when present.
+export interface PaintPatch { x1: number; y1: number; x2: number; y2: number; bmp: ImageBitmap }
+
 export function paintRegions(
     canvas: OffscreenCanvas, frame: ImageData, det: DetectResult, outputs: RegionOutput[],
+    patches?: PaintPatch[] | null,
 ): { i: number; f: number; n: number; o?: 1 }[] {
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-    // inpaint only regions the LLM didn't mark 'keep' (SFX/signatures stay as-is)
-    const keepIdx = new Set(
-        outputs.filter(o => o.translation === 'keep').map(o => o.index),
-    );
-    // erase ONLY boxes with a real translation — a skipped region (no output
-    // even after the retry) keeps its source text instead of ending up wiped
-    // and untranslated while the page registers as Done.
-    const translatedIdx = new Set(
-        outputs.filter(o => o.translation && o.translation !== 'keep').map(o => o.index),
-    );
-    // contained-duplicate guard (heals old cache entries on revisit, and
-    // confident dups the detection gate keeps): the lower-conf box is treated
-    // as keep — its source text stays instead of a second colliding paint.
-    const keptBoxes = new Set(dropContainedBoxes(det.boxes));
-    const dupIdx = new Set(det.boxes.map((b, i) => keptBoxes.has(b) ? -1 : i + 1).filter(i => i > 0));
-    const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && !dupIdx.has(i + 1));
-    const keepBoxes = det.boxes.filter((_, i) => keepIdx.has(i + 1) || dupIdx.has(i + 1));
-    const missedIdx = det.boxes.map((_, i) => i + 1).filter(i => !translatedIdx.has(i) && !keepIdx.has(i));
+    const { boxesToErase, keepBoxes, keepIdx, dupIdx, missedIdx } = erasePlan(det, outputs);
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
     if (dupIdx.size && isDebug()) console.log('[mt] contained-duplicate boxes kept as-is:', [...dupIdx].join(','));
-    inpaint(canvas, { ...det, boxes: boxesToErase, keepBoxes });
+    if (patches?.length) {
+        // AI cleanup ran on the original page: the patches already carry the
+        // erased background (only erase-box crops change), so paint them
+        // instead of the built-in fill
+        for (const p of patches) ctx.drawImage(p.bmp, p.x1, p.y1);
+    } else {
+        inpaint(canvas, { ...det, boxes: boxesToErase, keepBoxes });
+    }
 
     // chosen layout per rendered region — diagnoses shrink/clip issues live
     const layouts: { i: number; f: number; n: number }[] = [];

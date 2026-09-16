@@ -10,3 +10,9 @@ BABERU_FILES = [
     ("onnx/decoder_step_int8.onnx", "baberu-step.onnx"),
     ("tokenizer/vocab.json", "vocab.json"),
 ]
+
+# Manga text-cleanup inpainting (manga-LaMa, fp16 weights, FFT-as-matmuls
+# export). MIT model / Apache-2.0 arch — reproduce with
+# scripts/export-inpaint-onnx.py. Same artifact the extension downloads.
+INPAINT_URL = ("https://huggingface.co/c0ffeeOverdose/arn-manga-models"
+               "/resolve/main/lama-manga-512-fp16w.onnx?download=true")

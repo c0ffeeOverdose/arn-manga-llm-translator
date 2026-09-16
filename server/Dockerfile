@@ -16,6 +16,8 @@ RUN mkdir -p /models \
   done \
   && curl -fL -o /models/vocab.json \
     "https://huggingface.co/genshiai-daichi/baberu-ocr/resolve/main/tokenizer/vocab.json?download=true" \
+  && curl -fL -o /models/lama-manga-512-fp16w.onnx \
+    "https://huggingface.co/c0ffeeOverdose/arn-manga-models/resolve/main/lama-manga-512-fp16w.onnx?download=true" \
   && ls -la /models
 EXPOSE 7860
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860}"]

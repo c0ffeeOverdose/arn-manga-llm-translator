@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 23;
+export const RENDER_GEN = 24;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -343,12 +343,25 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
     const modal = interiorSeed(data, W, H, box);
 
     const boxW = box.x2 - box.x1, boxH = box.y2 - box.y1;
-    const window4 = (gx: number, gy: number) => ({
-        loX: Math.max(0, Math.floor(box.x1 - boxW * gx)),
-        loY: Math.max(0, Math.floor(box.y1 - boxH * gy)),
-        hiX: Math.min(W - 1, Math.ceil(box.x2 + boxW * gx)),
-        hiY: Math.min(H - 1, Math.ceil(box.y2 + boxH * gy)),
-    });
+    // Split children carry a clip (their side of the cut): the flood must not
+    // cross into the sibling region even when the outlines have a hole — a
+    // leaked fill claims the sibling's white and the area bbox spans both.
+    const clip = box.clip;
+    const window4 = (gx: number, gy: number) => {
+        let loX = Math.max(0, Math.floor(box.x1 - boxW * gx));
+        let loY = Math.max(0, Math.floor(box.y1 - boxH * gy));
+        let hiX = Math.min(W - 1, Math.ceil(box.x2 + boxW * gx));
+        let hiY = Math.min(H - 1, Math.ceil(box.y2 + boxH * gy));
+        if (clip) {
+            loX = Math.max(loX, Math.ceil(clip.x1));
+            loY = Math.max(loY, Math.ceil(clip.y1));
+            hiX = Math.min(hiX, Math.floor(clip.x2));
+            hiY = Math.min(hiY, Math.floor(clip.y2));
+            loX = Math.min(loX, hiX); // degenerate clip: keep a valid window
+            loY = Math.min(loY, hiY);
+        }
+        return { loX, loY, hiX, hiY };
+    };
 
     // Start pixel for a seed = the sampled pixel nearest the box center that
     // matches it. Flooding from the center itself is wrong when the center sits
@@ -499,12 +512,48 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
     return { ...pick.fill, ...pick.win };
 }
 
+// Sideways trim for the no-frame rect (see bubbleArea): per-row runs through
+// the box center, clamped with the same continuity rule widthProfile applies
+// along its stacking axis. The flood can escape the bubble where its outline
+// is open onto a same-coloured field (page white merging with the bubble
+// interior below a screen-tone patch): the fill then measures the field, not
+// the bubble, and the trust test downstream can even find art (a trunk, a tone
+// edge) "verifying" the leaked bound. Live page 5: fill minX 810 for a box at
+// 940, the area started 105px left of the box and the Thai text ran over the
+// hatch. Horizontal trim only: that is the proven leak geometry, vertical
+// bounds keep the clamp/trust/cap chain.
+function trimFillX(img: ImageData, box: DetBox, fill: InteriorFill, mask?: TextMask): { minX: number; maxX: number; leakL: number; leakR: number } {
+    const { width: W, height: H, data } = img;
+    const cx = Math.floor((box.x1 + box.x2) / 2);
+    const mk = maskView(mask, W, H);
+    const loX = Math.max(0, Math.floor(fill.minX)), hiX = Math.min(W - 1, Math.ceil(fill.maxX));
+    const y0 = Math.max(0, Math.floor(fill.minY)), y1 = Math.min(H - 1, Math.ceil(fill.maxY));
+    const pass = (x: number, y: number) =>
+        (x >= box.x1 && x <= box.x2 && y >= box.y1 && y <= box.y2)
+        || seedLike(data, (y * W + x) * 4, fill.seed)
+        || (mk != null && mk[y * W + x] > 127);
+    let supL: number | null = null, supR: number | null = null, leakL = 0, leakR = 0;
+    let minX = loX, maxX = hiX, seen = false;
+    for (let y = y0; y <= y1; y++) {
+        if (!pass(cx, y)) continue;
+        let a = cx, b = cx;
+        while (a - 1 >= loX && pass(a - 1, y)) a--;
+        while (b + 1 <= hiX && pass(b + 1, y)) b++;
+        const cl = clampRunEnd(supL, a, 1), cr = clampRunEnd(supR, b, -1);
+        if (cl.leaked) leakL++; else supL = cl.value;
+        if (cr.leaked) leakR++; else supR = cr.value;
+        if (!seen) { minX = cl.value; maxX = cr.value; seen = true; }
+        else { if (cl.value < minX) minX = cl.value; if (cr.value > maxX) maxX = cr.value; }
+    }
+    return seen ? { minX, maxX, leakL, leakR } : { minX: loX, maxX: hiX, leakL: 0, leakR: 0 };
+}
+
 // Rectangle placement area — the NO-FRAME path: narration and SFX over art,
 // open backgrounds. Flood-fill the box interior, hard-limited to box+30% (1.0×
 // sideways for vertical column boxes) and verified against real spanning
 // borders (see below), then capped at 1.5× the box. Live-tuned behavior; the
 // profile path (fitArea) takes over when a bubble border encloses the box.
-export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: number; y: number; w: number; h: number } {
+export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: number; y: number; w: number; h: number; leakL?: number; leakR?: number } {
     const { width: W, height: H, data } = img;
     const boxW = box.x2 - box.x1, boxH = box.y2 - box.y1;
     // Vertical text columns are narrow by nature (CTD hugs the glyphs, not the
@@ -524,7 +573,11 @@ export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: n
     // through the same sideways-only grow + long-axis-stable guard the profile
     // path uses.
     const fill = interiorFill(img, box, growX, 0.3, true, mask);
+    // Supported sideways bounds first (see trimFillX): the trust tests below
+    // must judge the bubble's edge, not art the leaked field ran into.
+    const trim = trimFillX(img, box, fill, mask);
     let { minX, minY, maxX, maxY } = fill;
+    minX = trim.minX; maxX = trim.maxX;
     const [r0, g0, b0] = fill.seed;
     const fillL = minX, fillR = maxX, fillT = minY, fillB = maxY; // pre-clamp bounds
 
@@ -607,6 +660,7 @@ export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: n
         return {
             x: box.x1 - px, y: box.y1 - py,
             w: boxW + 2 * px, h: boxH + 2 * py,
+            leakL: trim.leakL, leakR: trim.leakR,
         };
     }
     // 8% inner margin so text doesn't touch bubble edges. Floored at the
@@ -617,7 +671,7 @@ export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: n
     const mx = (maxX - minX) * 0.08, my = (maxY - minY) * 0.08;
     const fx1 = Math.min(minX + mx, box.x1), fy1 = Math.min(minY + my, box.y1);
     const fx2 = Math.max(maxX - mx, box.x2), fy2 = Math.max(maxY - my, box.y2);
-    return { x: fx1, y: fy1, w: fx2 - fx1, h: fy2 - fy1 };
+    return { x: fx1, y: fy1, w: fx2 - fx1, h: fy2 - fy1, leakL: trim.leakL, leakR: trim.leakR };
 }
 
 // ── Placement profile (enclosed bubbles) ─────────────────────────────────
@@ -639,6 +693,9 @@ export interface RunProfile {
     // the area away from where the source text actually sits (live: a caption
     // box's area doubled its height into the page margin and the text drifted).
     e0: number; e1: number;
+    // Rows whose run end was clamped by the continuity rule (see RUN_JUMP):
+    // the fill had escaped the bubble and was following art. Dump-only.
+    leakL: number; leakR: number;
 }
 
 // How much of the run rows must show a bubble outline right outside the run
@@ -654,6 +711,24 @@ export const ENCLOSED_MIN = 0.5;
 // area's stacking range, and trimming it keeps a band that merely touches such
 // a row from reading zero.
 const RUN_MIN = 16;
+
+// A run end must move continuously along the stacking axis: a bubble boundary
+// is a curve, so an end that jumps sideways by more than RUN_JUMP from the last
+// supported position is not that boundary — the fill escaped through a gap in
+// the outline and is now following art far away. The end sticks at the last
+// supported position and the row counts as leaked: it produces no outline
+// evidence, and the run cannot widen the band or the area. Live: a bubble whose
+// outline is open below a screen-tone patch, the fill ran 130px left along the
+// page white, the hatch edge and a tree trunk passed the thin-line test,
+// enclosure 0.53 admitted the profile and the Thai text was typeset over the
+// hatch and the neighbouring region.
+export const RUN_JUMP = 36;
+// Pure (unit tested): the clamped end + whether this row jumped outward.
+// dir 1 = min side (left end for horizontal text), -1 = max side (right end).
+export function clampRunEnd(prev: number | null, raw: number, dir: 1 | -1): { value: number; leaked: boolean } {
+    if (prev != null && dir * (prev - raw) > RUN_JUMP) return { value: prev, leaked: true };
+    return { value: raw, leaked: false };
+}
 
 // Measure the profile inside the fill's (clamped) extents. A pixel is passable
 // if it is interior-colored, or inside the detection box (the original glyphs
@@ -726,11 +801,20 @@ export function widthProfile(
         return k > 0 && k < OUTLINE_MAX && dark >= 1;
     };
     let rows = 0, enclosedRows = 0, e0 = -1, e1 = -1;
+    let supL: number | null = null, supR: number | null = null, leakL = 0, leakR = 0;
     for (let p = p0; p <= p1; p++) {
         if (!pass(p, center)) continue; // no interior at the box center line
         let a = center, b = center;
         while (a - 1 >= winLo && pass(p, a - 1)) a--;
         while (b + 1 <= winHi && pass(p, b + 1)) b++;
+        // Leak guard (see RUN_JUMP): a row that jumped outward is clamped to
+        // the last supported end, so its run cannot widen a band and its
+        // outline check runs at the supported line instead of the art it
+        // found outside.
+        const cl = clampRunEnd(supL, a, 1), cr = clampRunEnd(supR, b, -1);
+        a = cl.value; b = cr.value;
+        if (cl.leaked) leakL++; else supL = a;
+        if (cr.leaked) leakR++; else supR = b;
         const m = (b - a) * 0.08;
         let r1 = Math.round(a + m), r2 = Math.round(b - m);
         if (p >= boxP0 && p <= boxP1) { r1 = Math.min(r1, Math.floor(boxLo)); r2 = Math.max(r2, Math.ceil(boxHi)); }
@@ -742,7 +826,7 @@ export function widthProfile(
         }
     }
     if (!rows) return null;
-    return { vertical, p0, p1, i1, i2, enclosed: enclosedRows / rows, e0, e1 };
+    return { vertical, p0, p1, i1, i2, enclosed: enclosedRows / rows, e0, e1, leakL, leakR };
 }
 
 // Usable interval for a band of the stacking axis: the intersection of every
@@ -778,7 +862,12 @@ export function runInterval(prof: RunProfile, p0: number, p1: number): [number, 
 // Enclosed-bubble path: profile measurement, or the legacy rectangle when the
 // evidence says there is no bubble around this box.
 function fitArea(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask): LayoutRect {
-    const rect = (why: string): LayoutRect => ({ ...bubbleArea(img, box, mask), why });
+    const rect = (why: string, prof?: RunProfile): LayoutRect => ({
+        ...bubbleArea(img, box, mask), why,
+        // the profile's leak counts survive the fallback: "fell to rect with
+        // N clamped rows" is the diagnosis, not just the enclosure score
+        ...(prof ? { leakL: prof.leakL, leakR: prof.leakR } : null),
+    });
     // Per-axis leash. Stacking axis 0.6/side (≤2.2x): a bubble hugging its text
     // is well inside that, while a leaked fill (barely-enclosed white garment,
     // bubble tail slipping into a same-colored drawing) cannot run away.
@@ -797,8 +886,8 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask
     if ((maxX - minX) * (maxY - minY) >= boxW * boxH * 0.25) {
         const prof = widthProfile(img, box, vertical, fill.seed, { x1: minX, y1: minY, x2: maxX, y2: maxY }, fill, mask);
         if (!prof) return rect('norows');
-        if (prof.enclosed < ENCLOSED_MIN) return rect(`enclose ${prof.enclosed.toFixed(2)}`);
-        if (prof.e1 <= prof.e0) return rect('no-evidence-rows');
+        if (prof.enclosed < ENCLOSED_MIN) return rect(`enclose ${prof.enclosed.toFixed(2)}`, prof);
+        if (prof.e1 <= prof.e0) return rect('no-evidence-rows', prof);
         {
             const ks = Math.max(0, prof.e0 - prof.p0), ke = Math.min(prof.i1.length - 1, prof.e1 - prof.p0);
             let q1 = -1, q2 = -1;
@@ -819,7 +908,7 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask
                 if (q1 < 0 || prof.i1[k] < q1) q1 = prof.i1[k];
                 if (q2 < 0 || prof.i2[k] > q2) q2 = prof.i2[k];
             }
-            if (r0 < 0) return rect('no-run-rows');
+            if (r0 < 0) return rect('no-run-rows', prof);
             if (q2 > q1) {
                 // Extent on the stacking axis: rows with outline evidence on
                 // both sides, UNIONED with the detection box (clamped to the
@@ -898,6 +987,16 @@ export function boxIsVertical(box: DetBox): boolean {
     return (box.y2 - box.y1) > (box.x2 - box.x1) * renderTuning.verticalThreshold;
 }
 
+// Split children: never let the area cross the cut (the fill window is
+// clamped already, but the trust cap and ink-bbox paths can re-expand past
+// it). Pure — unit tested.
+export function clipArea(a: Area, clip?: { x1: number; y1: number; x2: number; y2: number }): Area {
+    if (!clip) return a;
+    const x1 = Math.max(a.x, clip.x1), y1 = Math.max(a.y, clip.y1);
+    const x2 = Math.min(a.x + a.w, clip.x2), y2 = Math.min(a.y + a.h, clip.y2);
+    return { x: x1, y: y1, w: Math.max(0, x2 - x1), h: Math.max(0, y2 - y1) };
+}
+
 // Layout area the renderer actually uses: enclosed bubbles get the measured
 // per-line profile; a big box with almost no ink (small SFX in empty space,
 // texture false-positive) lays out on the ink bbox instead — otherwise the
@@ -909,12 +1008,15 @@ export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxI
     if (ink.frac < 0.03) {
         const pad = 6;
         return {
-            x: Math.max(0, ink.x1 - pad), y: Math.max(0, ink.y1 - pad),
-            w: ink.x2 - ink.x1 + 2 * pad, h: ink.y2 - ink.y1 + 2 * pad,
+            ...clipArea({
+                x: Math.max(0, ink.x1 - pad), y: Math.max(0, ink.y1 - pad),
+                w: ink.x2 - ink.x1 + 2 * pad, h: ink.y2 - ink.y1 + 2 * pad,
+            }, box.clip),
             why: 'ink-bbox',
         };
     }
-    return fitArea(img, box, vertical, mask);
+    const found = fitArea(img, box, vertical, mask);
+    return { ...found, ...clipArea(found, box.clip) };
 }
 
 // Pick text color by contrast against the placement area background. Modal
@@ -996,7 +1098,7 @@ interface Area { x: number; y: number; w: number; h: number }
 
 // Placement rect, optionally carrying the measured per-line profile (see
 // widthProfile) for enclosed bubbles.
-export interface LayoutRect extends Area { runs?: RunProfile; why?: string }
+export interface LayoutRect extends Area { runs?: RunProfile; why?: string; leakL?: number; leakR?: number }
 
 // Shared placement-area resolution (layoutArea + canvas clamp + 20px floor).
 // Both orientations and the horizontal-fit probe use it, so the probe can

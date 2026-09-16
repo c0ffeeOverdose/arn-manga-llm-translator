@@ -118,6 +118,7 @@ if (!release) {
 for (const [file, hint] of [
   ['models/ctd-int8.onnx', 'run: sh scripts/fetch-models.sh  (dev/E2E only — users download on first use)'],
   ['models/panel-yolo26n.onnx', 'run: scripts/export-panel-onnx.sh  (dev/E2E only — users download on first use)'],
+  ['models/lama-manga-512-fp16w.onnx', 'run: python3 scripts/export-inpaint-onnx.py --ckpt lama_large_512px.ckpt  (dev/E2E only — users download on first use)'],
 ]) {
   try {
     cpSync(join(root, file), join(dist, file));

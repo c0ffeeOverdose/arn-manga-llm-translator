@@ -4,11 +4,13 @@
 import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
-import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0 } from './page-cache';
-import { withEncodeLock, type MtOnStatus } from './detection';
+import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN } from './page-cache';
+import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus } from './detection';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
-import { paintRegions, paintExtras, type Prep } from './pipeline';
+import { paintRegions, paintExtras, type Prep, type PaintPatch } from './pipeline';
+import { eraseBox, erasePlan, aiCleanupMask } from './inpaint';
+import { inpaintMode } from '../llm/pipeline-settings';
 import { ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
 import { rewindContextBefore, replayPagesAfter } from './queue';
@@ -80,6 +82,62 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     ctx.drawImage(bitmap, 0, 0);
 
+    // AI text cleanup: patches from the cache when valid, otherwise generated
+    // once from the original bitmap and written back to the entry. Any failure
+    // (no model, no WebGPU, download error) falls back to the built-in fill —
+    // a page must never fail here. Cloud mode rides the same shape (P6).
+    const aiMode = inpaintMode(pipeline);
+    let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
+    let aiGenerated = false, aiMs = 0, aiWindows = 0, aiError: string | undefined;
+    if (aiMode !== 'fill') {
+        const cached = prep.cached?.patches?.length && prep.cached.patchesGen === INPAINT_PATCH_GEN
+            ? prep.cached.patches : null;
+        if (cached) aiPatches = cached;
+        else {
+            const plan = erasePlan(det, outputs);
+            if (plan.boxesToErase.length) {
+                onStatus('Cleaning text…', 'render');
+                const rawMask = new Uint8Array(det.mask.data);
+                const boxes = plan.boxesToErase.map(b => eraseBox(rawMask, bitmap.width, bitmap.height, b,
+                    Math.max(8, Math.round((b.x2 - b.x1) * 0.08), Math.round((b.y2 - b.y1) * 0.08))));
+                const mask = aiCleanupMask(det, boxes, plan.keepBoxes);
+                if (aiMode === 'local') {
+                    try {
+                        const r = await inpaintPage(bitmap, boxes, mask);
+                        if (r.patches.length) { aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows; }
+                    } catch (e) {
+                        aiError = String((e as Error)?.message ?? e).slice(0, 120);
+                        if (isDebug()) console.log('[mt] AI cleanup unavailable — using built-in fill:', aiError);
+                    }
+                } else {
+                    // cloud engine: same client-side mask rides along, so local and
+                    // cloud erase the same pixels (the server falls back to its own
+                    // CTD pass for old clients)
+                    const cfg = await cloudConfig();
+                    if (cfg.endpoint && cfg.key) {
+                        try {
+                            const r = await cloudInpaint(
+                                bitmap, boxes,
+                                { quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw, endpoint: cfg.endpoint, key: cfg.key, mask },
+                            );
+                            if (r.patches.length) { aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows; }
+                        } catch (e) {
+                            aiError = String((e as Error)?.message ?? e).slice(0, 120);
+                            if (isDebug()) console.log('[mt] cloud AI cleanup unavailable — using built-in fill:', aiError);
+                        }
+                    } else {
+                        aiError = 'cloud endpoint not configured';
+                    }
+                }
+            }
+        }
+    }
+    let paintPatches: PaintPatch[] | null = null;
+    if (aiPatches?.length) {
+        paintPatches = await Promise.all(aiPatches.map(async p =>
+            ({ x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2, bmp: await createImageBitmap(new Blob([p.png], { type: 'image/png' })) })));
+    }
+
     await ensureFont();
     const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
@@ -87,7 +145,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // paint translated regions (shared helper — the seam path paints the whole
     // stitch, then slices per member)
     const tRender0 = performance.now();
-    const layouts = paintRegions(canvas, frame, det, outputs);
+    const layouts = paintRegions(canvas, frame, det, outputs, paintPatches);
+    for (const p of paintPatches ?? []) p.bmp.close();
 
     // VLM extras (shared helper — the seam path paints them on the stitch too)
     paintExtras(canvas, frame, det, extras);
@@ -104,6 +163,13 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         ...(prep.ocrResumed ? { ocrResumed: true } : null), // …and the OCR text came back too (OCR did not run)
         ...(prep.prepMs != null ? { prepMs: prep.prepMs } : null), // read + hash + cache-gate ms (excludes queue wait)
         renderMs, // paint ms (excludes PNG encode + overlays)
+        ...(aiMode !== 'fill' ? {
+            inpaint: {
+                mode: aiMode, ms: aiMs, windows: aiWindows, patches: aiPatches?.length ?? 0,
+                cached: !!aiPatches && !aiGenerated,
+                ...(aiError ? { error: aiError } : null),
+            },
+        } : null),
         minFont: renderTuning.minFont, // effective floor — stale options look identical to a render bug
         gen: RENDER_GEN, // render-logic generation — stale extension shows an older number
         detConf: pipeline.detConf, // threshold that let these boxes through — low values explain junk regions
@@ -128,6 +194,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 // enclosed score >0 = per-line profile layout, absent = no-frame rect
                 ...('runs' in a && a.runs ? { prof: +a.runs.enclosed.toFixed(2) } : null),
                 ...('why' in a && a.why ? { why: a.why } : null), // rect path reason (debug)
+                // leak guard (RUN_JUMP): rows whose run end was clamped from a
+                // fill that escaped the bubble — [left, right]
+                ...(a.runs?.leakL || a.runs?.leakR || a.leakL || a.leakR
+                    ? { leak: [a.runs?.leakL || a.leakL || 0, a.runs?.leakR || a.leakR || 0] }
+                    : null),
             };
         }),
         // chosen layout per region: {i, fontSize, line count} — null layout
@@ -191,11 +262,24 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             boxes: det.boxes, panels: det.panels ?? [],
             outputs, extras, mentions,
             mask: packMask(det.mask),
+            ...(aiPatches?.length ? { patches: aiPatches, patchesGen: INPAINT_PATCH_GEN } : null),
         }, pipeline.cacheMax);
     } else if (!prep.cached) {
         // cache off: the resume checkpoint this job may have resumed from is
         // in-flight work, and the job is done — leave nothing behind
         void cacheDelete(cacheKey(chapterKey(), prep.hash));
+    } else if (aiGenerated && aiPatches?.length && pipeline.cacheEnabled) {
+        // cache hit that had to regenerate crops (headless prefetch/arrival
+        // wrote the entry) — persist so the next visit paints without the model
+        void cachePut({
+            key: cacheKey(chapterKey(), prep.hash),
+            fp: settingsFingerprint(pipeline),
+            w: bitmap.width, h: bitmap.height,
+            boxes: det.boxes, panels: det.panels ?? [],
+            outputs, extras, mentions,
+            mask: packMask(det.mask),
+            patches: aiPatches, patchesGen: INPAINT_PATCH_GEN,
+        }, pipeline.cacheMax);
     }
     if (force && shareContext) {
         replayPagesAfter(state);
