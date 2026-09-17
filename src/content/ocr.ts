@@ -7,18 +7,59 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
-import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources } from './page-cache';
-import { chosenOrientation, pageArea } from './render';
+import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, INPAINT_PATCH_GEN } from './page-cache';
+import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './render';
+import { erasePlan, computeAiPatches } from './inpaint';
+import { type InpaintPatch } from './detection';
+import { inpaintMode } from '../llm/pipeline-settings';
+
+// Warm-path AI cleanup: compute the cleanup patches for a freshly translated
+// page and hand them to the caller's cache entry — arrival then paints with
+// the model's output instead of paying it while the user waits (the headless
+// prefetch/sweep entries otherwise carry no patches). Gated on cache-on +
+// local mode; `noDownload` keeps a background warm from starting the 112MB
+// model download (the worker checks model DB / dev bundle only). Lo-priority
+// ORT — background work must never delay the viewed page. Failures return
+// null — arrival regenerates or falls back to fill.
+export async function warmPatches(
+    bitmap: ImageBitmap, det: DetectResult, outputs: RegionOutput[],
+): Promise<{ patches: InpaintPatch[]; patchesGen: number } | null> {
+    if (!pipeline.cacheEnabled || inpaintMode(pipeline) !== 'local') return null;
+    const plan = erasePlan(det, outputs);
+    if (!plan.boxesToErase.length) return null;
+    try {
+        const r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes, { lo: true, noDownload: true });
+        if (isDebug()) console.log('[mt] warm patches', JSON.stringify({ erase: plan.boxesToErase.length, patches: r?.patches.length ?? 0 }));
+        return r?.patches.length ? { patches: r.patches, patchesGen: INPAINT_PATCH_GEN } : null;
+    } catch (e) {
+        if (isDebug()) console.log('[mt] warm patches failed:', String((e as Error)?.message ?? e).slice(0, 140));
+        return null;
+    }
+}
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
+// Full-page pixels for OCR-crop expansion (see expandCropToInk): read once per
+// page, shared by every crop below — per-crop readbacks would re-pay this per
+// region and slice the measurement window blind.
+async function pageImageData(bitmap: ImageBitmap): Promise<ImageData> {
+    const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = c.getContext('2d', { willReadFrequently: true })!;
+    ctx.drawImage(bitmap, 0, 0);
+    return ctx.getImageData(0, 0, c.width, c.height);
+}
+
 // crop + rotate as needed, then OCR via the iframe's Tesseract instance
-export async function ocrInWorkerPng(bitmap: ImageBitmap, box: DetBox): Promise<string> {
+export async function ocrInWorkerPng(bitmap: ImageBitmap, box: DetBox, pageImg: ImageData): Promise<string> {
     const pad = Math.max(8, (box.y2 - box.y1) * 0.30);
-    const x = Math.max(0, Math.floor(box.x1 - pad));
-    const y = Math.max(0, Math.floor(box.y1 - pad));
-    const w = Math.min(bitmap.width - x, Math.ceil(box.x2 - box.x1 + 2 * pad));
-    const h = Math.min(bitmap.height - y, Math.ceil(box.y2 - box.y1 + 2 * pad));
+    const r = expandCropToInk(pageImg, box, {
+        x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
+        w: Math.ceil(box.x2 - box.x1 + 2 * pad), h: Math.ceil(box.y2 - box.y1 + 2 * pad),
+    });
+    const x = Math.max(0, Math.floor(r.x));
+    const y = Math.max(0, Math.floor(r.y));
+    const w = Math.min(bitmap.width - x, Math.ceil(r.w));
+    const h = Math.min(bitmap.height - y, Math.ceil(r.h));
     const vertical = (box.y2 - box.y1) / Math.max(1, box.x2 - box.x1) > pipeline.verticalThreshold;
     const c = new OffscreenCanvas(w, h);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
@@ -42,12 +83,16 @@ export async function ocrInWorkerPng(bitmap: ImageBitmap, box: DetBox): Promise<
 
 // Baberu crop: tight padding (~10%) — the model was trained on tight bubble
 // crops and reads vertical text + busy backgrounds natively (no rotate/binarize)
-async function baberuCrop(bitmap: ImageBitmap, box: DetBox): Promise<ArrayBuffer> {
+async function baberuCrop(bitmap: ImageBitmap, box: DetBox, pageImg: ImageData): Promise<ArrayBuffer> {
     const pad = Math.max(4, (box.y2 - box.y1) * 0.10);
-    const x = Math.max(0, Math.floor(box.x1 - pad));
-    const y = Math.max(0, Math.floor(box.y1 - pad));
-    const w = Math.min(bitmap.width - x, Math.ceil(box.x2 - box.x1 + 2 * pad));
-    const h = Math.min(bitmap.height - y, Math.ceil(box.y2 - box.y1 + 2 * pad));
+    const r = expandCropToInk(pageImg, box, {
+        x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
+        w: Math.ceil(box.x2 - box.x1 + 2 * pad), h: Math.ceil(box.y2 - box.y1 + 2 * pad),
+    });
+    const x = Math.max(0, Math.floor(r.x));
+    const y = Math.max(0, Math.floor(r.y));
+    const w = Math.min(bitmap.width - x, Math.ceil(r.w));
+    const h = Math.min(bitmap.height - y, Math.ceil(r.h));
     const c = new OffscreenCanvas(w, h);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
     ctx.drawImage(bitmap, x, y, w, h, 0, 0, w, h);
@@ -61,15 +106,15 @@ async function baberuCrop(bitmap: ImageBitmap, box: DetBox): Promise<ArrayBuffer
 // still queues behind the in-flight decode step — the win is hiding PNG
 // crop/encode + message latency, not parallel inference (OCR ~40s → ~15s/page
 // measured). Per-box lock waits sum into lockWaitMs for the page-result dump.
-export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void): Promise<{ texts: string[]; lockWaitMs: number }> {
+export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], pageImg: ImageData, onProgress?: (done: number, total: number) => void, opts?: { lo?: boolean }): Promise<{ texts: string[]; lockWaitMs: number }> {
     const results: string[] = [];
     let lockWaitMs = 0;
     let next = 0;
     const startOne = async (): Promise<string> => {
         const i = next++;
         if (i >= boxes.length) return '';
-        const png = await baberuCrop(bitmap, boxes[i]);
-        const { text, lockWaitMs: w } = await baberuOcr(png);
+        const png = await baberuCrop(bitmap, boxes[i], pageImg);
+        const { text, lockWaitMs: w } = await baberuOcr(png, { lo: opts?.lo });
         lockWaitMs += w;
         return text;
     };
@@ -169,7 +214,7 @@ function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContex
 // (cyan, numbered in reading order), dashed green = the placement area the
 // layout actually got. Below-threshold near-misses draw dimmed gray with conf
 // and NO badge — a badge means "translated in this order".
-export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = []): Promise<string> {
+export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = [], mask?: TextMask): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d')!;
     ctx.drawImage(bitmap, 0, 0);
@@ -205,7 +250,7 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
     ctx.setLineDash([font, font * 0.6]);
     ctx.strokeStyle = '#2bff88';
     boxes.forEach((b, i) => {
-        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i), mask), mask);
         if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
     });
     // measured per-line runs (enclosed bubbles): orange outline of the shape
@@ -214,7 +259,7 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
     ctx.setLineDash([font * 0.5, font * 0.4]);
     ctx.strokeStyle = '#ffa02b';
     boxes.forEach((b, i) => {
-        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i)));
+        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i), mask), mask);
         const prof = a?.runs;
         if (!prof) return; // forEach: skip boxes without a measured profile
         const left: [number, number][] = [], right: [number, number][] = [];
@@ -263,12 +308,12 @@ export async function ensureDebugViews(): Promise<void> {
                 if (!st.debugOrig) {
                     const orig = await canvasPaintSrc(st, 'orig');
                     if (orig) {
-                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                         pages.set(st.debugOrig, st);
                     }
                 }
                 if (!st.debug && st.translatedBmp) {
-                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                     pages.set(st.debug, st);
                 }
             } catch (e) {
@@ -280,11 +325,11 @@ export async function ensureDebugViews(): Promise<void> {
         try {
             const ranks = panelRanks(st.det.panels ?? []);
             if (!st.debugOrig) {
-                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                 pages.set(st.debugOrig, st);
             }
             if (!st.debug) {
-                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs);
+                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
                 pages.set(st.debug, st);
             }
         } catch (e) {
@@ -316,12 +361,16 @@ async function canvasPaintSrc(state: PageState, which: 'orig' | 'translated' | '
 }
 
 // Zoomed crop per region (upscaled so small narration text is readable).
-async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean): Promise<string> {
+async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, pageImg: ImageData): Promise<string> {
     const pad = Math.max(8, (box.y2 - box.y1) * 0.12);
-    const x = Math.max(0, Math.floor(box.x1 - pad));
-    const y = Math.max(0, Math.floor(box.y1 - pad));
-    const w = Math.min(bitmap.width - x, Math.ceil(box.x2 - box.x1 + 2 * pad));
-    const h = Math.min(bitmap.height - y, Math.ceil(box.y2 - box.y1 + 2 * pad));
+    const r = expandCropToInk(pageImg, box, {
+        x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
+        w: Math.ceil(box.x2 - box.x1 + 2 * pad), h: Math.ceil(box.y2 - box.y1 + 2 * pad),
+    });
+    const x = Math.max(0, Math.floor(r.x));
+    const y = Math.max(0, Math.floor(r.y));
+    const w = Math.min(bitmap.width - x, Math.ceil(r.w));
+    const h = Math.min(bitmap.height - y, Math.ceil(r.h));
     const scale = Math.min(3, Math.max(1, pipeline.cropSize / Math.max(w, h)));
     const c = new OffscreenCanvas(Math.round(w * scale), Math.round(h * scale));
     const ctx = c.getContext('2d')!;
@@ -368,7 +417,10 @@ export async function translateRegions(
     // needs caller corroboration (resumed checkpoint, or no cache to resume
     // from) so a dead call never inflates the counter; force callers drop the
     // entry first (fresh work counts fresh).
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean },
+    // afterOcr: OCR finished and the ORT queue just drained — lets the
+    // caller start infer-lock work (AI cleanup warm) while the LLM is in
+    // flight; on the critical path from here is only the network wait.
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void },
 ): Promise<TranslateOutcome> {
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
     // ponytail: region cap 150 — dense art pages can drown a single LLM call;
@@ -411,6 +463,9 @@ export async function translateRegions(
         // back in THIS space — the model can't know the full-resolution page)
         let annW = bitmap.width, annH = bitmap.height;
         let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
+        // OCR crops grow past edge-cut glyphs (see expandCropToInk) — one shared
+        // readback, not one per region
+        const pageImg = await pageImageData(bitmap);
         if (ocr) {
             const tOcr = performance.now();
             onStatus('OCR…', 'ocr');
@@ -424,9 +479,9 @@ export async function translateRegions(
                         { kind: 'ocr', hint: 'Download the model first — Settings → Model → Text source → OCR engine → Download' },
                     );
                 }
-                const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, (done, total) => {
+                const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, pageImg, (done, total) => {
                     if (done % 4 === 0 || done === total) onStatus(`OCR ${done}/${total}…`, 'ocr');
-                });
+                }, { lo: opts?.lo });
                 ocrLockWaitMs = lockWaitMs;
                 texts.forEach((t, i) => { regions[i].source = t; });
             } else {
@@ -439,7 +494,7 @@ export async function translateRegions(
                     );
                 }
                 for (const [i, b] of det.boxes.entries()) {
-                    regions[i].source = await ocrInWorkerPng(bitmap, b);
+                    regions[i].source = await ocrInWorkerPng(bitmap, b, pageImg);
                 }
             }
             ocrStatus = regions.map(r => r.source ? 'ok' : 'empty');
@@ -452,14 +507,14 @@ export async function translateRegions(
             const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
             if (cropsOnly) {
                 imagesB64 = [];
-                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs));
+                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
             } else {
                 const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
                 annW = Math.round(bitmap.width * scale);
                 annH = Math.round(bitmap.height * scale);
                 badgeR = Math.round(annotFont(scale) * 0.9);
                 imagesB64 = [await annotateForVLM(bitmap, det.boxes, gs)];
-                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs));
+                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
             }
         }
         // build what we send: shareContext off = standalone page (ablation);
@@ -486,6 +541,7 @@ export async function translateRegions(
             llmSeconds = Math.max(llmSeconds + 1, Math.round((Date.now() - tickBase) / 1000));
             onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
         }, 1000);
+        opts?.afterOcr?.();
         let resp: any;
         // transcripts seen on the interim message — if the RPC channel dies
         // mid-translate (service worker killed / reloaded), the fallback below

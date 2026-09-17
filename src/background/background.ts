@@ -54,7 +54,8 @@ interface FontGetMsg {
     type: 'mt:font-get';
     id: string;               // font-store id
 }
-type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string } | { type: 'mt:cloud-warm'; endpoint: string; key: string };
+type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string } | { type: 'mt:cloud-warm'; endpoint: string; key: string }
+    | { type: 'mt:cloud-inpaint'; endpoint: string; key: string; jpegB64: string; maskB64: string; boxes: { x1: number; y1: number; x2: number; y2: number }[] };
 interface CharBookMsg {
     type: 'mt:char-book';
     book: { desc: string; gender: 'M' | 'F' | '?'; source: 'user' | 'vlm' | 'speech'; name?: string }[];
@@ -355,6 +356,34 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 sendResponse({ ok: true, ms: Date.now() - t0 });
             } catch (e) {
                 const m = e instanceof Error && e.name === 'AbortError' ? 'cloud warm timed out after 180s' : String((e as Error)?.message ?? e);
+                sendResponse({ ok: false, error: m });
+            } finally {
+                clearTimeout(to);
+            }
+        })();
+        return true;
+    }
+    if (msg?.type === 'mt:cloud-inpaint') {
+        // AI text cleanup on the user's own endpoint: the page rides as base64
+        // JPEG and the prepared erase mask as base64 PNG (JSON through
+        // messaging), boxes as JSON; the server returns per-box PNG patches and
+        // falls back to its own CTD pass when no mask is sent.
+        (async () => {
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort(), 90000);
+            try {
+                const base = String(msg.endpoint ?? '').replace(/\/$/, '');
+                if (!/^https?:\/\//.test(base)) { sendResponse({ ok: false, error: 'Endpoint URL must start with http(s)://' }); return; }
+                const r = await fetch(`${base}/v1/inpaint`, {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${msg.key}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: msg.jpegB64, boxes: msg.boxes, mask: msg.maskB64 || undefined }),
+                    signal: ctrl.signal,
+                });
+                if (!r.ok) { const t = await r.text().catch(() => ''); sendResponse({ ok: false, error: `cloud HTTP ${r.status}: ${t.slice(0, 160)}` }); return; }
+                sendResponse({ ok: true, page: await r.json() });
+            } catch (e) {
+                const m = e instanceof Error && e.name === 'AbortError' ? 'cloud timed out after 90s' : String((e as Error)?.message ?? e);
                 sendResponse({ ok: false, error: m });
             } finally {
                 clearTimeout(to);

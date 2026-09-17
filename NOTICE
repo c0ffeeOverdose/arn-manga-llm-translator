@@ -28,3 +28,14 @@ This product includes the following developed by third parties:
 
   Tesseract language data (tesseract-ocr/tessdata_fast)
     License: Apache-2.0
+
+  Manga text-cleanup inpainting (lama-manga-512-fp16w.onnx, fp16 weights,
+  111,851,312 bytes, sha256 135e4eadb08c16372b8f212686aa59e03a3b185b7a33b9e947ee1e59d8d5e3c6)
+    Model: dreMaz/AnimeMangaInpainting lama_large_512px.ckpt
+           (https://huggingface.co/dreMaz/AnimeMangaInpainting)
+    big-lama fine-tuned on 300k manga/anime pages
+    License: MIT
+    Architecture: advimman/lama (Apache-2.0), generator code vendored via
+    TareHimself/AnimeMangaInpainting-torchscript (MIT) in scripts/lama_ffc.py
+    Export: python3 scripts/export-inpaint-onnx.py --ckpt lama_large_512px.ckpt
+    (FFT-as-matmuls for the ORT-web WebGPU EP; fp16 weight-only)

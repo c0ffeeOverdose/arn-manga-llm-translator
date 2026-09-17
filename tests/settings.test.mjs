@@ -10,7 +10,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/settings.mjs', sourcemap: 'inline',
 });
 
-const { DEFAULT_PIPELINE_SETTINGS, applyPreset, loadPipelineSettings, mergePipeline, matchingPreset, TARGET_LANGS, filterTargetLangs, isAutoSite, autoSiteOf, autoSiteList, autoSiteAdd, autoSiteRemove } =
+const { DEFAULT_PIPELINE_SETTINGS, applyPreset, loadPipelineSettings, mergePipeline, matchingPreset, inpaintMode, TARGET_LANGS, filterTargetLangs, isAutoSite, autoSiteOf, autoSiteList, autoSiteAdd, autoSiteRemove } =
   await import(new URL('../.test-build/settings.mjs', import.meta.url).href);
 
 test('defaults are balanced preset', () => {
@@ -268,4 +268,24 @@ test('mergePipeline: popup-owned keys survive an options save', () => {
   assert.equal(merged.prefetchN, 3); // popup's value kept
   assert.equal(merged.targetLang, 'English'); // options' edit applied
   assert.equal(mergePipeline(undefined, staleLocal).prefetchN, 3); // missing storage = default, still not stale
+});
+
+test('inpaintMode: auto follows the engine (cloud on, local off)', () => {
+  const b = DEFAULT_PIPELINE_SETTINGS;
+  assert.equal(inpaintMode({ ...b, inferEngine: 'cloud', inpaint: 'auto' }), 'cloud');
+  assert.equal(inpaintMode({ ...b, inferEngine: 'local', inpaint: 'auto' }), 'fill');
+  assert.equal(inpaintMode({ ...b, inferEngine: 'local', inpaint: 'on' }), 'local');
+  assert.equal(inpaintMode({ ...b, inferEngine: 'cloud', inpaint: 'on' }), 'cloud');
+  assert.equal(inpaintMode({ ...b, inferEngine: 'cloud', inpaint: 'off' }), 'fill');
+});
+
+test('loadPipelineSettings validates inpaint', () => {
+  assert.equal(loadPipelineSettings({ inpaint: 'nonsense' }).inpaint, 'auto');
+  assert.equal(loadPipelineSettings({ inpaint: 'on' }).inpaint, 'on');
+  assert.equal(loadPipelineSettings({ inpaint: 'off' }).inpaint, 'off');
+});
+
+test('presets never touch the AI cleanup choice', () => {
+  assert.equal(applyPreset('fast').inpaint, DEFAULT_PIPELINE_SETTINGS.inpaint);
+  assert.equal(applyPreset('best').inpaint, DEFAULT_PIPELINE_SETTINGS.inpaint);
 });

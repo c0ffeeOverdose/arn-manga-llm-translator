@@ -479,7 +479,7 @@
       <fieldset id="cloudFields" style="display:none">
         <div class="field">
           <label for="cloudEndpoint">Endpoint URL</label>
-          <input type="text" id="cloudEndpoint" placeholder="https://you--arn-manga-api.modal.run">
+          <input type="text" id="cloudEndpoint" placeholder="https://xxxx.trycloudflare.com">
         </div>
 
         <div class="field">
@@ -489,8 +489,26 @@
 
         <button id="testCloud" type="button" class="btn ghost" style="width:100%">Test cloud &amp; prewarm</button>
         <div class="hint" id="cloudTestStatus" style="min-height:18px;margin-top:6px"></div>
-        <div class="hint">No endpoint yet? Open <b>server/cloud-setup.ipynb</b> in <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Google Colab</a> → Run all → paste the 2 values it prints (link works once the repo is public). Testing also wakes a sleeping endpoint, so run it before reading — pages fall back to on-device automatically if cloud fails. Pages go to YOUR endpoint only.</div>
+        <div class="hint">No endpoint yet? Run the server yourself:
+          <br>• <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/colab-server.ipynb" target="_blank" rel="noopener">Run it on Colab</a> — free GPU; needs only a Google sign-in (no card, no other account). URL changes each session; VM ends after ~90 min idle (12 h max).
+          <br>• <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Deploy it to Modal</a> — stable URL; Starter is free ($30/mo credit, no card to start). Sleeps when idle — first page may wait ~1–2 min.
+          <br>Both print the endpoint + key to paste above; press <b>Test</b> before reading. Pages go to YOUR endpoint only.</div>
       </fieldset>
+
+      <div class="field">
+        <label class="check"><input type="checkbox" id="aiCleanup"> AI text cleanup</label>
+        <div class="hint" id="aiCleanupHint"></div>
+      </div>
+
+      <div id="aiCleanupRow" style="display:none">
+        <div class="dl-row">
+          <span class="name" id="aiCleanupLabel">Text cleanup model (112MB)</span>
+          <span class="dl-text"></span>
+          <span class="dl-bar" id="aiCleanupBar"><span class="fill"></span></span>
+          <button id="aiCleanupBtn" type="button" class="btn ghost sm">Download</button>
+        </div>
+        <div class="hint" style="margin-top:8px">Erases the original text with a manga-trained model instead of a flat fill — noticeably cleaner over artwork and screentones. Runs on the GPU (WebGPU); without one, pages keep the built-in cleanup.</div>
+      </div>
     </div>
 
     <div class="card">
@@ -577,6 +595,8 @@
       </fieldset>
 
       <div id="ocrManager" style="display:none">
+        <div class="hint" id="ocrCloudNote" style="display:none">Cloud inference reads the text on the server — nothing to download or select here.</div>
+        <div id="ocrLocalRows">
         <div class="field">
           <label for="ocrEngine">OCR engine</label>
           <select id="ocrEngine">
@@ -595,6 +615,7 @@
           </div>
         </div>
         <div class="hint" style="margin-top:8px">Downloads once, then works offline. Delete anytime.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -616,10 +637,6 @@
         <div class="range-head"><label for="textScale">Text size vs original</label><span class="unit-wrap"><input type="number" id="textScaleNum" class="val-input" min="0.6" max="1.6" step="0.05"><span class="unit">×</span></span></div>
         <input type="range" id="textScale" min="0.6" max="1.6" step="0.05">
         <div class="hint">Ceiling for the font, measured from the original text's line pitch: 1 = same size as the source, higher reads easier, lower leaves more air. Long text still shrinks to fit.</div>
-      </div>
-      <div class="field">
-        <label class="check"><input type="checkbox" id="preferHorizontal"> Prefer horizontal text</label>
-        <div class="hint">Tall boxes render left-to-right first and rotate only when the text can't fit. Off = rotate tall columns as before.</div>
       </div>
       <div class="field">
         <div class="range-head"><label for="textStroke">Text outline</label><span class="unit-wrap"><input type="number" id="textStrokeNum" class="val-input" min="0" max="0.5" step="0.01"><span class="unit">×font</span></span></div>

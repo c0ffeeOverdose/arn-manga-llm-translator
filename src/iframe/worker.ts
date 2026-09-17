@@ -54,7 +54,7 @@ async function openModelsDb(): Promise<IDBDatabase> {
 // on fresh bytes means a corrupt download (evict so the next retry re-fetches
 // instead of re-reading poison); on cached bytes it means an environment
 // problem (keep the cache, retrying must not re-download 40MB).
-async function loadModelFile(key: string, bundlePath: string, hfFile: string, label: string): Promise<{ buf: ArrayBuffer; fresh: boolean }> {
+async function loadModelFile(key: string, bundlePath: string, hfFile: string, label: string, noDownload = false): Promise<{ buf: ArrayBuffer; fresh: boolean }> {
     const db = await openModelsDb();
     const cached = await new Promise<ArrayBuffer | undefined>(res => {
         const q = idbStore(db, 'readonly').get(key);
@@ -70,6 +70,10 @@ async function loadModelFile(key: string, bundlePath: string, hfFile: string, la
         buf = await dl(chrome.runtime.getURL(bundlePath));
     } catch { /* production dist ships no models — fall through to HF */ }
     if (!buf) {
+        // warm/background callers must never start a surprise download: the
+        // dev bundle above covers local testing, release users get the model
+        // from the options download (or their first real page, which may)
+        if (noDownload) throw new Error(`${label} not downloaded yet`);
         if (isDebug()) console.log(`[mt] downloading ${label} (once per install)…`);
         try {
             buf = await dl(DET_URL(hfFile));
@@ -171,18 +175,33 @@ function nms(boxes: number[][], confs: number[]): number[] {
 // (live-proven twice: wasm-create vs wasm-run, then gpu-vision vs
 // gpu-prefill on separate chains). ONE chain for everything ORT. The
 // pipeline overlap lives on the CPU side (crops, preprocess, LLM calls).
-const chains = new Map<string, Promise<void>>();
+//
+// Scheduling: FIFO with a background lane — RPCs tagged prio 1 (lookahead /
+// chapter sweep, which now precompute AI cleanup too) yield to the page the
+// user is waiting on (prio 0), which would otherwise queue behind a
+// multi-second background OCR. A running task is never preempted; ties keep
+// FIFO.
+type InferPrio = 0 | 1;
+interface InferTask { fn: () => Promise<unknown>; prio: InferPrio; t0: number; ok: (v: unknown) => void; fail: (e: unknown) => void }
+const inferQ: InferTask[] = [];
+let inferBusy = false;
 // lock contention meter: cumulative ms ORT runs spent queued on the infer
 // lock behind other models' runs. Handlers snapshot per-RPC deltas into
 // their replies — the page-result dump shows whether detect/panel/ocr
 // actually blocked on each other (0 = the lock was free).
 let lockWaitMs = 0;
-function withInferLock<T>(fn: () => Promise<T>, chainId = 'ort'): Promise<T> {
-    const t0 = performance.now();
-    const chain = chains.get(chainId) ?? Promise.resolve();
-    const run = chain.then(async () => { lockWaitMs += performance.now() - t0; return fn(); });
-    chains.set(chainId, run.then(() => {}, () => {}));
-    return run;
+function pumpInfer(): void {
+    if (inferBusy || !inferQ.length) return;
+    const task = inferQ.splice(pickInferIndex(inferQ), 1)[0];
+    inferBusy = true;
+    lockWaitMs += performance.now() - task.t0;
+    task.fn().then(task.ok, task.fail).finally(() => { inferBusy = false; pumpInfer(); });
+}
+function withInferLock<T>(fn: () => Promise<T>, prio: InferPrio = 0): Promise<T> {
+    return new Promise<T>((ok, fail) => {
+        inferQ.push({ fn: fn as () => Promise<unknown>, prio, t0: performance.now(), ok: v => ok(v as T), fail });
+        pumpInfer();
+    });
 }
 async function metered<T>(fn: () => Promise<T>): Promise<{ v: T; lockWait: number }> {
     const w0 = lockWaitMs;
@@ -194,7 +213,7 @@ async function metered<T>(fn: () => Promise<T>): Promise<{ v: T; lockWait: numbe
 // predictions in REGION coords + the raw text-probability mask at region size.
 // Extracted verbatim from the old monolithic runDetect — same pixels in,
 // same numbers out; tiling just calls it N times.
-async function inferOnce(bmp: ImageBitmap, confThr: number): Promise<{  boxes: number[][]; confs: number[]; lowBoxes: number[][]; lowConfs: number[];
+async function inferOnce(bmp: ImageBitmap, confThr: number, prio: InferPrio = 0): Promise<{  boxes: number[][]; confs: number[]; lowBoxes: number[][]; lowConfs: number[];
     prob: Float32Array; inferMs: number;
 }> {
     const w = bmp.width, h = bmp.height;
@@ -220,7 +239,7 @@ async function inferOnce(bmp: ImageBitmap, confThr: number): Promise<{  boxes: n
     // with (the evict's release waits on the infer lock this run holds)
     const sess = session;
     if (!sess) throw new Error('CTD session unavailable');
-    const res: any = await withInferLock(() => sess.run({ image: new ort.Tensor('float32', x, [1, 3, INPUT, INPUT]) }));
+    const res: any = await withInferLock(() => sess.run({ image: new ort.Tensor('float32', x, [1, 3, INPUT, INPUT]) }), prio);
     const inferMs = performance.now() - t0;
 
     const raw = res.bbox_preds.data as Float32Array;
@@ -264,7 +283,7 @@ async function inferOnce(bmp: ImageBitmap, confThr: number): Promise<{  boxes: n
     return { boxes, confs, lowBoxes, lowConfs, prob, inferMs };
 }
 
-async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, forceWasm = false): Promise<unknown> {
+async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, forceWasm = false, prio: InferPrio = 0): Promise<unknown> {
     await ensureSession(forceWasm);
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     const w = bitmap.width, h = bitmap.height;
@@ -360,18 +379,37 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
                 || inter > 0.15 * (o.x2 - o.x1) * (o.y2 - o.y1);
         });
     // pass 1: collect components (count + mask-prob sum for the quality gate)
-    type Comp = { x1: number; y1: number; x2: number; y2: number; count: number; probSum: number };
+    type Comp = { x1: number; y1: number; x2: number; y2: number; count: number; probSum: number; ids: number[] };
+    // Same text-likelihood definition everywhere a mask component must claim
+    // to be text: mean raw mask prob, corroborated by any low-confidence
+    // box-head prediction overlapping it (FREE — evidence: 8-page sweep — p4
+    // handwriting 4/4 survive, p7 window false-positives 0/12 pass, junk cut 70%).
+    // compBoxConf takes the SplitComp shape so split-rescue pieces re-gate directly.
+    const compBoxConf = (c: SplitComp): number => {
+        let boxConf = 0;
+        const cArea = (c.x2 - c.x1) * (c.y2 - c.y1);
+        for (let i = 0; i < lowBoxes.length; i++) {
+            const bx = lowBoxes[i];
+            const ix = Math.max(0, Math.min(bx[2], c.x2) - Math.max(bx[0], c.x1));
+            const iy = Math.max(0, Math.min(bx[3], c.y2) - Math.max(bx[1], c.y1));
+            if (ix * iy > 0.1 * cArea && lowConfs[i] > boxConf) boxConf = lowConfs[i];
+        }
+        return boxConf;
+    };
     const comps: Comp[] = [];
     const seen = new Uint8Array(packed.length);
+    const compId = new Int32Array(packed.length); // label per pixel, for split-rescue recounts below
+    let nextCompId = 0;
     const stack: number[] = [];
     for (let p = 0; p < packed.length && comps.length < 400; p++) {
         if (!packed[p] || seen[p]) continue;
+        const id = nextCompId++;
         stack.length = 0; stack.push(p); seen[p] = 1;
         let minX = w, minY = h, maxX = 0, maxY = 0, count = 0, probSum = 0;
         while (stack.length) {
             const q = stack.pop()!;
             const x = q % w, y = (q / w) | 0;
-            count++; probSum += prob[q];
+            count++; probSum += prob[q]; compId[q] = id;
             if (x < minX) minX = x; if (x > maxX) maxX = x;
             if (y < minY) minY = y; if (y > maxY) maxY = y;
             if (x > 0 && packed[q - 1] && !seen[q - 1]) { seen[q - 1] = 1; stack.push(q - 1); }
@@ -379,7 +417,39 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
             if (y > 0 && packed[q - w] && !seen[q - w]) { seen[q - w] = 1; stack.push(q - w); }
             if (y < h - 1 && packed[q + w] && !seen[q + w]) { seen[q + w] = 1; stack.push(q + w); }
         }
-        if (maxX - minX + 1 >= 8 && maxY - minY + 1 >= 8) comps.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1, count, probSum });
+        if (maxX - minX + 1 >= 8 && maxY - minY + 1 >= 8) comps.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1, count, probSum, ids: [id] });
+    }
+    // Split-input comps: raw text clusters snapshotted BEFORE pass 2 merges (a
+    // merged bbox would hide the gap between two balloons) and filtered by the
+    // same text-likelihood gate pass 3 uses. A box-head box can cover two
+    // balloons when their clusters sit close in the model's receptive field —
+    // these clusters are the evidence that splits it (splitMergedBoxes).
+    const textyComps: SplitComp[] = [];
+    const boxComps: SplitComp[] = [];
+    for (const c of comps) {
+        const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
+        // split evidence goes smaller than emitted regions: a lobe's ~10px
+        // fragments still split reliably (the lanes' own guards hold the
+        // lines together — live md2 YES lobe). Pass-3 emission keeps its own
+        // ≥14 floor, so no new junk regions are created by this.
+        if (bw < 10 || bh < 10) continue;
+        // pass 3's fill upper bound (solid blocks like windows) is wrong for
+        // raw per-line clusters: bold lines (white-on-black dialogue, the "EM"
+        // in an overlapping pair) fill their tight bbox past 0.6 and would be
+        // dropped — a dropped middle line turns its bubble's real line spacing
+        // into a fake 60px+ gap and splits the bubble in half (live). Dust
+        // stays out via the floor, solid impostors via the prob/corroboration
+        // gate below.
+        if (c.count / (bw * bh) < 0.02) continue;
+        if (c.probSum / c.count < 0.75 && compBoxConf(c) < 0.20) continue;
+        const comp = { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 };
+        textyComps.push(comp);
+        // …and the stricter set the child BOXES are measured from: the
+        // corroboration rescue is free for the cut decision, but a texture
+        // patch the box head also boxed (a screentone area: mean prob ~0.35-0.4
+        // against 0.8+ for text) must not widen a child box into the artwork
+        // (live page 4: caption box 4 grew 109px over the hatch).
+        if (c.probSum / c.count >= 0.75) boxComps.push(comp);
     }
     // pass 2: merge components whose boxes touch when padded (line spacing)
     const GAP = 28;
@@ -396,6 +466,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
                         x2: Math.max(a.x2, b.x2), y2: Math.max(a.y2, b.y2),
                         count: a.count + b.count,
                         probSum: a.probSum + b.probSum,
+                        ids: [...a.ids, ...b.ids],
                     };
                     comps.splice(j, 1);
                     merged = true;
@@ -407,6 +478,24 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     // pass 3: filter + emit
     const maskBoxes: typeof outBoxes = [];
     const pageArea = w * h;
+    // recount a split-rescue piece: pixels of the parent comp's labels inside it
+    const recount = (ids: number[], x1: number, y1: number, x2: number, y2: number): { count: number; probSum: number } => {
+        const set = new Set(ids);
+        let count = 0, probSum = 0;
+        for (let y = Math.max(0, y1); y < Math.min(h, y2); y++) {
+            for (let x = Math.max(0, x1); x < Math.min(w, x2); x++) {
+                if (set.has(compId[y * w + x])) { count++; probSum += prob[y * w + x]; }
+            }
+        }
+        return { count, probSum };
+    };
+    // A merged comp killed ONLY by the overlap gate gets a second chance via
+    // split (see rescueSplitComp): pieces outside all boxes survive as their
+    // own regions. Comps passing every gate are untouched.
+    const rescueSplitCompW = (c: Comp): typeof outBoxes => rescueSplitComp(
+        c, textyComps, boxComps, GAP, pageArea,
+        (x1, y1, x2, y2) => recount(c.ids, x1, y1, x2, y2),
+        overlap, compBoxConf);
     for (const c of comps) {
         if (maskBoxes.length >= 16) break;
         const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
@@ -416,28 +505,26 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         // GAP-merges that swallow whole panels
         if (bw < 14 || bh < 14 || fill < 0.02 || fill > 0.6) continue;
         if (bw * bh > 0.2 * pageArea) continue;
-        if (overlap(c)) continue;
-        // FREE text-likelihood gate (evidence: 8-page sweep — p4 handwriting
-        // 4/4 survive, p7 window false-positives 0/12 pass, junk cut 70%):
-        // mean raw mask prob inside the component, corroborated by any
-        // low-confidence box-head prediction overlapping it
         const maskProb = c.probSum / c.count;
-        let boxConf = 0;
-        const cArea = bw * bh;
-        for (let i = 0; i < lowBoxes.length; i++) {
-            const bx = lowBoxes[i];
-            const ix = Math.max(0, Math.min(bx[2], c.x2) - Math.max(bx[0], c.x1));
-            const iy = Math.max(0, Math.min(bx[3], c.y2) - Math.max(bx[1], c.y1));
-            if (ix * iy > 0.1 * cArea && lowConfs[i] > boxConf) boxConf = lowConfs[i];
+        if (maskProb < 0.75 && compBoxConf(c) < 0.20) continue; // text-likelihood gate — same definition as the split-input filter
+        if (!overlap(c)) {
+            maskBoxes.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: 0.5 });
+            continue;
         }
-        if (maskProb < 0.75 && boxConf < 0.20) continue;
-        maskBoxes.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: 0.5 });
+        // sole killer was the overlap gate — second chance via split
+        for (const r of rescueSplitCompW(c)) {
+            if (maskBoxes.length >= 16) break;
+            maskBoxes.push(r);
+        }
     }
 
     const initMs = sessionInitMs; // reported once — reset so later pages show steady-state 0
     sessionInitMs = 0;
     return {
-        boxes: [...outBoxes, ...maskBoxes],
+        // split AFTER the mask-only pass: a merged box's generous coverage must
+        // still suppress mask clusters it swallowed (pre-split list feeds the
+        // overlap gate), and only then does each balloon become its own box.
+        boxes: splitMergedBoxes([...outBoxes, ...maskBoxes], textyComps, GAP, boxComps),
         dropped: nearMisses(lowBoxes, lowConfs, outBoxes, confThr, minSize, w, h),
         mask: { width: w, height: h, data: packed.buffer },
         inferMs,
@@ -514,8 +601,10 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
 // scripts in extension pages; only the language data is user-managed,
 // downloaded from CDN on demand and cached in IndexedDB via ocr-models.ts) ----
-import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL } from '../llm/ocr-models';
-import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, type Tile } from '../content/detection';
+import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
+import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
+import { windowIndex } from '../content/inpaint';
+import { pickInferIndex } from '../content/page-cache';
 import { initDebug, isDebug } from '../debug';
 
 await initDebug();
@@ -621,7 +710,7 @@ async function ensureBaberu(): Promise<void> {
 }
 
 // one bubble crop → text. Ported 1:1 from BaberuOnnxOCR.__call__
-async function runBaberu(png: ArrayBuffer): Promise<string> {
+async function runBaberu(png: ArrayBuffer, prio: InferPrio = 0): Promise<string> {
     await ensureBaberu();
     const v = baberuVocab!;
     const { vis, pre, stp } = baberuSessions!;
@@ -640,7 +729,7 @@ async function runBaberu(png: ArrayBuffer): Promise<string> {
         x[i + 2 * N] = (d[i * 4 + 2] / 255 - BABERU_MEAN[2]) / BABERU_STD[2];
     }
     const t0 = performance.now();
-    const visOut = await withInferLock(async () => vis.run({ pixel_values: new ort.Tensor('float32', x, [1, 3, 224, 224]) })) as Record<string, any>;
+    const visOut = await withInferLock(async () => vis.run({ pixel_values: new ort.Tensor('float32', x, [1, 3, 224, 224]) }), prio) as Record<string, any>;
     const rawEmbeds = visOut.vision_embeds;
     // GPU→CPU bridge: when vision ran on webgpu the tensor is gpu-resident;
     // feeding it to the wasm prefill produced all-NaN logits (empty OCR for
@@ -658,7 +747,7 @@ async function runBaberu(png: ArrayBuffer): Promise<string> {
     const preOut = await withInferLock(async () => pre.run({
         vision_embeds: embeds,
         input_ids: new ort.Tensor('int64', BigInt64Array.from([BigInt(v.bos)]), [1, 1]),
-    })) as Record<string, any>;
+    }), prio) as Record<string, any>;
     // outputs: logits [1,seq,V] (use last position) + present_k/v caches
     let logits = baberuLastLogits(preOut);
     let present = BABERU_PRESENT_OUT.map(n => preOut[n]);
@@ -692,7 +781,7 @@ async function runBaberu(png: ArrayBuffer): Promise<string> {
             position_ids: new ort.Tensor('int64', BigInt64Array.from([BigInt(pos)]), [1, 1]),
         };
         BABERU_PAST_IN.forEach((nm, i) => { feed[nm] = present[i]; });
-        const out = await withInferLock(async () => stp.run(feed)) as Record<string, any>;
+        const out = await withInferLock(async () => stp.run(feed), prio) as Record<string, any>;
         logits = baberuLastLogits(out);
         present = BABERU_PRESENT_OUT.map(n => out[n]);
         pos++;
@@ -749,6 +838,157 @@ async function runOcr(png: ArrayBuffer, langs: string[]): Promise<string> {
     return data?.text ?? '';
 }
 
+// ---- text-cleanup inpainting (manga-LaMa, fp16 weights, fixed 512) --------
+// Per-region windows are cut from the ORIGINAL page (never from a neighbour's
+// fresh paint), edge-extended to a square, resized to 512, and composited
+// back only where the caller's mask says text was. WebGPU only: the wasm
+// fallback measures ~22s/window, so a machine without a working WebGPU
+// session is reported unavailable and the caller keeps the built-in fill.
+type InpaintBox = { x1: number; y1: number; x2: number; y2: number };
+const INPAINT_SIZE = 512;
+let inpaintSession: any = null;
+let inpaintCreating: Promise<void> | null = null;
+let inpaintNoGpu = false;
+
+async function ensureInpaintSession(noDownload = false): Promise<void> {
+    if (inpaintSession) return;
+    if (inpaintNoGpu) throw new Error('inpainting needs WebGPU');
+    if (!inpaintCreating) {
+        inpaintCreating = (async () => {
+            const { buf } = await loadModelFile(INPAINT_KEY, `models/${INPAINT_FILE}`, INPAINT_FILE, 'inpaint model (~112MB)', noDownload);
+            try {
+                inpaintSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }));
+            } catch (e) {
+                // EP-level failure: retrying on every page would only re-pay the
+                // upload before failing again. Download errors above are NOT
+                // sticky (a flaky network must be retryable).
+                inpaintNoGpu = true;
+                throw e;
+            }
+        })().finally(() => { inpaintCreating = null; });
+    }
+    await inpaintCreating;
+}
+
+async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[], padRatio: number, prio: InferPrio = 0, noDownload = false): Promise<{
+    patches: { i: number; x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
+    windows: number; inferMs: number;
+}> {
+    await ensureInpaintSession(noDownload);
+    const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
+    const W = bitmap.width, H = bitmap.height;
+    const src = new OffscreenCanvas(W, H);
+    const sctx = src.getContext('2d', { willReadFrequently: true })!;
+    sctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const out = new ImageData(new Uint8ClampedArray(sctx.getImageData(0, 0, W, H).data), W, H);
+    const sq = new OffscreenCanvas(1, 1);
+    const sqc = sq.getContext('2d', { willReadFrequently: true })!;
+    const img512 = new OffscreenCanvas(INPAINT_SIZE, INPAINT_SIZE);
+    const i512 = img512.getContext('2d', { willReadFrequently: true })!;
+    const out512 = new OffscreenCanvas(INPAINT_SIZE, INPAINT_SIZE);
+    const o512 = out512.getContext('2d', { willReadFrequently: true })!;
+    const back = new OffscreenCanvas(1, 1);
+    const bctx = back.getContext('2d', { willReadFrequently: true })!;
+    const inferBuf = new Float32Array(4 * INPAINT_SIZE * INPAINT_SIZE);
+    const N512 = INPAINT_SIZE * INPAINT_SIZE;
+    let inferMs = 0, windows = 0;
+    for (const b of boxes) {
+        const bw = b.x2 - b.x1, bh = b.y2 - b.y1;
+        const pad = Math.max(8, Math.round(Math.max(bw, bh) * padRatio));
+        const side = Math.round(Math.max(bw, bh) + pad * 2);
+        const sx = Math.round(b.x1 + bw / 2 - side / 2), sy = Math.round(b.y1 + bh / 2 - side / 2);
+        sq.width = sq.height = side; // resize clears the canvas
+        sqc.imageSmoothingEnabled = false;
+        const ox = Math.max(0, -sx), oy = Math.max(0, -sy);
+        const px = Math.max(0, sx), py = Math.max(0, sy);
+        const pw = Math.min(W, sx + side) - px, ph = Math.min(H, sy + side) - py;
+        if (pw > 0 && ph > 0) sqc.drawImage(src, px, py, pw, ph, ox, oy, pw, ph);
+        if (ox > 0 && ph > 0) sqc.drawImage(src, px, py, 1, ph, 0, oy, ox, ph);
+        if (ox + pw < side && ph > 0) sqc.drawImage(src, px + pw - 1, py, 1, ph, ox + pw, oy, side - ox - pw, ph);
+        if (oy > 0 && pw > 0) sqc.drawImage(src, px, py, pw, 1, ox, 0, pw, oy);
+        if (oy + ph < side && pw > 0) sqc.drawImage(src, px, py + ph - 1, pw, 1, ox, oy + ph, pw, side - oy - ph);
+        if (ox > 0 && oy > 0) sqc.drawImage(src, px, py, 1, 1, 0, 0, ox, oy);
+        if (ox + pw < side && oy > 0 && pw > 0) sqc.drawImage(src, px + pw - 1, py, 1, 1, ox + pw, 0, side - ox - pw, oy);
+        if (ox > 0 && oy + ph < side && ph > 0) sqc.drawImage(src, px, py + ph - 1, 1, 1, 0, oy + ph, ox, side - oy - ph);
+        if (ox + pw < side && oy + ph < side && pw > 0 && ph > 0) {
+            sqc.drawImage(src, px + pw - 1, py + ph - 1, 1, 1, ox + pw, oy + ph, side - ox - pw, side - oy - ph);
+        }
+        i512.imageSmoothingEnabled = true;
+        i512.imageSmoothingQuality = 'high';
+        i512.clearRect(0, 0, INPAINT_SIZE, INPAINT_SIZE);
+        i512.drawImage(sq, 0, 0, INPAINT_SIZE, INPAINT_SIZE);
+        const imgData = i512.getImageData(0, 0, INPAINT_SIZE, INPAINT_SIZE).data;
+        // nearest-sample the caller's full-res binary mask through the same
+        // square geometry — smoothed mask edges would invent half-covered pixels
+        const scale = side / INPAINT_SIZE;
+        for (let y = 0; y < INPAINT_SIZE; y++) {
+            const my = Math.min(H - 1, Math.max(0, Math.floor(sy + (y + 0.5) * scale)));
+            for (let x = 0; x < INPAINT_SIZE; x++) {
+                const mx = Math.min(W - 1, Math.max(0, Math.floor(sx + (x + 0.5) * scale)));
+                const i = y * INPAINT_SIZE + x, j = i * 4;
+                const m = mask[my * W + mx] > 127 ? 1 : 0;
+                inferBuf[i] = (imgData[j] / 255) * (1 - m);
+                inferBuf[N512 + i] = (imgData[j + 1] / 255) * (1 - m);
+                inferBuf[2 * N512 + i] = (imgData[j + 2] / 255) * (1 - m);
+                inferBuf[3 * N512 + i] = m;
+            }
+        }
+        const t0 = performance.now();
+        const res = await withInferLock(() => inpaintSession.run({
+            input: new ort.Tensor('float32', inferBuf, [1, 4, INPAINT_SIZE, INPAINT_SIZE]),
+        })) as Record<string, any>;
+        inferMs += performance.now() - t0;
+        windows++;
+        const o = res.output.data as Float32Array;
+        const outImg = o512.createImageData(INPAINT_SIZE, INPAINT_SIZE);
+        for (let i = 0; i < N512; i++) {
+            outImg.data[i * 4] = Math.max(0, Math.min(255, Math.round(o[i] * 255)));
+            outImg.data[i * 4 + 1] = Math.max(0, Math.min(255, Math.round(o[N512 + i] * 255)));
+            outImg.data[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(o[2 * N512 + i] * 255)));
+            outImg.data[i * 4 + 3] = 255;
+        }
+        o512.putImageData(outImg, 0, 0);
+        back.width = back.height = side;
+        bctx.imageSmoothingEnabled = true;
+        bctx.imageSmoothingQuality = 'high';
+        bctx.drawImage(out512, 0, 0, side, side);
+        const backData = bctx.getImageData(0, 0, side, side).data;
+        // composite only where the caller's mask had text (page resolution)
+        const cx1 = Math.max(0, Math.floor(b.x1) - 2), cy1 = Math.max(0, Math.floor(b.y1) - 2);
+        const cx2 = Math.min(W, Math.ceil(b.x2) + 2), cy2 = Math.min(H, Math.ceil(b.y2) + 2);
+        for (let yy = cy1; yy < cy2; yy++) {
+            const vy = windowIndex(yy, sy, side);
+            for (let xx = cx1; xx < cx2; xx++) {
+                if (mask[yy * W + xx] <= 127) continue;
+                const vx = windowIndex(xx, sx, side);
+                const si = (vy * side + vx) * 4, di = (yy * W + xx) * 4;
+                out.data[di] = backData[si];
+                out.data[di + 1] = backData[si + 1];
+                out.data[di + 2] = backData[si + 2];
+                out.data[di + 3] = 255;
+            }
+        }
+    }
+    // patches: one crop per box (+4px bleed so the caller can draw them under
+    // the translated text without seams) — same shape the cache stores
+    const patches: { i: number; x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] = [];
+    const pc = new OffscreenCanvas(1, 1);
+    const pctx = pc.getContext('2d', { willReadFrequently: true })!;
+    for (let bi = 0; bi < boxes.length; bi++) {
+        const b = boxes[bi];
+        const px1 = Math.max(0, Math.floor(b.x1) - 4), py1 = Math.max(0, Math.floor(b.y1) - 4);
+        const px2 = Math.min(W, Math.ceil(b.x2) + 4), py2 = Math.min(H, Math.ceil(b.y2) + 4);
+        if (px2 <= px1 || py2 <= py1) continue;
+        pc.width = px2 - px1;
+        pc.height = py2 - py1;
+        pctx.putImageData(out, -px1, -py1);
+        const blob = await pc.convertToBlob({ type: 'image/png' });
+        patches.push({ i: bi, x1: px1, y1: py1, x2: px2, y2: py2, png: await blob.arrayBuffer() });
+    }
+    return { patches, windows, inferMs };
+}
+
 // Handshake token: postMessage into this iframe carries the PAGE origin (the
 // content script shares it), so origin checks can't separate our content
 // script from hostile page JS — and worker.html is web-accessible, meaning
@@ -771,14 +1011,16 @@ window.addEventListener('message', async (ev: MessageEvent) => {
         (ev.source as Window | null)?.postMessage({ type: 'mt:rpc-result', ...payload, id: msg?.id }, '*', transfer);
     if (msg?.type !== 'mt:detect' && msg?.type !== 'mt:ocr' && msg?.type !== 'mt:ocr-status'
         && msg?.type !== 'mt:ocr-download' && msg?.type !== 'mt:ocr-delete' && msg?.type !== 'mt:ocr-list'
-        && msg?.type !== 'mt:panels' && msg?.type !== 'mt:baberu-ocr' && msg?.type !== 'mt:baberu-status') return;
+        && msg?.type !== 'mt:panels' && msg?.type !== 'mt:baberu-ocr' && msg?.type !== 'mt:baberu-status'
+        && msg?.type !== 'mt:inpaint') return;
+    const prio: InferPrio = msg.lo === true ? 1 : 0; // background warm work yields to the viewed page
     try {
         if (msg.type === 'mt:ocr-status' || msg.type === 'mt:ocr-list') {
             reply({ ok: true, installed: await ocrInstalled() });
         } else if (msg.type === 'mt:baberu-status') {
             reply({ ok: true, installed: await baberuInstalled() });
         } else if (msg.type === 'mt:baberu-ocr') {
-            const { v: text, lockWait } = await metered(() => runBaberu(msg.png));
+            const { v: text, lockWait } = await metered(() => runBaberu(msg.png, prio));
             reply({ ok: true, text, ms: Math.round(baberuMs), lockWait });
         } else if (msg.type === 'mt:ocr-download') {
             await ocrDownload(msg.lang); // download + cache (throws on failure)
@@ -792,8 +1034,15 @@ window.addEventListener('message', async (ev: MessageEvent) => {
         } else if (msg.type === 'mt:panels') {
             const { v: r, lockWait } = await metered(() => runPanels(msg.png, typeof msg.thr === 'number' ? msg.thr : PANEL_CONF_THR));
             reply({ ok: true, panels: r.panels, dropped: r.dropped, ms: Math.round(r.inferMs), lockWait });
+        } else if (msg.type === 'mt:inpaint') {
+            const { v: r, lockWait } = await metered(() => runInpaint(
+                msg.png, new Uint8Array(msg.mask), msg.boxes ?? [],
+                typeof msg.padRatio === 'number' ? msg.padRatio : 0.5, prio, msg.noDownload === true,
+            ));
+            reply({ ok: true, patches: r.patches, windows: r.windows, ms: Math.round(r.inferMs), lockWait },
+                r.patches.map(p => p.png));
         } else {
-            const { v: result, lockWait } = await metered(() => runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true));
+            const { v: result, lockWait } = await metered(() => runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true, prio));
             (result as any).lockWaitMs = lockWait;
             (ev.source as Window | null)?.postMessage(
                 { type: 'mt:detect-result', id: msg.id, ok: true, result },

@@ -8,9 +8,16 @@
 #
 # Panels: v1 returns [] — the client falls back to banding ordering, the same
 # path it takes when the panel model file is missing. No fidelity risk.
+# Splits: run_detect runs the same splitMergedBoxes family as the on-device
+# worker (lane 1/2, twin-balloon cut, short-first, 10px split-input floor),
+# and OCR crops grow past edge-cut glyphs like the client's expandCropToInk.
+# /v1/page reports SPLIT_GEN so the client re-detects entries from older
+# servers instead of rendering their fused boxes from cache.
 import asyncio
+import base64
 import io
 import json
+import math
 import os
 import re
 import time
@@ -47,6 +54,7 @@ app = FastAPI(title="arn-manga")
 lock = asyncio.Lock()  # one inference at a time (2 vCPU, no oversubscription)
 ctd = None
 baberu = None  # {vis, pre, stp, bos, eos, id2ch, contentIds}
+inpaint = None  # manga-LaMa fp16w; missing file only disables POST /v1/inpaint
 EPS = {}  # session -> provider chain (proves GPU placement in prod logs)
 
 
@@ -68,7 +76,7 @@ def _sess(path, providers):
 
 
 def load_models():
-    global ctd, baberu
+    global ctd, baberu, inpaint
     print("onnxruntime:", ort.__version__,
           "available:", ort.get_available_providers(), flush=True)
     t_all = time.perf_counter()
@@ -94,8 +102,18 @@ def load_models():
             content.add(i)
     baberu = {"vis": vis, "pre": pre, "stp": stp, "bos": 1, "eos": 2,
               "id2ch": id2ch, "contentIds": content}
+    # optionally loadable: a server without the 112MB cleanup model still
+    # serves detection/OCR, /v1/inpaint answers 503
+    try:
+        inpaint = _sess(f"{MODEL_DIR}/lama-manga-512-fp16w.onnx", ORT_PROVIDERS)
+    except Exception as e:
+        inpaint = None
+        print(f"inpaint model not loaded: {e}", flush=True)
     EPS.update({n: s.get_providers() for n, s in
-                {"ctd": ctd, "vis": vis, "pre": pre, "stp": stp}.items()})
+                {"ctd": ctd, "vis": vis, "pre": pre, "stp": stp}.items()
+                if n != "inpaint"})
+    if inpaint is not None:
+        EPS["inpaint"] = inpaint.get_providers()
     print("ORT providers:", EPS, flush=True)
 
 
@@ -106,13 +124,17 @@ def _startup():
 
 @app.get("/health")
 def health():
+    # splitGen is here (not just /v1/page) so a remote client can verify the
+    # server runs the split/mask logic its cache gate expects — a stale Colab
+    # process otherwise fails silently back to fused boxes.
     return {"ok": bool(ctd and baberu), "device": os.environ.get("ORT_DEVICE", "cpu"),
-            "panels": "client-fallback", "ep": EPS or None}
+            "panels": "client-fallback", "ep": EPS or None, "splitGen": SPLIT_GEN}
 
 
 @app.get("/")
 def root():
-    return {"service": "arn-manga", "endpoints": ["/health", "POST /v1/page"]}
+    return {"service": "arn-manga",
+            "endpoints": ["/health", "POST /v1/page", "POST /v1/inpaint"]}
 
 
 def nms(boxes, confs):
@@ -180,6 +202,8 @@ def merge_tile_boxes(tiled):
     return [(x1, y1, x2, y2, c) for x1, y1, x2, y2, c, _ in allb]
 
 
+from split import (SPLIT_GEN, expand_crop_to_ink, pack_mask, rescue_split_comp,
+                   split_merged_boxes)
 def infer_once(pil, conf_thr):
     w, h = pil.size
     s = CTD_INPUT / max(w, h)
@@ -276,6 +300,19 @@ def run_detect(pil, conf_thr, min_size):
                 return True
         return False
 
+    # Same text-likelihood definition everywhere a mask component must claim
+    # to be text: mean raw mask prob, corroborated by any low-confidence
+    # box-head prediction overlapping it.
+    def comp_box_conf(c):
+        box_conf = 0.0
+        c_area = (c["x2"] - c["x1"]) * (c["y2"] - c["y1"])
+        for bx, bc in zip(low_boxes, low_confs):
+            ix = max(0, min(bx[2], c["x2"]) - max(bx[0], c["x1"]))
+            iy = max(0, min(bx[3], c["y2"]) - max(bx[1], c["y1"]))
+            if ix * iy > 0.1 * c_area and bc > box_conf:
+                box_conf = bc
+        return box_conf
+
     # mask components (4-connectivity like the browser BFS)
     packed = (prob > MASK_THR).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(packed, connectivity=4)
@@ -284,7 +321,29 @@ def run_detect(pil, conf_thr, min_size):
     for lab in range(1, min(n, 401)):
         x, y, bw, bh, area = (int(stats[lab, i]) for i in range(5))
         if bw >= 8 and bh >= 8:
-            comps.append([x, y, x + bw, y + bh, int(area), float(prob_sum[lab])])
+            comps.append({"x1": x, "y1": y, "x2": x + bw, "y2": y + bh,
+                          "count": int(area), "psum": float(prob_sum[lab]),
+                          "labs": {lab}})
+    # Split-input comps: raw text clusters snapshotted BEFORE the merge below
+    # (a merged bbox would hide the gap between two balloons) and filtered by
+    # the same text-likelihood gate pass 3 uses — mirrors worker.ts, including
+    # the 10px split-evidence floor (pass 3 keeps its own >=14 floor, so no
+    # new junk regions are created by this). box_comps is the stricter set the
+    # child BOXES are measured from (mean prob >= 0.75).
+    texty_comps, box_comps = [], []
+    for c in comps:
+        bw, bh = c["x2"] - c["x1"], c["y2"] - c["y1"]
+        if bw < 10 or bh < 10:
+            continue
+        if c["count"] / (bw * bh) < 0.02:
+            continue
+        mean = c["psum"] / c["count"]
+        if mean < 0.75 and comp_box_conf(c) < 0.20:
+            continue
+        r = {"x1": c["x1"], "y1": c["y1"], "x2": c["x2"], "y2": c["y2"]}
+        texty_comps.append(r)
+        if mean >= 0.75:
+            box_comps.append(r)
     # merge touching-when-padded components
     changed = True
     while changed:
@@ -292,10 +351,12 @@ def run_detect(pil, conf_thr, min_size):
         for i in range(len(comps)):
             for j in range(i + 1, len(comps)):
                 a, b = comps[i], comps[j]
-                if not (a[0] - COMP_GAP > b[2] or b[0] - COMP_GAP > a[2]
-                        or a[1] - COMP_GAP > b[3] or b[1] - COMP_GAP > a[3]):
-                    comps[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]),
-                                max(a[3], b[3]), a[4] + b[4], a[5] + b[5]]
+                if not (a["x1"] - COMP_GAP > b["x2"] or b["x1"] - COMP_GAP > a["x2"]
+                        or a["y1"] - COMP_GAP > b["y2"] or b["y1"] - COMP_GAP > a["y2"]):
+                    comps[i] = {"x1": min(a["x1"], b["x1"]), "y1": min(a["y1"], b["y1"]),
+                                "x2": max(a["x2"], b["x2"]), "y2": max(a["y2"], b["y2"]),
+                                "count": a["count"] + b["count"], "psum": a["psum"] + b["psum"],
+                                "labs": a["labs"] | b["labs"]}
                     del comps[j]
                     changed = True
                     break
@@ -303,29 +364,62 @@ def run_detect(pil, conf_thr, min_size):
                 break
     page_area = w * h
     mask_boxes = []
-    for x1, y1, x2, y2, count, psum in comps:
+
+    def overlaps_rect(r):
+        for o in out_boxes:
+            ix = max(0, min(o["x2"], r["x2"]) - max(o["x1"], r["x1"]))
+            iy = max(0, min(o["y2"], r["y2"]) - max(o["y1"], r["y1"]))
+            inter = ix * iy
+            if inter > 0.05 * (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]) or \
+               inter > 0.15 * (o["x2"] - o["x1"]) * (o["y2"] - o["y1"]):
+                return True
+        return False
+
+    for c in comps:
         if len(mask_boxes) >= 16:
             break
+        x1, y1, x2, y2 = c["x1"], c["y1"], c["x2"], c["y2"]
         bw, bh = x2 - x1, y2 - y1
-        fill = count / (bw * bh)
+        fill = c["count"] / (bw * bh)
         if bw < 14 or bh < 14 or fill < 0.02 or fill > 0.6:
             continue
         if bw * bh > 0.2 * page_area:
             continue
-        if overlaps((x1, y1, x2, y2)):
+        mask_prob = c["psum"] / c["count"]
+        if mask_prob < 0.75 and comp_box_conf(c) < 0.20:
             continue
-        mask_prob = psum / count
-        box_conf, c_area = 0.0, bw * bh
-        for bx, bc in zip(low_boxes, low_confs):
-            ix = max(0, min(bx[2], x2) - max(bx[0], x1))
-            iy = max(0, min(bx[3], y2) - max(bx[1], y1))
-            if ix * iy > 0.1 * c_area and bc > box_conf:
-                box_conf = bc
-        if mask_prob < 0.75 and box_conf < 0.20:
+        if not overlaps((x1, y1, x2, y2)):
+            mask_boxes.append({"x1": float(x1), "y1": float(y1),
+                               "x2": float(x2), "y2": float(y2), "conf": 0.5})
             continue
-        mask_boxes.append({"x1": float(x1), "y1": float(y1),
-                           "x2": float(x2), "y2": float(y2), "conf": 0.5})
-    return out_boxes + mask_boxes, infer_ms
+        # sole killer was the overlap gate — second chance via split: pieces
+        # outside all boxes survive as their own regions (see rescue_split_comp)
+        labs = c["labs"]
+
+        def count_in(rx1, ry1, rx2, ry2, _labs=labs):
+            win_lab = labels[max(0, ry1):min(h, ry2), max(0, rx1):min(w, rx2)]
+            win_pr = prob[max(0, ry1):min(h, ry2), max(0, rx1):min(w, rx2)]
+            m = np.isin(win_lab, list(_labs))
+            return int(m.sum()), float(win_pr[m].sum())
+
+        for r in rescue_split_comp(
+                {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                texty_comps, box_comps, COMP_GAP, page_area,
+                count_in, overlaps_rect, comp_box_conf):
+            if len(mask_boxes) >= 16:
+                break
+            mask_boxes.append({"x1": float(r["x1"]), "y1": float(r["y1"]),
+                               "x2": float(r["x2"]), "y2": float(r["y2"]),
+                               "conf": 0.5})
+    # split AFTER the mask-only pass: a merged box's generous coverage must
+    # still suppress mask clusters it swallowed (pre-split list feeds the
+    # overlap gate), and only then does each balloon become its own box —
+    # mirrors worker.ts.
+    boxes = split_merged_boxes(out_boxes + mask_boxes, texty_comps, COMP_GAP, box_comps)
+    # packed is 0/1 — packMask mirrors the client's byte mask (0/255)
+    mw, mh, mbytes = pack_mask(w, h, (packed * 255).ravel())
+    return boxes, infer_ms, {"w": mw, "h": mh,
+                             "b64": base64.b64encode(mbytes).decode("ascii")}
 
 
 def run_baberu(crop):
@@ -385,13 +479,139 @@ def run_baberu(crop):
     return "".join(B["id2ch"].get(t, "") for t in toks), ms
 
 
-def baberu_crop(pil, b):
+def baberu_crop(pil, rgb, b):
     pad = max(4, (b["y2"] - b["y1"]) * 0.10)
-    x = max(0, int(b["x1"] - pad))
-    y = max(0, int(b["y1"] - pad))
-    w = min(pil.width - x, int(np.ceil(b["x2"] - b["x1"] + 2 * pad)))
-    h = min(pil.height - y, int(np.ceil(b["y2"] - b["y1"] + 2 * pad)))
+    rect = {"x": max(0, math.floor(b["x1"] - pad)), "y": max(0, math.floor(b["y1"] - pad)),
+            "w": math.ceil(b["x2"] - b["x1"] + 2 * pad), "h": math.ceil(b["y2"] - b["y1"] + 2 * pad)}
+    r = expand_crop_to_ink(rgb, b, rect)
+    x = max(0, math.floor(r["x"]))
+    y = max(0, math.floor(r["y"]))
+    w = min(pil.width - x, math.ceil(r["w"]))
+    h = min(pil.height - y, math.ceil(r["h"]))
     return pil.crop((x, y, x + w, y + h))
+
+
+INPAINT_SIZE = 512
+INPAINT_PAD_RATIO = 0.5
+
+
+def inpaint_dilate_radius(w, h):
+    """Mirror of aiCleanupDilate() in src/content/inpaint.ts — big scans have
+    bigger glyph gaps, and a tight mask makes the model paint the leftover white
+    glyphs over the whole window."""
+    return min(10, max(4, round(4 * max(w, h) / 1600)))
+
+
+def run_inpaint(pil, boxes, pad_ratio, mask=None):
+    """Erase the given boxes with the manga-LaMa model (fp16 weights, 512x512).
+
+    The client sends the prepared binary erase mask (restricted to the erase
+    boxes and dilated — thin glyph strokes and the gaps between them drop out of
+    the 512px window resize and the model then paints the leftover white glyphs'
+    background over the whole window). Without one the mask is rebuilt from CTD
+    here, restricted to the boxes and dilated with the same recipe. Windows are
+    cut from the original image, edge-padded to a square, run at 512x512, and
+    composited back only where the mask says text was. Returns per-box PNG
+    patches (the same shape the on-device worker produces).
+    """
+    det_ms = 0.0
+    if mask is None:
+        _, _, _, _, prob, det_ms = infer_once(pil, CONF_THR)
+        raw = prob > MASK_THR
+        mask = np.zeros_like(raw)
+        for b in boxes:
+            x1 = max(0, int(np.floor(b["x1"]))); y1 = max(0, int(np.floor(b["y1"])))
+            x2 = min(pil.width, int(np.ceil(b["x2"]))); y2 = min(pil.height, int(np.ceil(b["y2"])))
+            mask[y1:y2, x1:x2] = raw[y1:y2, x1:x2]
+        mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8),
+                          iterations=inpaint_dilate_radius(pil.width, pil.height)) > 0
+    rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
+    H, W = rgb.shape[:2]
+    out = rgb.copy()
+    t0 = time.perf_counter()
+    windows = 0
+    for b in boxes:
+        x1 = max(0, min(W - 1, int(np.floor(b["x1"]))))
+        y1 = max(0, min(H - 1, int(np.floor(b["y1"]))))
+        x2 = max(x1 + 1, min(W, int(np.ceil(b["x2"]))))
+        y2 = max(y1 + 1, min(H, int(np.ceil(b["y2"]))))
+        bw, bh = x2 - x1, y2 - y1
+        pad = max(8, round(max(bw, bh) * pad_ratio))
+        side = round(max(bw, bh) + 2 * pad)
+        sx = round(x1 + bw / 2 - side / 2)
+        sy = round(y1 + bh / 2 - side / 2)
+        cx1, cy1 = max(0, sx), max(0, sy)
+        cx2, cy2 = min(W, sx + side), min(H, sy + side)
+        top, left = cy1 - sy, cx1 - sx
+        bottom = side - (cy2 - cy1) - top
+        right = side - (cx2 - cx1) - left
+        crop = rgb[cy1:cy2, cx1:cx2]
+        mcrop = mask[cy1:cy2, cx1:cx2].astype(np.uint8) * 255
+        # edge padding (not reflect): always valid however wide the margin is
+        crop_sq = np.pad(crop, ((top, bottom), (left, right), (0, 0)), mode="edge")
+        mask_sq = np.pad(mcrop, ((top, bottom), (left, right)), mode="edge")
+        img512 = np.asarray(Image.fromarray(crop_sq).resize(
+            (INPAINT_SIZE, INPAINT_SIZE), Image.LANCZOS), dtype=np.float32) / 255.0
+        m512 = np.asarray(Image.fromarray(mask_sq).resize(
+            (INPAINT_SIZE, INPAINT_SIZE), Image.NEAREST)) > 127
+        inp = np.concatenate([img512 * (1 - m512[..., None]),
+                              m512[..., None].astype(np.float32)], axis=2)
+        pred = inpaint.run(None, {"input": np.transpose(inp, (2, 0, 1))[None].astype(np.float32)})[0][0]
+        pred = np.transpose(np.clip(pred, 0.0, 1.0), (1, 2, 0))
+        win = np.asarray(Image.fromarray((pred * 255).astype(np.uint8)).resize(
+            (side, side), Image.LANCZOS))
+        mwin = np.asarray(Image.fromarray(mask_sq).resize(
+            (side, side), Image.NEAREST)) > 127
+        ox, oy = max(0, -sx), max(0, -sy)
+        sub_out = out[cy1:cy2, cx1:cx2]
+        sub_win = win[oy:oy + (cy2 - cy1), ox:ox + (cx2 - cx1)]
+        sub_mask = mwin[oy:oy + (cy2 - cy1), ox:ox + (cx2 - cx1)]
+        sub_out[sub_mask] = sub_win[sub_mask]
+        windows += 1
+    patches = []
+    for b in boxes:
+        px1 = max(0, int(np.floor(b["x1"])) - 4)
+        py1 = max(0, int(np.floor(b["y1"])) - 4)
+        px2 = min(W, int(np.ceil(b["x2"])) + 4)
+        py2 = min(H, int(np.ceil(b["y2"])) + 4)
+        crop = out[py1:py2, px1:px2]
+        if crop.size == 0:
+            continue
+        buf = io.BytesIO()
+        Image.fromarray(crop).save(buf, format="PNG")
+        patches.append({"x1": px1, "y1": py1, "x2": px2, "y2": py2,
+                        "png": base64.b64encode(buf.getvalue()).decode("ascii")})
+    ms = (time.perf_counter() - t0) * 1000
+    return patches, windows, ms, det_ms
+
+
+@app.post("/v1/inpaint")
+async def inpaint_page(req: Request, pad_ratio: float = Query(INPAINT_PAD_RATIO)):
+    if inpaint is None:
+        return JSONResponse({"ok": False, "error": "inpaint model not loaded on the server"}, 503)
+    t0 = time.perf_counter()
+    mask = None
+    try:
+        body = await req.json()
+        raw = base64.b64decode(body.get("image") or "")
+        boxes = body.get("boxes") or []
+        pil = Image.open(io.BytesIO(raw)).convert("RGB")
+        mask_b64 = body.get("mask")
+        if mask_b64:
+            m = Image.open(io.BytesIO(base64.b64decode(mask_b64))).convert("L")
+            if m.size != pil.size:
+                return JSONResponse({"ok": False, "error": f"mask size {m.size} != image {pil.size}"}, 400)
+            mask = np.asarray(m) > 127
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"bad request: {e}"}, 400)
+    async with lock:
+        try:
+            patches, windows, ms, det_ms = run_inpaint(pil, boxes, pad_ratio, mask)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"inpaint failed: {e}"}, 500)
+    return {"ok": True, "patches": patches, "windows": windows,
+            "ms": {"detect": round(det_ms, 1), "inpaint": round(ms, 1),
+                   "total": round((time.perf_counter() - t0) * 1000, 1)}}
 
 
 @app.post("/v1/page")
@@ -405,11 +625,12 @@ async def page(req: Request,
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"bad image: {e} (got {len(raw)} bytes head={raw[:8].hex()})"}, 400)
     async with lock:
-        boxes, det_ms = run_detect(pil, conf_thr, min_size)
+        boxes, det_ms, mask = run_detect(pil, conf_thr, min_size)
+        rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
         texts, ocr_ms = [], 0.0
         for b in boxes:
             try:
-                t, ms = run_baberu(baberu_crop(pil, b))
+                t, ms = run_baberu(baberu_crop(pil, rgb, b))
             except Exception:
                 t, ms = "", 0.0
             texts.append(t)
@@ -423,6 +644,8 @@ async def page(req: Request,
                    "conf": round(float(b["conf"]), 4)} for b in boxes],
         "panels": [],
         "panelSkipped": "cloud-v1: panel runs client-side, banding fallback applies",
+        "splitGen": SPLIT_GEN,
+        "mask": mask,
         "texts": texts,
         "ms": {"body": round(body_ms, 1), "detect": round(det_ms, 1),
                "ocr": round(ocr_ms, 1), "total": round(total, 1)},
