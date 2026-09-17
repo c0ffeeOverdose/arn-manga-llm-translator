@@ -16,18 +16,24 @@ const MAX_FONT = 200;
 // tunable via pipeline settings (set before rendering a page).
 // font is a CSS stack: Thai uses the bundled Sriracha, other languages
 // fall back to system fonts (Noto Sans CJK covers zh/ja/ko on Linux/ChromeOS).
-export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, verticalThreshold: 2.2, preferHorizontal: true, font: `${FONT}, sans-serif`, textColor: 'auto', strokeColor: 'auto', textStroke: 0.1, textScale: 1 };
+export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, verticalThreshold: 2.2, font: `${FONT}, sans-serif`, textColor: 'auto', strokeColor: 'auto', textStroke: 0.1, textScale: 1 };
 
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 22;
+export const RENDER_GEN = 28;
 
-export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
+// Absolute floor for the last-resort shrink below the user's minFont: text
+// that cannot fit at minFont shrinks this far before the overflow path clips
+// it (live: a 35px caption holding a 4-line Thai translation clipped to 1.5
+// lines at f:13 — complete at f:8 beats clipped at f:13). The primary loop
+// still honors minFont; only genuinely overflowing text goes below it.
+export const HARD_MIN_FONT = 8;
+
+export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
     if (t.letterSpacing != null) renderTuning.letterSpacing = t.letterSpacing;
     if (t.verticalThreshold) renderTuning.verticalThreshold = t.verticalThreshold;
-    if (t.preferHorizontal != null) renderTuning.preferHorizontal = t.preferHorizontal;
     if (t.font) renderTuning.font = t.font;
     if (t.textColor) renderTuning.textColor = t.textColor;
     if (t.strokeColor) renderTuning.strokeColor = t.strokeColor;
@@ -162,7 +168,8 @@ function halfTrack(): number {
 // " / " segments are hard line groups. Returns the largest size whose wrapped
 // lines fit; on overflow, the SMALLEST wrappable layout — showing the most
 // text small beats one giant clipped line (live: vertical strip kept f:49
-// and showed a single column).
+// and showed a single column). Past minFont the loop continues to
+// HARD_MIN_FONT so a long translation still completes instead of clipping.
 export function layoutText(
     ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
     text: string,
@@ -174,19 +181,26 @@ export function layoutText(
     if (!segments.length) return { lines: [], fontSize: renderTuning.minFont, lineHeight: renderTuning.minFont };
 
     let fallback: LaidOut | null = null;
-    for (let size = cap; size >= renderTuning.minFont; size -= 2) {
-        setFont(ctx, size);
-        const lineHeight = size * (1 + HEADROOM + LINE_SPACING);
-        const { lines, failed } = wrapUnitsIntoLines(ctx, segments, () => maxW);
-        if (failed) continue;
-        if (lines.length * lineHeight <= maxH) {
-            return { lines, fontSize: size, lineHeight };
+    // one pass over sizes; `floor` decides how far an overflowing text may
+    // shrink (minFont normally, HARD_MIN_FONT as the last resort)
+    const runSizes = (from: number, floor: number): LaidOut | null => {
+        for (let size = from; size >= floor; size -= 2) {
+            setFont(ctx, size);
+            const lineHeight = size * (1 + HEADROOM + LINE_SPACING);
+            const { lines, failed } = wrapUnitsIntoLines(ctx, segments, () => maxW);
+            if (failed) continue;
+            if (lines.length * lineHeight <= maxH) return { lines, fontSize: size, lineHeight };
+            fallback = { lines, fontSize: size, lineHeight }; // keep smallest, not first
         }
-        fallback = { lines, fontSize: size, lineHeight }; // keep smallest, not first
-    }
-    if (fallback) return fallback;
-    setFont(ctx, renderTuning.minFont);
-    return { lines: segments, fontSize: renderTuning.minFont, lineHeight: renderTuning.minFont * (1 + HEADROOM + LINE_SPACING) };
+        return null;
+    };
+    return runSizes(cap, renderTuning.minFont)
+        ?? runSizes(renderTuning.minFont - 2, HARD_MIN_FONT)
+        ?? fallback
+        ?? (() => {
+            setFont(ctx, renderTuning.minFont);
+            return { lines: segments, fontSize: renderTuning.minFont, lineHeight: renderTuning.minFont * (1 + HEADROOM + LINE_SPACING) };
+        })();
 }
 
 // Border ink for the clamp below: dark AND far from the seed color (the
@@ -317,12 +331,24 @@ export interface InteriorFill {
     loX: number; loY: number; hiX: number; hiY: number;
 }
 
+// CTD text mask (full-res, 255 = text). Text pixels are passable in every
+// fill/profile walk: glyphs are eraser territory, not bubble edges. Without
+// this a dense glyph run cuts its own measured run at the first stroke — live:
+// a spiky white bubble measured 95px of its ~118px interior, font 17 against a
+// ~22px source. Wrong-size masks (a different page/scale) are ignored.
+export interface TextMask { width: number; height: number; data: ArrayBuffer }
+
+function maskView(mask: TextMask | undefined, W: number, H: number): Uint8Array | null {
+    if (!mask || mask.width !== W || mask.height !== H) return null;
+    return new Uint8Array(mask.data);
+}
+
 // Bounded flood fill of the bubble interior from the detection box center.
 // Seed = the box's most common color (a center landing on a glyph would flood
 // the glyph only), with the center pixel as an alternate — whichever floods
 // more pixels wins. Bounded to box ± grow (growX sideways) so a white page
 // cannot be claimed as layout area.
-function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, widen = false): InteriorFill {
+function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, widen = false, mask?: TextMask): InteriorFill {
     const { width: W, height: H, data } = img;
     const cx = Math.floor((box.x1 + box.x2) / 2);
     const cy = Math.floor((box.y1 + box.y2) / 2);
@@ -331,12 +357,37 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
     const modal = interiorSeed(data, W, H, box);
 
     const boxW = box.x2 - box.x1, boxH = box.y2 - box.y1;
-    const window4 = (gx: number, gy: number) => ({
-        loX: Math.max(0, Math.floor(box.x1 - boxW * gx)),
-        loY: Math.max(0, Math.floor(box.y1 - boxH * gy)),
-        hiX: Math.min(W - 1, Math.ceil(box.x2 + boxW * gx)),
-        hiY: Math.min(H - 1, Math.ceil(box.y2 + boxH * gy)),
-    });
+    // Split children carry a clip (their side of the cut): the flood must not
+    // cross into the sibling region even when the outlines have a hole — a
+    // leaked fill claims the sibling's white and the area bbox spans both.
+    const clip = box.clip;
+    const window4 = (gx: number, gy: number) => {
+        let loX = Math.max(0, Math.floor(box.x1 - boxW * gx));
+        let loY = Math.max(0, Math.floor(box.y1 - boxH * gy));
+        let hiX = Math.min(W - 1, Math.ceil(box.x2 + boxW * gx));
+        let hiY = Math.min(H - 1, Math.ceil(box.y2 + boxH * gy));
+        if (clip) {
+            // Clamp the CUT axis only — the side a sibling sits on. The cross
+            // axis is where the bubble is wider than the text block, so clamping
+            // it too traps the flood inside the parent's box: no bubble wall is
+            // reachable, every row's run end reads as a window edge, the
+            // enclosure score collapses and the region falls to the rect path
+            // while its bubble is much wider (live: 8 split children on a
+            // nhentai page, fonts 12-14 inside ~100px bubbles). Unknown axis
+            // (an entry detected before cutAxis existed) keeps the old clamp.
+            if (box.cutAxis !== 'y') {
+                loX = Math.max(loX, Math.ceil(clip.x1));
+                hiX = Math.min(hiX, Math.floor(clip.x2));
+            }
+            if (box.cutAxis !== 'x') {
+                loY = Math.max(loY, Math.ceil(clip.y1));
+                hiY = Math.min(hiY, Math.floor(clip.y2));
+            }
+            loX = Math.min(loX, hiX); // degenerate clip: keep a valid window
+            loY = Math.min(loY, hiY);
+        }
+        return { loX, loY, hiX, hiY };
+    };
 
     // Start pixel for a seed = the sampled pixel nearest the box center that
     // matches it. Flooding from the center itself is wrong when the center sits
@@ -376,6 +427,7 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
         return best;
     };
     const visited = new Uint8Array(W * H);
+    const mk = maskView(mask, W, H);
     type Win = ReturnType<typeof window4>;
     const fillFrom = (seed: [number, number, number], win: Win, at?: number) => {
         visited.fill(0);
@@ -401,7 +453,7 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
                 if (nx < win.loX || ny < win.loY || nx > win.hiX || ny > win.hiY) continue;
                 const np = ny * W + nx;
                 if (visited[np]) continue;
-                if (seedLike(data, np * 4, seed)) {
+                if (seedLike(data, np * 4, seed) || (mk != null && mk[np] > 127)) {
                     visited[np] = 1;
                     queue.push(np);
                 }
@@ -486,12 +538,48 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
     return { ...pick.fill, ...pick.win };
 }
 
+// Sideways trim for the no-frame rect (see bubbleArea): per-row runs through
+// the box center, clamped with the same continuity rule widthProfile applies
+// along its stacking axis. The flood can escape the bubble where its outline
+// is open onto a same-coloured field (page white merging with the bubble
+// interior below a screen-tone patch): the fill then measures the field, not
+// the bubble, and the trust test downstream can even find art (a trunk, a tone
+// edge) "verifying" the leaked bound. Live page 5: fill minX 810 for a box at
+// 940, the area started 105px left of the box and the Thai text ran over the
+// hatch. Horizontal trim only: that is the proven leak geometry, vertical
+// bounds keep the clamp/trust/cap chain.
+function trimFillX(img: ImageData, box: DetBox, fill: InteriorFill, mask?: TextMask): { minX: number; maxX: number; leakL: number; leakR: number } {
+    const { width: W, height: H, data } = img;
+    const cx = Math.floor((box.x1 + box.x2) / 2);
+    const mk = maskView(mask, W, H);
+    const loX = Math.max(0, Math.floor(fill.minX)), hiX = Math.min(W - 1, Math.ceil(fill.maxX));
+    const y0 = Math.max(0, Math.floor(fill.minY)), y1 = Math.min(H - 1, Math.ceil(fill.maxY));
+    const pass = (x: number, y: number) =>
+        (x >= box.x1 && x <= box.x2 && y >= box.y1 && y <= box.y2)
+        || seedLike(data, (y * W + x) * 4, fill.seed)
+        || (mk != null && mk[y * W + x] > 127);
+    let supL: number | null = null, supR: number | null = null, leakL = 0, leakR = 0;
+    let minX = loX, maxX = hiX, seen = false;
+    for (let y = y0; y <= y1; y++) {
+        if (!pass(cx, y)) continue;
+        let a = cx, b = cx;
+        while (a - 1 >= loX && pass(a - 1, y)) a--;
+        while (b + 1 <= hiX && pass(b + 1, y)) b++;
+        const cl = clampRunEnd(supL, a, 1), cr = clampRunEnd(supR, b, -1);
+        if (cl.leaked) leakL++; else supL = cl.value;
+        if (cr.leaked) leakR++; else supR = cr.value;
+        if (!seen) { minX = cl.value; maxX = cr.value; seen = true; }
+        else { if (cl.value < minX) minX = cl.value; if (cr.value > maxX) maxX = cr.value; }
+    }
+    return seen ? { minX, maxX, leakL, leakR } : { minX: loX, maxX: hiX, leakL: 0, leakR: 0 };
+}
+
 // Rectangle placement area — the NO-FRAME path: narration and SFX over art,
 // open backgrounds. Flood-fill the box interior, hard-limited to box+30% (1.0×
 // sideways for vertical column boxes) and verified against real spanning
 // borders (see below), then capped at 1.5× the box. Live-tuned behavior; the
 // profile path (fitArea) takes over when a bubble border encloses the box.
-export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number; w: number; h: number } {
+export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: number; y: number; w: number; h: number; leakL?: number; leakR?: number } {
     const { width: W, height: H, data } = img;
     const boxW = box.x2 - box.x1, boxH = box.y2 - box.y1;
     // Vertical text columns are narrow by nature (CTD hugs the glyphs, not the
@@ -510,8 +598,12 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
     // bubble (live: badge 12, font 13). The widen path reaches the real border
     // through the same sideways-only grow + long-axis-stable guard the profile
     // path uses.
-    const fill = interiorFill(img, box, growX, 0.3, true);
+    const fill = interiorFill(img, box, growX, 0.3, true, mask);
+    // Supported sideways bounds first (see trimFillX): the trust tests below
+    // must judge the bubble's edge, not art the leaked field ran into.
+    const trim = trimFillX(img, box, fill, mask);
     let { minX, minY, maxX, maxY } = fill;
+    minX = trim.minX; maxX = trim.maxX;
     const [r0, g0, b0] = fill.seed;
     const fillL = minX, fillR = maxX, fillT = minY, fillB = maxY; // pre-clamp bounds
 
@@ -560,8 +652,16 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
     // (window edge, white margin, spotty ink) measures ~0.0-0.2, so the leak
     // protection is untouched.
     const TRUST_MIN = 0.4;
-    const trustL = minX !== fillL, trustR = maxX !== fillR;
-    const trustT = minY !== fillT, trustB = maxY !== fillB;
+    // A bound sitting on the clip is our own sibling guard, not art: trust it.
+    // The trust test reads the white beyond the cut as "no border" and caps the
+    // span at 1.5x the box, which is exactly what starves a split child of the
+    // bubble width it may legitimately use up to the cut (live: children capped
+    // to 29-64px inside 100px bubbles). NaN comparisons are false, so an
+    // absent clip keeps the old behaviour.
+    const clipL = box.clip ? Math.ceil(box.clip.x1) : NaN, clipR = box.clip ? Math.floor(box.clip.x2) : NaN;
+    const clipT = box.clip ? Math.ceil(box.clip.y1) : NaN, clipB = box.clip ? Math.floor(box.clip.y2) : NaN;
+    const trustL = minX !== fillL || Math.abs(minX - clipL) <= 1, trustR = maxX !== fillR || Math.abs(maxX - clipR) <= 1;
+    const trustT = minY !== fillT || Math.abs(minY - clipT) <= 1, trustB = maxY !== fillB || Math.abs(maxY - clipB) <= 1;
     if ((!trustL && (minX <= 0 ? 0 : edgeColFrac(minX - 1)) < TRUST_MIN) || (!trustR && (maxX >= W - 1 ? 0 : edgeColFrac(maxX + 1)) < TRUST_MIN)) {
         const w = Math.min(maxX - minX, (box.x2 - box.x1) * 1.5);
         const cxb = (box.x1 + box.x2) / 2;
@@ -572,6 +672,20 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
         const cyb = (box.y1 + box.y2) / 2;
         minY = Math.round(cyb - h / 2); maxY = Math.round(cyb + h / 2);
     }
+    // Dark interiors (black speech balloons with white text, sitting on black
+    // hair/garments): the fill merges with the artwork around the balloon and
+    // the border test reads art edges as trusted, so the measured span is not
+    // the balloon (live: a 217px box on a black balloon grew to a 274px area
+    // and the white text spilled onto the page). The bubble's own outline is
+    // not measurable down there — the detection box is the source text's
+    // footprint, inside the balloon by construction — so cap at box + 20%
+    // instead of the 1.5x trust cap.
+    if (0.299 * r0 + 0.587 * g0 + 0.114 * b0 < 110) {
+        const w = Math.min(maxX - minX, boxW * 1.2), h = Math.min(maxY - minY, boxH * 1.2);
+        const cxb = (box.x1 + box.x2) / 2, cyb = (box.y1 + box.y2) / 2;
+        minX = Math.round(cxb - w / 2); maxX = Math.round(cxb + w / 2);
+        minY = Math.round(cyb - h / 2); maxY = Math.round(cyb + h / 2);
+    }
 
     const area = (maxX - minX) * (maxY - minY);
     if (area < boxW * boxH * 0.25) {
@@ -580,8 +694,40 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
         return {
             x: box.x1 - px, y: box.y1 - py,
             w: boxW + 2 * px, h: boxH + 2 * py,
+            leakL: trim.leakL, leakR: trim.leakR,
         };
     }
+    // Split child: on the CUT axis its box is a slice of the parent's block, so
+    // a fallback area centred on that slice parks the text off-centre and in the
+    // bubble's upper half (live: children 6/8 skewed, text at the top of a
+    // ~250px-tall bubble). Grow the area to the clip on that axis only: the
+    // cross axis keeps the child's own strict-core-seeded box, whose tightness
+    // is the whole point of the seeding — expanding it re-admits what the
+    // seeding removed (page 4: the caption area blew from 88 to 183px, back
+    // over the hatch). layoutArea still clamps the final area to the clip.
+    if (box.clip && box.cutAxis) {
+        // CUT axis only. There, the clip is the parent's extent along the cut
+        // (the split decision's own axis, slack ≤12px), so a fallback centred on
+        // the child's slice would ignore it. The cross axis is NOT reliable: the
+        // parent box also carries the sibling's span and loose texture comps, so
+        // expanding there re-introduces what the strict-core seeding dropped
+        // (page 4: caption area 88 -> 183px over the hatch) or centres the text
+        // below its bubble (child 6: parent box runs 100px past the bubble into
+        // the art). The child's own box is text by construction — keep it.
+        if (box.cutAxis === 'x') {
+            // Divider clips leave the far sides unbounded (±Infinity — "no
+            // restriction there", see dividerClips): only adopt finite bounds
+            // or the area goes infinite (live: a kiss-divider's x2=Infinity
+            // maxed the area to the page edge and the text vanished into a
+            // 1-line strip). Split-child clips are always finite.
+            if (Number.isFinite(box.clip.x1)) minX = Math.min(minX, Math.ceil(box.clip.x1));
+            if (Number.isFinite(box.clip.x2)) maxX = Math.max(maxX, Math.floor(box.clip.x2));
+        } else {
+            if (Number.isFinite(box.clip.y1)) minY = Math.min(minY, Math.ceil(box.clip.y1));
+            if (Number.isFinite(box.clip.y2)) maxY = Math.max(maxY, Math.floor(box.clip.y2));
+        }
+    }
+
     // 8% inner margin so text doesn't touch bubble edges. Floored at the
     // detection box: a fill trapped in a pocket between glyph strokes comes
     // out narrower/shorter than the box it must hold (live: 85x57 area in a
@@ -590,7 +736,40 @@ export function bubbleArea(img: ImageData, box: DetBox): { x: number; y: number;
     const mx = (maxX - minX) * 0.08, my = (maxY - minY) * 0.08;
     const fx1 = Math.min(minX + mx, box.x1), fy1 = Math.min(minY + my, box.y1);
     const fx2 = Math.max(maxX - mx, box.x2), fy2 = Math.max(maxY - my, box.y2);
-    return { x: fx1, y: fy1, w: fx2 - fx1, h: fy2 - fy1 };
+    return { x: fx1, y: fy1, w: fx2 - fx1, h: fy2 - fy1, leakL: trim.leakL, leakR: trim.leakR };
+}
+
+// Dark-caption growth (rect path only, exported for tests): a caption strip on
+// black art gets its area from the box+20% dark cap (the fill would merge with
+// the artwork), so a translation longer than the source always overflows —
+// live: a 185x35 caption holding 4 Thai lines clipped to 1.5 at f:13. When the
+// box sits on uniform darkness, grow the area along the stacking axis while
+// the new rows stay uniformly seed-dark, up to 2x the box height. The grown
+// strips were verified clean, so no extra erase is needed beyond the box —
+// the source glyphs live inside it. Null when the box is not on darkness or
+// nothing grew.
+export function growDarkArea(img: ImageData, box: DetBox, area: Area): Area | null {
+    const { width: W, height: H, data } = img;
+    const seed = interiorSeed(data, W, H, box);
+    if (0.299 * seed[0] + 0.587 * seed[1] + 0.114 * seed[2] >= 110) return null;
+    const x1 = Math.max(0, Math.floor(area.x)), x2 = Math.min(W - 1, Math.ceil(area.x + area.w));
+    const rowClean = (y: number): boolean => {
+        if (y < 0 || y >= H) return false;
+        if (box.clip && (y < Math.ceil(box.clip.y1) || y > Math.floor(box.clip.y2))) return false;
+        const step = Math.max(1, Math.floor((x2 - x1) / 24));
+        for (let x = x1; x <= x2; x += step) {
+            if (!seedLike(data, (y * W + x) * 4, seed)) return false;
+        }
+        return true;
+    };
+    let y1 = Math.round(area.y), y2 = Math.round(area.y + area.h);
+    const cap = Math.round((box.y2 - box.y1) * 2);
+    let grown = 0;
+    // down first: captions usually have the title above and margin below
+    while (grown < cap && rowClean(y2)) { y2++; grown++; }
+    while (grown < cap && rowClean(y1 - 1)) { y1--; grown++; }
+    if (!grown) return null;
+    return { x: area.x, y: y1, w: area.w, h: y2 - y1 };
 }
 
 // ── Placement profile (enclosed bubbles) ─────────────────────────────────
@@ -612,6 +791,9 @@ export interface RunProfile {
     // the area away from where the source text actually sits (live: a caption
     // box's area doubled its height into the page margin and the text drifted).
     e0: number; e1: number;
+    // Rows whose run end was clamped by the continuity rule (see RUN_JUMP):
+    // the fill had escaped the bubble and was following art. Dump-only.
+    leakL: number; leakR: number;
 }
 
 // How much of the run rows must show a bubble outline right outside the run
@@ -621,6 +803,30 @@ export interface RunProfile {
 // profile entirely once the outline walk required a thin dark line. Below the
 // bar the tuned no-frame rectangle (bubbleArea) takes over.
 export const ENCLOSED_MIN = 0.5;
+
+// A run narrower than this is an artifact sliver (leak edge, taper tip, the
+// row past the last glyph), not a text line: it must not extend the placement
+// area's stacking range, and trimming it keeps a band that merely touches such
+// a row from reading zero.
+const RUN_MIN = 16;
+
+// A run end must move continuously along the stacking axis: a bubble boundary
+// is a curve, so an end that jumps sideways by more than RUN_JUMP from the last
+// supported position is not that boundary — the fill escaped through a gap in
+// the outline and is now following art far away. The end sticks at the last
+// supported position and the row counts as leaked: it produces no outline
+// evidence, and the run cannot widen the band or the area. Live: a bubble whose
+// outline is open below a screen-tone patch, the fill ran 130px left along the
+// page white, the hatch edge and a tree trunk passed the thin-line test,
+// enclosure 0.53 admitted the profile and the Thai text was typeset over the
+// hatch and the neighbouring region.
+export const RUN_JUMP = 36;
+// Pure (unit tested): the clamped end + whether this row jumped outward.
+// dir 1 = min side (left end for horizontal text), -1 = max side (right end).
+export function clampRunEnd(prev: number | null, raw: number, dir: 1 | -1): { value: number; leaked: boolean } {
+    if (prev != null && dir * (prev - raw) > RUN_JUMP) return { value: prev, leaked: true };
+    return { value: raw, leaked: false };
+}
 
 // Measure the profile inside the fill's (clamped) extents. A pixel is passable
 // if it is interior-colored, or inside the detection box (the original glyphs
@@ -632,6 +838,7 @@ export function widthProfile(
     seed: [number, number, number],
     range: { x1: number; y1: number; x2: number; y2: number },
     win: { loX: number; loY: number; hiX: number; hiY: number },
+    mask?: TextMask,
 ): RunProfile | null {
     const { width: W, height: H, data } = img;
     const cx = Math.floor((box.x1 + box.x2) / 2);
@@ -643,6 +850,14 @@ export function widthProfile(
     const lim = vertical ? H : W; // run-axis page size
     const winLo = vertical ? win.loY : win.loX;
     const winHi = vertical ? win.hiY : win.hiX;
+    // The run scan must stay inside the AREA (the clamped fill bbox): the area
+    // is what the caller returns and what the paint clips to, so a run measured
+    // beyond it (the fill window is wider than the clamped bbox) hands the
+    // wrapper a line the paint then truncates — live: "อยากตอบ" painted as
+    // "อยากตอ", "อยากใช้" as "อยากใช". The window bounds are still what decides
+    // "clipped by its window, not by ink" in the outline check.
+    const scanLo = Math.max(winLo, Math.round(vertical ? range.y1 : range.x1));
+    const scanHi = Math.min(winHi, Math.round(vertical ? range.y2 : range.x2));
     const boxLo = vertical ? box.y1 : box.x1, boxHi = vertical ? box.y2 : box.x2;
     const boxP0 = vertical ? box.x1 : box.y1, boxP1 = vertical ? box.x2 : box.y2;
     const center = vertical ? cy : cx;
@@ -658,7 +873,13 @@ export function widthProfile(
         return i != null && seedLike(data, i, seed);
     };
     const inBox = (p: number, q: number) => q >= boxLo && q <= boxHi && p >= boxP0 && p <= boxP1;
-    const pass = (p: number, q: number) => inBox(p, q) || seedAt(p, q);
+    const mk = maskView(mask, W, H);
+    const maskAt = (p: number, q: number): boolean => {
+        if (!mk) return false;
+        const x = vertical ? p : q, y = vertical ? q : p;
+        return mk[y * W + x] > 127;
+    };
+    const pass = (p: number, q: number) => inBox(p, q) || seedAt(p, q) || maskAt(p, q);
     // Boundary evidence = a THIN DARK LINE just outside the run: a bubble
     // outline. The pixel merely being non-interior is not enough — artwork
     // (hair, shading, screentone) is non-interior too, and text over art must
@@ -686,11 +907,20 @@ export function widthProfile(
         return k > 0 && k < OUTLINE_MAX && dark >= 1;
     };
     let rows = 0, enclosedRows = 0, e0 = -1, e1 = -1;
+    let supL: number | null = null, supR: number | null = null, leakL = 0, leakR = 0;
     for (let p = p0; p <= p1; p++) {
         if (!pass(p, center)) continue; // no interior at the box center line
         let a = center, b = center;
-        while (a - 1 >= winLo && pass(p, a - 1)) a--;
-        while (b + 1 <= winHi && pass(p, b + 1)) b++;
+        while (a - 1 >= scanLo && pass(p, a - 1)) a--;
+        while (b + 1 <= scanHi && pass(p, b + 1)) b++;
+        // Leak guard (see RUN_JUMP): a row that jumped outward is clamped to
+        // the last supported end, so its run cannot widen a band and its
+        // outline check runs at the supported line instead of the art it
+        // found outside.
+        const cl = clampRunEnd(supL, a, 1), cr = clampRunEnd(supR, b, -1);
+        a = cl.value; b = cr.value;
+        if (cl.leaked) leakL++; else supL = a;
+        if (cr.leaked) leakR++; else supR = b;
         const m = (b - a) * 0.08;
         let r1 = Math.round(a + m), r2 = Math.round(b - m);
         if (p >= boxP0 && p <= boxP1) { r1 = Math.min(r1, Math.floor(boxLo)); r2 = Math.max(r2, Math.ceil(boxHi)); }
@@ -702,20 +932,33 @@ export function widthProfile(
         }
     }
     if (!rows) return null;
-    return { vertical, p0, p1, i1, i2, enclosed: enclosedRows / rows, e0, e1 };
+    return { vertical, p0, p1, i1, i2, enclosed: enclosedRows / rows, e0, e1, leakL, leakR };
 }
 
 // Usable interval for a band of the stacking axis: the intersection of every
 // row's run across the band (min-over-band — a single leaked or noisy row
 // cannot widen a line). Null = the band is not fully inside the interior.
+// Hole rows AT the band's edges are profile artifacts (the fill/evidence ended
+// there — a leak tail, the row past the bubble's last glyph), not real gaps:
+// they are trimmed before measuring, or a single end row zeroed every band
+// touching it and the font collapsed (live: band 2 of a round bubble read 0
+// and the size loop skipped from cap 149 down to 47; a spiky bubble's cap 23
+// fell to 17). A hole INSIDE the remaining span still nulls the band — a line
+// must not cross it.
 export function runInterval(prof: RunProfile, p0: number, p1: number): [number, number] | null {
     const a = Math.max(prof.p0, Math.ceil(p0 - 0.5));
     const b = Math.min(prof.p1, Math.floor(p1 - 0.5));
     if (b < a) return null;
+    const hole = (p: number) => { const k = p - prof.p0; return prof.i1[k] > prof.i2[k]; };
+    const dead = (p: number) => { const k = p - prof.p0; return prof.i1[k] > prof.i2[k] || prof.i2[k] - prof.i1[k] < RUN_MIN; };
+    let lo = a, hi = b;
+    while (lo <= hi && dead(lo)) lo++;
+    while (hi >= lo && dead(hi)) hi--;
+    if (lo > hi) return null;
     let x1 = -1, x2 = -1;
-    for (let p = a; p <= b; p++) {
+    for (let p = lo; p <= hi; p++) {
+        if (hole(p)) return null; // a real gap inside the span: text must not cross it
         const k = p - prof.p0;
-        if (prof.i1[k] > prof.i2[k]) return null;
         if (x1 < 0 || prof.i1[k] > x1) x1 = prof.i1[k];
         if (x2 < 0 || prof.i2[k] < x2) x2 = prof.i2[k];
     }
@@ -724,8 +967,13 @@ export function runInterval(prof: RunProfile, p0: number, p1: number): [number, 
 
 // Enclosed-bubble path: profile measurement, or the legacy rectangle when the
 // evidence says there is no bubble around this box.
-function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
-    const rect = (why: string): LayoutRect => ({ ...bubbleArea(img, box), why });
+function fitArea(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask): LayoutRect {
+    const rect = (why: string, prof?: RunProfile): LayoutRect => ({
+        ...bubbleArea(img, box, mask), why,
+        // the profile's leak counts survive the fallback: "fell to rect with
+        // N clamped rows" is the diagnosis, not just the enclosure score
+        ...(prof ? { leakL: prof.leakL, leakR: prof.leakR } : null),
+    });
     // Per-axis leash. Stacking axis 0.6/side (≤2.2x): a bubble hugging its text
     // is well inside that, while a leaked fill (barely-enclosed white garment,
     // bubble tail slipping into a same-colored drawing) cannot run away.
@@ -736,24 +984,37 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
     // (enclosed read 0 → rect → 1.5x cap → Thai wrapped into a skinny strip).
     // 3.4x still clips the measured leak (a caption fill that ran 3.9x its box
     // into the page margin), whose clipped ends keep the rect fallback.
-    const fill = interiorFill(img, box, vertical ? 0.6 : 1.2, vertical ? 1.2 : 0.6, true);
+    const fill = interiorFill(img, box, vertical ? 0.6 : 1.2, vertical ? 1.2 : 0.6, true, mask);
     const [r0, g0, b0] = fill.seed;
     let { minX, minY, maxX, maxY } = fill;
     ({ minX, maxX, minY, maxY } = clampToBorders(img.data, img.width, img.height, [r0, g0, b0], box, { minX, minY, maxX, maxY }));
     const boxW = box.x2 - box.x1, boxH = box.y2 - box.y1;
     if ((maxX - minX) * (maxY - minY) >= boxW * boxH * 0.25) {
-        const prof = widthProfile(img, box, vertical, fill.seed, { x1: minX, y1: minY, x2: maxX, y2: maxY }, fill);
+        const prof = widthProfile(img, box, vertical, fill.seed, { x1: minX, y1: minY, x2: maxX, y2: maxY }, fill, mask);
         if (!prof) return rect('norows');
-        if (prof.enclosed < ENCLOSED_MIN) return rect(`enclose ${prof.enclosed.toFixed(2)}`);
-        if (prof.e1 <= prof.e0) return rect('no-evidence-rows');
+        if (prof.enclosed < ENCLOSED_MIN) return rect(`enclose ${prof.enclosed.toFixed(2)}`, prof);
+        if (prof.e1 <= prof.e0) return rect('no-evidence-rows', prof);
         {
             const ks = Math.max(0, prof.e0 - prof.p0), ke = Math.min(prof.i1.length - 1, prof.e1 - prof.p0);
             let q1 = -1, q2 = -1;
+            // First/last EVIDENCED row that actually holds a usable run (≥16px;
+            // isolated 1px slivers in a leak/taper region are not text rows).
+            // The outline walk can mark rows the run measurement then rejects
+            // (a sliver of interior at the center line with a border nearby),
+            // and a band over such rows reads 0 (live: a round bubble's top ~80
+            // rows were all slivers — the area included them, every centered
+            // window ≥ a certain size failed on them and the font collapsed,
+            // cap 149 → 47). Rows inside the box always have runs (the box is
+            // passable by construction), so this never trims the source text.
+            let r0 = -1, r1 = -1;
             for (let k = ks; k <= ke; k++) {
-                if (prof.i1[k] > prof.i2[k]) continue;
+                if (prof.i1[k] > prof.i2[k] || prof.i2[k] - prof.i1[k] < RUN_MIN) continue;
+                if (r0 < 0) r0 = k;
+                r1 = k;
                 if (q1 < 0 || prof.i1[k] < q1) q1 = prof.i1[k];
                 if (q2 < 0 || prof.i2[k] > q2) q2 = prof.i2[k];
             }
+            if (r0 < 0) return rect('no-run-rows', prof);
             if (q2 > q1) {
                 // Extent on the stacking axis: rows with outline evidence on
                 // both sides, UNIONED with the detection box (clamped to the
@@ -765,8 +1026,8 @@ function fitArea(img: ImageData, box: DetBox, vertical: boolean): LayoutRect {
                 // box top, 88px above its bottom. The box is the source text
                 // by construction, so it cannot inflate a leak — and the
                 // evidenced rows still bound the widths.
-                const s0 = Math.max(prof.p0, Math.min(prof.e0, vertical ? Math.round(box.x1) : Math.round(box.y1)));
-                const s1 = Math.min(prof.p1, Math.max(prof.e1, vertical ? Math.round(box.x2) : Math.round(box.y2)));
+                const s0 = Math.max(prof.p0, Math.min(prof.p0 + r0, vertical ? Math.round(box.x1) : Math.round(box.y1)));
+                const s1 = Math.min(prof.p1, Math.max(prof.p0 + r1, vertical ? Math.round(box.x2) : Math.round(box.y2)));
                 return vertical
                     ? { x: s0, y: q1, w: s1 - s0 + 1, h: q2 - q1, runs: prof }
                     : { x: q1, y: s0, w: q2 - q1, h: s1 - s0 + 1, runs: prof };
@@ -832,37 +1093,247 @@ export function boxIsVertical(box: DetBox): boolean {
     return (box.y2 - box.y1) > (box.x2 - box.x1) * renderTuning.verticalThreshold;
 }
 
+// Split children: never let the area cross the cut (the fill window is
+// clamped already, but the trust cap and ink-bbox paths can re-expand past
+// it). Pure — unit tested.
+export function clipArea(a: Area, clip?: { x1: number; y1: number; x2: number; y2: number }): Area {
+    if (!clip) return a;
+    const x1 = Math.max(a.x, clip.x1), y1 = Math.max(a.y, clip.y1);
+    const x2 = Math.min(a.x + a.w, clip.x2), y2 = Math.min(a.y + a.h, clip.y2);
+    return { x: x1, y: y1, w: Math.max(0, x2 - x1), h: Math.max(0, y2 - y1) };
+}
+
+// OCR-crop expansion (exported pure for tests): a detection box can clip its
+// own glyphs — CTD hugs the text it saw, so a lobe's "YES" sticking 24px past
+// the edge never enters the OCR crop and the reader (Baberu or VLM) guesses
+// from a sliver or drops it. After padding, any side whose edge still touches
+// ink (or sits within a hair of it) grows outward to the last ink plus a small
+// margin, capped at half the box's smaller side. Split children stay inside
+// their clip — past the cut sits the sibling's text, not ours. Only the READ
+// window grows: erase, layout and fingerprint boxes are untouched, and crops
+// stay tight whenever nothing is cut (Baberu is trained on tight crops).
+export interface CropRect { x: number; y: number; w: number; h: number }
+// Per-side expansion budget for OCR crops (see expandCropToInk).
+export function cropExpandCap(box: DetBox): number {
+    return Math.max(16, Math.round(Math.min(box.x2 - box.x1, box.y2 - box.y1) * 0.5));
+}
+// OCR-crop expansion (exported pure for tests): a detection box can clip its
+export function expandCropToInk(img: ImageData, box: DetBox, rect: CropRect): CropRect {
+    const { width: W, height: H, data } = img;
+    const seed = interiorSeed(data, W, H, box);
+    const seedLum = 0.299 * seed[0] + 0.587 * seed[1] + 0.114 * seed[2];
+    const cap = cropExpandCap(box);
+    const clip = box.clip;
+    let x1 = Math.max(0, Math.floor(rect.x)), y1 = Math.max(0, Math.floor(rect.y));
+    let x2 = Math.min(W - 1, Math.ceil(rect.x + rect.w)), y2 = Math.min(H - 1, Math.ceil(rect.y + rect.h));
+    const inkAt = (x: number, y: number): boolean =>
+        x >= 0 && y >= 0 && x < W && y < H && cropInk(data, (y * W + x) * 4, seedLum);
+    // ink pixels on an edge line (every px — 2px strokes must not be missed)
+    const edgeInk = (vertical: boolean, at: number, lo: number, hi: number): number[] => {
+        const out: number[] = [];
+        for (let q = lo; q <= hi; q++) {
+            if (vertical ? inkAt(at, q) : inkAt(q, at)) out.push(q);
+        }
+        return out;
+    };
+    // the touch ink reaches the box's own text: BFS over ink from the edge
+    // points, bounded by the growth window — a neighbor fragment in daylight
+    // never connects (live: caption strip hugging title art). Returns the
+    // connected ink mass's bbox (null when nothing reaches the inset box), so
+    // growth absorbs exactly that mass. Path length is capped at the expansion
+    // budget: line art connects everything eventually (a balloon outline runs
+    // into fingers), and far art is never what a cut glyph needs (live: finger
+    // outlines dragged a lobe crop to the cap).
+    const connectedMass = (vertical: boolean, pts: number[], at: number): { x1: number; y1: number; x2: number; y2: number } | null => {
+        const loX = Math.max(0, x1 - cap), hiX = Math.min(W - 1, x2 + cap);
+        const loY = Math.max(0, y1 - cap), hiY = Math.min(H - 1, y2 + cap);
+        const ix1 = Math.ceil(box.x1) + 2, iy1 = Math.ceil(box.y1) + 2;
+        const ix2 = Math.floor(box.x2) - 2, iy2 = Math.floor(box.y2) - 2;
+        const seen = new Uint8Array(W * H);
+        const dist = new Int16Array(W * H).fill(-1);
+        // FIFO queue (index pointer, no shift): distances must be SHORTEST-path
+        // — a LIFO stack wanders, inflates first-visit distances and the radius
+        // below strangles the flood a few px out (live: capped at +19 instead
+        // of +52 on a solid bar).
+        const queue: number[] = [];
+        for (const q of pts) {
+            const x = vertical ? at : q, y = vertical ? q : at;
+            if (x < loX || x > hiX || y < loY || y > hiY || seen[y * W + x]) continue;
+            seen[y * W + x] = 1;
+            dist[y * W + x] = 0;
+            queue.push(x + y * W);
+        }
+        let reached = false;
+        let bx1 = Infinity, by1 = Infinity, bx2 = -Infinity, by2 = -Infinity;
+        for (let head = 0; head < queue.length; head++) {
+            const p = queue[head];
+            const x = p % W, y = (p / W) | 0;
+            if (!inkAt(x, y)) continue;
+            const d = dist[p];
+            if (x < bx1) bx1 = x;
+            if (y < by1) by1 = y;
+            if (x > bx2) bx2 = x;
+            if (y > by2) by2 = y;
+            if (x >= ix1 && x <= ix2 && y >= iy1 && y <= iy2) reached = true;
+            if (d + 1 > cap) continue;
+            if (x - 1 >= loX && !seen[p - 1]) { seen[p - 1] = 1; dist[p - 1] = d + 1; queue.push(p - 1); }
+            if (x + 1 <= hiX && !seen[p + 1]) { seen[p + 1] = 1; dist[p + 1] = d + 1; queue.push(p + 1); }
+            if (y - 1 >= loY && !seen[p - W]) { seen[p - W] = 1; dist[p - W] = d + 1; queue.push(p - W); }
+            if (y + 1 <= hiY && !seen[p + W]) { seen[p + W] = 1; dist[p + W] = d + 1; queue.push(p + W); }
+        }
+        return reached && bx2 >= bx1 ? { x1: bx1, y1: by1, x2: bx2, y2: by2 } : null;
+    };
+    // grow one side to the last ink plus margin. Stops after 3 consecutive
+    // clean lines past the last ink, at the cap, the canvas, or the split clip.
+    const grow = (side: 'l' | 'r' | 't' | 'b'): void => {
+        // l/r edges are columns (scan y), t/b edges are rows (scan x)
+        const vertical = side === 'l' || side === 'r';
+        const dir = side === 'l' || side === 't' ? -1 : 1;
+        const edge = side === 'l' ? x1 : side === 'r' ? x2 : side === 't' ? y1 : y2;
+        const lo = vertical ? y1 : x1, hi = vertical ? y2 : x2;
+        const bound = side === 'l'
+            ? Math.max(0, Math.ceil(box.x1) - cap, clip ? Math.ceil(clip.x1) : 0)
+            : side === 'r'
+                ? Math.min(W - 1, Math.floor(box.x2) + cap, clip ? Math.floor(clip.x2) : W - 1)
+                : side === 't'
+                    ? Math.max(0, Math.ceil(box.y1) - cap, clip ? Math.ceil(clip.y1) : 0)
+                    : Math.min(H - 1, Math.floor(box.y2) + cap, clip ? Math.floor(clip.y2) : H - 1);
+        const touch = edgeInk(vertical, edge, lo, hi);
+        // a spanning rule/border is not a cut glyph (and a clean edge with
+        // daylight beyond never moves, so a nearby neighbor is not swallowed)
+        if (!touch.length || touch.length >= (hi - lo + 1) * 0.6) return;
+        const mass = connectedMass(vertical, touch, edge);
+        if (!mass) return;
+        // absorb the mass's outward end plus margin — never blind-scan past it
+        const grown = side === 'l' ? mass.x1 - 4 : side === 'r' ? mass.x2 + 4 : side === 't' ? mass.y1 - 4 : mass.y2 + 4;
+        const limited = dir < 0 ? Math.max(grown, edge - cap) : Math.min(grown, edge + cap);
+        if (side === 'l') x1 = Math.min(edge, Math.max(limited, bound));
+        else if (side === 'r') x2 = Math.max(edge, Math.min(limited, bound));
+        else if (side === 't') y1 = Math.min(edge, Math.max(limited, bound));
+        else y2 = Math.max(edge, Math.min(limited, bound));
+    };
+    grow('l'); grow('r'); grow('t'); grow('b');
+    return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+}
+// Glyph ink for the crop expansion below: far from the seed tone in EITHER
+// direction (black strokes on a balloon, white glyphs on a caption strip).
+// Gray screentone and shading sit between and must NOT count — otherwise every
+// crop would grow into the background until the cap (live: a gray wall at
+// |212-255|=43 dragged all 11 boxes of a page to the cap).
+function cropInk(data: Uint8ClampedArray, i: number, seedLum: number): boolean {
+    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    return Math.abs(lum - seedLum) >= 90;
+}
+// Divider clips between overlapping placement areas (exported pure for
+// tests): two boxes whose areas overlap while the boxes themselves stay
+// disjoint sit in kissing bubbles (or one leaked into the other's field) —
+// painting both areas as-is stacks the translations in the shared strip
+// (live: two balloons kissing at x541/547, areas overlapped 16px after the
+// leak guard and the Thai lines touched). Each box is clipped to its side of
+// the midline of the box gap on the separating axis; the split-child
+// machinery (fill-window clamp, cut-axis trust/expansion, run trim) then keeps
+// each side to itself. The midline always clears both boxes, so a box's own
+// text is never cut. Boxes sharing ink are one text mass (double detection)
+// and are skipped.
+export interface Divider {
+    index: number;
+    clip: { x1: number; y1: number; x2: number; y2: number };
+    cutAxis: 'x' | 'y';
+}
+export function dividerClips(boxes: DetBox[], areas: (LayoutRect | null)[]): Divider[] {
+    const byIdx = new Map<number, Divider>();
+    const put = (index: number, clip: Divider['clip'], cutAxis: 'x' | 'y') => {
+        const prev = byIdx.get(index);
+        const base = prev?.clip ?? boxes[index].clip ?? { x1: -Infinity, y1: -Infinity, x2: Infinity, y2: Infinity };
+        byIdx.set(index, {
+            index,
+            clip: {
+                x1: Math.max(base.x1, clip.x1), y1: Math.max(base.y1, clip.y1),
+                x2: Math.min(base.x2, clip.x2), y2: Math.min(base.y2, clip.y2),
+            },
+            cutAxis: boxes[index].cutAxis ?? prev?.cutAxis ?? cutAxis,
+        });
+    };
+    for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+            const ai = areas[i], aj = areas[j];
+            if (!ai || !aj) continue;
+            const bi = boxes[i], bj = boxes[j];
+            if (bi.x1 < bj.x2 && bj.x1 < bi.x2 && bi.y1 < bj.y2 && bj.y1 < bi.y2) continue;
+            const ix1 = Math.max(ai.x, aj.x), iy1 = Math.max(ai.y, aj.y);
+            const ix2 = Math.min(ai.x + ai.w, aj.x + aj.w), iy2 = Math.min(ai.y + ai.h, aj.y + aj.h);
+            if (ix2 <= ix1 || iy2 <= iy1) continue;
+            if (!((ix2 - ix1) * (iy2 - iy1) > Math.min(ai.w * ai.h, aj.w * aj.h) * 0.05)) continue;
+            if (bi.x2 <= bj.x1 || bj.x2 <= bi.x1) {
+                const mid = bi.x2 <= bj.x1 ? (bi.x2 + bj.x1) / 2 : (bj.x2 + bi.x1) / 2;
+                const [l, r] = (bi.x1 + bi.x2) / 2 <= (bj.x1 + bj.x2) / 2 ? [i, j] : [j, i];
+                put(l, { x1: -Infinity, y1: -Infinity, x2: mid, y2: Infinity }, 'x');
+                put(r, { x1: mid, y1: -Infinity, x2: Infinity, y2: Infinity }, 'x');
+            } else if (bi.y2 <= bj.y1 || bj.y2 <= bi.y1) {
+                const mid = bi.y2 <= bj.y1 ? (bi.y2 + bj.y1) / 2 : (bj.y2 + bi.y1) / 2;
+                const [t, b] = (bi.y1 + bi.y2) / 2 <= (bj.y1 + bj.y2) / 2 ? [i, j] : [j, i];
+                put(t, { x1: -Infinity, y1: -Infinity, x2: Infinity, y2: mid }, 'y');
+                put(b, { x1: -Infinity, y1: mid, x2: Infinity, y2: Infinity }, 'y');
+            }
+        }
+    }
+    return [...byIdx.values()];
+}
+
 // Layout area the renderer actually uses: enclosed bubbles get the measured
 // per-line profile; a big box with almost no ink (small SFX in empty space,
 // texture false-positive) lays out on the ink bbox instead — otherwise the
 // font scales to the box and billboards over its neighbors. (Live: "อ๊ะ♡" in
 // a 222×268 box rendered at 124px.) Null = zero ink, nothing to place on.
-export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxIsVertical(box)): LayoutRect | null {
+export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxIsVertical(box), mask?: TextMask): LayoutRect | null {
     const ink = inkStats(img, box);
     if (ink.x2 <= ink.x1 || ink.y2 <= ink.y1) return null;
     if (ink.frac < 0.03) {
         const pad = 6;
         return {
-            x: Math.max(0, ink.x1 - pad), y: Math.max(0, ink.y1 - pad),
-            w: ink.x2 - ink.x1 + 2 * pad, h: ink.y2 - ink.y1 + 2 * pad,
+            ...clipArea({
+                x: Math.max(0, ink.x1 - pad), y: Math.max(0, ink.y1 - pad),
+                w: ink.x2 - ink.x1 + 2 * pad, h: ink.y2 - ink.y1 + 2 * pad,
+            }, box.clip),
             why: 'ink-bbox',
         };
     }
-    return fitArea(img, box, vertical);
+    const found = fitArea(img, box, vertical, mask);
+    const clamped = clipArea(found, box.clip);
+    // The clip shrinks the AREA, but the profile inside `found` still describes
+    // runs that reach past the cut. Everything downstream (wrap width, line
+    // centres, and the paint's clip rect) must agree with the area the caller
+    // gets, or a line is wrapped for a run the paint then truncates — live:
+    // "อยากตอบ" painted as "อยากตอ", "อยากใช้" as "อยากใช". Trim the runs.
+    if (found.runs && (clamped.x !== found.x || clamped.y !== found.y || clamped.w !== found.w || clamped.h !== found.h)) {
+        const prof = found.runs;
+        const lo = Math.ceil(prof.vertical ? clamped.y : clamped.x);
+        const hi = Math.floor(prof.vertical ? clamped.y + clamped.h : clamped.x + clamped.w);
+        for (let k = 0; k < prof.i1.length; k++) {
+            if (prof.i2[k] < prof.i1[k]) continue;
+            prof.i1[k] = Math.max(prof.i1[k], lo);
+            prof.i2[k] = Math.min(prof.i2[k], hi);
+        }
+    }
+    return { ...clamped, runs: found.runs, why: found.why, leakL: found.leakL, leakR: found.leakR };
 }
 
 // Pick text color by contrast against the placement area background. Modal
 // tone, not mean: leaked rows (or interior art) drag a mean across the
 // contrast boundary and print white-on-white, while the largest bucket is the
 // surface the text mostly sits on.
-function textColorFor(img: ImageData, area: { x: number; y: number; w: number; h: number }): string {
+function textColorFor(img: ImageData, area: { x: number; y: number; w: number; h: number }, mask?: TextMask): string {
     const { width: W, data } = img;
+    const mk = maskView(mask, W, img.height);
     const stepX = Math.max(1, Math.floor(area.w / 24));
     const stepY = Math.max(1, Math.floor(area.h / 24));
     const buckets = new Map<number, { n: number; lum: number }>();
     let best: { n: number; lum: number } | null = null;
     for (let y = Math.floor(area.y); y < area.y + area.h; y += stepY) {
+        // Source glyph ink is not background: a box that is mostly original text
+        // would otherwise hand the contrast test the ink colour.
         for (let x = Math.floor(area.x); x < area.x + area.w; x += stepX) {
+            if (mk && mk[y * W + x] > 127) continue;
             const i = (y * W + x) * 4;
             const r = data[i], g = data[i + 1], b = data[i + 2];
             const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
@@ -885,8 +1356,17 @@ export function isLight(hex: string): boolean {
 
 // Resolved paint colors: user-fixed colors win, 'auto' keeps the old
 // behavior (contrast text, stroke opposite the resolved text).
-function resolveColors(img: ImageData, area: { x: number; y: number; w: number; h: number }): { color: string; stroke: string } {
-    const color = renderTuning.textColor === 'auto' ? textColorFor(img, area) : renderTuning.textColor;
+function resolveColors(img: ImageData, area: { x: number; y: number; w: number; h: number }, box?: DetBox, mask?: TextMask): { color: string; stroke: string } {
+    // The modal tone of the AREA is the usual source, but a split child's rect
+    // fallback spans the parent block and can be dominated by artwork the
+    // source text never touched — the text then comes out white-on-white (live:
+    // child 6, both lines but "โดน" unreadable). When the area is much larger
+    // than the detection box, resolve from the box instead: the source text sat
+    // there, so the contrast is right by construction (mask excluded).
+    const big = box != null && (area.w > (box.x2 - box.x1) * 1.5 || area.h > (box.y2 - box.y1) * 1.5);
+    const color = renderTuning.textColor === 'auto'
+        ? textColorFor(img, big ? { x: box!.x1, y: box!.y1, w: box!.x2 - box!.x1, h: box!.y2 - box!.y1 } : area, big ? mask : undefined)
+        : renderTuning.textColor;
     const stroke = renderTuning.strokeColor === 'auto'
         ? (isLight(color) ? '#111' : '#fff')
         : renderTuning.strokeColor;
@@ -898,38 +1378,34 @@ export function renderRegion(
     img: ImageData,
     box: DetBox,
     text: string,
+    mask?: TextMask,
 ): Placed | null {
     if (!text.trim()) return null;
-    if (chosenOrientation(ctx, img, box, text)) return renderVertical(ctx, img, box, text);
-    return renderHorizontal(ctx, img, box, text);
+    if (chosenOrientation(ctx, img, box, text, mask)) return renderVertical(ctx, img, box, text, mask);
+    return renderHorizontal(ctx, img, box, text, mask);
 }
 
-// Which way this region will actually be laid out. Tall+narrow Japanese
-// columns render rotated so Thai reads down the column; preferHorizontal crams
-// horizontal first and rotates only on overflow (short text fits — the common
-// case). Exported so the result dump and the debug overlay report the area the
-// text really got: deriving it from the box aspect alone drew the vertical
-// area under text that was laid out horizontally (live: a debug view showed a
-// narrow area while the paint used a different one).
+// Which way this region will actually be laid out. Always horizontal: Thai (and
+// every target here) reads left-to-right, and rotating the block inside a
+// Japanese column drew sideways Thai the reader rejected (user verdict
+// 2026-09-17: "แนวนอนเสมอ ห้ามหมุน"). renderVertical and the vertical profile
+// machinery stay for a future vertical-script target, but nothing selects them.
+// Exported so the result dump and the debug overlay report the area the text
+// really got (see pageArea).
 export function chosenOrientation(
-    ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-    img: ImageData, box: DetBox, text: string,
+    _ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+    _img: ImageData, _box: DetBox, _text: string, _mask?: TextMask,
 ): boolean {
-    if (!boxIsVertical(box)) return false;
-    if (renderTuning.preferHorizontal) {
-        const probe = pageArea(ctx, img, box, true);
-        if (probe && horizontalFits(ctx, text, probe)) return false;
-    }
-    return true;
+    return false;
 }
 
-export interface Placed { fontSize: number; lines: string[]; overflow?: boolean; color?: string; block?: [number, number] }
+export interface Placed { fontSize: number; lines: string[]; overflow?: boolean; color?: string; block?: [number, number]; grown?: 1 }
 
 interface Area { x: number; y: number; w: number; h: number }
 
 // Placement rect, optionally carrying the measured per-line profile (see
 // widthProfile) for enclosed bubbles.
-export interface LayoutRect extends Area { runs?: RunProfile; why?: string }
+export interface LayoutRect extends Area { runs?: RunProfile; why?: string; leakL?: number; leakR?: number }
 
 // Shared placement-area resolution (layoutArea + canvas clamp + 20px floor).
 // Both orientations and the horizontal-fit probe use it, so the probe can
@@ -940,10 +1416,11 @@ export function pageArea(
     img: ImageData,
     box: DetBox,
     vertical: boolean,
+    mask?: TextMask,
 ): LayoutRect | null {
     // clamp to canvas bounds (boxes at page edges can otherwise hang over)
     const CW = ctx.canvas.width, CH = ctx.canvas.height;
-    const found = layoutArea(img, box, vertical);
+    const found = layoutArea(img, box, vertical, mask);
     if (!found) return null;
     const area: LayoutRect = {
         x: Math.max(0, found.x), y: Math.max(0, found.y),
@@ -951,6 +1428,29 @@ export function pageArea(
         runs: found.runs,
     };
     return area.w < 20 || area.h < 20 ? null : area;
+}
+
+// Effective layout boxes: copies carrying divider clips for boxes whose
+// clip-less areas overlap a disjoint neighbor (see dividerClips). The erase
+// plan keeps the ORIGINAL boxes (source ink must be erased wherever it is) —
+// only placement goes through these. Exported so the solo paint and the page
+// result dump resolve the same boxes.
+export function effBoxesForAreas(
+    ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+    img: ImageData,
+    boxes: DetBox[],
+    textFor: (index: number) => string,
+    mask?: TextMask,
+): DetBox[] {
+    const areas = boxes.map((b, i) =>
+        pageArea(ctx, img, b, chosenOrientation(ctx, img, b, textFor(i + 1), mask), mask));
+    const divs = dividerClips(boxes, areas);
+    if (!divs.length) return boxes;
+    const byIdx = new Map(divs.map(d => [d.index, d]));
+    return boxes.map((b, i) => {
+        const d = byIdx.get(i);
+        return d ? { ...b, clip: d.clip, cutAxis: d.cutAxis } : b;
+    });
 }
 
 // Horizontal font cap: one line needs ≈ 1.8x font size (glyph + headroom);
@@ -980,6 +1480,12 @@ export function layoutTextFit(
     area: LayoutRect,
     cap: number,
     maxStack?: number,
+    // source-box center on the stacking axis: a fitting block parks on the
+    // source text, not the area middle (live: a 16px fragment at the bottom of
+    // a 109px balloon area painted 40px above its box). The move only stands
+    // when every line still fits its band there — otherwise the area-centered
+    // top wins as before. Absent = area-centered (legacy).
+    boxC?: number,
 ): LaidOutFit | null {
     const prof = area.runs!;
     const segments = text.split(' / ').map(s => s.trim()).filter(Boolean);
@@ -995,9 +1501,18 @@ export function layoutTextFit(
     // line j's band along the stacking axis, walking away from `anchor`:
     // horizontal blocks start at the area top; vertical blocks stack to the
     // LEFT (JA reading order) so their anchor is the block's RIGHT edge.
+    // Width for a line = the interior measured at the line's CENTRE row, not the
+    // min over its whole band: in a wavy/round bubble a 36px band's narrowest
+    // row (usually its top) can be half the width at the glyphs, so min-over-band
+    // wrapped everything into 1-2 word lines and the bubble never filled. The
+    // glyph body sits at the band centre, so that row is what the reader sees.
+    const midIv = (p0: number, p1: number) => {
+        const mid = Math.round((p0 + p1) / 2);
+        return runInterval(prof, mid, mid + 1) ?? runInterval(prof, p0, p1);
+    };
     const widthFor = (anchor: number, lh: number) => (j: number) => {
         const b0 = prof.vertical ? anchor - (j + 1) * lh : anchor + j * lh;
-        const iv = runInterval(prof, b0, b0 + lh);
+        const iv = midIv(b0, b0 + lh);
         if (iv) return iv[1] - iv[0];
         // band past the measured range: reuse the nearest measured interval so
         // a long text still lays out (clipped) instead of vanishing — the
@@ -1013,59 +1528,94 @@ export function layoutTextFit(
         setFont(ctx, size);
         const lh = size * (1 + HEADROOM + LINE_SPACING);
         const anchorA = prof.vertical ? stack0 + stackLen : stack0;
-        let a = wrapUnitsIntoLines(ctx, segments, widthFor(anchorA, lh));
-        let edgeFailed = a.failed;
-        if (a.failed) {
-            // The first pass starts at the area's reading-order edge, where a
-            // round bubble is narrowest. A unit that cannot fit there can still
-            // fit the centered band — a short line lives in the middle. Skipping
-            // the size outright made a round profile shrink short text far below
-            // the source size (live: a two-word line, font 32 → 15 in a 67px
-            // box; the same skip capped a JP column at 19 against a 34px source).
-            const centered = prof.vertical ? stack0 + (stackLen + lh) / 2 : stack0 + (stackLen - lh) / 2;
-            const c = wrapUnitsIntoLines(ctx, segments, widthFor(centered, lh));
-            if (c.failed) continue;
-            a = c;
+        const edge = wrapUnitsIntoLines(ctx, segments, widthFor(anchorA, lh));
+        // Centered block by free-boundary search: the anchor depends on the
+        // block span, and the span is only known after wrapping. Walk candidate
+        // spans (windows that fit the height budget) ascending; the first
+        // self-consistent wrap — the block produced has exactly the span it was
+        // anchored for — is the centered solution. A failed candidate only
+        // means that window's bands were too narrow; the old two-pass code
+        // treated that as "no centered fit at this size" and collapsed (live: a
+        // round bubble's cap 149 fell to 47 because every size ≥49 failed at
+        // the top edge band or at a tail band past the evidence rows; a spiky
+        // bubble's cap 23 fell to 17). A wrap that comes out shorter than its
+        // window is kept only when nothing is self-consistent. The edge band is
+        // where a round bubble is narrowest, so a unit too wide for it can
+        // still fit the middle.
+        let b: { lines: string[]; failed: boolean } | null = null;
+        {
+            const maxLines = Math.max(1, Math.floor((stackFit + 0.5) / lh));
+            let inexact: { lines: string[]; failed: boolean } | null = null;
+            for (let n = 1; n <= maxLines; n++) {
+                const anchor = prof.vertical ? stack0 + (stackLen + n * lh) / 2 : stack0 + (stackLen - n * lh) / 2;
+                const w = wrapUnitsIntoLines(ctx, segments, widthFor(anchor, lh));
+                if (w.failed) continue;
+                if (w.lines.length === n) { b = w; break; }        // self-consistent: the best centered fit
+                if (w.lines.length < n) { inexact ??= w; }         // fits a wider window than it needs
+            }
+            b ??= inexact;
         }
-        const fitsA = a.lines.length * lh <= stackFit + 0.5;
-        // Recenter the block and re-wrap with the shifted bands. A block that
-        // wrapped at the edge keeps the legacy overflow policy (start at the
-        // edge, clipped tail) rather than centering a block that cannot fit.
-        const spanA = a.lines.length * lh;
-        const anchorB = prof.vertical ? stack0 + (stackLen + spanA) / 2 : stack0 + (stackLen - spanA) / 2;
-        const b = fitsA ? wrapUnitsIntoLines(ctx, segments, widthFor(anchorB, lh)) : { lines: a.lines, failed: false };
-        const overflowUse = b.failed || b.lines.length * lh > stackFit + 0.5;
-        const lines = overflowUse ? a.lines : b.lines;
-        // The centered anchor comes from the block actually placed. The centered
+        if (!b) { if (edge.failed) continue; }
+        // The centered anchor comes from the block actually placed. A centered
         // re-wrap can need FEWER lines than the edge pass (a round bubble's
-        // narrow top band wraps what the wide middle band fits on one line), and
-        // an anchor built from the edge pass's longer span parks the shorter
-        // block half a line above center (live: badge 6 ly 679 vs centered 695,
-        // n=1 with a 2-line span; badge 9 likewise 1014 vs 1051 at n=2/span 3).
+        // narrow top band wraps what the wide middle band fits on one line).
+        const bFits = !!b && b.lines.length * lh <= stackFit + 0.5;
+        const lines = bFits ? b!.lines : (edge.lines.length ? edge.lines : (b?.lines ?? []));
+        if (!lines.length) continue;
         const span = lines.length * lh;
         // Anchor: keep the wrap and the placement consistent. A centered block
-        // (b) takes the centered anchor; an edge-wrapped block (a) that the
-        // centered re-wrap could not match stays at the edge — placing it
-        // centered would move its lines onto narrower bands than the ones they
-        // were wrapped for (a 'word word word' line wrapped for a 200px band
-        // landing on a 60px one). Edge anchor = the legacy overflow policy.
-        const useCentered = !overflowUse || edgeFailed;
-        const top = useCentered
+        // takes the centered anchor; an edge-wrapped block (the centered wrap
+        // could not match its bands) stays at the edge — placing it centered
+        // would move its lines onto narrower bands than the ones they were
+        // wrapped for. Edge anchor = the legacy overflow policy.
+        const useCentered = bFits || edge.failed;
+        const areaTop = useCentered
             ? (prof.vertical ? stack0 + (stackLen + span) / 2 : stack0 + (stackLen - span) / 2)
             : anchorA;
-        const use = { lines, top };
-        const centers = use.lines.map((_, j) => {
-            const b0 = prof.vertical ? use.top - (j + 1) * lh : use.top + j * lh;
-            const iv = runInterval(prof, b0, b0 + lh);
-            return iv ? (iv[0] + iv[1]) / 2 : midCross;
+        // box-anchored candidate first (see boxC): same wrap, parked on the
+        // source — the per-line fits check below guards the move. Offered
+        // whenever the span fits the AREA, not just the source-derived budget
+        // (stackFit): a fragment box's budget is a hair of the balloon (live:
+        // a 16px fragment in a 109px area could never center on its source),
+        // while the cap already bounds the font against blowup.
+        const tops = [areaTop];
+        if (boxC != null && span <= stackLen + 0.5) {
+            const boxTop = Math.min(Math.max(boxC - span / 2, stack0), Math.max(stack0, stack0 + stackLen - span));
+            if (Math.abs(boxTop - areaTop) > 0.5) tops.unshift(boxTop);
+        }
+        const slack = size * (renderTuning.letterSpacing * 0.5 + renderTuning.textStroke) + 1;
+        const fitsAt = (top: number) => lines.every((line, j) => {
+            const b0 = prof.vertical ? top - (j + 1) * lh : top + j * lh;
+            const iv = midIv(b0, b0 + lh);
+            return !iv || ctx.measureText(line).width <= iv[1] - iv[0] + slack;
         });
-        const out: LaidOutFit = { lines: use.lines, fontSize: size, lineHeight: lh, top: use.top, centers };
-        // Return only a fitting CENTERED block; an edge-anchored one stays a
-        // fallback so a smaller size can still deliver a centered fit (live:
-        // badge 1, "1 สัปดาห์ต่อมา" fit the top band at f19 but the centered
-        // band only at f17 — returning the f19 edge solution parked the caption
-        // 39px above its box). fallback keeps the FIRST (largest-font) solution.
-        if (fitsA && useCentered) return out;
+        let out: LaidOutFit | null = null;
+        let wonBoxC = false;
+        for (const top of tops) {
+            if (!fitsAt(top)) continue;
+            const centers = lines.map((_, j) => {
+                const b0 = prof.vertical ? top - (j + 1) * lh : top + j * lh;
+                const iv = midIv(b0, b0 + lh);
+                return iv ? (iv[0] + iv[1]) / 2 : midCross;
+            });
+            out = { lines, fontSize: size, lineHeight: lh, top, centers };
+            wonBoxC = tops.length > 1 && top === tops[0];
+            break;
+        }
+        // A fitting CENTERED block wins outright. An edge-anchored block is
+        // kept as the fallback (largest size first) so a smaller size can still
+        // deliver a centered fit (live: badge 1, "1 สัปดาห์ต่อมา" fit the top
+        // band at f19 but the centered band only at f17 — returning the f19
+        // edge solution parked the caption 39px above its box).
+        // A line whose measured width overflows the interval it was wrapped for
+        // must never reach the paint: the paint clips to the area, so the tail
+        // glyphs vanish (live: "อยากตอบ" painted as "อยากตอ"). Reject the size
+        // instead — the loop steps the font down and the fallback stays clean.
+        if (!out) continue;
+        // A box-parked fit wins outright too: it fits the area's measured bands
+        // AND sits on the source (a smaller area-centered size is never better
+        // than the cap size parked right — the cap already bounds blowup).
+        if (bFits || wonBoxC) return out;
         fallback ??= out;
     }
     if (fallback) return fallback;
@@ -1080,11 +1630,15 @@ export function layoutTextFit(
     if (!laid.lines.length) return null;
     const total = laid.lines.length * laid.lineHeight;
     const fits = total <= stackLen + 0.5;
+    // a fitting block parks on the source (see boxC); overflow keeps the edge
+    const centerTop = (base: number) => boxC != null && fits
+        ? Math.min(Math.max(boxC - total / 2, stack0), stack0 + stackLen - total)
+        : base;
     return {
         lines: laid.lines, fontSize: laid.fontSize, lineHeight: laid.lineHeight,
         top: prof.vertical
-            ? (fits ? stack0 + (stackLen + total) / 2 : stack0 + stackLen)
-            : (fits ? stack0 + (stackLen - total) / 2 : stack0),
+            ? (fits ? centerTop(stack0 + (stackLen + total) / 2) : stack0 + stackLen)
+            : (fits ? centerTop(stack0 + (stackLen - total) / 2) : stack0),
         centers: laid.lines.map(() => midCross),
     };
 }
@@ -1116,18 +1670,24 @@ function renderHorizontal(
     img: ImageData,
     box: DetBox,
     text: string,
+    mask?: TextMask,
 ): Placed | null {
     if (!text.trim()) return null;
-    const area = pageArea(ctx, img, box, false);
+    const area = pageArea(ctx, img, box, false, mask);
     if (!area) return null;
-    const { color, stroke } = resolveColors(img, area);
+    const { color, stroke } = resolveColors(img, area, box, mask);
     const cap = Math.min(hCap(area), sizeCapFrom(img, box, false) ?? MAX_FONT);
 
     // Enclosed bubble: every line is fitted to its own measured band (widths
     // vary with the bubble shape), centered on its own run.
     if (area.runs) {
-        const laid = layoutTextFit(ctx, text, area, cap, Math.round((box.y2 - box.y1) * Math.max(1.15, renderTuning.textScale)));
+        const boxC = (box.y1 + box.y2) / 2;
+        const laid = layoutTextFit(ctx, text, area, cap, Math.round((box.y2 - box.y1) * Math.max(1.15, renderTuning.textScale)), boxC);
         if (!laid || !laid.lines.length) return null;
+        // The paint must use the size the wrap MEASURED: layoutTextFit's loop
+        // leaves the ctx font at the last size it tried, which is not the size of
+        // the fit it returns as a fallback.
+        setFont(ctx, laid.fontSize);
         const overflow = laid.top + laid.lines.length * laid.lineHeight > area.y + area.h + 0.5 || laid.top < area.y - 0.5;
         ctx.save();
         ctx.beginPath();
@@ -1152,8 +1712,24 @@ function renderHorizontal(
         return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color, block: [b0, b1] };
     }
 
-    const laid = layoutText(ctx, text, area.w, area.h, cap);
+    let laid = layoutText(ctx, text, area.w, area.h, cap);
     if (!laid.lines.length) return null;
+
+    // Dark caption on black art: the area above is the box+20% cap, so a longer
+    // translation always overflows — grow into the uniform darkness first (see
+    // growDarkArea), then lay out again. The grown strips need no extra erase.
+    let grown: Area | null = null;
+    let paintArea: LayoutRect = area;
+    if (laid.lines.length * laid.lineHeight > area.h + 0.5) {
+        grown = growDarkArea(img, box, area);
+        if (grown && grown.h > area.h + 0.5) {
+            paintArea = { ...area, ...grown };
+            laid = layoutText(ctx, text, paintArea.w, paintArea.h, cap);
+            if (!laid.lines.length) return null;
+        } else {
+            grown = null;
+        }
+    }
 
     setFont(ctx, laid.fontSize);
     ctx.textAlign = 'center';
@@ -1163,17 +1739,22 @@ function renderHorizontal(
     // Overflow policy: text NEVER leaves the region (clipped). If it can't fit,
     // top-align so the start of the text stays readable inside the clip.
     const totalH = laid.lines.length * laid.lineHeight;
-    const overflow = totalH > area.h + 0.5;
+    const overflow = totalH > paintArea.h + 0.5;
+    // a fitting block parks on the source box, not the area middle (same
+    // boxC rule as the profile path — a grown caption's middle is below the
+    // source, an unclamped area's middle may be anywhere)
+    const boxC = (box.y1 + box.y2) / 2;
     let y = overflow
-        ? area.y + laid.lineHeight / 2
-        : area.y + (area.h - totalH) / 2 + laid.lineHeight / 2;
+        ? paintArea.y + laid.lineHeight / 2
+        : Math.min(Math.max(boxC, paintArea.y + totalH / 2), paintArea.y + paintArea.h - totalH / 2)
+        - totalH / 2 + laid.lineHeight / 2;
 
     const y0 = y; // first line's center — the block runs [y0 - lh/2, y0 - lh/2 + totalH]
     ctx.save();
     ctx.beginPath();
-    ctx.rect(area.x, area.y, area.w, area.h);
+    ctx.rect(paintArea.x, paintArea.y, paintArea.w, paintArea.h);
     ctx.clip();
-    const cx = area.x + area.w / 2 + halfTrack() * laid.fontSize; // trailing-spacing compensation
+    const cx = paintArea.x + paintArea.w / 2 + halfTrack() * laid.fontSize; // trailing-spacing compensation
     for (const line of laid.lines) {
         if (renderTuning.textStroke > 0) {
             ctx.strokeStyle = stroke;
@@ -1185,7 +1766,7 @@ function renderHorizontal(
         y += laid.lineHeight;
     }
     ctx.restore();
-    return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color, block: [y0 - laid.lineHeight / 2, y0 - laid.lineHeight / 2 + totalH] };
+    return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color, block: [y0 - laid.lineHeight / 2, y0 - laid.lineHeight / 2 + totalH], ...(grown ? { grown: 1 as const } : null) };
 }
 
 // Left edge of the first (rightmost) column in a vertical stack. Columns
@@ -1204,8 +1785,9 @@ function renderVertical(
     img: ImageData,
     box: DetBox,
     text: string,
+    mask?: TextMask,
 ): Placed | null {
-    const area = pageArea(ctx, img, box, true);
+    const area = pageArea(ctx, img, box, true, mask);
     if (!area) return null;
     const { color, stroke } = resolveColors(img, area);
     const cap = Math.min(
@@ -1215,7 +1797,7 @@ function renderVertical(
 
     // Enclosed bubble: each column is fitted to its own measured run (the
     // transposed profile), so columns follow the bubble height.
-    const fit = area.runs ? layoutTextFit(ctx, text, area, cap, Math.round((box.x2 - box.x1) * Math.max(1.15, renderTuning.textScale))) : null;
+    const fit = area.runs ? layoutTextFit(ctx, text, area, cap, Math.round((box.x2 - box.x1) * Math.max(1.15, renderTuning.textScale)), (box.x1 + box.x2) / 2) : null;
     let laid: LaidOut | null = null;
     if (area.runs) {
         if (!fit || !fit.lines.length) return null;

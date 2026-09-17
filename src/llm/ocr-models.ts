@@ -252,3 +252,48 @@ export async function baberuRead(key: string): Promise<ArrayBuffer | undefined> 
         q.onerror = () => res(undefined);
     });
 }
+
+// ---- text-cleanup inpainting (manga-LaMa, fp16 weights, 112MB) ----
+// Same HF runtime mirror + IDB store as the detection weights. WebGPU-only in
+// practice (ORT-web wasm measures ~22s per 512px window) — callers fall back
+// to the built-in fill when the model is missing or no WebGPU session can be
+// created. fp16 weights (weight-only Cast) avoid both the int8
+// DequantizeLinear WebGPU bug and the shader-f16 requirement.
+
+export const INPAINT_KEY = 'inpaint:manga512';
+export const INPAINT_FILE = 'lama-manga-512-fp16w.onnx';
+export const INPAINT_LABEL = 'text cleanup model (~112MB)';
+
+export async function inpaintInstalled(): Promise<boolean> {
+    const db = await openDb();
+    return new Promise(res => {
+        const q = db.transaction('m', 'readonly').objectStore('m').getKey(INPAINT_KEY);
+        q.onsuccess = () => res(q.result !== undefined);
+        q.onerror = () => res(false);
+    });
+}
+
+export async function inpaintDownload(onProgress?: (loaded: number, total: number) => void): Promise<void> {
+    const db = await openDb();
+    const have = await new Promise<boolean>(res => {
+        const q = db.transaction('m', 'readonly').objectStore('m').getKey(INPAINT_KEY);
+        q.onsuccess = () => res(q.result !== undefined);
+        q.onerror = () => res(false);
+    });
+    if (have) return;
+    const buf = await fetchWithProgress(DET_URL(INPAINT_FILE), onProgress);
+    await new Promise<void>((res, rej) => {
+        const q = db.transaction('m', 'readwrite').objectStore('m').put(buf, INPAINT_KEY);
+        q.onsuccess = () => res();
+        q.onerror = () => rej(q.error);
+    });
+}
+
+export async function inpaintDelete(): Promise<void> {
+    const db = await openDb();
+    await new Promise<void>(res => {
+        const q = db.transaction('m', 'readwrite').objectStore('m').delete(INPAINT_KEY);
+        q.onsuccess = () => res();
+        q.onerror = () => res();
+    });
+}

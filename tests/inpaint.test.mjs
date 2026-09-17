@@ -1,0 +1,243 @@
+// Unit tests for the inpaint erase-region expansion (pure mask logic).
+import { build } from 'esbuild';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync } from 'fs';
+
+mkdirSync('.test-build', { recursive: true });
+await build({
+  entryPoints: ['src/content/inpaint.ts'],
+  bundle: true, format: 'esm', outfile: '.test-build/inpaint.mjs', sourcemap: 'inline',
+});
+const { eraseBox, erasePlan, aiCleanupMask, aiCleanupDilate, windowIndex, eraseBgColor } = await import(new URL('../.test-build/inpaint.mjs', import.meta.url).href);
+
+function mask(W, H, fill = []) {
+  const m = new Uint8Array(W * H);
+  for (const [x, y] of fill) m[y * W + x] = 255;
+  return m;
+}
+
+const box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+
+test('eraseBox: keeps the box when nothing touches it', () => {
+  const m = mask(60, 60, [[50, 50]]);
+  assert.deepEqual(eraseBox(m, 60, 60, box, 20), { x1: 10, y1: 10, x2: 30, y2: 30 });
+});
+
+test('eraseBox: expands over mask ink touching a side (the clipped last line)', () => {
+  // live: the box bottom crossed a narration line at y2077 while its ink ran
+  // to y2102 — the translation painted over the top half, "SAO…" showed below
+  const m = mask(60, 60, [[15, 31], [20, 34], [25, 36]]);
+  const e = eraseBox(m, 60, 60, box, 20);
+  assert.equal(e.y2, 36, 'bottom follows the ink');
+  assert.equal(e.y1, 10);
+  assert.equal(e.x1, 10);
+  assert.equal(e.x2, 30);
+});
+
+test('eraseBox: a gap wider than a glyph gap stops the walk', () => {
+  const m = mask(80, 80, [[20, 32], [20, 40]]); // ink at 32, gap 33-39 (7 rows), ink at 40
+  const e = eraseBox(m, 80, 80, box, 40);
+  assert.equal(e.y2, 32, 'stops at the first cluster, does not bridge 7 empty rows');
+});
+
+test('eraseBox: sideways ink outside the span is ignored (no wander to a neighbour)', () => {
+  const m = mask(80, 80, [[45, 20]]); // right of the box, same rows
+  const e = eraseBox(m, 80, 80, box, 40);
+  assert.deepEqual(e, { x1: 10, y1: 10, x2: 30, y2: 30 });
+});
+
+test('eraseBox: expansion is capped by pad', () => {
+  const m = mask(200, 200, Array.from({ length: 80 }, (_, i) => [20, 31 + i]));
+  const e = eraseBox(m, 200, 200, box, 12);
+  assert.equal(e.y2, 42, 'pad bounds the walk');
+});
+
+test('erasePlan: translated boxes erase, keep + contained dups stay, missing -> missed', () => {
+  const boxes = [
+    { x1: 0, y1: 0, x2: 100, y2: 100, conf: 0.9 },
+    { x1: 5, y1: 5, x2: 95, y2: 95, conf: 0.5 }, // contained in #1, lower conf
+    { x1: 200, y1: 0, x2: 300, y2: 100, conf: 0.8 }, // LLM said keep
+    { x1: 400, y1: 0, x2: 500, y2: 100, conf: 0.7 }, // no output -> missed
+  ];
+  const det = { boxes, mask: { width: 1, height: 1, data: new ArrayBuffer(1) } };
+  const outputs = [
+    { index: 1, translation: 'A' },
+    { index: 2, translation: 'B' },
+    { index: 3, translation: 'keep' },
+  ];
+  const p = erasePlan(det, outputs);
+  assert.deepEqual(p.boxesToErase.map(b => b.conf), [0.9]);
+  assert.deepEqual(p.keepBoxes.map(b => b.conf), [0.5, 0.8]);
+  assert.deepEqual([...p.dupIdx], [2]);
+  assert.deepEqual([...p.keepIdx], [3]);
+  assert.deepEqual(p.missedIdx, [4]);
+});
+
+// ---- aiCleanupMask: what the manga-LaMa windows actually see ---------------
+
+function detOf(W, H, fill = []) {
+  return { boxes: [], mask: { width: W, height: H, data: mask(W, H, fill).buffer } };
+}
+const at = (r, W, x, y) => r.data[y * W + x];
+
+test('aiCleanupMask: ink outside the erase boxes never reaches the model', () => {
+  const det = detOf(40, 40, [[12, 15], [30, 15]]);
+  const r = aiCleanupMask(det, [{ x1: 10, y1: 10, x2: 20, y2: 20 }], []);
+  assert.ok(at(r, 40, 12, 15) > 127, 'inside kept');
+  assert.equal(at(r, 40, 30, 15), 0, 'outside dropped');
+  assert.equal(r.width, 40);
+  assert.equal(r.height, 40);
+});
+
+test('aiCleanupMask: dilates by the page-scaled radius (strokes must merge at 512)', () => {
+  const det = detOf(40, 40, [[12, 15]]); // tiny det -> radius clamps to 4
+  const r = aiCleanupMask(det, [{ x1: 10, y1: 10, x2: 20, y2: 20 }], []);
+  assert.ok(at(r, 40, 8, 15) > 127, '4px left is grown');
+  assert.equal(at(r, 40, 7, 15), 0, '5px left is not');
+  assert.ok(at(r, 40, 12, 11) > 127, '4px up is grown');
+  assert.ok(at(r, 40, 16, 19) > 127, '4px down-right is grown');
+});
+
+test('aiCleanupDilate: 4px at a 1600px page, grows with the scan, clamped', () => {
+  assert.equal(aiCleanupDilate(1126, 1600), 4);
+  assert.equal(aiCleanupDilate(800, 1200), 4, 'small pages keep the floor');
+  assert.equal(aiCleanupDilate(1600, 2400), 6);
+  assert.equal(aiCleanupDilate(3000, 4000), 10, 'capped');
+});
+
+test('aiCleanupMask: keep boxes are cleared after dilation (SFX glyphs stay)', () => {
+  const det = detOf(40, 40, [[12, 15]]);
+  const r = aiCleanupMask(det, [{ x1: 10, y1: 10, x2: 20, y2: 20 }], [{ x1: 12, y1: 15, x2: 12, y2: 15 }]);
+  assert.equal(at(r, 40, 12, 15), 0, 'ink inside the keep box is cleared');
+  assert.equal(at(r, 40, 10, 15), 0, 'the keep box clears with a 2px pad');
+  assert.ok(at(r, 40, 16, 15) > 127, 'dilation past the padded keep box stays');
+});
+
+test('aiCleanupMask: no boxes -> empty mask', () => {
+  const det = detOf(20, 20, [[5, 5]]);
+  const r = aiCleanupMask(det, [], []);
+  assert.ok(r.data.every(v => v === 0));
+});
+
+// ---- windowIndex: page pixel -> index inside the side-sized cleanup window --
+
+test('windowIndex: page coords map to window pixels at page scale', () => {
+  assert.equal(windowIndex(100, 50, 200), 50, 'half-pixel center floor');
+  assert.equal(windowIndex(0, -30, 200), 30, 'negative origin (window past the page edge)');
+  assert.equal(windowIndex(349.7, 0, 200), 200 - 1, 'clamped to the last index');
+  assert.equal(windowIndex(-5, 0, 200), 0, 'clamped at the start');
+});
+
+test('windowIndex: regression — side > 512 windows must not sample 512-space', () => {
+  // v2 composite divided by side/512, so a window pixel at 599 landed on 511
+  // (art from above the box) — live: foliage smeared over the erased text
+  assert.equal(windowIndex(599, 0, 600), 599);
+  assert.equal(windowIndex(300, 0, 600), 300);
+  assert.equal(windowIndex(599, -20, 600), 600 - 1, 'origin past the page edge still clamps');
+});
+
+
+// The bounded cleanup-mask dilate must be pixel-identical to the old full-page
+// walk: the passes only ever touch pixels within `r` px of box ink, so the
+// union bbox grown by r is a lossless window.
+test('aiCleanupMask: bounded dilate matches the full-page reference', () => {
+  const W = 220, H = 160;
+  const fill = [[4, 4], [5, 4], [6, 4], [4, 5], [60, 20], [61, 20], [62, 20], [200, 150], [201, 150], [150, 80], [151, 80], [152, 80]];
+  const m = mask(W, H, fill);
+  const det = { mask: { width: W, height: H, data: m.buffer } };
+  const boxes = [{ x1: 55, y1: 18, x2: 70, y2: 26 }, { x1: 145, y1: 76, x2: 158, y2: 86 }];
+  const keep = [{ x1: 148, y1: 78, x2: 156, y2: 84 }];
+  const got = aiCleanupMask(det, boxes, keep);
+  const r = aiCleanupDilate(W, H);
+  let cur = new Uint8Array(W * H);
+  for (const b of boxes) {
+    for (let y = b.y1; y <= b.y2; y++) for (let x = b.x1; x <= b.x2; x++) if (m[y * W + x] > 127) cur[y * W + x] = 255;
+  }
+  for (let p = 0; p < r; p++) {
+    const next = new Uint8Array(cur.length);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      let on = false;
+      for (let dy = -1; dy <= 1 && !on; dy++) for (let dx = -1; dx <= 1 && !on; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < W && ny < H && cur[ny * W + nx]) on = true;
+      }
+      if (on) next[y * W + x] = 255;
+    }
+    cur = next;
+  }
+  for (const k of keep) for (let y = k.y1 - 2; y <= k.y2 + 2; y++) cur.fill(0, y * W + (k.x1 - 2), y * W + k.x2 + 3);
+  assert.deepEqual(got.data, cur, 'bounded window dilate is lossless');
+  // edge glyphs (outside every box) must not appear — the mask is box-scoped
+  assert.equal(got.data[4 * W + 4], 0);
+});
+
+// ---- eraseBgColor: the surface the glyphs sit on (picked, never averaged) --
+
+function rgba(W, H, bg, rects = []) {
+  const d = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) { d[i * 4] = bg[0]; d[i * 4 + 1] = bg[1]; d[i * 4 + 2] = bg[2]; d[i * 4 + 3] = 255; }
+  for (const [x1, y1, x2, y2, c] of rects)
+    for (let y = y1; y <= y2; y++) for (let x = x1; x <= x2; x++) {
+      const i = (y * W + x) * 4; d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2];
+    }
+  return d;
+}
+function dilate1(W, H, pts) {
+  // raw ink + 1px halo (stands in for the real dilated mask)
+  const raw = new Uint8Array(W * H), dil = new Uint8Array(W * H);
+  for (const [x, y] of pts) raw[y * W + x] = 255;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (!raw[y * W + x]) continue;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < W && ny < H) dil[ny * W + nx] = 255;
+    }
+  }
+  return { raw, dil };
+}
+
+test('eraseBgColor: white caption on a black banner erases white, not gray', () => {
+  // live /14 badge 2: ring=black banner, inside=white caption — the old
+  // (ring+inside)/2 average painted #808080
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [0, 0, 0], [[10, 10, 30, 30, [255, 255, 255]], [18, 18, 22, 24, [0, 0, 0]]]);
+  const pts = [];
+  for (let y = 18; y <= 24; y++) for (let x = 18; x <= 22; x++) pts.push([x, y]);
+  const { raw, dil } = dilate1(W, H, pts);
+  assert.deepEqual(eraseBgColor(d, W, H, raw, dil, box), [255, 255, 255]);
+});
+
+test('eraseBgColor: disagreement without glyphs still picks the inside', () => {
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [0, 0, 0], [[10, 10, 30, 30, [255, 255, 255]]]);
+  const z = new Uint8Array(W * H);
+  assert.deepEqual(eraseBgColor(d, W, H, z, z, box), [255, 255, 255]);
+});
+
+test('eraseBgColor: white-on-black dialogue erases black', () => {
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [0, 0, 0], [[18, 18, 22, 24, [255, 255, 255]]]);
+  const pts = [];
+  for (let y = 18; y <= 24; y++) for (let x = 18; x <= 22; x++) pts.push([x, y]);
+  const { raw, dil } = dilate1(W, H, pts);
+  const bg = eraseBgColor(d, W, H, raw, dil, box);
+  assert.ok(bg.every(v => v <= 8), `expected near-black, got ${bg}`);
+});
+
+test('eraseBgColor: dark band in the ring does not drag paper gray', () => {
+  // the old comment's case: ring catches a dark scan band, text sits on paper
+  const W = 60, H = 60, box = { x1: 10, y1: 20, x2: 30, y2: 40 };
+  const d = rgba(W, H, [255, 255, 255], [[0, 14, 59, 14, [20, 20, 20]], [18, 28, 22, 34, [0, 0, 0]]]);
+  const pts = [];
+  for (let y = 28; y <= 34; y++) for (let x = 18; x <= 22; x++) pts.push([x, y]);
+  const { raw, dil } = dilate1(W, H, pts);
+  assert.deepEqual(eraseBgColor(d, W, H, raw, dil, box), [255, 255, 255]);
+});
+
+test('eraseBgColor: dense text with no background falls back to the ring', () => {
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [255, 255, 255]);
+  const raw = new Uint8Array(W * H).fill(255), dil = new Uint8Array(W * H).fill(255);
+  assert.deepEqual(eraseBgColor(d, W, H, raw, dil, box), [255, 255, 255]);
+});

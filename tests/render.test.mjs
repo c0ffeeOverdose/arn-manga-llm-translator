@@ -14,6 +14,9 @@ await build({
 const {
   bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, isLight, layoutText, horizontalFits,
   widthProfile, runInterval, sourcePitch, sizeCapFrom, layoutTextFit, boxIsVertical, setRenderTuning, renderTuning, ENCLOSED_MIN,
+  clampRunEnd, RUN_JUMP,
+  clipArea,
+  dividerClips, growDarkArea, expandCropToInk,
 } = await import(new URL('../.test-build/render.mjs', import.meta.url).href);
 
 // white W×H page, optional dark vertical borders (bubble edges)
@@ -278,11 +281,20 @@ test('layoutText: fitting text takes the cap (unchanged behavior)', () => {
   assert.deepEqual(r.lines, ['ab cd']);
 });
 
-test('layoutText: unavoidable overflow keeps SMALLEST wrappable, not largest', () => {
-  // one line at every size, but maxH fits nothing (minFont 14 default)
+test('layoutText: overflow shrinks below minFont to fit (absolute floor)', () => {
+  // one line at every size; maxH 20 fits nothing at minFont 14 (lh 25.2) but
+  // fits at f:10 (lh 18) — complete small beats clipped big
   const words = Array.from({ length: 20 }, (_, i) => `w${i}`).join(' ');
   const r = layoutText(fakeCtx(), words, 10000, 20, 40);
-  assert.equal(r.fontSize, 14);
+  assert.equal(r.fontSize, 10);
+  assert.ok(r.lines.length * r.lineHeight <= 20);
+});
+
+test('layoutText: nothing fits even at the absolute floor keeps smallest', () => {
+  const words = Array.from({ length: 20 }, (_, i) => `w${i}`).join(' ');
+  const r = layoutText(fakeCtx(), words, 10000, 10, 40);
+  assert.equal(r.fontSize, 8, 'smallest wrappable at the absolute floor, still overflowing');
+  assert.ok(r.lines.length * r.lineHeight > 10);
 });
 
 test('layoutText: spaceless 12-char Thai run splits instead of collapsing the font', () => {
@@ -301,8 +313,9 @@ test('layoutText: English short words do not gain mid-word breaks', () => {
 test('horizontalFits: short text in a tall strip fits; long text does not', () => {
   const strip = { x: 0, y: 0, w: 90, h: 300 };
   assert.equal(horizontalFits(fakeCtx(), 'short line here', strip), true);
-  const novel = 'word '.repeat(60).trim();
-  assert.equal(horizontalFits(fakeCtx(), novel, strip), false);
+  // 60 words need ~288px even at the absolute floor — a 200px strip cannot
+  // hold them (the probe shares layoutText's floor, so this stays honest)
+  assert.equal(horizontalFits(fakeCtx(), 'word '.repeat(60).trim(), { x: 0, y: 0, w: 90, h: 200 }), false);
 });
 
 // ---- width profile / source pitch (enclosed-bubble measurement) ----
@@ -352,6 +365,52 @@ test('widthProfile: open white page has no boundary evidence (no-frame path)', (
   const prof = widthProfile(img, box, false, [255, 255, 255], { x1: 40, y1: 40, x2: 160, y2: 160 }, { loX: 40, loY: 40, hiX: 160, hiY: 160 });
   assert.ok(prof, 'rows measured');
   assert.equal(prof.enclosed, 0, 'nothing stops the fill — not a bubble');
+});
+
+test('clampRunEnd: an outward jump clamps to the last supported end', () => {
+  assert.deepEqual(clampRunEnd(null, 100, 1), { value: 100, leaked: false }, 'first row seeds the support');
+  assert.deepEqual(clampRunEnd(100, 96, 1), { value: 96, leaked: false }, 'min side: small moves are a curve');
+  assert.deepEqual(clampRunEnd(100, 60, 1), { value: 100, leaked: true }, 'min side: 40px jump outward is a leak');
+  assert.deepEqual(clampRunEnd(100, 130, -1), { value: 130, leaked: false }, 'max side: 30px move is a curve');
+  assert.deepEqual(clampRunEnd(100, 160, -1), { value: 100, leaked: true }, 'max side: 60px jump outward is a leak');
+  assert.deepEqual(clampRunEnd(100, 80, -1), { value: 80, leaked: false }, 'max side: inward moves always pass');
+});
+
+// Live page 5 (scaled): a bubble whose outline is open below a screen-tone
+// patch, sitting on a page-white field that runs to a far dark line. The fill
+// escapes the bubble, follows the field, and the far line passes the
+// thin-line test — pre-guard the layout area started 66px left of the box.
+// The run-continuity rule clamps the leaked rows at the bubble's last
+// supported edge, so the area stays on the box's side of the field.
+test('layoutArea: open-field leak below a tone patch stays on the bubble edge', () => {
+  const W = 240, H = 200;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const dark = (x, y) => { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; };
+  for (let y = 40; y <= 95; y++) { dark(95, y); dark(96, y); }   // bubble's left edge (thin), open below
+  for (let y = 96; y <= 190; y++) { dark(41, y); dark(42, y); }  // far art line across the open field
+  for (const gx of [115, 130, 145, 160]) for (let y = 90; y < 130; y++) dark(gx, y); // glyphs
+  const img = { width: W, height: H, data };
+  const box = { x1: 110, y1: 80, x2: 180, y2: 140, conf: 0.9 };
+  const a = layoutArea(img, box);
+  assert.ok(a, 'area');
+  assert.ok(a.x > 90, `area does not follow the leaked field to the far line (x=${a.x})`);
+  assert.ok(a.x + a.w >= 180, `and still holds the box width (x2=${a.x + a.w})`);
+});
+
+// The rect path gets the same trim: a fill whose right bound jumped past the
+// bubble's edge (a thin line that only spans the top rows) must not measure
+// the field beyond it — the guard clamps the leaked rows first.
+test('bubbleArea: a jumped right bound is trimmed to the supported edge', () => {
+  const W = 440, H = 160;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const dark = (x, y) => { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; };
+  for (let y = 40; y <= 70; y++) { dark(330, y); dark(331, y); } // bubble edge, top rows only
+  for (const gx of [130, 180, 230, 280]) for (let y = 70; y < 100; y++) dark(gx, y);
+  const img = { width: W, height: H, data };
+  const box = { x1: 100, y1: 60, x2: 320, y2: 110, conf: 0.9 };
+  const a = bubbleArea(img, box);
+  assert.ok(a.leakR > 0, `right-side rows were clamped (leakR=${a.leakR})`);
+  assert.ok(a.x + a.w <= 340, `area stops near the supported edge, not the window (x2=${a.x + a.w})`);
 });
 
 test('widthProfile: vertical profile measures columns (transposed axes)', () => {
@@ -452,7 +511,10 @@ test('layoutTextFit: lines use their own band width (narrow top, wide middle)', 
   const area = { x: 0, y: 0, w: 200, h: rows, runs: prof };
   const text = 'word '.repeat(8).trim();
   const fit = layoutTextFit(fakeCtx(), text, area, 20);
-  assert.ok(fit && fit.lines.length >= 3, `several lines, got ${fit && fit.lines.length}`);
+  assert.ok(fit && fit.lines.length >= 2, `several lines, got ${fit && fit.lines.length}`);
+  // the block is places inside the wide middle band it was wrapped for, not
+  // against the narrow reading-order edge
+  assert.ok(fit.top >= 19.5 && fit.top + fit.lines.length * fit.lineHeight <= 80.5, `centered in the wide band, top=${fit.top}`);
   // every line fits the interval measured at its own band
   fit.lines.forEach((line, j) => {
     const b0 = fit.top + j * fit.lineHeight;
@@ -461,8 +523,16 @@ test('layoutTextFit: lines use their own band width (narrow top, wide middle)', 
     assert.ok(fakeCtxMeasure(line, fit.fontSize) <= iv[1] - iv[0] + 0.51, `line ${j} fits its band`);
     assert.ok(fit.centers[j] > iv[0] && fit.centers[j] < iv[1], `line ${j} centers on its run`);
   });
-  const widths = fit.lines.map(l => l.length);
-  assert.ok(Math.max(...widths) > Math.min(...widths) + 3, `band widths shape the text (${widths.join(',')})`);
+});
+
+test('runInterval: edge sliver/hole rows are trimmed, an interior hole still nulls', () => {
+  const rows = 20;
+  const prof = bandProfile(rows, () => 100, 10);
+  prof.i1[0] = 1; prof.i2[0] = 0;       // hole at the top edge
+  prof.i1[19] = 50; prof.i2[19] = 53;   // 4px sliver at the bottom edge
+  assert.deepEqual(runInterval(prof, 0, 20), [10, 109]);
+  prof.i1[10] = 1; prof.i2[10] = 0;     // interior gap: a line must not cross it
+  assert.equal(runInterval(prof, 0, 20), null);
 });
 
 function fakeCtxMeasure(s, size, pxPerChar = 0.6) {
@@ -694,8 +764,14 @@ test('layoutTextFit: last-resort rect layout centers a fitting block', () => {
   assert.ok(fit && fit.lines.length === 1, `one line, got ${fit && fit.lines.length}`);
   const center = fit.top + fit.lineHeight / 2;
   assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `centered (top=${fit.top}, center=${center}, areaCenter=${area.h / 2})`);
+  // a block that fits only below minFont still centers (no overflow clip)
+  const snug = { x: 0, y: 0, w: 200, h: 20, runs: bandProfile(20, () => 40) };
+  const small = layoutTextFit(fakeCtx(), 'abcdefgh', snug, 30);
+  assert.ok(small && small.lines.length === 1, 'lays out below minFont instead of clipping');
+  assert.equal(small.fontSize, 10, 'largest size fitting 20px at any floor');
+  assert.ok(Math.abs(small.top + small.lineHeight / 2 - 10) <= 1, `centered (top=${small.top})`);
   // a block that truly cannot fit the area keeps the legacy edge anchor
-  const tight = { x: 0, y: 0, w: 200, h: 20, runs: bandProfile(20, () => 40) };
+  const tight = { x: 0, y: 0, w: 200, h: 10, runs: bandProfile(10, () => 40) };
   const over = layoutTextFit(fakeCtx(), 'abcdefgh', tight, 30);
   assert.ok(over && over.lines.length === 1, 'overflow still lays out');
   assert.equal(over.top, 0, `unavoidable overflow stays edge-anchored (top=${over.top})`);
@@ -714,4 +790,309 @@ test('layoutTextFit: a failed centered re-wrap still centers a fitting block', (
   assert.ok(fit && fit.lines.length === 1, `one line, got ${fit && fit.lines.length}`);
   const center = fit.top + fit.lineHeight / 2;
   assert.ok(Math.abs(center - (area.y + area.h / 2)) <= 1, `block centered (top=${fit.top}, center=${center}, areaCenter=${area.h / 2})`);
+});
+
+// ---- split-child clip: the fill must not cross into the sibling region ------
+// Live: a balloon pair's areas merged 145px past the split cut (the interiors
+// connect through the touching outlines) and the translation laid out across
+// both bubbles and the panel border. Split children carry their side of the
+// cut; the flood window and the final area clamp to it.
+
+test('clipArea: intersects, and a missing clip is a no-op', () => {
+  const a = { x: 10, y: 20, w: 100, h: 50 };
+  assert.deepEqual(clipArea(a, undefined), a);
+  assert.deepEqual(clipArea(a, { x1: 0, y1: 0, x2: 60, y2: 100 }), { x: 10, y: 20, w: 50, h: 50 });
+  assert.deepEqual(clipArea(a, { x1: 50, y1: 0, x2: 60, y2: 30 }), { x: 50, y: 20, w: 10, h: 10 });
+  assert.deepEqual(clipArea(a, { x1: 200, y1: 200, x2: 300, y2: 300 }), { x: 200, y: 200, w: 0, h: 0 });
+});
+
+// Two white fields split by a wide gap in a dark divider inside one outlined
+// "bubble" (the balloon-tangent shape): the fill escapes through the hole into
+// the right field's white. The run-continuity guard (RUN_JUMP) clamps the
+// leaked runs at the divider, so enclosure drops below the bar and the rect
+// fallback caps at 1.5x the box; the child's clip remains the hard stop.
+test('layoutArea: divider-hole leak — the guard holds, the clip clamps harder', () => {
+  const W = 300, H = 160;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  const dark = (x, y) => { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; };
+  for (let x = 40; x <= 230; x++) { dark(x, 50); dark(x, 110); }        // outlined bubble, top/bottom
+  for (let y = 50; y <= 110; y++) { dark(40, y); dark(230, y); }        // left/right
+  for (let y = 50; y <= 110; y++) for (let x = 140; x <= 144; x++) if (y < 70 || y > 100) dark(x, y); // divider with a hole
+  for (const gx of [70, 85, 100, 115, 130]) for (let y = 65; y < 95; y++) dark(gx, y); // glyphs (layoutArea needs ink in the box)
+  const img = { width: W, height: H, data };
+  const box = { x1: 60, y1: 60, x2: 139, y2: 100, conf: 0.9 };
+  const leak = layoutArea(img, box);
+  assert.ok(leak && leak.x + leak.w > 141, `guard still spills past the cut (1.5x cap, got x2=${leak && leak.x + leak.w})`);
+  assert.ok(leak && leak.x + leak.w <= 165, `…but stays on the capped box, got x2=${leak && leak.x + leak.w}`);
+  const held = layoutArea(img, { ...box, clip: { x1: 0, y1: 0, x2: 141, y2: H } });
+  assert.ok(held && held.x + held.w <= 141, `clip holds the area on its side (got x2=${held && held.x + held.w})`);
+  assert.ok(held.w >= 60, `and keeps the box width (got w=${held.w})`);
+});
+
+// The area is clamped to the child's clip, but widthProfile's window can be
+// wider: a run measured past the area handed the wrapper a line the paint then
+// truncated (live: "อยากตอบ" painted as "อยากตอ"). The run axis stops at the
+// area, whatever the window allows.
+test('widthProfile: the run axis stops at the area, not the fill window', () => {
+  const W = 200, H = 120;
+  const img = page(W, H, [10, 189]);            // bubble sides, window can reach them
+  barsInto(img, W, [60], 40, [40], 40);          // ink inside the box
+  const box = { x1: 55, y1: 30, x2: 105, y2: 95, conf: 0.9 };
+  const win = { loX: 0, loY: 0, hiX: 199, hiY: 119 };
+  const full = widthProfile(img, box, false, [255, 255, 255], { x1: 12, y1: 12, x2: 187, y2: 110 }, win);
+  assert.ok(full, 'profile measured');
+  assert.ok(Math.max(...Array.from(full.i2)) > 130, 'runs reach the bubble without a clamp');
+  const held = widthProfile(img, box, false, [255, 255, 255], { x1: 12, y1: 12, x2: 120, y2: 110 }, win);
+  assert.ok(held, 'profile measured with the narrower area');
+  for (let k = 0; k < held.i1.length; k++) {
+    if (held.i2[k] < held.i1[k]) continue;
+    assert.ok(held.i2[k] <= 120, `run ${k} ends at ${held.i2[k]}, past the area edge 120`);
+  }
+});
+
+test('layoutArea: the clip also bounds the ink-bbox fallback', () => {
+  const W = 120, H = 80;
+  const data = new Uint8ClampedArray(W * H * 4).fill(255);
+  // a 3x3 speck: ink.frac ≈ 0.014 < 0.03 -> ink-bbox path (pad 6 around it)
+  for (let y = 30; y < 33; y++) for (let x = 50; x < 53; x++) { const i = (y * W + x) * 4; data[i] = data[i + 1] = data[i + 2] = 0; }
+  const img = { width: W, height: H, data };
+  const box = { x1: 20, y1: 25, x2: 60, y2: 40, conf: 0.9 };
+  const unclipped = layoutArea(img, box);
+  assert.equal(unclipped.why, 'ink-bbox', `ink-bbox path (got ${unclipped.why})`);
+  assert.ok(unclipped.x + unclipped.w > 53, `bbox pad crosses the clip line without it (got x2=${unclipped.x + unclipped.w})`);
+  const a = layoutArea(img, { ...box, clip: { x1: 0, y1: 0, x2: 53, y2: H } });
+  assert.ok(a && a.x + a.w <= 53, `area clamped to the clip (got x2=${a.x + a.w})`);
+});
+
+// ---- divider clips (kissing bubbles) ----
+
+test('dividerClips: overlapping areas of disjoint boxes split at the box-gap midline', () => {
+  // live 6/7 geometry: boxes kiss at x541/547, areas overlap 537..553
+  const boxes = [
+    { x1: 547, y1: 467, x2: 634, y2: 607, conf: 0.84 },
+    { x1: 447, y1: 505, x2: 541, y2: 621, conf: 0.89 },
+  ];
+  const areas = [
+    { x: 537, y: 456, w: 107, h: 163 },
+    { x: 435, y: 490, w: 118, h: 146 },
+  ];
+  const divs = dividerClips(boxes, areas);
+  assert.equal(divs.length, 2);
+  const byIdx = new Map(divs.map(d => [d.index, d]));
+  assert.equal(byIdx.get(0).clip.x1, 544, 'right box keeps x>=544');
+  assert.equal(byIdx.get(1).clip.x2, 544, 'left box keeps x<=544');
+  assert.equal(byIdx.get(0).cutAxis, 'x');
+  // the midline clears both boxes: no box loses its own text
+  assert.ok(544 >= 541 && 544 <= 547);
+});
+
+test('dividerClips: disjoint areas, shared ink, and stacked pairs', () => {
+  const boxes = [
+    { x1: 0, y1: 0, x2: 40, y2: 40, conf: 1 },
+    { x1: 100, y1: 0, x2: 140, y2: 40, conf: 1 },
+  ];
+  assert.deepEqual(dividerClips(boxes, [
+    { x: 0, y: 0, w: 40, h: 40 },
+    { x: 100, y: 0, w: 40, h: 40 },
+  ]), [], 'disjoint areas: no divider');
+  // boxes sharing ink are one text mass (double detection), never divided
+  assert.deepEqual(dividerClips(
+    [{ x1: 0, y1: 0, x2: 60, y2: 60, conf: 1 }, { x1: 40, y1: 40, x2: 100, y2: 100, conf: 1 }],
+    [{ x: 0, y: 0, w: 70, h: 70 }, { x: 30, y: 30, w: 80, h: 80 }],
+  ), [], 'overlapping boxes: no divider');
+  // stacked pair divides along y
+  const v = dividerClips(
+    [{ x1: 0, y1: 0, x2: 60, y2: 40, conf: 1 }, { x1: 0, y1: 50, x2: 60, y2: 90, conf: 1 }],
+    [{ x: 0, y: 0, w: 60, h: 60 }, { x: 0, y: 30, w: 60, h: 60 }],
+  );
+  assert.equal(v.length, 2);
+  assert.equal(v.find(d => d.index === 0).clip.y2, 45);
+  assert.equal(v.find(d => d.index === 1).clip.y1, 45);
+  assert.equal(v[0].cutAxis, 'y');
+});
+
+test('dividerClips: intersects an existing split clip instead of widening it', () => {
+  const boxes = [
+    { x1: 547, y1: 467, x2: 634, y2: 607, conf: 1, clip: { x1: 500, y1: 400, x2: 700, y2: 700 }, cutAxis: 'x' },
+    { x1: 447, y1: 505, x2: 541, y2: 621, conf: 1 },
+  ];
+  const areas = [
+    { x: 537, y: 456, w: 107, h: 163 },
+    { x: 435, y: 490, w: 118, h: 146 },
+  ];
+  const byIdx = new Map(dividerClips(boxes, areas).map(d => [d.index, d]));
+  assert.equal(byIdx.get(0).clip.x1, 544);
+  assert.equal(byIdx.get(0).clip.x2, 700, 'existing bound kept');
+  assert.equal(byIdx.get(0).cutAxis, 'x', 'existing axis kept');
+});
+
+// ---- box-anchored placement (fragment boxes must not float) ----
+
+test('layoutTextFit: boxC parks the block on the source, not the area middle', () => {
+  // live #10 shape: 109px area, 1-line text, source box at the bottom
+  const rows = 109;
+  const prof = bandProfile(rows, () => 67);
+  const area = { x: 258, y: 736, w: 67, h: rows, runs: prof };
+  const text = 'ได้โปรด';
+  const plain = layoutTextFit(fakeCtx(), text, area, 12);
+  assert.ok(plain, 'fits');
+  assert.ok(Math.abs(plain.top - 736 - (109 - plain.lines.length * plain.lineHeight) / 2) < 1,
+    `area-centered without boxC, top=${plain.top}`);
+  const anchored = layoutTextFit(fakeCtx(), text, area, 12, undefined, 787);
+  assert.ok(anchored, 'fits');
+  assert.ok(Math.abs(anchored.top + anchored.lines.length * anchored.lineHeight / 2 - 787) < 2,
+    `block centered on the box (787), top=${anchored.top}`);
+  assert.ok(anchored.top >= 736 && anchored.top + anchored.lines.length * anchored.lineHeight <= 736 + 109 + 0.5,
+    'stays inside the area');
+});
+
+test('layoutTextFit: boxC that cannot fit there falls back to area-centered', () => {
+  // narrow bands at the box end: the move is rejected, the old top wins
+  const rows = 109;
+  const prof = bandProfile(rows, (p) => (p < 60 ? 67 : 10));
+  const area = { x: 0, y: 0, w: 67, h: rows, runs: prof };
+  const fit = layoutTextFit(fakeCtx(), 'ได้โปรด ได้โปรด ได้โปรด', area, 20, undefined, 100);
+  assert.ok(fit, 'fits somewhere');
+  assert.ok(fit.top + fit.lines.length * fit.lineHeight / 2 < 80,
+    `not parked on the narrow end, top=${fit.top}`);
+});
+
+// ---- dark-caption growth ----
+
+function darkPage(W, H, bg, grayFrom = Infinity, gray = 150) {
+  const data = new Uint8ClampedArray(W * H * 4);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = y >= grayFrom ? gray : bg;
+    const i = (y * W + x) * 4;
+    data[i] = data[i + 1] = data[i + 2] = v; data[i + 3] = 255;
+  }
+  return { width: W, height: H, data };
+}
+
+test('growDarkArea: caption strip grows into clean black, stops at art', () => {
+  // live #5 shape: 35px box on black, gray art 21px below
+  const img = darkPage(200, 200, 8, 120);
+  const box = { x1: 45, y1: 64, x2: 230, y2: 99, conf: 0.76 }; // 185x35
+  const area = { x: 45, y: 64, w: 185, h: 35 };
+  const g = growDarkArea(img, box, area);
+  assert.ok(g, 'grows');
+  assert.equal(g.y + g.h, 120, `grows down to the gray, got y2=${g.y + g.h}`);
+  assert.equal(g.y, 15, `remaining cap grows up, got y=${g.y}`);
+  assert.ok(g.y + g.h - g.y <= 35 + 70, 'capped at 2x box height');
+});
+
+test('growDarkArea: light interiors grow nothing; growth never crosses art', () => {
+  const white = darkPage(100, 100, 250);
+  assert.equal(growDarkArea(white, { x1: 10, y1: 10, x2: 60, y2: 40, conf: 1 }, { x: 10, y: 10, w: 50, h: 30 }), null);
+  // seed dark with gray art directly below: grows up into clean black, never
+  // past the gray
+  const img = darkPage(100, 100, 8, 41, 150);
+  const box = { x1: 10, y1: 10, x2: 60, y2: 40, conf: 1 };
+  const g = growDarkArea(img, box, { x: 10, y: 10, w: 50, h: 30 });
+  assert.ok(g, 'grows where black');
+  assert.ok(g.y + g.h <= 41, `never crosses art (y2=${g.y + g.h})`);
+});
+
+test('bubbleArea: divider-style unbounded clip sides never widen the area', () => {
+  // live: a kiss-divider clip {x1:544, x2:Infinity} maxed the area to the page
+  // edge through the cut-axis expansion and the text vanished into a strip
+  const img = page(800, 200, [500, 600]);
+  // the box sits right of the divider (a real midline always clears both boxes)
+  const box = { x1: 550, y1: 20, x2: 590, y2: 180, conf: 1, clip: { x1: 544, y1: -Infinity, x2: Infinity, y2: Infinity }, cutAxis: 'x' };
+  const a = bubbleArea(img, box);
+  assert.ok(Number.isFinite(a.x + a.w), 'finite');
+  assert.ok(a.x >= 544, `keeps the divider (x=${a.x})`);
+  assert.ok(a.x + a.w <= 601, `stopped by the border, not infinity (x2=${a.x + a.w})`);
+});
+
+test('layoutTextFit: boxC wins outright even over the source budget', () => {
+  // live #10: 16px fragment, maxStack budget 18px — the cap-size fit parked on
+  // the source must return, not shrink to the budget nor float at the edge
+  const rows = 109;
+  const prof = bandProfile(rows, () => 67);
+  const area = { x: 258, y: 736, w: 67, h: rows, runs: prof };
+  const fit = layoutTextFit(fakeCtx(), 'ได้โปรด', area, 12, 18, 787);
+  assert.ok(fit, 'fits');
+  assert.equal(fit.fontSize, 12, 'cap size kept (no budget shrink)');
+  assert.ok(Math.abs(fit.top + fit.lineHeight / 2 - 787) < 2, `parked on the box (top=${fit.top})`);
+});
+
+// ---- OCR-crop expansion (edge-cut glyphs re-enter the read window) ----
+
+function inkRect(img, W, x1, y1, x2, y2, v = 0) {
+  for (let y = y1; y <= y2; y++) for (let x = x1; x <= x2; x++) {
+    const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+  }
+  return img;
+}
+
+test('expandCropToInk: edge-cut glyph grows the window to include it', () => {
+  // live #8 shape: 103x121 box, padded rect cuts a glyph 24px past x2
+  const img = page(400, 300);
+  inkRect(img, 400, 100, 60, 140, 120); // main text mass inside
+  inkRect(img, 400, 195, 20, 235, 48);  // lobe glyph sticking past the rect
+  const box = { x1: 108, y1: 30, x2: 211, y2: 151, conf: 0.9 };
+  const rect = { x: 96, y: 18, w: 127, h: 145 }; // padded: x2=223 cuts the glyph
+  const e = expandCropToInk(img, box, rect);
+  assert.ok(e.x + e.w >= 235 && e.x + e.w <= 235 + 8, `covers the glyph + margin, got x2=${e.x + e.w}`);
+  assert.equal(e.x, 96, 'clean left edge stays');
+  assert.ok(e.y <= 20 && e.y + e.h >= 48 + 2, 'top/bottom reach the glyph rows');
+});
+
+test('expandCropToInk: clean edges never move; daylight gaps stop growth', () => {
+  const img = page(400, 300);
+  inkRect(img, 400, 100, 60, 140, 120);
+  const box = { x1: 108, y1: 30, x2: 211, y2: 151, conf: 0.9 };
+  const rect = { x: 96, y: 18, w: 127, h: 145 };
+  assert.deepEqual(expandCropToInk(img, box, rect), rect, 'no ink near edges: identical');
+  // a neighbor 5px past the edge (clean gap >= margin): untouched
+  const img2 = page(400, 300);
+  inkRect(img2, 400, 100, 60, 140, 120);
+  inkRect(img2, 400, 228, 60, 260, 120);
+  assert.deepEqual(expandCropToInk(img2, box, rect), rect, 'daylight gap: identical');
+});
+
+test('expandCropToInk: contiguous ink stops at the cap; clip clamps', () => {
+  // a wide glyph mass cut by the edge (41% touch) runs far past the cap and
+  // continues into the box text: growth absorbs it but stops at the cap
+  const img = page(800, 200);
+  inkRect(img, 800, 100, 60, 400, 120); // one wide glyph mass, same text
+  const box = { x1: 108, y1: 30, x2: 211, y2: 151, conf: 0.9 }; // min dim 103 -> cap 52
+  const rect = { x: 96, y: 18, w: 127, h: 145 }; // x2 = 223
+  const e = expandCropToInk(img, box, rect);
+  assert.equal(e.x + e.w, 211 + 52, `capped at box+cap (x2=${e.x + e.w})`);
+  // split child: the cut side never crosses into the sibling
+  const boxC = { ...box, clip: { x1: 0, y1: 0, x2: 230, y2: 200 }, cutAxis: 'x' };
+  const ec = expandCropToInk(img, boxC, rect);
+  assert.ok(ec.x + ec.w <= 230, `clip clamps (x2=${ec.x + ec.w})`);
+});
+
+test('expandCropToInk: white glyph on dark caption expands symmetrically', () => {
+  const img = darkPage(300, 200, 8);
+  inkRect(img, 300, 100, 60, 140, 120, 245); // light glyph mass
+  inkRect(img, 300, 45, 64, 85, 116, 245);  // cut off at the left edge, continues in
+  const box = { x1: 80, y1: 50, x2: 200, y2: 130, conf: 0.9 };
+  const e = expandCropToInk(img, box, { x: 70, y: 40, w: 140, h: 100 });
+  assert.ok(e.x <= 45, `covers the cut glyph (x=${e.x})`);
+});
+
+test('expandCropToInk: spanning rule is not a cut glyph (fraction guard)', () => {
+  // caption strip with white rules top/bottom: full-width touches must not grow
+  const img = darkPage(300, 200, 8);
+  inkRect(img, 300, 40, 90, 240, 110, 245); // caption glyphs
+  inkRect(img, 300, 0, 84, 299, 86, 245);   // top rule spans everything
+  inkRect(img, 300, 0, 114, 299, 116, 245); // bottom rule spans everything
+  const box = { x1: 60, y1: 88, x2: 220, y2: 112, conf: 0.9 };
+  const rect = { x: 56, y: 84, w: 168, h: 32 };
+  assert.deepEqual(expandCropToInk(img, box, rect), rect, 'rules ignored');
+});
+
+test('expandCropToInk: neighbor fragment in daylight is not ours (connectivity)', () => {
+  // white page: box glyphs + a disconnected sliver fully past the pad edge
+  const img = page(400, 300);
+  inkRect(img, 400, 100, 60, 140, 120); // box text (ends x140)
+  inkRect(img, 400, 162, 70, 170, 110); // neighbor sliver, daylight on both sides
+  const box = { x1: 90, y1: 50, x2: 145, y2: 130, conf: 0.9 };
+  const rect = { x: 80, y: 40, w: 77, h: 100 }; // x2 = 157, sliver starts at 160
+  assert.deepEqual(expandCropToInk(img, box, rect), rect, 'untouched');
 });

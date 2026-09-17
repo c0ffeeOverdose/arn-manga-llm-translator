@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
   && rm -rf /var/lib/apt/lists/* \
   && pip install --no-cache-dir fastapi "uvicorn[standard]" onnxruntime numpy pillow opencv-python-headless
 WORKDIR /app
-COPY app.py .
+COPY app.py split.py ./
 RUN mkdir -p /models \
   && curl -fL -o /models/ctd.onnx \
     "https://huggingface.co/lemondouble/lemon-manga-translator/resolve/main/onnx/comic-text-detector/ctd.onnx?download=true" \
@@ -16,6 +16,8 @@ RUN mkdir -p /models \
   done \
   && curl -fL -o /models/vocab.json \
     "https://huggingface.co/genshiai-daichi/baberu-ocr/resolve/main/tokenizer/vocab.json?download=true" \
+  && curl -fL -o /models/lama-manga-512-fp16w.onnx \
+    "https://huggingface.co/c0ffeeOverdose/arn-manga-models/resolve/main/lama-manga-512-fp16w.onnx?download=true" \
   && ls -la /models
 EXPOSE 7860
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860}"]
