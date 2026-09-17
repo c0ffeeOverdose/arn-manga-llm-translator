@@ -135,7 +135,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // a page must never fail here. Cloud mode rides the same shape (P6).
     const aiMode = inpaintMode(pipeline);
     let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
-    let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiError: string | undefined;
+    let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiPre = false, aiError: string | undefined;
     let aiMaskMs = 0, aiLockWaitMs = 0, aiEncodeMs = 0;
     if (aiMode !== 'fill') {
         const cached = prep.cached?.patches?.length && prep.cached.patchesGen === INPAINT_PATCH_GEN
@@ -173,25 +173,40 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                         if (isDebug()) console.log('[mt] AI cleanup unavailable — using built-in fill:', aiError);
                     }
                 } else {
-                    // cloud engine: same client-side mask rides along, so local and
-                    // cloud erase the same pixels (the server falls back to its own
-                    // CTD pass for old clients)
-                    const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes);
-                    aiMaskMs = maskMs;
-                    const cfg = await cloudConfig();
-                    if (cfg.endpoint && cfg.key) {
-                        try {
-                            const r = await cloudInpaint(
-                                bitmap, boxes,
-                                { quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw, endpoint: cfg.endpoint, key: cfg.key, mask },
-                            );
-                            if (r.patches.length) { aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows; }
-                        } catch (e) {
-                            aiError = String((e as Error)?.message ?? e).slice(0, 120);
-                            if (isDebug()) console.log('[mt] cloud AI cleanup unavailable — using built-in fill:', aiError);
+                    // cloud engine: prefer the patches merged into the detect
+                    // roundtrip (server already had the CTD mask — no second
+                    // upload, no second queue wait). Same contract as the local
+                    // warm path: unusable when a keep box sits inside an erase
+                    // window (the model would have eaten glyphs that must stay)
+                    // → fall through to the dedicated /v1/inpaint POST.
+                    const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
+                        a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+                    if (det.cloudPatches?.length && !plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
+                        const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
+                        const pre = det.cloudPatches.filter(p => idx.has(p.i ?? -1));
+                        if (pre.length) { aiPatches = pre; aiWindows = pre.length; aiPre = true; }
+                    }
+                    if (!aiPatches) {
+                        // same client-side mask rides along, so local and cloud
+                        // erase the same pixels (the server falls back to its own
+                        // CTD pass for old clients)
+                        const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes);
+                        aiMaskMs = maskMs;
+                        const cfg = await cloudConfig();
+                        if (cfg.endpoint && cfg.key) {
+                            try {
+                                const r = await cloudInpaint(
+                                    bitmap, boxes,
+                                    { quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw, endpoint: cfg.endpoint, key: cfg.key, mask },
+                                );
+                                if (r.patches.length) { aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows; }
+                            } catch (e) {
+                                aiError = String((e as Error)?.message ?? e).slice(0, 120);
+                                if (isDebug()) console.log('[mt] cloud AI cleanup unavailable — using built-in fill:', aiError);
+                            }
+                        } else {
+                            aiError = 'cloud endpoint not configured';
                         }
-                    } else {
-                        aiError = 'cloud endpoint not configured';
                     }
                 }
             }
@@ -236,6 +251,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 // worker ORT queue wait; warm = patches rode the LLM wait
                 ...(aiGenerated ? { maskMs: aiMaskMs, encodeMs: aiEncodeMs, lockWaitMs: aiLockWaitMs } : null),
                 ...(aiWarmUsed ? { warm: true } : null),
+                ...(aiPre ? { pre: true } : null), // patches rode the cloud detect call, not a second roundtrip
                 ...(aiError ? { error: aiError } : null),
             },
         } : null),
@@ -243,7 +259,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         gen: RENDER_GEN, // render-logic generation — stale extension shows an older number
         detConf: pipeline.detConf, // threshold that let these boxes through — low values explain junk regions
         usedLLM,
-        det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null, splitGen: det.splitGen ?? null },
+        det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null, splitGen: det.splitGen ?? null, ...(det.cloudMs ? { cloud: det.cloudMs } : null) },
         llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
         ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
         boxes: det.boxes.map(b => ({

@@ -43,7 +43,10 @@ image = (
 app = modal.App("arn-manga")
 
 
-@app.function(image=image, gpu=["T4", "L4"], timeout=600,
+# scaledown_window=90 (default 60): reading bursts run nonstop so the window
+# only matters after a batch finishes — 90s covers page-to-page manual pauses
+# without billing a long idle tail. Longer gaps always pay a cold boot anyway.
+@app.function(image=image, gpu=["T4", "L4"], timeout=600, scaledown_window=90,
               secrets=[modal.Secret.from_name("arn-manga-key")])
 @modal.asgi_app()
 def api():

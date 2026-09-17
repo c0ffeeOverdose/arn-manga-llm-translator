@@ -508,7 +508,11 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     bookAdd(c.hash);
     committedSync(); committedHashes.add(c.hash);
     if (pipeline.cacheEnabled) {
-        void cachePut({
+        // await, not void: the paintIfLoaded job below builds its prep at
+        // enqueue time and its cacheGet must not see the stale partial
+        // checkpoint (isResumable) or it re-runs translateRegions — a full
+        // duplicate LLM roundtrip for a page the user is looking at
+        await cachePut({
             key: cacheKey(s.chapter, c.hash),
             fp: settingsFingerprint(pipeline),
             w: c.w, h: c.h,

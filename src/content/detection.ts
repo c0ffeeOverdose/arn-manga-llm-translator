@@ -31,7 +31,14 @@ export interface DetectResult {
     ep: string;
     lockWaitMs?: number; // ms this page's detect runs waited on the shared ORT lock (0 = uncontended)
     cloudTexts?: string[]; // cloud path: OCR texts aligned 1:1 with boxes (raw — caller trims)
-    cloudMs?: { detect: number; ocr: number }; // cloud path: server-side breakdown
+    // cloud path: server-side breakdown — detect/ocr are server inference,
+    // total is the server wall clock; enc/net are client-side (JPEG encode,
+    // message+upload+download roundtrip minus server total)
+    cloudMs?: { detect: number; ocr: number; enc?: number; net?: number; total?: number };
+    // cloud path: cleanup patches computed server-side in the same /v1/page
+    // call (inpaint=1) — one patch per box (full-res coords), filtered to the
+    // erase plan at render; clouds without the flag return nothing here
+    cloudPatches?: InpaintPatch[];
     // cloud path: the server's box-split generation (0/absent = pre-split
     // server) — entries below CLOUD_SPLIT_GEN re-detect instead of rendering
     // fused boxes from cache
@@ -887,12 +894,6 @@ export async function cloudInpaint(
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud inpaint failed');
     const j = resp.page;
     if (!j?.ok) throw new Error(String(j?.error ?? 'cloud inpaint failed'));
-    const b64buf = (s: string): ArrayBuffer => {
-        const bin = atob(s);
-        const out = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-        return out.buffer;
-    };
     const patches = (j.patches ?? []).map((p: any) => ({
         x1: +p.x1, y1: +p.y1, x2: +p.x2, y2: +p.y2, png: b64buf(String(p.png ?? '')),
     }));
@@ -929,33 +930,65 @@ async function maskToPngB64(mask: { width: number; height: number; data: Uint8Ar
     });
 }
 
-// base64 straight out of a data URL — canvas JPEG blobs must NOT be read via
-// blob.arrayBuffer(): on Firefox that throws "Permission denied to access
+// JPEG encode + data-URL read, shared by both cloud upload encoders. FileReader,
+// not blob.arrayBuffer(): on Firefox that throws "Permission denied to access
 // property constructor" (Xray wrapper on canvas blobs; same trap ocr.ts's
 // toJpegB64 documents, live-proven there). Returns the payload after the comma.
+async function jpegDataUrl(c: OffscreenCanvas, quality: number, gray: boolean): Promise<string> {
+    const ctx = c.getContext('2d', { willReadFrequently: true })!;
+    if (gray) {
+        const img = ctx.getImageData(0, 0, c.width, c.height);
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 4) {
+            const y = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
+            d[i] = d[i + 1] = d[i + 2] = y;
+        }
+        ctx.putImageData(img, 0, 0);
+    }
+    const blob = await c.convertToBlob({ type: 'image/jpeg', quality });
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
+        fr.onload = () => resolve(fr.result as string);
+        fr.readAsDataURL(blob);
+    });
+    const comma = dataUrl.indexOf(',');
+    return comma < 0 ? '' : dataUrl.slice(comma + 1);
+}
+
 export async function bitmapToJpegB64(bitmap: ImageBitmap, quality: number, gray: boolean): Promise<string> {
     return withEncodeLock(async () => {
         const c = new OffscreenCanvas(bitmap.width, bitmap.height);
-        const ctx = c.getContext('2d', { willReadFrequently: true })!;
-        ctx.drawImage(bitmap, 0, 0);
-        if (gray) {
-            const img = ctx.getImageData(0, 0, c.width, c.height);
-            const d = img.data;
-            for (let i = 0; i < d.length; i += 4) {
-                const y = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
-                d[i] = d[i + 1] = d[i + 2] = y;
-            }
-            ctx.putImageData(img, 0, 0);
+        c.getContext('2d', { willReadFrequently: true })!.drawImage(bitmap, 0, 0);
+        return jpegDataUrl(c, quality, gray);
+    });
+}
+
+// Cloud uploads from weak devices pay the mobile uplink per byte, while CTD
+// resizes any input into its fixed 1024 field and Baberu crops shrink to
+// 224x224 — a capped long side costs detection nothing and OCR a sliver of
+// sharpness on very large scans. Returns the downscale factor
+// (fullPage / sent) so callers can map response coords back to full-page
+// space; 1 when nothing was scaled (also used by parity tests: scale 1 must
+// be byte-identical to bitmapToJpegB64).
+export const CLOUD_MAX_SIDE = 1600;
+export async function bitmapToJpegB64Capped(
+    bitmap: ImageBitmap, quality: number, gray: boolean, maxSide: number,
+): Promise<{ b64: string; scale: number }> {
+    return withEncodeLock(async () => {
+        const long = Math.max(bitmap.width, bitmap.height);
+        if (maxSide <= 0 || long <= maxSide) {
+            const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+            c.getContext('2d', { willReadFrequently: true })!.drawImage(bitmap, 0, 0);
+            return { b64: await jpegDataUrl(c, quality, gray), scale: 1 };
         }
-        const blob = await c.convertToBlob({ type: 'image/jpeg', quality });
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-            const fr = new FileReader();
-            fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
-            fr.onload = () => resolve(fr.result as string);
-            fr.readAsDataURL(blob);
-        });
-        const comma = dataUrl.indexOf(',');
-        return comma < 0 ? '' : dataUrl.slice(comma + 1);
+        const scale = long / maxSide;
+        const w = Math.round(bitmap.width / scale), h = Math.round(bitmap.height / scale);
+        const c = new OffscreenCanvas(w, h);
+        const ctx = c.getContext('2d', { willReadFrequently: true })!;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(bitmap, 0, 0, w, h);
+        return { b64: await jpegDataUrl(c, quality, gray), scale };
     });
 }
 
@@ -983,23 +1016,32 @@ export async function cloudWarm(endpoint: string, key: string): Promise<number> 
 export async function cloudDetect(
     bitmap: ImageBitmap,
     endpoint: string, key: string,
-    opts: { confThr: number; minSize: number; quality: number; gray: boolean },
+    opts: { confThr: number; minSize: number; quality: number; gray: boolean; inpaint?: boolean },
 ): Promise<DetectResult> {
-    const jpegB64 = await bitmapToJpegB64(bitmap, opts.quality, opts.gray);
+    // capped upload (mobile uplink): CTD/Baberu inputs are resize-invariant,
+    // so anything above CLOUD_MAX_SIDE is pure wire cost — response coords
+    // come back in sent space and are mapped back with `scale` below
+    const tEnc = performance.now();
+    const { b64: jpegB64, scale } = await bitmapToJpegB64Capped(bitmap, opts.quality, opts.gray, CLOUD_MAX_SIDE);
+    const encMs = Math.round(performance.now() - tEnc);
     // via the SW: content-script fetch is CORS-gated on the page origin
     // (host permissions don't lift it — same trap as image fetch). The
     // channel JSON-serializes, so the JPEG rides as base64 (an ArrayBuffer
     // arrives as {} — proven live by a 15-byte "[object…]" body)
+    const tUp = performance.now();
     const resp = await chrome.runtime.sendMessage({
         type: 'mt:cloud-page', endpoint, key,
         confThr: opts.confThr, minSize: opts.minSize, jpegB64,
+        inpaint: opts.inpaint === true,
     }) as { ok: boolean; page?: any; error?: string };
+    const upMs = Math.round(performance.now() - tUp);
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud failed');
     {
         const j = resp.page;
         if (!j?.ok) throw new Error(String(j?.error ?? 'cloud failed'));
         const boxes: DetBox[] = (j.boxes ?? []).map((b: any) => ({ x1: +b.x1, y1: +b.y1, x2: +b.x2, y2: +b.y2, conf: +b.conf }));
         const w = bitmap.width, h = bitmap.height;
+        const serverTotal = Math.round(j.ms?.total ?? 0);
         // Real CTD mask when the server ships one (gen 2+): text-color
         // sampling, inpaint and the debug view all read it. Older servers send
         // nothing — fall back to box-filled stand-in (whole boxes read as ink,
@@ -1021,6 +1063,17 @@ export async function cloudDetect(
             }
             maskData = packed.buffer as ArrayBuffer;
         }
+        // cleanup patches computed server-side in the same roundtrip (one per
+        // box, coords in sent space) — scale back to full-page space here so
+        // every consumer (render paint, cache entry) sees full-res coords.
+        // The render filters to the erase plan and falls back to the dedicated
+        // /v1/inpaint roundtrip when the keep-overlap guard rejects them.
+        const cloudPatches: InpaintPatch[] = (j.patches ?? []).map((p: any) => ({
+            i: +(p.i ?? -1),
+            x1: Math.round(+p.x1 * scale), y1: Math.round(+p.y1 * scale),
+            x2: Math.round(+p.x2 * scale), y2: Math.round(+p.y2 * scale),
+            png: b64buf(String(p.png ?? '')),
+        }));
         return {
             boxes,
             mask: { width: w, height: h, data: maskData },
@@ -1028,11 +1081,23 @@ export async function cloudDetect(
             ep: 'cloud',
             splitGen: typeof j.splitGen === 'number' ? j.splitGen : 0,
             cloudTexts: (j.texts ?? []).map((t: unknown) => String(t ?? '').replace(/\s+/g, ' ').trim()),
-            cloudMs: { detect: Math.round(j.ms?.detect ?? 0), ocr: Math.round(j.ms?.ocr ?? 0) },
+            cloudMs: {
+                detect: Math.round(j.ms?.detect ?? 0), ocr: Math.round(j.ms?.ocr ?? 0),
+                enc: encMs, net: Math.max(0, upMs - serverTotal), total: serverTotal,
+            },
+            cloudPatches: cloudPatches.length ? cloudPatches : undefined,
             panels: [],
             panelSkipped: String(j.panelSkipped ?? 'cloud: banding fallback'),
         };
     }
+}
+
+// base64 → ArrayBuffer for cloud response payloads (patches PNG)
+function b64buf(s: string): ArrayBuffer {
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
 }
 
 // generic request/response over the iframe postMessage channel

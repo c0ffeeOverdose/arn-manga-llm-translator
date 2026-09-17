@@ -7,6 +7,7 @@ import { boxIsVertical, renderRegion, sizeCapFrom, effBoxesForAreas } from './re
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
+import { inpaintMode } from '../llm/pipeline-settings';
 import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, type CachedPage } from './page-cache';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
@@ -78,6 +79,10 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
             return await cloudDetect(bitmap, endpoint, key, {
                 confThr: pipeline.detConf, minSize: pipeline.detMinSize,
                 quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw && pageIsGrayscale(bitmap),
+                // merge AI cleanup into the same roundtrip — the server already
+                // has the CTD mask; a second /v1/inpaint POST re-uploads the
+                // page and queues behind the inference lock again
+                inpaint: inpaintMode(pipeline) !== 'fill',
             });
         } catch (e) {
             throw Object.assign(
@@ -272,8 +277,12 @@ export function paintRegions(
     if (patches?.length) {
         // AI cleanup ran on the original page: the patches already carry the
         // erased background (only erase-box crops change), so paint them
-        // instead of the built-in fill
-        for (const p of patches) ctx.drawImage(p.bmp, p.x1, p.y1);
+        // instead of the built-in fill. Drawn into the full rect (not 1:1):
+        // cloud-merged patches are computed on the capped upload and come
+        // back smaller than the full-res window — drawImage scales them up;
+        // local/full-res patches have png dims == rect dims, so this is a
+        // no-op for them.
+        for (const p of patches) ctx.drawImage(p.bmp, p.x1, p.y1, p.x2 - p.x1, p.y2 - p.y1);
     } else {
         inpaint(canvas, { ...det, boxes: boxesToErase, keepBoxes });
     }

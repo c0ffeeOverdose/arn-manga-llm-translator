@@ -49,6 +49,7 @@ interface CloudPageMsg {
     confThr: number;
     minSize: number;
     jpegB64: string; // base64 JPEG (raw bytes don't survive MV3 messaging)
+    inpaint?: boolean; // ask the server to merge cleanup patches into the response
 }
 interface FontGetMsg {
     type: 'mt:font-get';
@@ -405,7 +406,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 const bytes = new Uint8Array(bin.length);
                 for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                 const r = await fetch(
-                    `${base}/v1/page?conf_thr=${msg.confThr}&min_size=${msg.minSize}`,
+                    `${base}/v1/page?conf_thr=${msg.confThr}&min_size=${msg.minSize}${msg.inpaint ? '&inpaint=1' : ''}`,
                     { method: 'POST', headers: { Authorization: `Bearer ${msg.key}`, 'Content-Type': 'image/jpeg' }, body: bytes, signal: ctrl.signal });
                 if (!r.ok) { const t = await r.text().catch(() => ''); sendResponse({ ok: false, error: `cloud HTTP ${r.status}: ${t.slice(0, 160)}` }); return; }
                 sendResponse({ ok: true, page: await r.json() });

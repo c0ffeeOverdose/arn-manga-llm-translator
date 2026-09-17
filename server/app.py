@@ -416,10 +416,13 @@ def run_detect(pil, conf_thr, min_size):
     # overlap gate), and only then does each balloon become its own box —
     # mirrors worker.ts.
     boxes = split_merged_boxes(out_boxes + mask_boxes, texty_comps, COMP_GAP, box_comps)
-    # packed is 0/1 — packMask mirrors the client's byte mask (0/255)
+    # packed is 0/1 — packMask mirrors the client's byte mask (0/255); the bool
+    # mask rides along for the merged /v1/page inpaint pass (same source the
+    # mask b64 is built from, so erase windows match what the client renders)
+    mask_img = packed.astype(bool)
     mw, mh, mbytes = pack_mask(w, h, (packed * 255).ravel())
     return boxes, infer_ms, {"w": mw, "h": mh,
-                             "b64": base64.b64encode(mbytes).decode("ascii")}
+                             "b64": base64.b64encode(mbytes).decode("ascii")}, mask_img
 
 
 def run_baberu(crop):
@@ -569,7 +572,7 @@ def run_inpaint(pil, boxes, pad_ratio, mask=None):
         sub_out[sub_mask] = sub_win[sub_mask]
         windows += 1
     patches = []
-    for b in boxes:
+    for i, b in enumerate(boxes):
         px1 = max(0, int(np.floor(b["x1"])) - 4)
         py1 = max(0, int(np.floor(b["y1"])) - 4)
         px2 = min(W, int(np.ceil(b["x2"])) + 4)
@@ -579,7 +582,9 @@ def run_inpaint(pil, boxes, pad_ratio, mask=None):
             continue
         buf = io.BytesIO()
         Image.fromarray(crop).save(buf, format="PNG")
-        patches.append({"x1": px1, "y1": py1, "x2": px2, "y2": py2,
+        # i = box index — /v1/page's merged patches map 1:1 to the response
+        # boxes so the client can filter to its erase plan by index
+        patches.append({"i": i, "x1": px1, "y1": py1, "x2": px2, "y2": py2,
                         "png": base64.b64encode(buf.getvalue()).decode("ascii")})
     ms = (time.perf_counter() - t0) * 1000
     return patches, windows, ms, det_ms
@@ -616,7 +621,9 @@ async def inpaint_page(req: Request, pad_ratio: float = Query(INPAINT_PAD_RATIO)
 
 @app.post("/v1/page")
 async def page(req: Request,
-               conf_thr: float = Query(CONF_THR), min_size: int = Query(MIN_SIZE)):
+               conf_thr: float = Query(CONF_THR), min_size: int = Query(MIN_SIZE),
+               inpaint_flag: int = Query(0, alias="inpaint"),
+               pad_ratio: float = Query(INPAINT_PAD_RATIO)):
     t0 = time.perf_counter()
     raw = await req.body()
     body_ms = (time.perf_counter() - t0) * 1000
@@ -625,7 +632,7 @@ async def page(req: Request,
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"bad image: {e} (got {len(raw)} bytes head={raw[:8].hex()})"}, 400)
     async with lock:
-        boxes, det_ms, mask = run_detect(pil, conf_thr, min_size)
+        boxes, det_ms, mask, mask_img = run_detect(pil, conf_thr, min_size)
         rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
         texts, ocr_ms = [], 0.0
         for b in boxes:
@@ -635,8 +642,20 @@ async def page(req: Request,
                 t, ms = "", 0.0
             texts.append(t)
             ocr_ms += ms
+        # merged cleanup pass: the client asked for patches in the same
+        # roundtrip (saves a second full-image upload + lock wait). run_inpaint
+        # uses the real CTD mask — identical pixels to the mask b64 shipped
+        # above — and emits one patch per box (i = box index) so the client can
+        # filter to its erase plan without re-mapping anything.
+        patches, windows, inpaint_ms = [], 0, 0.0
+        if inpaint_flag:
+            try:
+                patches, windows, inpaint_ms, _ = run_inpaint(pil, boxes, pad_ratio, mask_img)
+            except Exception as e:
+                print(f"inpaint pass failed: {e}", flush=True)
+                patches, windows, inpaint_ms = [], 0, 0.0
     total = (time.perf_counter() - t0) * 1000
-    return {
+    resp = {
         "ok": True,
         "w": pil.width, "h": pil.height,
         "boxes": [{"x1": round(float(b["x1"]), 1), "y1": round(float(b["y1"]), 1),
@@ -650,3 +669,8 @@ async def page(req: Request,
         "ms": {"body": round(body_ms, 1), "detect": round(det_ms, 1),
                "ocr": round(ocr_ms, 1), "total": round(total, 1)},
     }
+    if inpaint_flag:
+        resp["patches"] = patches
+        resp["windows"] = windows
+        resp["ms"]["inpaint"] = round(inpaint_ms, 1)
+    return resp
