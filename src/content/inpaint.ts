@@ -183,51 +183,10 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
     }));
     const inSkip = (x: number, y: number): boolean => skip.some(s => x >= s.x1 && x <= s.x2 && y >= s.y1 && y <= s.y2);
 
-    // per-box background color from a ring just outside the box
+    // per-box background: the surface the box's glyphs sit on (see eraseBgColor)
     for (const b of det.boxes) {
         const ex = eraseBox(m, W, H, b, Math.max(8, Math.round((b.x2 - b.x1) * 0.08), Math.round((b.y2 - b.y1) * 0.08)));
-        const x1 = Math.floor(Math.max(0, b.x1)), y1 = Math.floor(Math.max(0, b.y1));
-        const x2 = Math.ceil(Math.min(W - 1, b.x2)), y2 = Math.ceil(Math.min(H - 1, b.y2));
-        const ring: number[] = [];
-        const step = Math.max(2, Math.floor((x2 - x1) / 16));
-        for (let x = x1 - 6; x <= x2 + 6; x += step) {
-            for (const y of [y1 - 6, y2 + 6]) {
-                if (x >= 0 && x < W && y >= 0 && y < H) {
-                    const i = (y * W + x) * 4;
-                    ring.push(d[i], d[i + 1], d[i + 2]);
-                }
-            }
-        }
-        for (let y = y1 - 6; y <= y2 + 6; y += step) {
-            for (const x of [x1 - 6, x2 + 6]) {
-                if (x >= 0 && x < W && y >= 0 && y < H) {
-                    const i = (y * W + x) * 4;
-                    ring.push(d[i], d[i + 1], d[i + 2]);
-                }
-            }
-        }
-        // background estimate: blend ring median with the dominant color INSIDE
-        // the box (post-mask) — dark scan bands under disclaimer lines otherwise
-        // poison the ring sample
-        const inside: number[] = [];
-        const innerStep = Math.max(2, Math.floor((x2 - x1) / 20));
-        for (let y = y1; y <= y2; y += Math.max(2, innerStep)) {
-            for (let x = x1; x <= x2; x += innerStep) {
-                const p = y * W + x;
-                if (!md[p]) { // not text
-                    const i = p * 4;
-                    inside.push(d[i], d[i + 1], d[i + 2]);
-                }
-            }
-        }
-        const bg = [0, 0, 0].map((_, c) => {
-            const ringCh = ring.filter((_, i) => i % 3 === c).sort((a, b) => a - b);
-            const inCh = inside.filter((_, i) => i % 3 === c).sort((a, b) => a - b);
-            const ringMed = ringCh.length ? ringCh[Math.floor(ringCh.length / 2)] : null;
-            const inMed = inCh.length ? inCh[Math.floor(inCh.length / 2)] : null;
-            if (ringMed != null && inMed != null) return Math.round((ringMed + inMed) / 2);
-            return inMed ?? ringMed ?? 255;
-        });
+        const bg = eraseBgColor(d, W, H, m, md, b);
 
         // fill strategy: masked pixels + connected faint text the mask missed.
         // Scan each row: rows with meaningful mask coverage are text rows —
@@ -252,6 +211,60 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
         }
     }
     ctx.putImageData(img, 0, 0);
+}
+
+// Background color for the built-in erase: the surface the glyphs sit on.
+// Priority is glyph-adjacent background (dilated-halo pixels that are not ink
+// themselves), then the box interior (post-mask), then the outside ring — a
+// side is PICKED, never averaged: averaging a black outside with a white
+// inside paints gray on both (live /14: a white caption on the black banner
+// erased to #808080). The ring exists only as a fallback for boxes with no
+// background pixels of their own (dense text); the inside median covers the
+// comment's old case too (dark scan bands poisoning the ring — the text still
+// sits on paper). Pure — unit tested.
+export function eraseBgColor(
+    data: Uint8ClampedArray, W: number, H: number,
+    maskRaw: Uint8Array, maskDilated: Uint8Array,
+    box: { x1: number; y1: number; x2: number; y2: number },
+): [number, number, number] {
+    const x1 = Math.floor(Math.max(0, box.x1)), y1 = Math.floor(Math.max(0, box.y1));
+    const x2 = Math.ceil(Math.min(W - 1, box.x2)), y2 = Math.ceil(Math.min(H - 1, box.y2));
+    const ring: number[] = [];
+    const step = Math.max(2, Math.floor((x2 - x1) / 16));
+    for (let x = x1 - 6; x <= x2 + 6; x += step) {
+        for (const y of [y1 - 6, y2 + 6]) {
+            if (x >= 0 && x < W && y >= 0 && y < H) {
+                const i = (y * W + x) * 4;
+                ring.push(data[i], data[i + 1], data[i + 2]);
+            }
+        }
+    }
+    for (let y = y1 - 6; y <= y2 + 6; y += step) {
+        for (const x of [x1 - 6, x2 + 6]) {
+            if (x >= 0 && x < W && y >= 0 && y < H) {
+                const i = (y * W + x) * 4;
+                ring.push(data[i], data[i + 1], data[i + 2]);
+            }
+        }
+    }
+    const adj: number[] = [];
+    const inside: number[] = [];
+    const innerStep = Math.max(2, Math.floor((x2 - x1) / 20));
+    for (let y = y1; y <= y2; y += Math.max(2, innerStep)) {
+        for (let x = x1; x <= x2; x += innerStep) {
+            const p = y * W + x;
+            if (maskRaw[p]) continue; // ink itself
+            const i = p * 4;
+            (maskDilated[p] ? adj : inside).push(data[i], data[i + 1], data[i + 2]);
+        }
+    }
+    const med = (s: number[]): [number, number, number] | null => {
+        if (!s.length) return null;
+        const ch = (c: number) => s.filter((_, i) => i % 3 === c).sort((a, b) => a - b);
+        const r = ch(0), g = ch(1), b = ch(2);
+        return [r[Math.floor(r.length / 2)], g[Math.floor(g.length / 2)], b[Math.floor(b.length / 2)]];
+    };
+    return med(adj) ?? med(inside) ?? med(ring) ?? [255, 255, 255];
 }
 
 // faint-text detector for text rows: dark-ish pixel against the box background

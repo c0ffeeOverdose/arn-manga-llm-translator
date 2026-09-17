@@ -9,7 +9,7 @@ await build({
   entryPoints: ['src/content/inpaint.ts'],
   bundle: true, format: 'esm', outfile: '.test-build/inpaint.mjs', sourcemap: 'inline',
 });
-const { eraseBox, erasePlan, aiCleanupMask, aiCleanupDilate, windowIndex } = await import(new URL('../.test-build/inpaint.mjs', import.meta.url).href);
+const { eraseBox, erasePlan, aiCleanupMask, aiCleanupDilate, windowIndex, eraseBgColor } = await import(new URL('../.test-build/inpaint.mjs', import.meta.url).href);
 
 function mask(W, H, fill = []) {
   const m = new Uint8Array(W * H);
@@ -170,4 +170,74 @@ test('aiCleanupMask: bounded dilate matches the full-page reference', () => {
   assert.deepEqual(got.data, cur, 'bounded window dilate is lossless');
   // edge glyphs (outside every box) must not appear — the mask is box-scoped
   assert.equal(got.data[4 * W + 4], 0);
+});
+
+// ---- eraseBgColor: the surface the glyphs sit on (picked, never averaged) --
+
+function rgba(W, H, bg, rects = []) {
+  const d = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) { d[i * 4] = bg[0]; d[i * 4 + 1] = bg[1]; d[i * 4 + 2] = bg[2]; d[i * 4 + 3] = 255; }
+  for (const [x1, y1, x2, y2, c] of rects)
+    for (let y = y1; y <= y2; y++) for (let x = x1; x <= x2; x++) {
+      const i = (y * W + x) * 4; d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2];
+    }
+  return d;
+}
+function dilate1(W, H, pts) {
+  // raw ink + 1px halo (stands in for the real dilated mask)
+  const raw = new Uint8Array(W * H), dil = new Uint8Array(W * H);
+  for (const [x, y] of pts) raw[y * W + x] = 255;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (!raw[y * W + x]) continue;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < W && ny < H) dil[ny * W + nx] = 255;
+    }
+  }
+  return { raw, dil };
+}
+
+test('eraseBgColor: white caption on a black banner erases white, not gray', () => {
+  // live /14 badge 2: ring=black banner, inside=white caption — the old
+  // (ring+inside)/2 average painted #808080
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [0, 0, 0], [[10, 10, 30, 30, [255, 255, 255]], [18, 18, 22, 24, [0, 0, 0]]]);
+  const pts = [];
+  for (let y = 18; y <= 24; y++) for (let x = 18; x <= 22; x++) pts.push([x, y]);
+  const { raw, dil } = dilate1(W, H, pts);
+  assert.deepEqual(eraseBgColor(d, W, H, raw, dil, box), [255, 255, 255]);
+});
+
+test('eraseBgColor: disagreement without glyphs still picks the inside', () => {
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [0, 0, 0], [[10, 10, 30, 30, [255, 255, 255]]]);
+  const z = new Uint8Array(W * H);
+  assert.deepEqual(eraseBgColor(d, W, H, z, z, box), [255, 255, 255]);
+});
+
+test('eraseBgColor: white-on-black dialogue erases black', () => {
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [0, 0, 0], [[18, 18, 22, 24, [255, 255, 255]]]);
+  const pts = [];
+  for (let y = 18; y <= 24; y++) for (let x = 18; x <= 22; x++) pts.push([x, y]);
+  const { raw, dil } = dilate1(W, H, pts);
+  const bg = eraseBgColor(d, W, H, raw, dil, box);
+  assert.ok(bg.every(v => v <= 8), `expected near-black, got ${bg}`);
+});
+
+test('eraseBgColor: dark band in the ring does not drag paper gray', () => {
+  // the old comment's case: ring catches a dark scan band, text sits on paper
+  const W = 60, H = 60, box = { x1: 10, y1: 20, x2: 30, y2: 40 };
+  const d = rgba(W, H, [255, 255, 255], [[0, 14, 59, 14, [20, 20, 20]], [18, 28, 22, 34, [0, 0, 0]]]);
+  const pts = [];
+  for (let y = 28; y <= 34; y++) for (let x = 18; x <= 22; x++) pts.push([x, y]);
+  const { raw, dil } = dilate1(W, H, pts);
+  assert.deepEqual(eraseBgColor(d, W, H, raw, dil, box), [255, 255, 255]);
+});
+
+test('eraseBgColor: dense text with no background falls back to the ring', () => {
+  const W = 60, H = 60, box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+  const d = rgba(W, H, [255, 255, 255]);
+  const raw = new Uint8Array(W * H).fill(255), dil = new Uint8Array(W * H).fill(255);
+  assert.deepEqual(eraseBgColor(d, W, H, raw, dil, box), [255, 255, 255]);
 });
