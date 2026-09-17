@@ -216,7 +216,19 @@ async function prefetchAhead(): Promise<void> {
             if (sweepActive()) break; // sweep started mid-chain — it owns these pages now (startSweep also aborts us, belt & braces)
             try {
                 if (isDebug()) console.log('[mt] prefetch lookahead:', url); // full URL — host matters (volatile CDN hosts)
-                await prefetchHeadless(url, cur.kind !== 'img', lkStatus); // canvas-branch URLs are manifest puzzles (descramble); img-branch URLs are final pixels
+                // per-page hard cap: the chain has no watchdog (the sweep's
+                // 5-min stall check doesn't apply here) and one never-settling
+                // await would leave 'lookahead' alive forever — prefetchBusy
+                // then blocks every future chain and cancelLookahead can't
+                // reach it. The loser keeps running; its late rejection is
+                // suppressed (cooldown+continue mirrors the error path below).
+                const page = prefetchHeadless(url, cur.kind !== 'img', lkStatus); // canvas-branch URLs are manifest puzzles (descramble); img-branch URLs are final pixels
+                page.catch(() => { /* raced-out pages still settle — suppressed here, handled by the live race below */ });
+                await Promise.race([
+                    page,
+                    new Promise<never>((_, rej) =>
+                        setTimeout(() => rej(new Error('lookahead page timed out (240s)')), 240_000)),
+                ]);
                 warmedUrls.add(url);
                 warmed++;
             } catch (e) {

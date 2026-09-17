@@ -140,6 +140,7 @@ export function enqueue(ref: PageRef, force = false, auto = false): 'queued' | '
     if (twin !== -1) {
         if (!force) return 'dup';
         queue.splice(twin, 1); // force replaces the queued twin (its prep resolves, dropped)
+        removeActivity(key); // the twin's activity entry dies with the job (new prep re-creates it below)
     }
     // detection kicks off NOW — it overlaps whatever LLM call is in flight.
     // Status goes to the activity registry (priority picks the winner), never
@@ -278,7 +279,15 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     // A queued job outlives reader churn on purpose (pre-translate-ahead):
     // story changes are caught by the sweep's clearQueue, so the only stale
     // case left is the <2s race — drop if the chapter already moved on.
-    if (chapterKey() !== contextChapter) return;
+    // The prep (started at enqueue time) already wrote its activity entry —
+    // dropping the job without removing it left a dead "Reading page…" in the
+    // registry that renderStatus showed forever (jobLive then rejects all
+    // further writes for the key).
+    if (chapterKey() !== contextChapter) {
+        removeActivity(job.key);
+        renderStatus();
+        return;
+    }
     pillUnDismiss(); // new job → un-dismiss the pill
     activeRef = job.ref;
     activeKey = job.key;

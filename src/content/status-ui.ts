@@ -9,6 +9,8 @@ import { getPages } from './page-io';
 import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap, paintFind, paintHas, paintQueued, autoHalted } from './queue';
 import { ensureDebugViews } from './ocr';
 import { applyOverlays } from './overlays';
+import { lookaheadActive } from './auto';
+import { sweepActive } from './sweep';
 
 // ---- status ownership: one pill, many writers ----
 // Parallel jobs, fire-and-forget preps and lookahead all used to write the
@@ -108,10 +110,19 @@ export function renderStatus(): void {
     const now = Date.now();
     if (overrideMsg && overrideMsg.until < now) overrideMsg = null;
     if (lastMsg?.until && lastMsg.until < now) lastMsg = null;
-    const list = [...activities.entries()].map(([key, a]) => ({
-        key, text: a.text, kind: a.kind, stage: a.stage,
-        overlap: a.kind === 'lookahead' ? 0 : viewportOverlapByKey(key),
-    }));
+    const list = [...activities.entries()]
+        // render-time liveness re-check: the write-time gate can't catch
+        // entries orphaned AFTER being written (runJob's chapter-change
+        // return, a wedged lookahead epilogue) — without this a dead
+        // "Reading page…" is picked as primary forever
+        .filter(([key, a]) =>
+            a.kind === 'lookahead' ? lookaheadActive()
+                : a.kind === 'sweep' ? sweepActive()
+                    : jobLive(key))
+        .map(([key, a]) => ({
+            key, text: a.text, kind: a.kind, stage: a.stage,
+            overlap: a.kind === 'lookahead' ? 0 : viewportOverlapByKey(key),
+        }));
     const primary: (typeof list)[number] | null = pickActivity(list);
     let text: string, phase: MtState, stage: MtStage | undefined;
     if (overrideMsg) { ({ text } = overrideMsg); phase = overrideMsg.phase; }

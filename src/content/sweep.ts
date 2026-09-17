@@ -121,7 +121,10 @@ export function awaitSweep(url: string, onStatus: MtOnStatus): Promise<void> {
     const s = sweep;
     const claim = s && !s.dead ? claimFor(url) : undefined;
     if (!claim) return Promise.resolve();
-    onStatus('Waiting for chapter sweep…');
+    // explicit stage: the caller's pill keeps whatever stage it had otherwise
+    // (typically 'read') and the stepper reads as frozen mid-read for the
+    // whole wait — this wait is a queue position, not a read
+    onStatus('Waiting for chapter sweep…', 'detect');
     return new Promise<void>(res => {
         let set = waiters.get(claim);
         if (!set) { set = new Set(); waiters.set(claim, set); }

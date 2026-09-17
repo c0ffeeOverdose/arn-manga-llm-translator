@@ -506,7 +506,12 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 const { fetchImageBlocked } = await import('../content/page-cache');
                 const blocked = fetchImageBlocked(msg.url, sender.url ?? '');
                 if (blocked) { sendResponse({ ok: false, error: `proxy fetch blocked: ${blocked}` }); return; }
-                const resp = await fetch(msg.url);
+                // hard cap: a CDN that accepts the connection and never answers
+                // would pend this fetch forever — the content side has no
+                // timeout either, so the job's pill would stick at "Reading
+                // page…" while the keepalive port keeps this SW alive past the
+                // "SW death rejects the channel" escape (live-audit finding)
+                const resp = await fetch(msg.url, { signal: AbortSignal.timeout(60_000) });
                 // re-check the FINAL url: fetch follows redirects, and a public https
                 // URL 302-ing to http://127.0.0.1/… would otherwise resurrect the
                 // local-network readback the pre-fetch check exists to block

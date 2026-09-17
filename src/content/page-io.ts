@@ -190,8 +190,11 @@ async function screenshotPage(el: Element): Promise<ImageBitmap> {
     el.scrollIntoView({ block: 'center' });
     await new Promise(r => setTimeout(r, 350));
     const r = el.getBoundingClientRect();
-    const resp = await chrome.runtime.sendMessage({ type: 'mt:screenshot' }) as
-        { ok: boolean; dataUrl?: string; error?: string };
+    const resp = await Promise.race([
+        chrome.runtime.sendMessage({ type: 'mt:screenshot' }) as
+            { ok: boolean; dataUrl?: string; error?: string } | Promise<{ ok: boolean; dataUrl?: string; error?: string }>,
+        new Promise<{ ok: boolean; dataUrl?: string; error?: string }>(res => setTimeout(() => res({ ok: false, error: 'screenshot timed out' }), 20_000)),
+    ]) as { ok: boolean; dataUrl?: string; error?: string };
     if (!resp?.ok || !resp.dataUrl) throw new Error(resp?.error ?? 'screenshot failed');
     const blob = await (await fetch(resp.dataUrl)).blob();
     const probe = await createImageBitmap(blob);
@@ -216,15 +219,23 @@ export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap
     // page CORS, so proxy the bytes through it (readPage falls back to
     // screenshot if this throws too)
     type FetchResp = { ok: boolean; b64?: string; error?: string };
-    const via = (url: string): Promise<FetchResp> =>
-        chrome.runtime.sendMessage({ type: 'mt:fetch-image', url }) as Promise<FetchResp>;
+    // the SW caps its own fetch at 60s, but a wedged/killed handler can also
+    // leave this channel pended — race a content-side cap so the job always
+    // gets a catchable error instead of a pill stuck on "Reading page…"
+    const via = (url: string): Promise<FetchResp> => Promise.race([
+        chrome.runtime.sendMessage({ type: 'mt:fetch-image', url }) as Promise<FetchResp>,
+        new Promise<FetchResp>(res => setTimeout(() => res({ ok: false, error: 'proxy fetch timed out (75s)' }), 75_000)),
+    ]);
     let r = await via(srcUrl);
     // hotlink-guarded CDN (403s the Referer-less worker fetch): ask
     // the worker to stamp our origin as Referer via a DNR session rule, then
     // retry ONCE — a second 403 is a real block, not a missing header.
     if ((!r?.ok || !r.b64) && (r?.error ?? '').startsWith('image HTTP 403')) {
-        const rule = await chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin: location.origin }) as
-            { ok: boolean; error?: string };
+        const rule = await Promise.race([
+            chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin: location.origin }) as
+                Promise<{ ok: boolean; error?: string }>,
+            new Promise<{ ok: boolean; error?: string }>(res => setTimeout(() => res({ ok: false, error: 'hotlink rule timed out' }), 15_000)),
+        ]);
         if (rule?.ok) r = await via(srcUrl);
     }
     if (!r?.ok || !r.b64) throw new Error(r?.error ?? `fetch failed: ${srcUrl.slice(0, 80)}`);
@@ -348,9 +359,13 @@ export async function readPage(ref: PageRef, srcUrl: string, stashed?: ArrayBuff
             } catch { /* tainted-canvas path below */ }
         }
         const url = ref.el.toDataURL('image/png'); // throws when tainted
-        const blob = await (await fetch(url)).blob();
-        const bytes = await blob.arrayBuffer();
-        return { bitmap: await createImageBitmap(new Blob([bytes])), bytes };
+        // decode the data URL directly — fetch(dataUrl).blob().arrayBuffer()
+        // hits the Firefox Xray trap on canvas blobs (same one that moved
+        // bitmapToJpegB64/ocr's toJpegB64 onto FileReader)
+        const bin = atob(url.slice(url.indexOf(',') + 1));
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return { bitmap: await createImageBitmap(new Blob([bytes])), bytes: bytes.buffer };
     } catch (e) {
         // a stale-source verdict must not turn into a photo of our own render
         if ((e as { noScreenshot?: boolean })?.noScreenshot) throw e;

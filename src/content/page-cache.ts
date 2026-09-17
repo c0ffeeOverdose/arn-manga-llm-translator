@@ -851,6 +851,10 @@ function db(): Promise<IDBDatabase | null> {
                 };
                 r.onsuccess = () => res(r.result);
                 r.onerror = () => res(null);
+                // another context holding an old version open (DevTools, a
+                // stale tab across a future version bump) blocks the upgrade —
+                // resolve null instead of pending forever
+                r.onblocked = () => res(null);
             } catch { res(null); } // private mode etc — cache just stays off
         });
     }
