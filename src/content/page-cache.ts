@@ -10,6 +10,14 @@
 import type { DetBox, DetectResult, MtOnStatus } from './detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
 
+// ORT inference-queue picker (worker-side, pure): first hi-priority task
+// (0), else the oldest — used by the iframe scheduler so background
+// lookahead/sweep inference yields to the page the user is waiting on.
+export function pickInferIndex(q: { prio: 0 | 1 }[]): number {
+    const i = q.findIndex(t => t.prio === 0);
+    return i < 0 ? 0 : i;
+}
+
 export const CACHE_MAX = 200;
 const HASH_SIZE = 48;
 
@@ -130,6 +138,35 @@ export interface CachedPage {
     texts?: string[];
     // detector EP at checkpoint time — restored so the Done line stays honest
     ep?: string;
+    // cloud path: the server's box-split generation (server/split.py SPLIT_GEN)
+    // — cache entries from older servers hold fused boxes and must re-detect
+    splitGen?: number;
+    // AI text cleanup output: one erased-background crop per erase box, drawn
+    // in place of the built-in fill. patchesGen tags the pipeline version so
+    // old crops are ignored (regenerated) instead of painting stale pixels.
+    patches?: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
+    patchesGen?: number;
+}
+
+// Bump when the AI-cleanup crop pipeline changes (window geometry, model,
+// mask recipe, composite) — cached patches with a different generation are
+// regenerated. v2: page-scaled mask dilation (v1's glyph-tight mask made the
+// model paint paper white over the leftover white glyphs). v3: composite
+// window indices fixed (v2 sampled the upscaled output in 512-space and
+// smeared neighbouring art over the erased text).
+export const INPAINT_PATCH_GEN = 3;
+
+// Bump when the server's box-splitting changes (server/split.py SPLIT_GEN):
+// cloud cache entries below this hold fused boxes (gen 0), box-filled
+// stand-in masks that force white text (gen 1), miss overlap-swallowed
+// text the rescue would have saved (gen 2), or fuse comparable stacked
+// groups the first-pair rule now splits (gen 3) — all re-detect instead of
+// rendering from cache. Local entries never carry splitGen (their tile
+// fingerprint already forces re-detect) — isCloud scopes the gate to cloud
+// mode so local caches never pay for it.
+export const CLOUD_SPLIT_GEN = 4;
+export function cloudSplitFresh(hit: { ep?: string; splitGen?: number } | undefined, isCloud: boolean): boolean {
+    return !isCloud || (hit?.splitGen ?? 0) >= CLOUD_SPLIT_GEN;
 }
 
 // CTD masks are full-page 1 byte/px (~MBs) — too big for IDB at 200 pages.
@@ -178,9 +215,10 @@ export function unpackMask(
 // ---- detect checkpoints: a partial entry (boxes, no outputs) is resumable
 // when fingerprint + dims still match and it carries a mask. Full entries
 // never resume (they render from cache); stale partials re-detect. Pure.
-export function isResumable(hit: CachedPage | undefined, fp: string, w: number, h: number): hit is CachedPage {
+export function isResumable(hit: CachedPage | undefined, fp: string, w: number, h: number, isCloud: boolean): hit is CachedPage {
     return !!hit && hit.partial === true && hit.fp === fp
-        && hit.w === w && hit.h === h && hit.boxes.length > 0 && !!hit.mask;
+        && hit.w === w && hit.h === h && hit.boxes.length > 0 && !!hit.mask
+        && cloudSplitFresh(hit, isCloud);
 }
 
 // rebuild a live DetectResult from a resumable partial — ordered boxes,
@@ -195,6 +233,7 @@ export function detFromPartial(hit: CachedPage, w: number, h: number): DetectRes
         mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
         inferMs: 0, ep: hit.ep ?? 'cache', dropped: [], panelDropped: [],
         ...(hit.texts?.length ? { cloudTexts: hit.texts } : null),
+        ...(hit.splitGen != null ? { splitGen: hit.splitGen } : null),
     };
 }
 
@@ -215,6 +254,7 @@ export function partialEntry(key: string, fp: string, det: DetectResult, w: numb
         outputs: [], extras: [],
         texts: det.cloudTexts ?? [],
         ep: det.ep,
+        splitGen: det.splitGen ?? 0,
         mask: packMask(det.mask),
         partial: true as const,
     };
@@ -739,8 +779,49 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // Bumped to tile2: pre-fix entries may hold EMPTY outputs (total parse
     // failures used to come back ok:true and get cached) — orphan them all at
     // once instead of making the user Clear by hand.
+    // Bumped to tile3: splitMergedBoxes now splits a CTD box that covered two
+    // balloons — pre-split entries hold one merged region (one translation
+    // spread across both balloons) and must re-detect + re-translate.
+    // Bumped to tile4: splitMergedBoxes lane 2 splits tightly packed pairs
+    // (side-by-side balloons, stacked caption blocks) that tile3 kept merged.
+    // Bumped to tile5: split children carry a render clip (their side of the
+    // cut) — entries whose boxes lack it keep rendering leaked areas.
+    // Bumped to tile6: split child boxes are measured from the strict
+    // text-likelihood comps, so a texture patch no longer widens them.
+    // Bumped to tile7: the render's leak guard (RUN_JUMP) clamps runs/rects
+    // where a flood escaped an open bubble outline — placement areas change,
+    // so cached pages must re-render.
+    // Bumped to tile8: split child boxes are seeded by the strict comps but
+    // keep adjacent loose clusters (SPLIT_CORE_LEASH) — strict-only boxes
+    // drifted sideways off the balloon text.
+    // Bumped to tile9: split padding faces the cut axis only (cross-axis pad
+    // stretched child boxes to the parent's edges — shifted frames).
+    // Bumped to tile10: split children carry the cut axis, so the render clamps
+    // the sibling guard on that axis only and the flood can reach the bubble's
+    // own walls on the cross axis (areas/fonts change) — old entries lack the
+    // field and would keep the both-sides clamp until a re-detect, so they miss.
+    // Bumped to tile11: OCR crops grow past edge-cut glyphs (expandCropToInk) —
+    // old entries' translations may miss edge text (a lobe's "YES" sticking
+    // past its box), so cached pages must re-read + re-translate.
+    // Bumped to tile12: split-input comps go down to 10px (were 14) — a small
+    // lobe fragment ("YES" 31x13 over its balloon) now splits its box instead
+    // of painting blank. Old entries hold the merged box and must re-detect.
+    // Bumped to tile13: twin-balloon cut splits a box at a straight ink-free
+    // avenue with wide multi-row text both sides (live md4: names lobe 8px
+    // from its body lobe, nested + under lane 2's floor) — old entries hold
+    // the merged box and must re-detect.
+    // Bumped to tile14: split children never cross the cut (emitSplit clamps
+    // each child at the cut line — overlapping siblings disabled the
+    // dividerClips safety net, so a longer translation could paint into the
+    // shared strip) — old entries hold crossing boxes and must re-detect.
+    // Bumped to tile15: lane-2 short-first split detaches a one-line balloon
+    // far above its block (live p7 WHOA!) — old entries hold the merged box
+    // and must re-detect.
+    // Bumped to tile16: lane-2 first-pair split detaches a comparable-size
+    // top group despite nesting (live /14: 3-row hamu 34px above its EN
+    // block) — old entries hold the fused box and must re-detect.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile2'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile16'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

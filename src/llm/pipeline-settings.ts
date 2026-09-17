@@ -11,6 +11,7 @@ export interface PipelineSettings {
     deferLabels: boolean;      // small clustered labels read after balloon dialogue
     transcribeSrc: boolean;    // vision modes: model also transcribes source text (options toggle, ~2x output tokens)
     inferEngine: 'local' | 'cloud'; // where panel+detect+OCR run (cloud = your Modal endpoint, opt-in)
+    inpaint: 'auto' | 'on' | 'off'; // AI text cleanup, runs wherever inferEngine points; 'auto' = cloud on, local off (the model needs a download)
     detEp: 'auto' | 'wasm';     // CTD execution provider: auto = webgpu (wasm fallback), wasm = force CPU (broken GPU drivers, ~10x slower)
     cacheEnabled: boolean;     // reuse translations when reopening pages (read + write)
     cacheMax: number;          // stored-page cap (LRU oldest-first, 10-1000)
@@ -49,7 +50,6 @@ export interface PipelineSettings {
     minFont: number;
     letterSpacing: number;     // fraction of font size
     verticalThreshold: number; // box h/w ratio that switches to vertical layout
-    preferHorizontal: boolean; // tall boxes try horizontal first, rotate only on overflow
     textColor: string;         // 'auto' (contrast vs background) or '#rrggbb'
     strokeColor: string;       // 'auto' (opposite of resolved text) or '#rrggbb'
     textStroke: number;        // stroke width as fraction of font size (0 = off)
@@ -65,6 +65,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     deferLabels: true,
     transcribeSrc: false,
     inferEngine: 'local',
+    inpaint: 'auto',
     detEp: 'auto',
     cacheEnabled: true,
     cacheMax: 200,
@@ -99,7 +100,6 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     renderFont: 'default',
     letterSpacing: 0.10,
     verticalThreshold: 2.2,
-    preferHorizontal: true,
     textColor: 'auto',
     strokeColor: 'auto',
     textStroke: 0.1,
@@ -248,11 +248,11 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.useOcrModel !== 'boolean') out.useOcrModel = false;
     if (typeof out.ocrPerRegion !== 'boolean') out.ocrPerRegion = false;
     if (out.inferEngine !== 'local' && out.inferEngine !== 'cloud') out.inferEngine = 'local';
+    if (out.inpaint !== 'auto' && out.inpaint !== 'on' && out.inpaint !== 'off') out.inpaint = 'auto';
     if (out.detEp !== 'auto' && out.detEp !== 'wasm') out.detEp = 'auto';
     if (typeof out.prefetchN !== 'number' || !(out.prefetchN >= 1 && out.prefetchN <= 30)) out.prefetchN = 3;
     else out.prefetchN = Math.round(out.prefetchN);
     if (typeof out.cacheEnabled !== 'boolean') out.cacheEnabled = true;
-    if (typeof out.preferHorizontal !== 'boolean') out.preferHorizontal = true;
     if (typeof out.cacheMax !== 'number' || !(out.cacheMax >= 10 && out.cacheMax <= 2000)) out.cacheMax = 200;
     else out.cacheMax = Math.round(out.cacheMax);
     if (typeof out.contextPairs !== 'number' || !(out.contextPairs >= 0 && out.contextPairs <= 200)) out.contextPairs = 40;
@@ -283,12 +283,22 @@ export function matchingPreset(s: PipelineSettings): string {
         const full = applyPreset(name);
         let same = true;
         for (const k of Object.keys(DEFAULT_PIPELINE_SETTINGS)) {
-            if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts' || k === 'useOcrModel' || k === 'ocrThinking') continue; // behavior knobs, not quality
+            if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts' || k === 'useOcrModel' || k === 'ocrThinking' || k === 'inpaint') continue; // behavior knobs, not quality
             if ((full as any)[k] !== (s as any)[k]) { same = false; break; }
         }
         if (same) return name;
     }
     return 'custom';
+}
+
+// Where AI text cleanup runs for this settings object: 'auto' keeps cloud
+// users on the AI path automatically (no download there) and leaves on-device
+// users on the built-in fill until they opt in and download the model.
+export type InpaintMode = 'fill' | 'local' | 'cloud';
+export function inpaintMode(s: PipelineSettings): InpaintMode {
+    if (s.inpaint === 'off') return 'fill';
+    if (s.inferEngine !== 'cloud') return s.inpaint === 'on' ? 'local' : 'fill';
+    return 'cloud';
 }
 
 // ---- per-site auto-translate ----

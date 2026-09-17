@@ -81,11 +81,22 @@ IndexedDB — no bundling, nothing shipped in the repo.
 ## Optional: cloud inference
 
 If your machine can't run detection comfortably (older laptops, phones), the
-extension can send pages to an endpoint you deploy yourself — a one-click
-Colab notebook deploys the same detection+OCR pipeline to your own Modal
-account (free tier is enough):
+extension can send pages to an endpoint you run yourself. Two generated
+notebooks cover the options:
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb)
+- **Run it in Colab** (`colab-server.ipynb`) — uses Colab's free T4 GPU
+  directly and exposes it through a Cloudflare quick tunnel. Nothing beyond a
+  Google sign-in; the URL is new every session and the VM dies after ~90 min
+  idle / 12 h, so re-run and paste again when it disconnects.
+
+  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/colab-server.ipynb)
+
+- **Deploy to Modal** (`cloud-setup.ipynb`) — one-click deploy of the same
+  detection+OCR pipeline to your own Modal account; stable URL. Starter is
+  free ($30/month of compute, no card to start) and scales to zero, so the
+  first page after a break waits ~1-2 min.
+
+  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb)
 
 Run all, paste the printed endpoint + key into Options → Model. See
 [server/README.md](server/README.md) for details.
@@ -100,7 +111,7 @@ src/
   llm/          prompt building, adapters, character book
   options/      settings UI (model, pipeline, character book, fonts)
   popup/        per-site control center
-server/         optional cloud inference (Modal, one-click Colab deploy)
+server/         optional cloud inference (run on Colab or deploy to Modal)
 scripts/        model export/quantize utilities
 tests/          unit tests (node --test)
 ```
