@@ -146,14 +146,18 @@ export const SPLIT2_FLOOR_RATIO = 0.5; // × median cluster minor extent (glyph 
 export const SPLIT2_FLOOR_MIN = 8;     // px — absolute floor on small pages
 export const SPLIT2_OVERLAP_MAX = 0.5; // cross-span overlap / smaller span
 export const SPLIT2_STRONG_FACTOR = 2; // × floor — cuts despite cross overlap
-// Stacked twin balloons (live p7: a one-line "WHOA!" 69px above its block —
-// nested, so the strong factor vetoes it like the dropped-line case): a short
-// FIRST group is its own balloon, not a paragraph first line (line gaps run
-// ~1× floor). Direction matters — a short LAST group with a big gap is the
+// Stacked twin groups (live p7: a one-line "WHOA!" 69px above its block;
+// live /14: a 3-row hamu 34px above its EN block — nested, so the strong
+// factor vetoes both like the dropped-line case): a detached FIRST group is
+// its own text, not a paragraph fragment — paragraphs never start with a
+// detached top group. Direction matters — a detached LAST group is the
 // dropped-line case and stays fused. y-axis only: columns are twinCut's
 // territory, and a mid-paragraph line gap would be indistinguishable there.
+// The size ratio keeps stragglers fused: a small bottom group under a big top
+// block is a dropped line (live: bold 70px line 72px under its 380px block),
+// while comparable stacked groups are twin balloons.
 export const SPLIT2_FIRST_GAP_MULT = 3; // × floor — far beyond line spacing
-export const SPLIT2_FIRST_SPAN_MULT = 2; // × glyph unit — single short line
+export const SPLIT2_FIRST_MIN_RATIO = 0.5; // second group ≥ half the first
 
 export interface SplitComp { x1: number; y1: number; x2: number; y2: number }
 
@@ -425,12 +429,12 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
             const ratio = ov <= 0 ? 0 : ov / Math.min(cHi(prev) - cLo(prev), cHi(g) - cLo(g));
             const nested = (cLo(prev) >= cLo(g) && cHi(prev) <= cHi(g))
                 || (cLo(g) >= cLo(prev) && cHi(g) <= cHi(prev));
-            const firstShort = axis === 'y' && merged.length === 1 && i === 1
+            const firstPair = axis === 'y' && merged.length === 1 && i === 1
                 && nested && gap >= SPLIT2_FIRST_GAP_MULT * floor
-                && hi(prev) - lo(prev) <= SPLIT2_FIRST_SPAN_MULT * unit;
+                && hi(g) - lo(g) >= (hi(prev) - lo(prev)) * SPLIT2_FIRST_MIN_RATIO;
             if (gap >= floor && (ratio < SPLIT2_OVERLAP_MAX
                 || (gap >= SPLIT2_STRONG_FACTOR * floor && !nested)
-                || firstShort)) {
+                || firstPair)) {
                 merged.push(g);
             } else {
                 prev.x1 = Math.min(prev.x1, g.x1); prev.y1 = Math.min(prev.y1, g.y1);

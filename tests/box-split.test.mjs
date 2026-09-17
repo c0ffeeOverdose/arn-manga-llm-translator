@@ -391,3 +391,33 @@ test('rescue: sparse piece fails the fill re-gate', () => {
   const out = rescueSplitComp({ x1: 467, y1: 390, x2: 652, y2: 552 }, MD14_TEXTY, MD14_TEXTY, GAP, 752 * 1080, thin, () => false, () => 0);
   assert.deepEqual(out, []);
 });
+
+// ---- lane-2 first-pair split (live /14 right group: 3-row hamu 34px above
+// its EN block, nested — the strong factor vetoes it, but a detached FIRST
+// group of comparable size is a twin, not a paragraph fragment)
+const MD14_RIGHT = [
+  [613, 390, 644, 405], [608, 409, 648, 425], [610, 429, 645, 445],
+  [617, 479, 630, 494], [596, 498, 648, 514], [591, 518, 652, 533], [597, 537, 639, 552],
+].map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+
+test('first-pair: nested top group of comparable size splits off', () => {
+  const parent = box(594.9, 389.5, 650.8, 553.3, 0.68);
+  const kids = splitMergedBoxes([parent], MD14_RIGHT, GAP, MD14_RIGHT);
+  assert.equal(kids.length, 2);
+  assert.ok(kids[0].y2 <= kids[1].y1, 'children do not overlap on the cut axis');
+  assert.ok(kids[0].y1 <= 392 && kids[0].y2 >= 443 && kids[0].y2 <= 479, 'top child covers the hamu rows');
+  assert.ok(kids[1].y1 >= 445 && kids[1].y2 >= 550, 'bottom child covers the EN block');
+  assert.equal(kids[0].cutAxis, 'y');
+});
+
+test('first-pair: small bottom group under a big top block stays fused (straggler)', () => {
+  // the dropped-line family, direction mirrored: an 80px block with an 18px
+  // straggler 120px below it (gap clears 3x the floor, like /14) — without
+  // the size-ratio guard this splits exactly like the hamu case
+  const parent = box(42, 700, 200, 940, 0.8);
+  const comps = [
+    box(48, 710, 150, 750), box(48, 758, 150, 790),
+    box(80, 910, 120, 928),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});

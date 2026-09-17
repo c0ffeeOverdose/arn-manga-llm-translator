@@ -158,12 +158,13 @@ export const INPAINT_PATCH_GEN = 3;
 
 // Bump when the server's box-splitting changes (server/split.py SPLIT_GEN):
 // cloud cache entries below this hold fused boxes (gen 0), box-filled
-// stand-in masks that force white text (gen 1), or miss overlap-swallowed
-// text the rescue would have saved (gen 2) — all re-detect instead of
+// stand-in masks that force white text (gen 1), miss overlap-swallowed
+// text the rescue would have saved (gen 2), or fuse comparable stacked
+// groups the first-pair rule now splits (gen 3) — all re-detect instead of
 // rendering from cache. Local entries never carry splitGen (their tile
 // fingerprint already forces re-detect) — isCloud scopes the gate to cloud
 // mode so local caches never pay for it.
-export const CLOUD_SPLIT_GEN = 3;
+export const CLOUD_SPLIT_GEN = 4;
 export function cloudSplitFresh(hit: { ep?: string; splitGen?: number } | undefined, isCloud: boolean): boolean {
     return !isCloud || (hit?.splitGen ?? 0) >= CLOUD_SPLIT_GEN;
 }
@@ -816,8 +817,11 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // Bumped to tile15: lane-2 short-first split detaches a one-line balloon
     // far above its block (live p7 WHOA!) — old entries hold the merged box
     // and must re-detect.
+    // Bumped to tile16: lane-2 first-pair split detaches a comparable-size
+    // top group despite nesting (live /14: 3-row hamu 34px above its EN
+    // block) — old entries hold the fused box and must re-detect.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile15'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile16'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

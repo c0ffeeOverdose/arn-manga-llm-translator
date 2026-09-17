@@ -15,7 +15,7 @@ import math
 #   - medians are the UPPER middle (sorted[floor(n/2)]), same in _med().
 # Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on split children);
 # comps are plain rect dicts (the SplitComp shape — no count/psum).
-SPLIT_GEN = 3  # bump when this section's logic changes; /v1/page reports it
+SPLIT_GEN = 4  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
 # gen 2: OCR crops grow past edge-cut glyphs + /v1/page ships the packed CTD
 # mask (gen 1 split without it — the client's box-filled stand-in mask forced
@@ -23,6 +23,10 @@ SPLIT_GEN = 3  # bump when this section's logic changes; /v1/page reports it
 # gen 3: pass-3 rescue — a merged comp killed only by the overlap gate is
 # split and re-gated per piece (live /14: the merge chained the left はむ
 # into a super-comp that box 5 swallowed whole).
+# gen 4: lane-2 first-pair — a detached FIRST group of comparable size splits
+# despite nesting (live /14 right group: 3-row hamu 34px above its EN block).
+# Stragglers (small group under a big block, the dropped-line family) stay
+# fused via the size ratio.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
 SPLIT_PAD_CAP = 40
@@ -31,7 +35,7 @@ SPLIT2_FLOOR_MIN = 8
 SPLIT2_OVERLAP_MAX = 0.5
 SPLIT2_STRONG_FACTOR = 2
 SPLIT2_FIRST_GAP_MULT = 3
-SPLIT2_FIRST_SPAN_MULT = 2
+SPLIT2_FIRST_MIN_RATIO = 0.5
 SPLIT_CLIP_SLACK = 12
 SPLIT_CORE_LEASH = 16
 TWIN_GUTTER_MIN = 4
@@ -277,12 +281,12 @@ def _split_box_lane2(box, cs, box_comps):
             ratio = 0 if ov <= 0 else ov / span
             nested = ((c_lo(prev) >= c_lo(g) and c_hi(prev) <= c_hi(g))
                       or (c_lo(g) >= c_lo(prev) and c_hi(g) <= c_hi(prev)))
-            first_short = (axis == "y" and len(merged) == 1 and i == 1
-                           and nested and gap >= SPLIT2_FIRST_GAP_MULT * floor
-                           and hi(prev) - lo(prev) <= SPLIT2_FIRST_SPAN_MULT * unit)
+            first_pair = (axis == "y" and len(merged) == 1 and i == 1
+                            and nested and gap >= SPLIT2_FIRST_GAP_MULT * floor
+                            and hi(g) - lo(g) >= (hi(prev) - lo(prev)) * SPLIT2_FIRST_MIN_RATIO)
             if gap >= floor and (ratio < SPLIT2_OVERLAP_MAX
                                  or (gap >= SPLIT2_STRONG_FACTOR * floor and not nested)
-                                 or first_short):
+                                 or first_pair):
                 merged.append(g)
             else:
                 prev["x1"] = min(prev["x1"], g["x1"])

@@ -296,3 +296,34 @@ class RescueTest(unittest.TestCase):
                           self.texty, self.texty, GAP, 752 * 1080,
                           lambda *a: (1, 0.85), lambda r: False, lambda r: 0)
         self.assertEqual(out, [])
+
+
+MD14_RIGHT = [[613, 390, 644, 405], [608, 409, 648, 425], [610, 429, 645, 445],
+              [617, 479, 630, 494], [596, 498, 648, 514], [591, 518, 652, 533],
+              [597, 537, 639, 552]]
+
+
+class FirstPairTest(unittest.TestCase):
+    def setUp(self):
+        from split import split_merged_boxes
+        self.split = split_merged_boxes
+
+    def comps(self, tuples):
+        return [{"x1": x1, "y1": y1, "x2": x2, "y2": y2} for x1, y1, x2, y2 in tuples]
+
+    def test_nested_top_group_of_comparable_size_splits(self):
+        parent = {"x1": 594.9, "y1": 389.5, "x2": 650.8, "y2": 553.3, "conf": 0.68}
+        cs = self.comps(MD14_RIGHT)
+        kids = self.split([parent], cs, GAP, cs)
+        self.assertEqual(len(kids), 2)
+        self.assertLessEqual(kids[0]["y2"], kids[1]["y1"])
+        self.assertLessEqual(kids[0]["y1"], 392)
+        self.assertGreaterEqual(kids[0]["y2"], 443)
+        self.assertLessEqual(kids[0]["y2"], 479)
+        self.assertGreaterEqual(kids[1]["y2"], 550)
+        self.assertEqual(kids[0]["cutAxis"], "y")
+
+    def test_small_bottom_straggler_stays_fused(self):
+        parent = {"x1": 42, "y1": 700, "x2": 200, "y2": 940, "conf": 0.8}
+        cs = self.comps([[48, 710, 150, 750], [48, 758, 150, 790], [80, 910, 120, 928]])
+        self.assertEqual(self.split([parent], cs, GAP, cs), [parent])
