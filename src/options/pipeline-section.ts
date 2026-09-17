@@ -106,10 +106,16 @@ export function syncOcrSeparateUI(): void {
 
 export function syncOcrManager(): void {
     const manager = $('ocrManager');
-    // cloud engine ships its own OCR — local model downloads are meaningless there
-    const show = pipeline.textSource === 'ocr' && pipeline.inferEngine === 'local';
+    // OCR-text mode always shows this card: local needs an engine + downloads
+    // below, cloud ships its own OCR (nothing to pick — say so instead of
+    // showing a bare card, which reads as a missing selector).
+    const show = pipeline.textSource === 'ocr';
     manager.style.display = show ? 'block' : 'none';
     if (!show) return;
+    const cloud = pipeline.inferEngine !== 'local';
+    $('ocrCloudNote').style.display = cloud ? '' : 'none';
+    $('ocrLocalRows').style.display = cloud ? 'none' : '';
+    if (cloud) return;
     syncOcrEngineUI();
     renderOcrLangs();
 }

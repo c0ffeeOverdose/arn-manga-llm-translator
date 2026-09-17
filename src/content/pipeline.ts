@@ -3,7 +3,7 @@
 
 import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type MtOnStatus } from './detection';
 import { inpaint, inpaintBoxRegion, erasePlan } from './inpaint';
-import { boxIsVertical, renderRegion, sizeCapFrom } from './render';
+import { boxIsVertical, renderRegion, sizeCapFrom, effBoxesForAreas } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
@@ -264,7 +264,7 @@ export interface PaintPatch { x1: number; y1: number; x2: number; y2: number; bm
 export function paintRegions(
     canvas: OffscreenCanvas, frame: ImageData, det: DetectResult, outputs: RegionOutput[],
     patches?: PaintPatch[] | null,
-): { i: number; f: number; n: number; o?: 1 }[] {
+): { i: number; f: number; n: number; o?: 1; g?: 1 }[] {
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const { boxesToErase, keepBoxes, keepIdx, dupIdx, missedIdx } = erasePlan(det, outputs);
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
@@ -280,14 +280,23 @@ export function paintRegions(
 
     // chosen layout per rendered region — diagnoses shrink/clip issues live
     const layouts: { i: number; f: number; n: number }[] = [];
+    // divider-clipped layout boxes (see effBoxesForAreas): boxes whose areas
+    // overlap a disjoint neighbor each keep their side of the midline, so
+    // kissing bubbles no longer paint into each other. Erase above already ran
+    // on the ORIGINAL boxes — source ink is erased wherever it is.
+    const textFor = (k: number) => {
+        const out = outputs.find(o => o.index === k);
+        return out?.translation && out.translation !== 'keep' ? out.translation : '';
+    };
+    const effBoxes = effBoxesForAreas(ctx, frame, det.boxes, textFor, det.mask);
     det.boxes.forEach((box, i) => {
         if (keepIdx.has(i + 1) || dupIdx.has(i + 1)) return; // untouched
-        const out = outputs.find(o => o.index === i + 1);
-        const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
-        const placed = renderRegion(ctx, frame, box, text, det.mask);
+        const text = textFor(i + 1);
+        const placed = renderRegion(ctx, frame, effBoxes[i], text, det.mask);
         if (placed) layouts.push({
             i: i + 1, f: placed.fontSize, n: placed.lines.length,
             ...(placed.overflow ? { o: 1 as const } : {}),
+            ...(placed.grown ? { g: 1 as const } : {}), // dark-caption area grew past the box cap to hold the text
             ...(isDebug() && placed.color ? { c: placed.color } : null),
             ...(isDebug() && placed.block ? { ly: placed.block.map(Math.round) } : null),
             // font ceiling from the measured source pitch (debug): f at sc

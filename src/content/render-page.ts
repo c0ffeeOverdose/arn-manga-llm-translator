@@ -1,11 +1,11 @@
 // renderPage: the solo path — translate one prepared page, paint, register,
 // cache, fold into the book.
 
-import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea } from './render';
+import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea, effBoxesForAreas, growDarkArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
 import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN } from './page-cache';
-import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus } from './detection';
+import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus, type DetectResult } from './detection';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep, type PaintPatch } from './pipeline';
@@ -16,6 +16,41 @@ import { translateRegions, renderDebugView, panelRanks } from './ocr';
 import { rewindContextBefore, replayPagesAfter } from './queue';
 import { bookHas, bookAdd, bookDrop } from './sweep';
 import { saveContext } from './state';
+
+// Dump-only twin of the paint's area resolution (see the `areas` entry below).
+function dumpAreas(
+    ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+    frame: ImageData,
+    det: DetectResult,
+    outputs: RegionOutput[],
+    layouts: { i: number; g?: 1 }[],
+) {
+    const textFor = (k: number) => {
+        const o = outputs.find(o => o.index === k);
+        return o?.translation && o.translation !== 'keep' ? o.translation : '';
+    };
+    const eff = effBoxesForAreas(ctx, frame, det.boxes, textFor, det.mask);
+    return det.boxes.map((_b, i) => {
+        // same orientation the paint picked for this region (not the box
+        // aspect): the dumped area must be the area the text got
+        const text = textFor(i + 1);
+        const vertical = chosenOrientation(ctx, frame, eff[i], text, det.mask);
+        let a = layoutArea(frame, eff[i], vertical, det.mask) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
+        if (layouts.find(l => l.i === i + 1)?.g) a = { ...a, ...growDarkArea(frame, eff[i], a) ?? {} };
+        return {
+            x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
+            ...(vertical ? { v: 1 } : null), // orientation the layout/paint picked (1 = vertical columns)
+            // enclosed score >0 = per-line profile layout, absent = no-frame rect
+            ...('runs' in a && a.runs ? { prof: +a.runs.enclosed.toFixed(2) } : null),
+            ...('why' in a && a.why ? { why: a.why } : null), // rect path reason (debug)
+            // leak guard (RUN_JUMP): rows whose run end was clamped from a
+            // fill that escaped the bubble — [left, right]
+            ...(a.runs?.leakL || a.runs?.leakR || a.leakL || a.leakR
+                ? { leak: [a.runs?.leakL || a.leakL || 0, a.runs?.leakR || a.leakR || 0] }
+                : null),
+        };
+    });
+}
 
 // paintOnly: paint + register a page WITHOUT folding it into the book — the
 // sweep paints the page the user is looking at the moment its worker finishes,
@@ -221,27 +256,12 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         ...(det.panelSkipped ? { panelSkipped: det.panelSkipped } : null),
         // placement areas the renderer actually used (layoutArea: flood-fill
         // clamped at bubble borders, shrunk to ink on near-empty boxes —
-        // compare against boxes to spot either failure)
-        areas: det.boxes.map((b, i) => {
-            // same orientation the paint picked for this region (not the box
-            // aspect): the dumped area must be the area the text got
-            const out = outputs.find(o => o.index === i + 1);
-            const text = out?.translation && out.translation !== 'keep' ? out.translation : '';
-            const vertical = chosenOrientation(ctx, frame, b, text, det.mask);
-            const a = layoutArea(frame, b, vertical, det.mask) ?? { x: 0, y: 0, w: 0, h: 0 }; // null = zero ink, skipped
-            return {
-                x: Math.round(a.x), y: Math.round(a.y), w: Math.round(a.w), h: Math.round(a.h),
-                ...(vertical ? { v: 1 } : null), // orientation the layout/paint picked (1 = vertical columns)
-                // enclosed score >0 = per-line profile layout, absent = no-frame rect
-                ...('runs' in a && a.runs ? { prof: +a.runs.enclosed.toFixed(2) } : null),
-                ...('why' in a && a.why ? { why: a.why } : null), // rect path reason (debug)
-                // leak guard (RUN_JUMP): rows whose run end was clamped from a
-                // fill that escaped the bubble — [left, right]
-                ...(a.runs?.leakL || a.runs?.leakR || a.leakL || a.leakR
-                    ? { leak: [a.runs?.leakL || a.leakL || 0, a.runs?.leakR || a.leakR || 0] }
-                    : null),
-            };
-        }),
+        // compare against boxes to spot either failure). Resolved through the
+        // same effective boxes the paint used (divider clips), with dark growth
+        // replayed where the layout grew (g) — what you see is what painted.
+        // (A plain method call: an IIFE here once lost its parens and shipped
+        // a function value that JSON.stringify silently drops.)
+        areas: dumpAreas(ctx, frame, det, outputs, layouts),
         // chosen layout per region: {i, fontSize, line count} — null layout
         // (skipped/degenerate) is simply absent
         layout: layouts,

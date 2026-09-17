@@ -424,7 +424,11 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     const boxComps: SplitComp[] = [];
     for (const c of comps) {
         const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
-        if (bw < 14 || bh < 14) continue;
+        // split evidence goes smaller than emitted regions: a lobe's ~10px
+        // fragments still split reliably (the lanes' own guards hold the
+        // lines together — live md2 YES lobe). Pass-3 emission keeps its own
+        // ≥14 floor, so no new junk regions are created by this.
+        if (bw < 10 || bh < 10) continue;
         // pass 3's fill upper bound (solid blocks like windows) is wrong for
         // raw per-line clusters: bold lines (white-on-black dialogue, the "EM"
         // in an overlapping pair) fill their tight bbox past 0.6 and would be

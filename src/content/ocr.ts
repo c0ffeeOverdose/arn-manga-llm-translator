@@ -8,7 +8,7 @@ import { pipeline, context, setContext, shareContext, loadContext, saveContext, 
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, INPAINT_PATCH_GEN } from './page-cache';
-import { chosenOrientation, pageArea, type TextMask } from './render';
+import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './render';
 import { erasePlan, computeAiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
 import { inpaintMode } from '../llm/pipeline-settings';
@@ -39,13 +39,27 @@ export async function warmPatches(
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
+// Full-page pixels for OCR-crop expansion (see expandCropToInk): read once per
+// page, shared by every crop below — per-crop readbacks would re-pay this per
+// region and slice the measurement window blind.
+async function pageImageData(bitmap: ImageBitmap): Promise<ImageData> {
+    const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = c.getContext('2d', { willReadFrequently: true })!;
+    ctx.drawImage(bitmap, 0, 0);
+    return ctx.getImageData(0, 0, c.width, c.height);
+}
+
 // crop + rotate as needed, then OCR via the iframe's Tesseract instance
-export async function ocrInWorkerPng(bitmap: ImageBitmap, box: DetBox): Promise<string> {
+export async function ocrInWorkerPng(bitmap: ImageBitmap, box: DetBox, pageImg: ImageData): Promise<string> {
     const pad = Math.max(8, (box.y2 - box.y1) * 0.30);
-    const x = Math.max(0, Math.floor(box.x1 - pad));
-    const y = Math.max(0, Math.floor(box.y1 - pad));
-    const w = Math.min(bitmap.width - x, Math.ceil(box.x2 - box.x1 + 2 * pad));
-    const h = Math.min(bitmap.height - y, Math.ceil(box.y2 - box.y1 + 2 * pad));
+    const r = expandCropToInk(pageImg, box, {
+        x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
+        w: Math.ceil(box.x2 - box.x1 + 2 * pad), h: Math.ceil(box.y2 - box.y1 + 2 * pad),
+    });
+    const x = Math.max(0, Math.floor(r.x));
+    const y = Math.max(0, Math.floor(r.y));
+    const w = Math.min(bitmap.width - x, Math.ceil(r.w));
+    const h = Math.min(bitmap.height - y, Math.ceil(r.h));
     const vertical = (box.y2 - box.y1) / Math.max(1, box.x2 - box.x1) > pipeline.verticalThreshold;
     const c = new OffscreenCanvas(w, h);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
@@ -69,12 +83,16 @@ export async function ocrInWorkerPng(bitmap: ImageBitmap, box: DetBox): Promise<
 
 // Baberu crop: tight padding (~10%) — the model was trained on tight bubble
 // crops and reads vertical text + busy backgrounds natively (no rotate/binarize)
-async function baberuCrop(bitmap: ImageBitmap, box: DetBox): Promise<ArrayBuffer> {
+async function baberuCrop(bitmap: ImageBitmap, box: DetBox, pageImg: ImageData): Promise<ArrayBuffer> {
     const pad = Math.max(4, (box.y2 - box.y1) * 0.10);
-    const x = Math.max(0, Math.floor(box.x1 - pad));
-    const y = Math.max(0, Math.floor(box.y1 - pad));
-    const w = Math.min(bitmap.width - x, Math.ceil(box.x2 - box.x1 + 2 * pad));
-    const h = Math.min(bitmap.height - y, Math.ceil(box.y2 - box.y1 + 2 * pad));
+    const r = expandCropToInk(pageImg, box, {
+        x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
+        w: Math.ceil(box.x2 - box.x1 + 2 * pad), h: Math.ceil(box.y2 - box.y1 + 2 * pad),
+    });
+    const x = Math.max(0, Math.floor(r.x));
+    const y = Math.max(0, Math.floor(r.y));
+    const w = Math.min(bitmap.width - x, Math.ceil(r.w));
+    const h = Math.min(bitmap.height - y, Math.ceil(r.h));
     const c = new OffscreenCanvas(w, h);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
     ctx.drawImage(bitmap, x, y, w, h, 0, 0, w, h);
@@ -88,14 +106,14 @@ async function baberuCrop(bitmap: ImageBitmap, box: DetBox): Promise<ArrayBuffer
 // still queues behind the in-flight decode step — the win is hiding PNG
 // crop/encode + message latency, not parallel inference (OCR ~40s → ~15s/page
 // measured). Per-box lock waits sum into lockWaitMs for the page-result dump.
-export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], onProgress?: (done: number, total: number) => void, opts?: { lo?: boolean }): Promise<{ texts: string[]; lockWaitMs: number }> {
+export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], pageImg: ImageData, onProgress?: (done: number, total: number) => void, opts?: { lo?: boolean }): Promise<{ texts: string[]; lockWaitMs: number }> {
     const results: string[] = [];
     let lockWaitMs = 0;
     let next = 0;
     const startOne = async (): Promise<string> => {
         const i = next++;
         if (i >= boxes.length) return '';
-        const png = await baberuCrop(bitmap, boxes[i]);
+        const png = await baberuCrop(bitmap, boxes[i], pageImg);
         const { text, lockWaitMs: w } = await baberuOcr(png, { lo: opts?.lo });
         lockWaitMs += w;
         return text;
@@ -343,12 +361,16 @@ async function canvasPaintSrc(state: PageState, which: 'orig' | 'translated' | '
 }
 
 // Zoomed crop per region (upscaled so small narration text is readable).
-async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean): Promise<string> {
+async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, pageImg: ImageData): Promise<string> {
     const pad = Math.max(8, (box.y2 - box.y1) * 0.12);
-    const x = Math.max(0, Math.floor(box.x1 - pad));
-    const y = Math.max(0, Math.floor(box.y1 - pad));
-    const w = Math.min(bitmap.width - x, Math.ceil(box.x2 - box.x1 + 2 * pad));
-    const h = Math.min(bitmap.height - y, Math.ceil(box.y2 - box.y1 + 2 * pad));
+    const r = expandCropToInk(pageImg, box, {
+        x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
+        w: Math.ceil(box.x2 - box.x1 + 2 * pad), h: Math.ceil(box.y2 - box.y1 + 2 * pad),
+    });
+    const x = Math.max(0, Math.floor(r.x));
+    const y = Math.max(0, Math.floor(r.y));
+    const w = Math.min(bitmap.width - x, Math.ceil(r.w));
+    const h = Math.min(bitmap.height - y, Math.ceil(r.h));
     const scale = Math.min(3, Math.max(1, pipeline.cropSize / Math.max(w, h)));
     const c = new OffscreenCanvas(Math.round(w * scale), Math.round(h * scale));
     const ctx = c.getContext('2d')!;
@@ -441,6 +463,9 @@ export async function translateRegions(
         // back in THIS space — the model can't know the full-resolution page)
         let annW = bitmap.width, annH = bitmap.height;
         let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
+        // OCR crops grow past edge-cut glyphs (see expandCropToInk) — one shared
+        // readback, not one per region
+        const pageImg = await pageImageData(bitmap);
         if (ocr) {
             const tOcr = performance.now();
             onStatus('OCR…', 'ocr');
@@ -454,7 +479,7 @@ export async function translateRegions(
                         { kind: 'ocr', hint: 'Download the model first — Settings → Model → Text source → OCR engine → Download' },
                     );
                 }
-                const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, (done, total) => {
+                const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, pageImg, (done, total) => {
                     if (done % 4 === 0 || done === total) onStatus(`OCR ${done}/${total}…`, 'ocr');
                 }, { lo: opts?.lo });
                 ocrLockWaitMs = lockWaitMs;
@@ -469,7 +494,7 @@ export async function translateRegions(
                     );
                 }
                 for (const [i, b] of det.boxes.entries()) {
-                    regions[i].source = await ocrInWorkerPng(bitmap, b);
+                    regions[i].source = await ocrInWorkerPng(bitmap, b, pageImg);
                 }
             }
             ocrStatus = regions.map(r => r.source ? 'ok' : 'empty');
@@ -482,14 +507,14 @@ export async function translateRegions(
             const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
             if (cropsOnly) {
                 imagesB64 = [];
-                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs));
+                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
             } else {
                 const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
                 annW = Math.round(bitmap.width * scale);
                 annH = Math.round(bitmap.height * scale);
                 badgeR = Math.round(annotFont(scale) * 0.9);
                 imagesB64 = [await annotateForVLM(bitmap, det.boxes, gs)];
-                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs));
+                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
             }
         }
         // build what we send: shareContext off = standalone page (ablation);

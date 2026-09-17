@@ -257,3 +257,19 @@ test('split pad faces the cut axis only (live stacked balloons)', () => {
     [441, 992, 495, 1144],
   ]);
 });
+
+// Live case (MangaDex page 2, worker comps verbatim): a 31x13 "YES" lobe
+// fragment above its balloon's 3-line block. The fragment sits under the old
+// ≥14 split-input floor (bh 13) so the box never split and the lobe painted
+// blank — with the floor at 10, lane 2 cuts it (48px gap, disjoint spans).
+test('live YES-lobe fragment splits off its balloon (10px split-input floor)', () => {
+  const parent = box(108, 500, 211, 621, 0.9);
+  const comps = [
+    box(180, 504, 211, 517),
+    box(114, 565, 168, 580), box(117, 584, 165, 599), box(112, 603, 170, 618),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [
+    { x1: 180, y1: 504, x2: 211, y2: 541, conf: 0.9, clip: { x1: 108, y1: 500, x2: 211, y2: 553 }, cutAxis: 'y' },
+    { x1: 112, y1: 541, x2: 170, y2: 618, conf: 0.9, clip: { x1: 108, y1: 529, x2: 211, y2: 621 }, cutAxis: 'y' },
+  ]);
+});

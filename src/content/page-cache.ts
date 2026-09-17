@@ -781,8 +781,14 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // the sibling guard on that axis only and the flood can reach the bubble's
     // own walls on the cross axis (areas/fonts change) — old entries lack the
     // field and would keep the both-sides clamp until a re-detect, so they miss.
+    // Bumped to tile11: OCR crops grow past edge-cut glyphs (expandCropToInk) —
+    // old entries' translations may miss edge text (a lobe's "YES" sticking
+    // past its box), so cached pages must re-read + re-translate.
+    // Bumped to tile12: split-input comps go down to 10px (were 14) — a small
+    // lobe fragment ("YES" 31x13 over its balloon) now splits its box instead
+    // of painting blank. Old entries hold the merged box and must re-detect.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile10'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile12'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----
