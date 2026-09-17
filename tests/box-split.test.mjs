@@ -273,3 +273,90 @@ test('live YES-lobe fragment splits off its balloon (10px split-input floor)', (
     { x1: 112, y1: 541, x2: 170, y2: 618, conf: 0.9, clip: { x1: 108, y1: 529, x2: 211, y2: 621 }, cutAxis: 'y' },
   ]);
 });
+
+// ---- twin-balloon cut (live md4: names lobe 8px from body, nested + under
+// lane 2's floor — both lanes fuse; a straight ink-free avenue with wide
+// multi-row text both sides still splits). Worker zone comps verbatim (raw
+// pre-merge, center-in-box subset of the 20 logged).
+test('live md4 twin balloons split at the 8px avenue despite nesting', () => {
+  const parent = box(477, 76, 679, 239, 0.62);
+  // [x1,y1,x2,y2]: BY, body words, Eli/Ella/Ildana; ornament + border excluded
+  // (centres outside the box, like the worker filter)
+  const comps = [
+    box(609, 73, 629, 90), box(585, 95, 611, 111), box(614, 95, 653, 111),
+    box(565, 117, 583, 132), box(587, 117, 612, 133), box(615, 117, 675, 133),
+    box(498, 120, 533, 145), box(560, 138, 570, 153), box(572, 138, 613, 154),
+    box(617, 138, 677, 154), box(490, 152, 539, 176), box(611, 159, 654, 176),
+    box(584, 160, 609, 176), box(595, 181, 613, 197), box(618, 181, 642, 198),
+    box(482, 182, 552, 207), box(590, 203, 645, 220), box(600, 224, 636, 241),
+  ];
+  const kids = splitMergedBoxes([parent], comps, GAP, comps);
+  assert.equal(kids.length, 2);
+  assert.deepEqual([kids[0].x1, kids[0].y1, kids[0].x2, kids[0].y2], [482, 120, 558, 207]);
+  assert.deepEqual([kids[1].x1, kids[1].y1, kids[1].x2, kids[1].y2], [559, 76, 677, 239]);
+  assert.equal(kids[0].cutAxis, 'x');
+  assert.equal(kids[1].cutAxis, 'x');
+  assert.deepEqual([kids[0].clip.x1, kids[0].clip.x2], [477, 565]);
+  assert.deepEqual([kids[1].clip.x1, kids[1].clip.x2], [553, 679]);
+});
+
+// Vertical-text columns must never x-split: tall comps fail the wide test.
+test('twin cut ignores vertical-text columns', () => {
+  const parent = box(100, 100, 300, 400, 0.9);
+  const comps = [
+    box(110, 110, 140, 390), box(155, 110, 185, 390),
+    box(200, 110, 230, 390), box(245, 110, 275, 390),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});
+
+// A word gap with a full-width line crossing it is no avenue: no cut.
+test('twin cut ignores word gaps crossed by other lines', () => {
+  const parent = box(400, 100, 700, 200, 0.9);
+  const comps = [
+    box(410, 105, 690, 130),
+    box(410, 140, 480, 165), box(500, 140, 570, 165), box(590, 140, 660, 165),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});
+
+// ---- lane-2 short-first split (live p7: one-line WHOA! 69px above its block;
+// nested, so the strong factor vetoes it like the dropped-line case — but a
+// short FIRST group is its own balloon, not a paragraph first line). Worker
+// comps verbatim (raw pre-merge).
+test('live p7 WHOA! splits off its block (short first group, big gap)', () => {
+  const parent = box(42, 782, 153, 1010, 0.78);
+  const comps = [
+    box(63, 793, 134, 814),
+    box(66, 883, 125, 900), box(57, 905, 83, 922), box(83, 905, 98, 921),
+    box(106, 905, 143, 921), box(48, 926, 96, 943), box(103, 926, 151, 942),
+    box(70, 948, 129, 965), box(55, 969, 92, 986), box(93, 969, 144, 986),
+    box(106, 990, 154, 1007), box(45, 991, 97, 1009),
+  ];
+  const kids = splitMergedBoxes([parent], comps, GAP, comps);
+  assert.equal(kids.length, 2);
+  assert.deepEqual([kids[0].x1, kids[0].y1, kids[0].x2, kids[0].y2], [63, 793, 134, 848]);
+  assert.deepEqual([kids[1].x1, kids[1].y1, kids[1].x2, kids[1].y2], [45, 849, 153, 1009]);
+  assert.equal(kids[0].cutAxis, 'y');
+  assert.equal(kids[1].cutAxis, 'y');
+});
+
+// Guard: a short LAST group with a big gap is the dropped-line case — stays fused.
+test('short last group with a big gap stays fused (dropped-line guard)', () => {
+  const parent = box(42, 700, 153, 950, 0.8);
+  const comps = [
+    box(48, 710, 150, 730), box(48, 742, 150, 762), box(48, 774, 150, 794),
+    box(80, 866, 120, 884),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});
+
+// Guard: a short first group with a line-size gap is a paragraph — stays fused.
+test('short first group with a small gap stays fused (paragraph guard)', () => {
+  const parent = box(42, 700, 153, 950, 0.8);
+  const comps = [
+    box(60, 710, 130, 728),
+    box(48, 738, 150, 758), box(48, 770, 150, 790), box(48, 802, 150, 822),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});

@@ -787,8 +787,19 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // Bumped to tile12: split-input comps go down to 10px (were 14) — a small
     // lobe fragment ("YES" 31x13 over its balloon) now splits its box instead
     // of painting blank. Old entries hold the merged box and must re-detect.
+    // Bumped to tile13: twin-balloon cut splits a box at a straight ink-free
+    // avenue with wide multi-row text both sides (live md4: names lobe 8px
+    // from its body lobe, nested + under lane 2's floor) — old entries hold
+    // the merged box and must re-detect.
+    // Bumped to tile14: split children never cross the cut (emitSplit clamps
+    // each child at the cut line — overlapping siblings disabled the
+    // dividerClips safety net, so a longer translation could paint into the
+    // shared strip) — old entries hold crossing boxes and must re-detect.
+    // Bumped to tile15: lane-2 short-first split detaches a one-line balloon
+    // far above its block (live p7 WHOA!) — old entries hold the merged box
+    // and must re-detect.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile12'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile15'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

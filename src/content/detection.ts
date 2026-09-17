@@ -141,6 +141,14 @@ export const SPLIT2_FLOOR_RATIO = 0.5; // × median cluster minor extent (glyph 
 export const SPLIT2_FLOOR_MIN = 8;     // px — absolute floor on small pages
 export const SPLIT2_OVERLAP_MAX = 0.5; // cross-span overlap / smaller span
 export const SPLIT2_STRONG_FACTOR = 2; // × floor — cuts despite cross overlap
+// Stacked twin balloons (live p7: a one-line "WHOA!" 69px above its block —
+// nested, so the strong factor vetoes it like the dropped-line case): a short
+// FIRST group is its own balloon, not a paragraph first line (line gaps run
+// ~1× floor). Direction matters — a short LAST group with a big gap is the
+// dropped-line case and stays fused. y-axis only: columns are twinCut's
+// territory, and a mid-paragraph line gap would be indistinguishable there.
+export const SPLIT2_FIRST_GAP_MULT = 3; // × floor — far beyond line spacing
+export const SPLIT2_FIRST_SPAN_MULT = 2; // × glyph unit — single short line
 
 export interface SplitComp { x1: number; y1: number; x2: number; y2: number }
 
@@ -239,14 +247,23 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
             if (before) clip.x1 = Math.round(before.at - before.slack);
             if (after) clip.x2 = Math.round(after.at + after.slack);
         }
-        return {
-            ...box,
-            ...(axis === 'y'
-                ? { x1: Math.max(box.x1, ext.x1), y1: Math.max(box.y1, ext.y1 - padBefore), x2: Math.min(box.x2, ext.x2), y2: Math.min(box.y2, ext.y2 + padAfter) }
-                : { x1: Math.max(box.x1, ext.x1 - padBefore), y1: Math.max(box.y1, ext.y1), x2: Math.min(box.x2, ext.x2 + padAfter), y2: Math.min(box.y2, ext.y2) }),
-            clip,
-            cutAxis: axis,
-        };
+        // Siblings never cross the cut: pads face the cut but a strict-core
+        // recovery can pull an edge past it (live md4: right child x1 554 over
+        // the 558.5 cut), and overlapping siblings disable the dividerClips
+        // safety net (boxes that overlap are read as one text mass and
+        // skipped) — a longer translation on either side could then paint
+        // into the shared strip. Clips (with their slack) still own the paint.
+        const r = axis === 'y'
+            ? { x1: Math.max(box.x1, ext.x1), y1: Math.max(box.y1, ext.y1 - padBefore), x2: Math.min(box.x2, ext.x2), y2: Math.min(box.y2, ext.y2 + padAfter) }
+            : { x1: Math.max(box.x1, ext.x1 - padBefore), y1: Math.max(box.y1, ext.y1), x2: Math.min(box.x2, ext.x2 + padAfter), y2: Math.min(box.y2, ext.y2) };
+        if (axis === 'y') {
+            if (before) r.y1 = Math.max(r.y1, Math.round(before.at));
+            if (after) r.y2 = Math.min(r.y2, Math.round(after.at));
+        } else {
+            if (before) r.x1 = Math.max(r.x1, Math.round(before.at));
+            if (after) r.x2 = Math.min(r.x2, Math.round(after.at));
+        }
+        return { ...box, ...r, clip, cutAxis: axis };
     });
 }
 
@@ -255,7 +272,60 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
 // a child is never re-split.
 function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number, boxComps: SplitComp[]): T[] | null {
     if (cs.length < 2) return null;
-    return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps);
+    return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps) ?? splitTwinCut(box, cs, boxComps);
+}
+
+// Twin-balloon cut (live md4: a names lobe 8px from its body lobe — under
+// lane 2's floor and nested, so both lanes fuse them): a straight ink-free
+// avenue across the box with wide multi-row text on both sides splits,
+// whatever the gap width. The avenue must be crossed by ZERO comps — a word
+// gap always has another line's comps crossing it, and a headline spanning
+// both columns unites the block. Sides need ≥2 WIDE (w>h) comps spanning
+// ≥48px: vertical-text columns (tall comps) and single lines can never pass.
+// x-axis only: stacked blocks are lane 2's strong-factor territory, and a
+// mid-paragraph line gap would be indistinguishable there. Pure — unit tested.
+export const TWIN_GUTTER_MIN = 4; // px — dust margin on the avenue
+export const TWIN_SIDE_MIN = 2;   // wide comps per side
+export const TWIN_SPAN_MIN = 48;  // px of y per side (~2 text lines)
+function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
+    // clamp to the box, then sweep for avenues no comp crosses (closes sort
+    // before opens at ties, so touching comps leave no avenue)
+    const cl = cs.map(c => ({ ...c, x1: Math.max(c.x1, box.x1), x2: Math.min(c.x2, box.x2) }));
+    const edges: { x: number; open: boolean }[] = [];
+    for (const c of cl) {
+        if (c.x2 <= c.x1) continue;
+        edges.push({ x: c.x1, open: true }, { x: c.x2, open: false });
+    }
+    edges.sort((p, q) => p.x - q.x || (p.open ? 1 : -1));
+    const ivs: { a: number; b: number }[] = [];
+    let depth = 0, start = box.x1;
+    for (const e of edges) {
+        if (e.x < box.x1 || e.x > box.x2) continue;
+        if (e.open) {
+            if (depth === 0 && e.x - start >= TWIN_GUTTER_MIN) ivs.push({ a: start, b: e.x });
+            depth++;
+        } else {
+            depth--;
+            if (depth === 0) start = e.x;
+        }
+    }
+    if (depth === 0 && box.x2 - start >= TWIN_GUTTER_MIN) ivs.push({ a: start, b: box.x2 });
+    for (const iv of ivs) {
+        const mid = (iv.a + iv.b) / 2;
+        const left = cl.filter(c => c.x2 <= mid);
+        const right = cl.filter(c => c.x1 >= mid);
+        const wide = (ss: SplitComp[]) => ss.filter(c => c.x2 - c.x1 > c.y2 - c.y1);
+        const L = wide(left), R = wide(right);
+        if (L.length < TWIN_SIDE_MIN || R.length < TWIN_SIDE_MIN) continue;
+        const span = (ss: SplitComp[]) => Math.max(...ss.map(c => c.y2)) - Math.min(...ss.map(c => c.y1));
+        if (span(L) < TWIN_SPAN_MIN || span(R) < TWIN_SPAN_MIN) continue;
+        const boxOf = (ss: SplitComp[]) => ({
+            x1: Math.min(...ss.map(c => c.x1)), y1: Math.min(...ss.map(c => c.y1)),
+            x2: Math.max(...ss.map(c => c.x2)), y2: Math.max(...ss.map(c => c.y2)),
+        });
+        return emitSplit(box, [boxOf(L), boxOf(R)], 'x', cs, boxComps);
+    }
+    return null;
 }
 
 function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number, boxComps: SplitComp[]): T[] | null {
@@ -350,8 +420,12 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
             const ratio = ov <= 0 ? 0 : ov / Math.min(cHi(prev) - cLo(prev), cHi(g) - cLo(g));
             const nested = (cLo(prev) >= cLo(g) && cHi(prev) <= cHi(g))
                 || (cLo(g) >= cLo(prev) && cHi(g) <= cHi(prev));
+            const firstShort = axis === 'y' && merged.length === 1 && i === 1
+                && nested && gap >= SPLIT2_FIRST_GAP_MULT * floor
+                && hi(prev) - lo(prev) <= SPLIT2_FIRST_SPAN_MULT * unit;
             if (gap >= floor && (ratio < SPLIT2_OVERLAP_MAX
-                || (gap >= SPLIT2_STRONG_FACTOR * floor && !nested))) {
+                || (gap >= SPLIT2_STRONG_FACTOR * floor && !nested)
+                || firstShort)) {
                 merged.push(g);
             } else {
                 prev.x1 = Math.min(prev.x1, g.x1); prev.y1 = Math.min(prev.y1, g.y1);
