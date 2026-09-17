@@ -24,9 +24,24 @@ import { inpaintMode } from '../llm/pipeline-settings';
 export async function warmPatches(
     bitmap: ImageBitmap, det: DetectResult, outputs: RegionOutput[],
 ): Promise<{ patches: InpaintPatch[]; patchesGen: number } | null> {
-    if (!pipeline.cacheEnabled || inpaintMode(pipeline) !== 'local') return null;
+    if (!pipeline.cacheEnabled) return null;
     const plan = erasePlan(det, outputs);
     if (!plan.boxesToErase.length) return null;
+    if (inpaintMode(pipeline) !== 'local') {
+        // cloud: the patches were already computed server-side inside the
+        // detect roundtrip (det.cloudPatches) — filter to the erase plan under
+        // the same keep-overlap contract the render applies. Full coverage or
+        // nothing: paintRegions skips the built-in fill when any patches
+        // exist, so a partial set would strand unerased boxes. Returning null
+        // makes the paint fall back to the dedicated /v1/inpaint roundtrip.
+        const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
+            a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+        if (plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) return null;
+        const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
+        const patches = (det.cloudPatches ?? []).filter(p => idx.has(p.i ?? -1));
+        if (patches.length !== plan.boxesToErase.length) return null;
+        return { patches, patchesGen: INPAINT_PATCH_GEN };
+    }
     try {
         const r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes, { lo: true, noDownload: true });
         if (isDebug()) console.log('[mt] warm patches', JSON.stringify({ erase: plan.boxesToErase.length, patches: r?.patches.length ?? 0 }));

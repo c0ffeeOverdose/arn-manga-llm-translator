@@ -285,6 +285,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
     // in parallel (keep 3), a local CPU detector is ORT-lock-serial anyway and
     // extra workers only multiply main-thread spikes (see sweepPoolSize)
     const pool = sweepPoolSize(pipeline.inferEngine === 'cloud', 'gpu' in navigator, pipeline.detEp === 'wasm');
+    const cloud = pipeline.inferEngine === 'cloud';
     let next = 0, head = 0, streak = 0;
     const ready = new Map<number, Commit>();
     // drain the consecutive run from the head (atomic: sync take + head move,
@@ -328,7 +329,10 @@ async function runSweep(items: SweepItem[]): Promise<void> {
                 if (!s.firstErr) s.firstErr = 'provider refused requests (rate limit / auth) — see the error log';
                 return;
             }
-            if (inflight.size >= (s.done >= SWEEP_WARMUP ? pool : 1)) { await sleep(400); continue; }
+            // warm-up serial gate is a local-ORT-ism (2 commits seed the book
+            // before the pool opens — inference is lock-serial on-device); the
+            // cloud endpoint serves requests in parallel, so open the pool now
+            if (inflight.size >= (cloud || s.done >= SWEEP_WARMUP ? pool : 1)) { await sleep(400); continue; }
             const k = next++;
             const job = items[k];
             if (!job) return;

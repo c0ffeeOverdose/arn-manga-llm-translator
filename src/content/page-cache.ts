@@ -7,7 +7,7 @@
 // ponytail: one tiny store, LRU by access time, hard cap — no versioning,
 // no migrations, corrupt entries just miss.
 
-import type { DetBox, DetectResult, MtOnStatus } from './detection';
+import type { DetBox, DetectResult, InpaintPatch, MtOnStatus } from './detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
 
 // ORT inference-queue picker (worker-side, pure): first hi-priority task
@@ -146,6 +146,11 @@ export interface CachedPage {
     // old crops are ignored (regenerated) instead of painting stale pixels.
     patches?: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
     patchesGen?: number;
+    // partial-only: cloud cleanup patches checkpointed with the detection (i =
+    // index into `boxes`) — restored by detFromPartial so a resumed job skips
+    // the /v1/inpaint roundtrip. Full entries never carry this (their patches
+    // ride `patches` after the erase-plan filter).
+    cpatches?: InpaintPatch[];
 }
 
 // Bump when the AI-cleanup crop pipeline changes (window geometry, model,
@@ -233,6 +238,9 @@ export function detFromPartial(hit: CachedPage, w: number, h: number): DetectRes
         mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
         inferMs: 0, ep: hit.ep ?? 'cache', dropped: [], panelDropped: [],
         ...(hit.texts?.length ? { cloudTexts: hit.texts } : null),
+        // server-computed cleanup patches already paid for in the detect
+        // roundtrip — a resumed job must not re-pay /v1/inpaint for them
+        ...(hit.cpatches?.length ? { cloudPatches: hit.cpatches } : null),
         ...(hit.splitGen != null ? { splitGen: hit.splitGen } : null),
     };
 }
@@ -253,6 +261,9 @@ export function partialEntry(key: string, fp: string, det: DetectResult, w: numb
         boxes: det.boxes, panels: det.panels ?? [],
         outputs: [], extras: [],
         texts: det.cloudTexts ?? [],
+        // det is POST-ordering here, so cloudPatches.i already matches
+        // hit.boxes positions — restore is a straight passthrough
+        ...(det.cloudPatches?.length ? { cpatches: det.cloudPatches } : null),
         ep: det.ep,
         splitGen: det.splitGen ?? 0,
         mask: packMask(det.mask),

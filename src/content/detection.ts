@@ -1039,7 +1039,12 @@ export async function cloudDetect(
     {
         const j = resp.page;
         if (!j?.ok) throw new Error(String(j?.error ?? 'cloud failed'));
-        const boxes: DetBox[] = (j.boxes ?? []).map((b: any) => ({ x1: +b.x1, y1: +b.y1, x2: +b.x2, y2: +b.y2, conf: +b.conf }));
+        // response coords are in SENT-image space (capped upload) — scale
+        // everything back to full-page space here; every consumer downstream
+        // (paint, erase plan, VLM badges, cache) works in full-page coords
+        const boxes: DetBox[] = (j.boxes ?? []).map((b: any) => ({
+            x1: +b.x1 * scale, y1: +b.y1 * scale, x2: +b.x2 * scale, y2: +b.y2 * scale, conf: +b.conf,
+        }));
         const w = bitmap.width, h = bitmap.height;
         const serverTotal = Math.round(j.ms?.total ?? 0);
         // Real CTD mask when the server ships one (gen 2+): text-color

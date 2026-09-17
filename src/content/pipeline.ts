@@ -1,7 +1,7 @@
 // Detection pipeline: detectPage (local/cloud), orderDetection (panels/
 // banding), preparePage (read + cache gate), paintRegions/paintExtras.
 
-import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type MtOnStatus } from './detection';
+import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type InpaintPatch, type MtOnStatus } from './detection';
 import { inpaint, inpaintBoxRegion, erasePlan } from './inpaint';
 import { boxIsVertical, renderRegion, sizeCapFrom, effBoxesForAreas } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
@@ -100,6 +100,14 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
     // cloud texts ride with their boxes: ordering below sorts the same box
     // OBJECTS, so reattach by identity afterwards
     const cloudTextByBox = det.cloudTexts ? new Map<DetBox, string>(det.boxes.map((b, i) => [b, det.cloudTexts![i] ?? ''])) : null;
+    // same for server-computed cleanup patches — `i` is the PRE-ordering box
+    // index; after the reorder/dedup below it must point at the box's NEW
+    // position or render-page's indexOf-based filter picks the wrong patch
+    const cloudPatchByBox = det.cloudPatches?.length
+        ? new Map<DetBox, InpaintPatch>(det.cloudPatches
+            .filter(p => (p.i ?? -1) >= 0 && p.i! < det.boxes.length)
+            .map(p => [det.boxes[p.i!], p]))
+        : null;
     // panel-guided ordering when the model is present, banding otherwise
     // (the detector emits confidence order — numbering always sorts)
     const page = { w: bitmap.width, h: bitmap.height };
@@ -135,6 +143,13 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
     // Dropped boxes vanish from cloudTexts with them (identity reattach below).
     det.boxes = dropContainedBoxes(det.boxes, 0.9, 0.5);
     if (cloudTextByBox) det.cloudTexts = det.boxes.map(b => cloudTextByBox.get(b) ?? '');
+    if (cloudPatchByBox) {
+        det.cloudPatches = [];
+        det.boxes.forEach((b, i) => {
+            const p = cloudPatchByBox.get(b);
+            if (p) det.cloudPatches!.push({ ...p, i }); // reindex to the post-ordering position
+        });
+    }
 }
 
 // Detect phase — kicked off at ENQUEUE time so detection of the next page

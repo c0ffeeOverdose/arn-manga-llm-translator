@@ -396,9 +396,12 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         // content-script fetch is CORS-gated on the page origin (host permissions
         // don't lift it — same trap as mt:fetch-image), so the /v1/page POST
         // rides through here. 90s cap: past this, local fallback wins anyway.
+        // inpaint=1 folds the cleanup pass into the same request — its extra
+        // GPU time rides the same cap (150s), it just gets more headroom
         (async () => {
+            const capMs = msg.inpaint ? 150000 : 90000;
             const ctrl = new AbortController();
-            const to = setTimeout(() => ctrl.abort(), 90000);
+            const to = setTimeout(() => ctrl.abort(), capMs);
             try {
                 const base = String(msg.endpoint ?? '').replace(/\/$/, '');
                 if (!/^https?:\/\//.test(base)) { sendResponse({ ok: false, error: 'Endpoint URL must start with http(s)://' }); return; }
@@ -411,7 +414,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 if (!r.ok) { const t = await r.text().catch(() => ''); sendResponse({ ok: false, error: `cloud HTTP ${r.status}: ${t.slice(0, 160)}` }); return; }
                 sendResponse({ ok: true, page: await r.json() });
             } catch (e) {
-                const m = e instanceof Error && e.name === 'AbortError' ? 'cloud timed out after 90s' : String((e as Error)?.message ?? e);
+                const m = e instanceof Error && e.name === 'AbortError' ? `cloud timed out after ${Math.round(capMs / 1000)}s` : String((e as Error)?.message ?? e);
                 sendResponse({ ok: false, error: m });
             } finally {
                 clearTimeout(to);

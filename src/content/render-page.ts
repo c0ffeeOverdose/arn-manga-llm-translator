@@ -184,7 +184,10 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                     if (det.cloudPatches?.length && !plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
                         const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
                         const pre = det.cloudPatches.filter(p => idx.has(p.i ?? -1));
-                        if (pre.length) { aiPatches = pre; aiWindows = pre.length; aiPre = true; }
+                        // full coverage only — paintRegions skips the fill when
+                        // ANY patches exist, so a partial set would strand the
+                        // uncovered boxes with visible source text
+                        if (pre.length && pre.length === plan.boxesToErase.length) { aiPatches = pre; aiWindows = pre.length; aiPre = true; }
                     }
                     if (!aiPatches) {
                         // same client-side mask rides along, so local and cloud
