@@ -21,7 +21,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 26;
+export const RENDER_GEN = 27;
 
 export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
@@ -682,6 +682,32 @@ export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: n
             leakL: trim.leakL, leakR: trim.leakR,
         };
     }
+    // Split child: on the CUT axis its box is a slice of the parent's block, so
+    // a fallback area centred on that slice parks the text off-centre and in the
+    // bubble's upper half (live: children 6/8 skewed, text at the top of a
+    // ~250px-tall bubble). Grow the area to the clip on that axis only: the
+    // cross axis keeps the child's own strict-core-seeded box, whose tightness
+    // is the whole point of the seeding — expanding it re-admits what the
+    // seeding removed (page 4: the caption area blew from 88 to 183px, back
+    // over the hatch). layoutArea still clamps the final area to the clip.
+    if (box.clip && box.cutAxis) {
+        // CUT axis only. There, the clip is the parent's extent along the cut
+        // (the split decision's own axis, slack ≤12px), so a fallback centred on
+        // the child's slice would ignore it. The cross axis is NOT reliable: the
+        // parent box also carries the sibling's span and loose texture comps, so
+        // expanding there re-introduces what the strict-core seeding dropped
+        // (page 4: caption area 88 -> 183px over the hatch) or centres the text
+        // below its bubble (child 6: parent box runs 100px past the bubble into
+        // the art). The child's own box is text by construction — keep it.
+        if (box.cutAxis === 'x') {
+            minX = Math.min(minX, Math.ceil(box.clip.x1));
+            maxX = Math.max(maxX, Math.floor(box.clip.x2));
+        } else {
+            minY = Math.min(minY, Math.ceil(box.clip.y1));
+            maxY = Math.max(maxY, Math.floor(box.clip.y2));
+        }
+    }
+
     // 8% inner margin so text doesn't touch bubble edges. Floored at the
     // detection box: a fill trapped in a pocket between glyph strokes comes
     // out narrower/shorter than the box it must hold (live: 85x57 area in a
@@ -771,6 +797,14 @@ export function widthProfile(
     const lim = vertical ? H : W; // run-axis page size
     const winLo = vertical ? win.loY : win.loX;
     const winHi = vertical ? win.hiY : win.hiX;
+    // The run scan must stay inside the AREA (the clamped fill bbox): the area
+    // is what the caller returns and what the paint clips to, so a run measured
+    // beyond it (the fill window is wider than the clamped bbox) hands the
+    // wrapper a line the paint then truncates — live: "อยากตอบ" painted as
+    // "อยากตอ", "อยากใช้" as "อยากใช". The window bounds are still what decides
+    // "clipped by its window, not by ink" in the outline check.
+    const scanLo = Math.max(winLo, Math.round(vertical ? range.y1 : range.x1));
+    const scanHi = Math.min(winHi, Math.round(vertical ? range.y2 : range.x2));
     const boxLo = vertical ? box.y1 : box.x1, boxHi = vertical ? box.y2 : box.x2;
     const boxP0 = vertical ? box.x1 : box.y1, boxP1 = vertical ? box.x2 : box.y2;
     const center = vertical ? cy : cx;
@@ -824,8 +858,8 @@ export function widthProfile(
     for (let p = p0; p <= p1; p++) {
         if (!pass(p, center)) continue; // no interior at the box center line
         let a = center, b = center;
-        while (a - 1 >= winLo && pass(p, a - 1)) a--;
-        while (b + 1 <= winHi && pass(p, b + 1)) b++;
+        while (a - 1 >= scanLo && pass(p, a - 1)) a--;
+        while (b + 1 <= scanHi && pass(p, b + 1)) b++;
         // Leak guard (see RUN_JUMP): a row that jumped outward is clamped to
         // the last supported end, so its run cannot widen a band and its
         // outline check runs at the supported line instead of the art it
@@ -1035,21 +1069,41 @@ export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxI
         };
     }
     const found = fitArea(img, box, vertical, mask);
-    return { ...found, ...clipArea(found, box.clip) };
+    const clamped = clipArea(found, box.clip);
+    // The clip shrinks the AREA, but the profile inside `found` still describes
+    // runs that reach past the cut. Everything downstream (wrap width, line
+    // centres, and the paint's clip rect) must agree with the area the caller
+    // gets, or a line is wrapped for a run the paint then truncates — live:
+    // "อยากตอบ" painted as "อยากตอ", "อยากใช้" as "อยากใช". Trim the runs.
+    if (found.runs && (clamped.x !== found.x || clamped.y !== found.y || clamped.w !== found.w || clamped.h !== found.h)) {
+        const prof = found.runs;
+        const lo = Math.ceil(prof.vertical ? clamped.y : clamped.x);
+        const hi = Math.floor(prof.vertical ? clamped.y + clamped.h : clamped.x + clamped.w);
+        for (let k = 0; k < prof.i1.length; k++) {
+            if (prof.i2[k] < prof.i1[k]) continue;
+            prof.i1[k] = Math.max(prof.i1[k], lo);
+            prof.i2[k] = Math.min(prof.i2[k], hi);
+        }
+    }
+    return { ...clamped, runs: found.runs, why: found.why, leakL: found.leakL, leakR: found.leakR };
 }
 
 // Pick text color by contrast against the placement area background. Modal
 // tone, not mean: leaked rows (or interior art) drag a mean across the
 // contrast boundary and print white-on-white, while the largest bucket is the
 // surface the text mostly sits on.
-function textColorFor(img: ImageData, area: { x: number; y: number; w: number; h: number }): string {
+function textColorFor(img: ImageData, area: { x: number; y: number; w: number; h: number }, mask?: TextMask): string {
     const { width: W, data } = img;
+    const mk = maskView(mask, W, img.height);
     const stepX = Math.max(1, Math.floor(area.w / 24));
     const stepY = Math.max(1, Math.floor(area.h / 24));
     const buckets = new Map<number, { n: number; lum: number }>();
     let best: { n: number; lum: number } | null = null;
     for (let y = Math.floor(area.y); y < area.y + area.h; y += stepY) {
+        // Source glyph ink is not background: a box that is mostly original text
+        // would otherwise hand the contrast test the ink colour.
         for (let x = Math.floor(area.x); x < area.x + area.w; x += stepX) {
+            if (mk && mk[y * W + x] > 127) continue;
             const i = (y * W + x) * 4;
             const r = data[i], g = data[i + 1], b = data[i + 2];
             const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
@@ -1072,8 +1126,17 @@ export function isLight(hex: string): boolean {
 
 // Resolved paint colors: user-fixed colors win, 'auto' keeps the old
 // behavior (contrast text, stroke opposite the resolved text).
-function resolveColors(img: ImageData, area: { x: number; y: number; w: number; h: number }): { color: string; stroke: string } {
-    const color = renderTuning.textColor === 'auto' ? textColorFor(img, area) : renderTuning.textColor;
+function resolveColors(img: ImageData, area: { x: number; y: number; w: number; h: number }, box?: DetBox, mask?: TextMask): { color: string; stroke: string } {
+    // The modal tone of the AREA is the usual source, but a split child's rect
+    // fallback spans the parent block and can be dominated by artwork the
+    // source text never touched — the text then comes out white-on-white (live:
+    // child 6, both lines but "โดน" unreadable). When the area is much larger
+    // than the detection box, resolve from the box instead: the source text sat
+    // there, so the contrast is right by construction (mask excluded).
+    const big = box != null && (area.w > (box.x2 - box.x1) * 1.5 || area.h > (box.y2 - box.y1) * 1.5);
+    const color = renderTuning.textColor === 'auto'
+        ? textColorFor(img, big ? { x: box!.x1, y: box!.y1, w: box!.x2 - box!.x1, h: box!.y2 - box!.y1 } : area, big ? mask : undefined)
+        : renderTuning.textColor;
     const stroke = renderTuning.strokeColor === 'auto'
         ? (isLight(color) ? '#111' : '#fff')
         : renderTuning.strokeColor;
@@ -1179,9 +1242,18 @@ export function layoutTextFit(
     // line j's band along the stacking axis, walking away from `anchor`:
     // horizontal blocks start at the area top; vertical blocks stack to the
     // LEFT (JA reading order) so their anchor is the block's RIGHT edge.
+    // Width for a line = the interior measured at the line's CENTRE row, not the
+    // min over its whole band: in a wavy/round bubble a 36px band's narrowest
+    // row (usually its top) can be half the width at the glyphs, so min-over-band
+    // wrapped everything into 1-2 word lines and the bubble never filled. The
+    // glyph body sits at the band centre, so that row is what the reader sees.
+    const midIv = (p0: number, p1: number) => {
+        const mid = Math.round((p0 + p1) / 2);
+        return runInterval(prof, mid, mid + 1) ?? runInterval(prof, p0, p1);
+    };
     const widthFor = (anchor: number, lh: number) => (j: number) => {
         const b0 = prof.vertical ? anchor - (j + 1) * lh : anchor + j * lh;
-        const iv = runInterval(prof, b0, b0 + lh);
+        const iv = midIv(b0, b0 + lh);
         if (iv) return iv[1] - iv[0];
         // band past the measured range: reuse the nearest measured interval so
         // a long text still lays out (clipped) instead of vanishing — the
@@ -1244,7 +1316,7 @@ export function layoutTextFit(
         const use = { lines, top };
         const centers = use.lines.map((_, j) => {
             const b0 = prof.vertical ? use.top - (j + 1) * lh : use.top + j * lh;
-            const iv = runInterval(prof, b0, b0 + lh);
+            const iv = midIv(b0, b0 + lh);
             return iv ? (iv[0] + iv[1]) / 2 : midCross;
         });
         const out: LaidOutFit = { lines: use.lines, fontSize: size, lineHeight: lh, top: use.top, centers };
@@ -1253,6 +1325,17 @@ export function layoutTextFit(
         // deliver a centered fit (live: badge 1, "1 สัปดาห์ต่อมา" fit the top
         // band at f19 but the centered band only at f17 — returning the f19
         // edge solution parked the caption 39px above its box).
+        // A line whose measured width overflows the interval it was wrapped for
+        // must never reach the paint: the paint clips to the area, so the tail
+        // glyphs vanish (live: "อยากตอบ" painted as "อยากตอ"). Reject the size
+        // instead — the loop steps the font down and the fallback stays clean.
+        const slack = size * (renderTuning.letterSpacing * 0.5 + renderTuning.textStroke) + 1;
+        const fits = use.lines.every((line, j) => {
+            const b0 = prof.vertical ? use.top - (j + 1) * lh : use.top + j * lh;
+            const iv = midIv(b0, b0 + lh);
+            return !iv || ctx.measureText(line).width <= iv[1] - iv[0] + slack;
+        });
+        if (!fits) continue;
         if (bFits) return out;
         fallback ??= out;
     }
@@ -1309,7 +1392,7 @@ function renderHorizontal(
     if (!text.trim()) return null;
     const area = pageArea(ctx, img, box, false, mask);
     if (!area) return null;
-    const { color, stroke } = resolveColors(img, area);
+    const { color, stroke } = resolveColors(img, area, box, mask);
     const cap = Math.min(hCap(area), sizeCapFrom(img, box, false) ?? MAX_FONT);
 
     // Enclosed bubble: every line is fitted to its own measured band (widths
@@ -1317,6 +1400,10 @@ function renderHorizontal(
     if (area.runs) {
         const laid = layoutTextFit(ctx, text, area, cap, Math.round((box.y2 - box.y1) * Math.max(1.15, renderTuning.textScale)));
         if (!laid || !laid.lines.length) return null;
+        // The paint must use the size the wrap MEASURED: layoutTextFit's loop
+        // leaves the ctx font at the last size it tried, which is not the size of
+        // the fit it returns as a fallback.
+        setFont(ctx, laid.fontSize);
         const overflow = laid.top + laid.lines.length * laid.lineHeight > area.y + area.h + 0.5 || laid.top < area.y - 0.5;
         ctx.save();
         ctx.beginPath();

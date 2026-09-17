@@ -812,6 +812,27 @@ test('layoutArea: divider-hole leak — the guard holds, the clip clamps harder'
   assert.ok(held.w >= 60, `and keeps the box width (got w=${held.w})`);
 });
 
+// The area is clamped to the child's clip, but widthProfile's window can be
+// wider: a run measured past the area handed the wrapper a line the paint then
+// truncated (live: "อยากตอบ" painted as "อยากตอ"). The run axis stops at the
+// area, whatever the window allows.
+test('widthProfile: the run axis stops at the area, not the fill window', () => {
+  const W = 200, H = 120;
+  const img = page(W, H, [10, 189]);            // bubble sides, window can reach them
+  barsInto(img, W, [60], 40, [40], 40);          // ink inside the box
+  const box = { x1: 55, y1: 30, x2: 105, y2: 95, conf: 0.9 };
+  const win = { loX: 0, loY: 0, hiX: 199, hiY: 119 };
+  const full = widthProfile(img, box, false, [255, 255, 255], { x1: 12, y1: 12, x2: 187, y2: 110 }, win);
+  assert.ok(full, 'profile measured');
+  assert.ok(Math.max(...Array.from(full.i2)) > 130, 'runs reach the bubble without a clamp');
+  const held = widthProfile(img, box, false, [255, 255, 255], { x1: 12, y1: 12, x2: 120, y2: 110 }, win);
+  assert.ok(held, 'profile measured with the narrower area');
+  for (let k = 0; k < held.i1.length; k++) {
+    if (held.i2[k] < held.i1[k]) continue;
+    assert.ok(held.i2[k] <= 120, `run ${k} ends at ${held.i2[k]}, past the area edge 120`);
+  }
+});
+
 test('layoutArea: the clip also bounds the ink-bbox fallback', () => {
   const W = 120, H = 80;
   const data = new Uint8ClampedArray(W * H * 4).fill(255);
