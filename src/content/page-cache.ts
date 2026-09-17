@@ -777,8 +777,12 @@ export function settingsFingerprint(o: FingerprintOpts): string {
     // drifted sideways off the balloon text.
     // Bumped to tile9: split padding faces the cut axis only (cross-axis pad
     // stretched child boxes to the parent's edges — shifted frames).
+    // Bumped to tile10: split children carry the cut axis, so the render clamps
+    // the sibling guard on that axis only and the flood can reach the bubble's
+    // own walls on the cross axis (areas/fonts change) — old entries lack the
+    // field and would keep the both-sides clamp until a re-detect, so they miss.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile9'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile10'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

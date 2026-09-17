@@ -50,7 +50,6 @@ export interface PipelineSettings {
     minFont: number;
     letterSpacing: number;     // fraction of font size
     verticalThreshold: number; // box h/w ratio that switches to vertical layout
-    preferHorizontal: boolean; // tall boxes try horizontal first, rotate only on overflow
     textColor: string;         // 'auto' (contrast vs background) or '#rrggbb'
     strokeColor: string;       // 'auto' (opposite of resolved text) or '#rrggbb'
     textStroke: number;        // stroke width as fraction of font size (0 = off)
@@ -101,7 +100,6 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     renderFont: 'default',
     letterSpacing: 0.10,
     verticalThreshold: 2.2,
-    preferHorizontal: true,
     textColor: 'auto',
     strokeColor: 'auto',
     textStroke: 0.1,
@@ -255,7 +253,6 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.prefetchN !== 'number' || !(out.prefetchN >= 1 && out.prefetchN <= 30)) out.prefetchN = 3;
     else out.prefetchN = Math.round(out.prefetchN);
     if (typeof out.cacheEnabled !== 'boolean') out.cacheEnabled = true;
-    if (typeof out.preferHorizontal !== 'boolean') out.preferHorizontal = true;
     if (typeof out.cacheMax !== 'number' || !(out.cacheMax >= 10 && out.cacheMax <= 2000)) out.cacheMax = 200;
     else out.cacheMax = Math.round(out.cacheMax);
     if (typeof out.contextPairs !== 'number' || !(out.contextPairs >= 0 && out.contextPairs <= 200)) out.contextPairs = 40;

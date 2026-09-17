@@ -29,8 +29,8 @@ test('live two-balloon box splits at the cluster gap, children clamped to parent
     box(1074, 777, 1148, 826), box(1161, 783, 1266, 827),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
-    { x1: 1312, y1: 376, x2: 1408, y2: 535, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 547 } }, // x tight to the comps, y padded 33 toward the cut
-    { x1: 1062, y1: 535, x2: 1287, y2: 825, conf: 0.92, clip: { x1: 1061, y1: 523, x2: 1413, y2: 825 } },
+    { x1: 1312, y1: 376, x2: 1408, y2: 535, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 547 }, cutAxis: 'y' }, // x tight to the comps, y padded 33 toward the cut
+    { x1: 1062, y1: 535, x2: 1287, y2: 825, conf: 0.92, clip: { x1: 1061, y1: 523, x2: 1413, y2: 825 }, cutAxis: 'y' },
   ]);
 });
 
@@ -73,8 +73,8 @@ test('median cluster extent raises the cut threshold on large scales', () => {
   assert.equal(splitMergedBoxes([b], near, GAP).length, 1);
   const far = [box(0, 0, 100, 100), box(140, 240, 200, 340)];  // gap 140 ≥ 80
   assert.deepEqual(splitMergedBoxes([b], far, GAP), [
-    { x1: 0, y1: 0, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 200, y2: 182 } },   // pad 70→cap 40 toward the cut only
-    { x1: 140, y1: 200, x2: 200, y2: 340, conf: 0.9, clip: { x1: 0, y1: 158, x2: 200, y2: 400 } },
+    { x1: 0, y1: 0, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 200, y2: 182 }, cutAxis: 'y' },   // pad 70→cap 40 toward the cut only
+    { x1: 140, y1: 200, x2: 200, y2: 340, conf: 0.9, clip: { x1: 0, y1: 158, x2: 200, y2: 400 }, cutAxis: 'y' },
   ]);
 });
 
@@ -82,8 +82,8 @@ test('vertical text columns split along x when the y scan finds no gap', () => {
   const b = box(0, 0, 200, 300);
   const comps = [box(20, 20, 60, 140), box(140, 180, 180, 300)];
   assert.deepEqual(splitMergedBoxes([b], comps, GAP), [
-    { x1: 20, y1: 20, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 112, y2: 300 } },
-    { x1: 100, y1: 180, x2: 180, y2: 300, conf: 0.9, clip: { x1: 88, y1: 0, x2: 200, y2: 300 } },
+    { x1: 20, y1: 20, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 112, y2: 300 }, cutAxis: 'x' },
+    { x1: 100, y1: 180, x2: 180, y2: 300, conf: 0.9, clip: { x1: 88, y1: 0, x2: 200, y2: 300 }, cutAxis: 'x' },
   ]);
 });
 
@@ -91,9 +91,9 @@ test('three diagonal clusters cut twice', () => {
   const b = box(0, 0, 270, 240);
   const comps = [box(10, 0, 90, 40), box(100, 100, 180, 140), box(190, 200, 270, 240)];
   assert.deepEqual(splitMergedBoxes([b], comps, GAP), [
-    { x1: 10, y1: 0, x2: 90, y2: 70, conf: 0.9, clip: { x1: 0, y1: 0, x2: 270, y2: 82 } },
-    { x1: 100, y1: 70, x2: 180, y2: 170, conf: 0.9, clip: { x1: 0, y1: 58, x2: 270, y2: 182 } },
-    { x1: 190, y1: 170, x2: 270, y2: 240, conf: 0.9, clip: { x1: 0, y1: 158, x2: 270, y2: 240 } },
+    { x1: 10, y1: 0, x2: 90, y2: 70, conf: 0.9, clip: { x1: 0, y1: 0, x2: 270, y2: 82 }, cutAxis: 'y' },
+    { x1: 100, y1: 70, x2: 180, y2: 170, conf: 0.9, clip: { x1: 0, y1: 58, x2: 270, y2: 182 }, cutAxis: 'y' },
+    { x1: 190, y1: 170, x2: 270, y2: 240, conf: 0.9, clip: { x1: 0, y1: 158, x2: 270, y2: 240 }, cutAxis: 'y' },
   ]);
 });
 
@@ -176,8 +176,8 @@ test('lane 2: diagonal two-line groups are two blocks and split', () => {
     box(1062, 534, 1287, 575), box(1062, 600, 1287, 640),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
-    { x1: 1305, y1: 369, x2: 1413, y2: 519, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 531 } },
-    { x1: 1062, y1: 519, x2: 1287, y2: 640, conf: 0.92, clip: { x1: 1061, y1: 507, x2: 1413, y2: 825 } },
+    { x1: 1305, y1: 369, x2: 1413, y2: 519, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 531 }, cutAxis: 'y' },
+    { x1: 1062, y1: 519, x2: 1287, y2: 640, conf: 0.92, clip: { x1: 1061, y1: 507, x2: 1413, y2: 825 }, cutAxis: 'y' },
   ]);
 });
 

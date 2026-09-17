@@ -10,8 +10,15 @@ export interface DetBox {
     // hole (two balloons touch, an anti-aliased border has a gap, a caption
     // block shares one connected white field) — the area bbox then spans both
     // regions and the text lays out across them. The renderer clamps its fill
-    // window/runs/area to this rect. Absent on unsplit boxes.
+    // window/runs/area to this rect — on the CUT axis only (see cutAxis).
+    // Absent on unsplit boxes.
     clip?: { x1: number; y1: number; x2: number; y2: number };
+    // Which axis the parent was cut along ('y' = siblings stacked vertically, so
+    // the clip's top/bottom edges are the sibling sides). The renderer clamps
+    // the clip on this axis only; the cross axis stays free so the flood can
+    // still reach the bubble's own walls — clamping both trapped it inside the
+    // parent's box and every split child fell to the rect path.
+    cutAxis?: 'x' | 'y';
 }
 
 export interface DetectResult {
@@ -238,6 +245,7 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
                 ? { x1: Math.max(box.x1, ext.x1), y1: Math.max(box.y1, ext.y1 - padBefore), x2: Math.min(box.x2, ext.x2), y2: Math.min(box.y2, ext.y2 + padAfter) }
                 : { x1: Math.max(box.x1, ext.x1 - padBefore), y1: Math.max(box.y1, ext.y1), x2: Math.min(box.x2, ext.x2 + padAfter), y2: Math.min(box.y2, ext.y2) }),
             clip,
+            cutAxis: axis,
         };
     });
 }

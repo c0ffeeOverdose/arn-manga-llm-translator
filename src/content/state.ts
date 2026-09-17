@@ -156,7 +156,6 @@ export async function loadPipeline(): Promise<PipelineSettings> {
         minFont: pipeline.minFont,
         letterSpacing: pipeline.letterSpacing,
         verticalThreshold: pipeline.verticalThreshold,
-        preferHorizontal: pipeline.preferHorizontal,
         font: fontStackFor(pipeline.targetLang),
         textColor: pipeline.textColor,
         strokeColor: pipeline.strokeColor,

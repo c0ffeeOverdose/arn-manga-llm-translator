@@ -16,18 +16,17 @@ const MAX_FONT = 200;
 // tunable via pipeline settings (set before rendering a page).
 // font is a CSS stack: Thai uses the bundled Sriracha, other languages
 // fall back to system fonts (Noto Sans CJK covers zh/ja/ko on Linux/ChromeOS).
-export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, verticalThreshold: 2.2, preferHorizontal: true, font: `${FONT}, sans-serif`, textColor: 'auto', strokeColor: 'auto', textStroke: 0.1, textScale: 1 };
+export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, verticalThreshold: 2.2, font: `${FONT}, sans-serif`, textColor: 'auto', strokeColor: 'auto', textStroke: 0.1, textScale: 1 };
 
 // Render-logic generation, stamped into the [mt] page result dump — bump on
 // ANY render.ts layout change so a stale-extension vs weak-fix question is
 // answered by the dump instead of guesswork.
-export const RENDER_GEN = 25;
+export const RENDER_GEN = 26;
 
-export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; preferHorizontal?: boolean; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
+export function setRenderTuning(t: { minFont?: number; letterSpacing?: number; verticalThreshold?: number; font?: string; textColor?: string; strokeColor?: string; textStroke?: number; textScale?: number }): void {
     if (t.minFont) renderTuning.minFont = t.minFont;
     if (t.letterSpacing != null) renderTuning.letterSpacing = t.letterSpacing;
     if (t.verticalThreshold) renderTuning.verticalThreshold = t.verticalThreshold;
-    if (t.preferHorizontal != null) renderTuning.preferHorizontal = t.preferHorizontal;
     if (t.font) renderTuning.font = t.font;
     if (t.textColor) renderTuning.textColor = t.textColor;
     if (t.strokeColor) renderTuning.strokeColor = t.strokeColor;
@@ -353,10 +352,22 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
         let hiX = Math.min(W - 1, Math.ceil(box.x2 + boxW * gx));
         let hiY = Math.min(H - 1, Math.ceil(box.y2 + boxH * gy));
         if (clip) {
-            loX = Math.max(loX, Math.ceil(clip.x1));
-            loY = Math.max(loY, Math.ceil(clip.y1));
-            hiX = Math.min(hiX, Math.floor(clip.x2));
-            hiY = Math.min(hiY, Math.floor(clip.y2));
+            // Clamp the CUT axis only — the side a sibling sits on. The cross
+            // axis is where the bubble is wider than the text block, so clamping
+            // it too traps the flood inside the parent's box: no bubble wall is
+            // reachable, every row's run end reads as a window edge, the
+            // enclosure score collapses and the region falls to the rect path
+            // while its bubble is much wider (live: 8 split children on a
+            // nhentai page, fonts 12-14 inside ~100px bubbles). Unknown axis
+            // (an entry detected before cutAxis existed) keeps the old clamp.
+            if (box.cutAxis !== 'y') {
+                loX = Math.max(loX, Math.ceil(clip.x1));
+                hiX = Math.min(hiX, Math.floor(clip.x2));
+            }
+            if (box.cutAxis !== 'x') {
+                loY = Math.max(loY, Math.ceil(clip.y1));
+                hiY = Math.min(hiY, Math.floor(clip.y2));
+            }
             loX = Math.min(loX, hiX); // degenerate clip: keep a valid window
             loY = Math.min(loY, hiY);
         }
@@ -626,8 +637,16 @@ export function bubbleArea(img: ImageData, box: DetBox, mask?: TextMask): { x: n
     // (window edge, white margin, spotty ink) measures ~0.0-0.2, so the leak
     // protection is untouched.
     const TRUST_MIN = 0.4;
-    const trustL = minX !== fillL, trustR = maxX !== fillR;
-    const trustT = minY !== fillT, trustB = maxY !== fillB;
+    // A bound sitting on the clip is our own sibling guard, not art: trust it.
+    // The trust test reads the white beyond the cut as "no border" and caps the
+    // span at 1.5x the box, which is exactly what starves a split child of the
+    // bubble width it may legitimately use up to the cut (live: children capped
+    // to 29-64px inside 100px bubbles). NaN comparisons are false, so an
+    // absent clip keeps the old behaviour.
+    const clipL = box.clip ? Math.ceil(box.clip.x1) : NaN, clipR = box.clip ? Math.floor(box.clip.x2) : NaN;
+    const clipT = box.clip ? Math.ceil(box.clip.y1) : NaN, clipB = box.clip ? Math.floor(box.clip.y2) : NaN;
+    const trustL = minX !== fillL || Math.abs(minX - clipL) <= 1, trustR = maxX !== fillR || Math.abs(maxX - clipR) <= 1;
+    const trustT = minY !== fillT || Math.abs(minY - clipT) <= 1, trustB = maxY !== fillB || Math.abs(maxY - clipB) <= 1;
     if ((!trustL && (minX <= 0 ? 0 : edgeColFrac(minX - 1)) < TRUST_MIN) || (!trustR && (maxX >= W - 1 ? 0 : edgeColFrac(maxX + 1)) < TRUST_MIN)) {
         const w = Math.min(maxX - minX, (box.x2 - box.x1) * 1.5);
         const cxb = (box.x1 + box.x2) / 2;
@@ -1073,30 +1092,18 @@ export function renderRegion(
     return renderHorizontal(ctx, img, box, text, mask);
 }
 
-// Which way this region will actually be laid out. Tall+narrow Japanese
-// columns render rotated so Thai reads down the column; preferHorizontal crams
-// horizontal first and rotates only on overflow (short text fits — the common
-// case). Exported so the result dump and the debug overlay report the area the
-// text really got: deriving it from the box aspect alone drew the vertical
-// area under text that was laid out horizontally (live: a debug view showed a
-// narrow area while the paint used a different one).
+// Which way this region will actually be laid out. Always horizontal: Thai (and
+// every target here) reads left-to-right, and rotating the block inside a
+// Japanese column drew sideways Thai the reader rejected (user verdict
+// 2026-09-17: "แนวนอนเสมอ ห้ามหมุน"). renderVertical and the vertical profile
+// machinery stay for a future vertical-script target, but nothing selects them.
+// Exported so the result dump and the debug overlay report the area the text
+// really got (see pageArea).
 export function chosenOrientation(
-    ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-    img: ImageData, box: DetBox, text: string, mask?: TextMask,
+    _ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+    _img: ImageData, _box: DetBox, _text: string, _mask?: TextMask,
 ): boolean {
-    if (!boxIsVertical(box)) return false;
-    if (renderTuning.preferHorizontal) {
-        const probe = pageArea(ctx, img, box, true, mask);
-        // …but only while the bubble is not much wider than the text block: a
-        // thin column inside a wide oval is a vertical source line (the JP
-        // glyphs run down it), and laying the Thai horizontally across the
-        // bubble reads wrong and sticks out of its own box (live: thin columns
-        // 21-47px wide inside ~75-100px bubbles — 3/4 on the user's page).
-        // Region 2-style blocks (wide caption/paragraph in a same-sized
-        // bubble, ratio ~1.1) keep the horizontal preference.
-        if (probe && probe.w <= (box.x2 - box.x1) * 1.5 && horizontalFits(ctx, text, probe)) return false;
-    }
-    return true;
+    return false;
 }
 
 export interface Placed { fontSize: number; lines: string[]; overflow?: boolean; color?: string; block?: [number, number] }

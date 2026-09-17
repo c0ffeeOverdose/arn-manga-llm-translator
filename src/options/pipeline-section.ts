@@ -61,7 +61,6 @@ export function syncAdvancedUI(): void {
     ($('vlmAssisted') as HTMLInputElement).checked = pipeline.vlmAssistedDetection;
     ($('useContext') as HTMLInputElement).checked = pipeline.useContext;
     ($('useCharacters') as HTMLInputElement).checked = pipeline.useCharacters;
-    ($('preferHorizontal') as HTMLInputElement).checked = pipeline.preferHorizontal;
     ($('crossChapter') as HTMLInputElement).checked = pipeline.crossChapter;
     ($('grayscaleBw') as HTMLInputElement).checked = pipeline.grayscaleBw;
     ($('cacheEnabled') as HTMLInputElement).checked = pipeline.cacheEnabled;
@@ -318,10 +317,6 @@ for (const [auto, pick, key] of [['textColorAuto', 'textColorPick', 'textColor']
 };
 ($<HTMLInputElement>('showToasts')).onchange = () => {
     pipeline.showToasts = ($<HTMLInputElement>('showToasts')).checked;
-    markCustom();
-};
-($<HTMLInputElement>('preferHorizontal')).onchange = () => {
-    pipeline.preferHorizontal = ($<HTMLInputElement>('preferHorizontal')).checked;
     markCustom();
 };
 ($<HTMLInputElement>('crossChapter')).onchange = () => {
