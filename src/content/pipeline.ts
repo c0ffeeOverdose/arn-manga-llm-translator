@@ -7,7 +7,7 @@ import { boxIsVertical, renderRegion, sizeCapFrom, effBoxesForAreas } from './re
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, type CachedPage } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, type CachedPage } from './page-cache';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
@@ -18,7 +18,7 @@ export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; 
 // one construction, one gate set: full entry + fp + dims + mask, partials
 // never render as Done). Null when the entry must not paint.
 export function detFromCacheEntry(hit: CachedPage, w: number, h: number): DetectResult | null {
-    if (!hit || hit.partial || hit.fp !== settingsFingerprint(pipeline) || hit.w !== w || hit.h !== h || !hit.mask) return null;
+    if (!hit || hit.partial || hit.fp !== settingsFingerprint(pipeline) || hit.w !== w || hit.h !== h || !hit.mask || !cloudSplitFresh(hit, pipeline.inferEngine === 'cloud')) return null;
     return {
         boxes: hit.boxes, panels: hit.panels,
         mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
@@ -41,10 +41,10 @@ export async function resolveHeadlessDet(
         // resume checkpoints are in-flight work and always ride (a retry after
         // a failed LLM must never re-pay detection/OCR, cache or not)
         const hit = await cacheGet(key);
-        if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+        if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask && cloudSplitFresh(hit, pipeline.inferEngine === 'cloud')) {
             return { det: null, resumed: false };
         }
-        if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
+        if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
             onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
             return { det: detFromPartial(hit, bitmap.width, bitmap.height)!, resumed: true };
         }
@@ -219,12 +219,12 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                 // show our drawing after this (re-translate reads the stash, §readPage)
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
-        if (hit && pipeline.cacheEnabled) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : 'mask';
+        if (hit && pipeline.cacheEnabled) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : !cloudSplitFresh(hit, pipeline.inferEngine === 'cloud') ? 'splitgen' : 'mask';
         // detect checkpoint resume: the previous load finished detect (boxes +
         // panels + mask on disk) but died before translating — continue at
         // translateRegions, skipping detect entirely. The pill jumps read→llm,
         // which reads as "continuing" instead of "restarting".
-        if (isResumable(hit, fp, bitmap.width, bitmap.height)) {
+        if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
             cacheMiss = undefined;
             onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
             return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, resumed: true as const,

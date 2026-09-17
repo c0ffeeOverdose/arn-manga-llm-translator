@@ -516,6 +516,8 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
             outputs: c.o.outputs, extras: c.o.extras, mentions: c.o.mentions,
             ...(c.ai ? { patches: c.ai.patches, patchesGen: c.ai.patchesGen } : null),
             mask: packMask(c.det.mask),
+            splitGen: c.det.splitGen ?? 0,
+            ep: c.det.ep,
         }, pipeline.cacheMax);
     } else {
         void cacheDelete(cacheKey(s.chapter, c.hash)); // cache off: drop the resume checkpoint this commit finished

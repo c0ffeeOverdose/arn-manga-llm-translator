@@ -1,6 +1,7 @@
 // Detection client: spawns a hidden extension-origin iframe (which is allowed
 // to compile wasm under OUR CSP — the host page's CSP blocks it) and talks to
 // it via postMessage.
+import { unpackMask } from './page-cache';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -31,6 +32,10 @@ export interface DetectResult {
     lockWaitMs?: number; // ms this page's detect runs waited on the shared ORT lock (0 = uncontended)
     cloudTexts?: string[]; // cloud path: OCR texts aligned 1:1 with boxes (raw — caller trims)
     cloudMs?: { detect: number; ocr: number }; // cloud path: server-side breakdown
+    // cloud path: the server's box-split generation (0/absent = pre-split
+    // server) — entries below CLOUD_SPLIT_GEN re-detect instead of rendering
+    // fused boxes from cache
+    splitGen?: number;
     panelMs?: number;   // YOLO panel infer ms (0/absent when skipped) — timing breakdown only
     panels?: DetBox[];      // YOLO panel boxes (empty when the model is missing)
     panelSkipped?: string;  // why panel ordering was skipped (strip aspect / gate) — page-result log only
@@ -435,6 +440,38 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
         if (merged.length >= 2) return emitSplit(box, merged, axis, cs, boxComps);
     }
     return null;
+}
+
+// Pass-3 rescue for mask-component pipelines (see worker runDetect): a merged
+// comp killed ONLY by the overlap gate may still hold a text group outside
+// every kept box (live /14: the 28px merge chained the left はむ into a
+// super-comp overlapping box 5, which swallowed it whole and the split never
+// saw it). Split it with the lane machinery on the raw texty comps and
+// re-gate each piece: pieces outside all boxes survive as their own regions
+// (clips stripped — fresh regions, adjacency is the divider's job). Pure.
+export interface RescueCounts { count: number; probSum: number }
+export function rescueSplitComp(
+    c: SplitComp,
+    texty: SplitComp[], strict: SplitComp[], sameBlockGap: number, pageArea: number,
+    countIn: (x1: number, y1: number, x2: number, y2: number) => RescueCounts,
+    overlapsBox: (r: SplitComp) => boolean,
+    boxConf: (r: SplitComp) => number,
+): { x1: number; y1: number; x2: number; y2: number; conf: number }[] {
+    const pieces = splitMergedBoxes(
+        [{ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: 0.5 }], texty, sameBlockGap, strict);
+    if (pieces.length < 2) return [];
+    const out: { x1: number; y1: number; x2: number; y2: number; conf: number }[] = [];
+    for (const pc of pieces) {
+        const bw = pc.x2 - pc.x1, bh = pc.y2 - pc.y1;
+        if (bw < 14 || bh < 14 || bw * bh > 0.2 * pageArea) continue;
+        const r = countIn(Math.floor(pc.x1), Math.floor(pc.y1), Math.ceil(pc.x2), Math.ceil(pc.y2));
+        if (r.count / (bw * bh) < 0.02) continue;
+        const m = { x1: pc.x1, y1: pc.y1, x2: pc.x2, y2: pc.y2 };
+        if (overlapsBox(m)) continue;
+        if (r.probSum / r.count < 0.75 && boxConf(m) < 0.20) continue;
+        out.push({ x1: pc.x1, y1: pc.y1, x2: pc.x2, y2: pc.y2, conf: 0.5 });
+    }
+    return out;
 }
 
 // Region numbering order: the detector emits confidence order, so sort into
@@ -959,17 +996,33 @@ export async function cloudDetect(
         if (!j?.ok) throw new Error(String(j?.error ?? 'cloud failed'));
         const boxes: DetBox[] = (j.boxes ?? []).map((b: any) => ({ x1: +b.x1, y1: +b.y1, x2: +b.x2, y2: +b.y2, conf: +b.conf }));
         const w = bitmap.width, h = bitmap.height;
-        const packed = new Uint8Array(w * h);
-        for (const b of boxes) {
-            const x1 = Math.max(0, Math.floor(b.x1)), y1 = Math.max(0, Math.floor(b.y1));
-            const x2 = Math.min(w, Math.ceil(b.x2)), y2 = Math.min(h, Math.ceil(b.y2));
-            for (let y = y1; y < y2; y++) packed.fill(255, y * w + x1, y * w + x2);
+        // Real CTD mask when the server ships one (gen 2+): text-color
+        // sampling, inpaint and the debug view all read it. Older servers send
+        // nothing — fall back to box-filled stand-in (whole boxes read as ink,
+        // so leaked areas resolve white text; those entries miss the freshness
+        // gate and re-detect anyway).
+        let maskData: ArrayBuffer;
+        const pm = j.mask as { w?: unknown; h?: unknown; b64?: unknown } | undefined;
+        if (pm && typeof pm.b64 === 'string' && +pm.w! > 0 && +pm.h! > 0) {
+            const bin = atob(pm.b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            maskData = unpackMask({ w: Math.floor(+pm.w!), h: Math.floor(+pm.h!), data: bytes.buffer }, w, h);
+        } else {
+            const packed = new Uint8Array(w * h);
+            for (const b of boxes) {
+                const x1 = Math.max(0, Math.floor(b.x1)), y1 = Math.max(0, Math.floor(b.y1));
+                const x2 = Math.min(w, Math.ceil(b.x2)), y2 = Math.min(h, Math.ceil(b.y2));
+                for (let y = y1; y < y2; y++) packed.fill(255, y * w + x1, y * w + x2);
+            }
+            maskData = packed.buffer as ArrayBuffer;
         }
         return {
             boxes,
-            mask: { width: w, height: h, data: packed.buffer as ArrayBuffer },
+            mask: { width: w, height: h, data: maskData },
             inferMs: Math.round(j.ms?.detect ?? 0),
             ep: 'cloud',
+            splitGen: typeof j.splitGen === 'number' ? j.splitGen : 0,
             cloudTexts: (j.texts ?? []).map((t: unknown) => String(t ?? '').replace(/\s+/g, ' ').trim()),
             cloudMs: { detect: Math.round(j.ms?.detect ?? 0), ocr: Math.round(j.ms?.ocr ?? 0) },
             panels: [],

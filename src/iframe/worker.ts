@@ -379,12 +379,13 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
                 || inter > 0.15 * (o.x2 - o.x1) * (o.y2 - o.y1);
         });
     // pass 1: collect components (count + mask-prob sum for the quality gate)
-    type Comp = { x1: number; y1: number; x2: number; y2: number; count: number; probSum: number };
+    type Comp = { x1: number; y1: number; x2: number; y2: number; count: number; probSum: number; ids: number[] };
     // Same text-likelihood definition everywhere a mask component must claim
     // to be text: mean raw mask prob, corroborated by any low-confidence
     // box-head prediction overlapping it (FREE — evidence: 8-page sweep — p4
     // handwriting 4/4 survive, p7 window false-positives 0/12 pass, junk cut 70%).
-    const compBoxConf = (c: Comp): number => {
+    // compBoxConf takes the SplitComp shape so split-rescue pieces re-gate directly.
+    const compBoxConf = (c: SplitComp): number => {
         let boxConf = 0;
         const cArea = (c.x2 - c.x1) * (c.y2 - c.y1);
         for (let i = 0; i < lowBoxes.length; i++) {
@@ -397,15 +398,18 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     };
     const comps: Comp[] = [];
     const seen = new Uint8Array(packed.length);
+    const compId = new Int32Array(packed.length); // label per pixel, for split-rescue recounts below
+    let nextCompId = 0;
     const stack: number[] = [];
     for (let p = 0; p < packed.length && comps.length < 400; p++) {
         if (!packed[p] || seen[p]) continue;
+        const id = nextCompId++;
         stack.length = 0; stack.push(p); seen[p] = 1;
         let minX = w, minY = h, maxX = 0, maxY = 0, count = 0, probSum = 0;
         while (stack.length) {
             const q = stack.pop()!;
             const x = q % w, y = (q / w) | 0;
-            count++; probSum += prob[q];
+            count++; probSum += prob[q]; compId[q] = id;
             if (x < minX) minX = x; if (x > maxX) maxX = x;
             if (y < minY) minY = y; if (y > maxY) maxY = y;
             if (x > 0 && packed[q - 1] && !seen[q - 1]) { seen[q - 1] = 1; stack.push(q - 1); }
@@ -413,7 +417,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
             if (y > 0 && packed[q - w] && !seen[q - w]) { seen[q - w] = 1; stack.push(q - w); }
             if (y < h - 1 && packed[q + w] && !seen[q + w]) { seen[q + w] = 1; stack.push(q + w); }
         }
-        if (maxX - minX + 1 >= 8 && maxY - minY + 1 >= 8) comps.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1, count, probSum });
+        if (maxX - minX + 1 >= 8 && maxY - minY + 1 >= 8) comps.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1, count, probSum, ids: [id] });
     }
     // Split-input comps: raw text clusters snapshotted BEFORE pass 2 merges (a
     // merged bbox would hide the gap between two balloons) and filtered by the
@@ -462,6 +466,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
                         x2: Math.max(a.x2, b.x2), y2: Math.max(a.y2, b.y2),
                         count: a.count + b.count,
                         probSum: a.probSum + b.probSum,
+                        ids: [...a.ids, ...b.ids],
                     };
                     comps.splice(j, 1);
                     merged = true;
@@ -473,6 +478,24 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     // pass 3: filter + emit
     const maskBoxes: typeof outBoxes = [];
     const pageArea = w * h;
+    // recount a split-rescue piece: pixels of the parent comp's labels inside it
+    const recount = (ids: number[], x1: number, y1: number, x2: number, y2: number): { count: number; probSum: number } => {
+        const set = new Set(ids);
+        let count = 0, probSum = 0;
+        for (let y = Math.max(0, y1); y < Math.min(h, y2); y++) {
+            for (let x = Math.max(0, x1); x < Math.min(w, x2); x++) {
+                if (set.has(compId[y * w + x])) { count++; probSum += prob[y * w + x]; }
+            }
+        }
+        return { count, probSum };
+    };
+    // A merged comp killed ONLY by the overlap gate gets a second chance via
+    // split (see rescueSplitComp): pieces outside all boxes survive as their
+    // own regions. Comps passing every gate are untouched.
+    const rescueSplitCompW = (c: Comp): typeof outBoxes => rescueSplitComp(
+        c, textyComps, boxComps, GAP, pageArea,
+        (x1, y1, x2, y2) => recount(c.ids, x1, y1, x2, y2),
+        overlap, compBoxConf);
     for (const c of comps) {
         if (maskBoxes.length >= 16) break;
         const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
@@ -482,10 +505,17 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         // GAP-merges that swallow whole panels
         if (bw < 14 || bh < 14 || fill < 0.02 || fill > 0.6) continue;
         if (bw * bh > 0.2 * pageArea) continue;
-        if (overlap(c)) continue;
         const maskProb = c.probSum / c.count;
         if (maskProb < 0.75 && compBoxConf(c) < 0.20) continue; // text-likelihood gate — same definition as the split-input filter
-        maskBoxes.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: 0.5 });
+        if (!overlap(c)) {
+            maskBoxes.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: 0.5 });
+            continue;
+        }
+        // sole killer was the overlap gate — second chance via split
+        for (const r of rescueSplitCompW(c)) {
+            if (maskBoxes.length >= 16) break;
+            maskBoxes.push(r);
+        }
     }
 
     const initMs = sessionInitMs; // reported once — reset so later pages show steady-state 0
@@ -572,7 +602,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // scripts in extension pages; only the language data is user-managed,
 // downloaded from CDN on demand and cached in IndexedDB via ocr-models.ts) ----
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
-import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, type SplitComp, type Tile } from '../content/detection';
+import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
 import { windowIndex } from '../content/inpaint';
 import { pickInferIndex } from '../content/page-cache';
 import { initDebug, isDebug } from '../debug';

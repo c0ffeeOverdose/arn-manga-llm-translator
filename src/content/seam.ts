@@ -321,7 +321,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             page: `${W}x${H}`, seam: chain.length,
             minFont: renderTuning.minFont, gen: RENDER_GEN, detConf: pipeline.detConf,
             usedLLM,
-            det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null },
+            det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null, splitGen: det.splitGen ?? null },
             llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
             ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
             boxes: det.boxes.map(b => ({ x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2) })),
@@ -401,6 +401,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     boxes, panels: memberPanels,
                     outputs: memberOutputs, extras: memberExtras, mentions: state.mentions ?? [],
                     mask: packMask(localDet.mask),
+                    splitGen: localDet.splitGen ?? 0,
+                    ep: localDet.ep,
                 }, pipeline.cacheMax);
             } else {
                 void cacheDelete(cacheKey(chapterKey(), m.hash)); // cache off: drop the member's resume checkpoint

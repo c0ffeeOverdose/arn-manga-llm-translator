@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -566,15 +566,15 @@ function partialFixture(over = {}) {
 }
 
 test('isResumable: only fresh matching partials resume', () => {
-  assert.equal(isResumable(partialFixture(), RESUME_FP, 4, 4), true);
-  assert.equal(isResumable(undefined, RESUME_FP, 4, 4), false);
+  assert.equal(isResumable(partialFixture(), RESUME_FP, 4, 4, false), true);
+  assert.equal(isResumable(undefined, RESUME_FP, 4, 4, false), false);
   // full entries render from cache, never resume
-  assert.equal(isResumable(partialFixture({ partial: undefined }), RESUME_FP, 4, 4), false);
-  assert.equal(isResumable(partialFixture({ fp: 'other' }), RESUME_FP, 4, 4), false);
-  assert.equal(isResumable(partialFixture({ w: 8 }), RESUME_FP, 4, 4), false);
-  assert.equal(isResumable(partialFixture({ h: 8 }), RESUME_FP, 4, 4), false);
-  assert.equal(isResumable(partialFixture({ mask: undefined }), RESUME_FP, 4, 4), false);
-  assert.equal(isResumable(partialFixture({ boxes: [] }), RESUME_FP, 4, 4), false);
+  assert.equal(isResumable(partialFixture({ partial: undefined }), RESUME_FP, 4, 4, false), false);
+  assert.equal(isResumable(partialFixture({ fp: 'other' }), RESUME_FP, 4, 4, false), false);
+  assert.equal(isResumable(partialFixture({ w: 8 }), RESUME_FP, 4, 4, false), false);
+  assert.equal(isResumable(partialFixture({ h: 8 }), RESUME_FP, 4, 4, false), false);
+  assert.equal(isResumable(partialFixture({ mask: undefined }), RESUME_FP, 4, 4, false), false);
+  assert.equal(isResumable(partialFixture({ boxes: [] }), RESUME_FP, 4, 4, false), false);
 });
 
 test('detFromPartial: rebuilds detect output verbatim, texts ride cloudTexts', () => {
@@ -590,6 +590,40 @@ test('detFromPartial: rebuilds detect output verbatim, texts ride cloudTexts', (
   assert.equal(bare.cloudTexts, undefined);
   // maskless entry refuses (callers check isResumable first)
   assert.equal(detFromPartial(partialFixture({ mask: undefined }), 4, 4), null);
+});
+
+test('cloudSplitFresh: the gate only bites in cloud mode', () => {
+  assert.equal(CLOUD_SPLIT_GEN >= 2, true);
+  // local mode: the tile fingerprint owns freshness, everything renders
+  assert.equal(cloudSplitFresh(undefined, false), true);
+  assert.equal(cloudSplitFresh({}, false), true);
+  assert.equal(cloudSplitFresh({ ep: 'cloud' }, false), true);
+  assert.equal(cloudSplitFresh({ ep: 'cloud', splitGen: 0 }, false), true);
+  // cloud mode: entries that cannot prove freshness re-detect (gen 0 = fused
+  // boxes, gen 1 = box-filled stand-in masks that force white text)
+  assert.equal(cloudSplitFresh({ ep: 'cloud', splitGen: CLOUD_SPLIT_GEN }, true), true);
+  assert.equal(cloudSplitFresh({ ep: 'webgpu', splitGen: CLOUD_SPLIT_GEN }, true), true);
+  assert.equal(cloudSplitFresh(undefined, true), false);
+  assert.equal(cloudSplitFresh({}, true), false);
+  assert.equal(cloudSplitFresh({ ep: 'cloud' }, true), false);
+  assert.equal(cloudSplitFresh({ ep: 'cloud', splitGen: 0 }, true), false);
+  assert.equal(cloudSplitFresh({ ep: 'cloud', splitGen: CLOUD_SPLIT_GEN - 1 }, true), false);
+});
+
+test('isResumable: stale cloud partials re-detect, local ones resume', () => {
+  assert.equal(isResumable(partialFixture({ ep: 'cloud', splitGen: 0 }), RESUME_FP, 4, 4, true), false);
+  assert.equal(isResumable(partialFixture({ ep: 'cloud', splitGen: CLOUD_SPLIT_GEN }), RESUME_FP, 4, 4, true), true);
+  assert.equal(isResumable(partialFixture(), RESUME_FP, 4, 4, true), false);
+  assert.equal(isResumable(partialFixture(), RESUME_FP, 4, 4, false), true);
+});
+
+test('partialEntry/detFromPartial: splitGen rides along', () => {
+  const det = { boxes: [], panels: [], ep: 'cloud', splitGen: 7, mask: { width: 4, height: 4, data: new Uint8Array(16).buffer }, inferMs: 1 };
+  assert.equal(partialEntry('k', RESUME_FP, det, 4, 4).splitGen, 7);
+  const local = { boxes: [], panels: [], ep: 'webgpu', mask: { width: 4, height: 4, data: new Uint8Array(16).buffer }, inferMs: 1 };
+  assert.equal(partialEntry('k', RESUME_FP, local, 4, 4).splitGen, 0);
+  assert.equal(detFromPartial(partialFixture({ splitGen: 7 }), 4, 4).splitGen, 7);
+  assert.equal(detFromPartial(partialFixture(), 4, 4).splitGen, undefined);
 });
 
 test('partialEntry: checkpoint shape the full write later overwrites', () => {

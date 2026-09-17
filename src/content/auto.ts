@@ -144,6 +144,8 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
                 boxes: det.boxes, panels: det.panels ?? [],
                 outputs: o.outputs, extras: o.extras, mentions: o.mentions,
                 mask: packMask(det.mask),
+                splitGen: det.splitGen ?? 0,
+                ep: det.ep,
                 ...(ai ? { patches: ai.patches, patchesGen: ai.patchesGen } : null),
             }, pipeline.cacheMax);
         } else {

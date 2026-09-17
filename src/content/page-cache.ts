@@ -138,6 +138,9 @@ export interface CachedPage {
     texts?: string[];
     // detector EP at checkpoint time — restored so the Done line stays honest
     ep?: string;
+    // cloud path: the server's box-split generation (server/split.py SPLIT_GEN)
+    // — cache entries from older servers hold fused boxes and must re-detect
+    splitGen?: number;
     // AI text cleanup output: one erased-background crop per erase box, drawn
     // in place of the built-in fill. patchesGen tags the pipeline version so
     // old crops are ignored (regenerated) instead of painting stale pixels.
@@ -152,6 +155,18 @@ export interface CachedPage {
 // window indices fixed (v2 sampled the upscaled output in 512-space and
 // smeared neighbouring art over the erased text).
 export const INPAINT_PATCH_GEN = 3;
+
+// Bump when the server's box-splitting changes (server/split.py SPLIT_GEN):
+// cloud cache entries below this hold fused boxes (gen 0), box-filled
+// stand-in masks that force white text (gen 1), or miss overlap-swallowed
+// text the rescue would have saved (gen 2) — all re-detect instead of
+// rendering from cache. Local entries never carry splitGen (their tile
+// fingerprint already forces re-detect) — isCloud scopes the gate to cloud
+// mode so local caches never pay for it.
+export const CLOUD_SPLIT_GEN = 3;
+export function cloudSplitFresh(hit: { ep?: string; splitGen?: number } | undefined, isCloud: boolean): boolean {
+    return !isCloud || (hit?.splitGen ?? 0) >= CLOUD_SPLIT_GEN;
+}
 
 // CTD masks are full-page 1 byte/px (~MBs) — too big for IDB at 200 pages.
 // packMask block-maxes it to ≤maxSide (~45KB/page); unpackMask nearest-
@@ -199,9 +214,10 @@ export function unpackMask(
 // ---- detect checkpoints: a partial entry (boxes, no outputs) is resumable
 // when fingerprint + dims still match and it carries a mask. Full entries
 // never resume (they render from cache); stale partials re-detect. Pure.
-export function isResumable(hit: CachedPage | undefined, fp: string, w: number, h: number): hit is CachedPage {
+export function isResumable(hit: CachedPage | undefined, fp: string, w: number, h: number, isCloud: boolean): hit is CachedPage {
     return !!hit && hit.partial === true && hit.fp === fp
-        && hit.w === w && hit.h === h && hit.boxes.length > 0 && !!hit.mask;
+        && hit.w === w && hit.h === h && hit.boxes.length > 0 && !!hit.mask
+        && cloudSplitFresh(hit, isCloud);
 }
 
 // rebuild a live DetectResult from a resumable partial — ordered boxes,
@@ -216,6 +232,7 @@ export function detFromPartial(hit: CachedPage, w: number, h: number): DetectRes
         mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
         inferMs: 0, ep: hit.ep ?? 'cache', dropped: [], panelDropped: [],
         ...(hit.texts?.length ? { cloudTexts: hit.texts } : null),
+        ...(hit.splitGen != null ? { splitGen: hit.splitGen } : null),
     };
 }
 
@@ -236,6 +253,7 @@ export function partialEntry(key: string, fp: string, det: DetectResult, w: numb
         outputs: [], extras: [],
         texts: det.cloudTexts ?? [],
         ep: det.ep,
+        splitGen: det.splitGen ?? 0,
         mask: packMask(det.mask),
         partial: true as const,
     };

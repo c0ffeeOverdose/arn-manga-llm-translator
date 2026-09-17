@@ -52,9 +52,12 @@ selects the port. Modal keeps its own wrapper for the same rule.
 
 - `GET /health` → `{ok, device, panels, ep}` (no auth — liveness only)
 - `POST /v1/page?conf_thr=0.35&min_size=12` — raw PNG/JPEG bytes in the body →
-  `{ok, w, h, boxes:[{x1,y1,x2,y2,conf}], panels:[], panelSkipped, texts[],
+  `{ok, w, h, boxes:[{x1,y1,x2,y2,conf}], panels:[], panelSkipped, splitGen, mask:{w,h,b64}, texts[],
   ms:{body,detect,ocr,total}}`. `texts[i]` belongs to `boxes[i]`; text is raw
-  (the client collapses whitespace, same as the local path).
+  (the client collapses whitespace, same as the local path). `splitGen` is the
+  server's box-split generation (bump = client re-detects older cache entries);
+  `mask` is the packed CTD text mask (`packMask` codec — the client restores it
+  with `unpackMask` for text-color sampling, inpaint and the debug view).
 
 ## Attribution
 

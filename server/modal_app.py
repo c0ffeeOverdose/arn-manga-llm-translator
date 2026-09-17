@@ -35,6 +35,7 @@ image = (
     # single file, not add_local_dir("."): deploy sources like Colab's /content
     # hold mutating internal files (.config/gce) that abort the build mid-snapshot
     .add_local_file("app.py", remote_path="/pkg/app.py")
+    .add_local_file("split.py", remote_path="/pkg/split.py")
     # the container re-imports modal_app.py, which imports this
     .add_local_file("models_manifest.py", remote_path="/pkg/models_manifest.py")
 )

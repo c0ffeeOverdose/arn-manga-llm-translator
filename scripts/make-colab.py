@@ -129,6 +129,7 @@ modal_nb = {"nbformat": 4, "nbformat_minor": 5,
     ]),
     writefile_cell("modal_app.py", read("modal_app.py")),
     writefile_cell("app.py", read("app.py")),
+    writefile_cell("split.py", read("split.py")),
     writefile_cell("models_manifest.py", read("models_manifest.py")),
     md([
         "## 4. Deploy\n",
@@ -176,7 +177,7 @@ modal_nb = {"nbformat": 4, "nbformat_minor": 5,
         'with urllib.request.urlopen(ENDPOINT + "/health", timeout=300) as r:\n',
         "    h = json.load(r)\n",
         "eps = h.get('ep') or {}\n",
-        'print("device=%s ep=%s" % (h.get("device"), eps))\n',
+        'print("device=%s ep=%s splitGen=%s" % (h.get("device"), eps, h.get("splitGen")))\n',
         "if not any('CUDAExecutionProvider' in v for v in eps.values()):\n",
         '    print("! CUDA is not active — this endpoint is on CPU (much slower).")\n',
         '    print("  Re-deploy and check `modal app logs`; the image pins CUDA 13 + onnxruntime-gpu 1.30.")\n',
@@ -289,6 +290,7 @@ colab_nb = {"nbformat": 4, "nbformat_minor": 5,
         Copies the server code here. Just run both cells.
     """),
     writefile_cell("app.py", read("app.py")),
+    writefile_cell("split.py", read("split.py")),
     writefile_cell("serve.py", read("serve.py")),
     md_text("""
         ## 3. Download the models (~230MB)
@@ -316,15 +318,17 @@ colab_nb = {"nbformat": 4, "nbformat_minor": 5,
         ## 4. Start the server
 
         Loads the models onto the GPU (tens of seconds on a T4) and keeps the
-        server running in the background. Re-running this cell is safe — it
-        reuses a server that is already up. The API key is saved to
-        `/content/api_key.txt` so re-runs keep the same one.
+        server running in the background. Re-running this cell restarts the
+        server, so the files saved in step 2 always take effect (an already-up
+        server would otherwise keep running older code). The API key is saved
+        to `/content/api_key.txt` so re-runs keep the same one.
     """),
     code_text("""
-        import glob, json, os, secrets, subprocess, sys, time, urllib.request
+        import glob, json, os, secrets, signal, subprocess, sys, time, urllib.request
 
         PORT = 7860
         keyfile = "/content/api_key.txt"
+        pidfile = "/content/server.pid"
         if os.path.isfile(keyfile):
             API_KEY = open(keyfile).read().strip()
         else:
@@ -344,6 +348,35 @@ colab_nb = {"nbformat": 4, "nbformat_minor": 5,
             except Exception:
                 return None
 
+        def pid_alive(pid):
+            try:
+                os.kill(pid, 0)
+                return True
+            except Exception:
+                return False
+
+        # a previous run's server keeps running across cell re-runs — kill it
+        # so the files from step 2 (not older code) are what comes up
+        if os.path.isfile(pidfile):
+            try:
+                old = int(open(pidfile).read().strip())
+            except Exception:
+                old = None
+            if old and pid_alive(old):
+                print("stopping the previous server (pid %d)..." % old)
+                try:
+                    os.kill(old, signal.SIGTERM)
+                except Exception:
+                    pass
+                for _ in range(30):
+                    if not pid_alive(old):
+                        break
+                    time.sleep(1)
+            try:
+                os.remove(pidfile)
+            except Exception:
+                pass
+
         if health() is None:
             env = dict(os.environ, MODEL_DIR="/content/models", ARN_API_KEY=API_KEY, PORT=str(PORT),
                        ORT_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider", ORT_DEVICE="cuda",
@@ -351,6 +384,7 @@ colab_nb = {"nbformat": 4, "nbformat_minor": 5,
             log = open("/content/server.log", "w")
             proc = subprocess.Popen([sys.executable, "serve.py"], env=env,
                                     stdout=log, stderr=subprocess.STDOUT)
+            open(pidfile, "w").write(str(proc.pid))
             t0 = time.time()
             while time.time() - t0 < 240 and health() is None:
                 if proc.poll() is not None:
@@ -360,7 +394,7 @@ colab_nb = {"nbformat": 4, "nbformat_minor": 5,
             assert health() is not None, "server did not come up in 240s — see /content/server.log"
         h = health()
         eps = h.get("ep") or {}
-        print("✓ server up — ep=%s" % eps)
+        print("✓ server up — ep=%s splitGen=%s" % (eps, h.get("splitGen")))
         if not any("CUDAExecutionProvider" in v for v in eps.values()):
             print("! CUDA is not active (CPU only) — pages will be very slow. Re-run the install cell, or Runtime → Change runtime type → T4 GPU.")
     """),

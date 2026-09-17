@@ -360,3 +360,34 @@ test('short first group with a small gap stays fused (paragraph guard)', () => {
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
 });
+
+// ---- pass-3 rescue (live /14: the 28px merge chained the left はむ into a
+// super-comp overlapping box 5, which the overlap gate then swallowed whole)
+const { rescueSplitComp } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
+const dense = (mean = 0.85) => (x1, y1, x2, y2) => ({ count: (x2 - x1) * (y2 - y1) * 0.1, probSum: (x2 - x1) * (y2 - y1) * 0.1 * mean });
+const overlapsBox5 = (r) => !(r.x2 <= 594.9 || r.x1 >= 650.8 || r.y2 <= 389.5 || r.y1 >= 553.3);
+const MD14_TEXTY = [
+  [467, 409, 508, 446], [471, 443, 514, 478], [543, 409, 586, 474],
+  [613, 390, 644, 405], [608, 409, 648, 425], [610, 429, 645, 445],
+  [617, 479, 630, 494], [596, 498, 648, 514], [591, 518, 652, 533], [597, 537, 639, 552],
+].map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+
+test('rescue: chained super-comp splits, outside piece survives', () => {
+  const out = rescueSplitComp({ x1: 467, y1: 390, x2: 652, y2: 552 }, MD14_TEXTY, MD14_TEXTY, GAP, 752 * 1080, dense(), overlapsBox5, () => 0);
+  assert.equal(out.length, 1);
+  assert.ok(out[0].x2 <= 594.9, 'rescued piece stays outside box 5');
+  assert.ok(out[0].x1 <= 470 && out[0].y1 <= 412, 'piece covers the left はむ cluster');
+  assert.equal(out[0].conf, 0.5);
+});
+
+test('rescue: gapless comp stays dead (no phantom split)', () => {
+  const texty = [{ x1: 600, y1: 400, x2: 640, y2: 540 }];
+  const out = rescueSplitComp({ x1: 595, y1: 390, x2: 651, y2: 553 }, texty, texty, GAP, 752 * 1080, dense(), overlapsBox5, () => 0);
+  assert.deepEqual(out, []);
+});
+
+test('rescue: sparse piece fails the fill re-gate', () => {
+  const thin = () => ({ count: 1, probSum: 0.85 });
+  const out = rescueSplitComp({ x1: 467, y1: 390, x2: 652, y2: 552 }, MD14_TEXTY, MD14_TEXTY, GAP, 752 * 1080, thin, () => false, () => 0);
+  assert.deepEqual(out, []);
+});
