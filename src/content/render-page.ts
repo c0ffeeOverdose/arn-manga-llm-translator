@@ -56,14 +56,14 @@ function dumpAreas(
 // ordered commit still folds later (its !bookHas guard makes the double-visit
 // harmless). The book snapshot is skipped too (context is mid-chapter at paint time).
 export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean,
-    opts: { paintOnly?: boolean } = {}): Promise<PageState> {
+    opts: { paintOnly?: boolean; detached?: boolean } = {}): Promise<PageState> {
     const paintOnly = opts.paintOnly === true;
 
     const { srcUrl, bitmap, det } = prep;
     const existing = stateFor(ref) ?? pages.get(srcUrl);
     // twin prep made before the first job finished — reuse it, don't pay twice.
     if (existing && !force) return existing;
-    if (existing && shareContext) await rewindContextBefore(existing);
+    if (existing && shareContext && !paintOnly) await rewindContextBefore(existing);
     // the rebuilt book excludes this page — its hash must refold (fresh fold
     // below re-registers; an error leaves it dropped so arrival refolds).
     // Same for the progress stamp: a force retranslate counts fresh.
@@ -280,6 +280,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         origBytes: prep.origBytes ?? existing?.origBytes,
         translatedBmp: ref.kind === 'canvas' ? canvas.transferToImageBitmap() : undefined,
     };
+    // Execution hosts return a rendered artifact without touching reader/book state.
+    if (opts.detached) return state;
     // blob-origin readers: keep an extension-owned copy now — once we swap in
     // the translated blob the reader's URL may be dead (see ownOriginalUrl).
     if (ownCopyNeeded(srcUrl, bitmap.width, bitmap.height)) {

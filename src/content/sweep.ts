@@ -1,798 +1,380 @@
-// Chapter sweep: explicit whole-chapter background translation (popup button,
-// not auto). A pool of headless workers walks the chapter manifest in reading
-// order; slow stages overlap, but the book folds strictly in page order.
+// Reader-side chapter controller. Execution and rendered artifacts live in the extension host.
+import { chapterKey, pipeline, context, loadContext, loadPipeline, bookKey, shareContext, stateFor,
+    regPage, unregPage, overlayChoice, setOverlayChoice, setOverlayOn, acceptChapterContext, type PageRef } from './state';
+import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, galleryManifestJson,
+    collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap } from './page-io';
+import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMask,
+    registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cacheKey } from './page-cache';
+import { viewportOverlap, dropAutoQueued, resumeAuto, isBusy, paintBusy, haltAuto } from './queue';
+import { lookaheadActive } from './auto';
+import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, logError } from './status-ui';
+import { remainingPages, chapterMessage, type ChapterPage, type ChapterProgress, type ChapterStart } from '../chapter/model';
+import { blobDataUrl } from '../chapter/store';
+import type { CachedPage } from './page-cache';
+import { RENDER_GEN } from './render';
+import { nextDocument } from '../chapter/discovery';
 
-import { updateContext } from '../llm/core';
-import { pipeline, context, setContext, shareContext, loadContext, loadPipeline, resetContextIfNewChapter, saveContext, chapterKey, sessionUsage, setLastPageUsage, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
-import { fetchBitmap, getPages, refKey, unscrambleTiles, episodeManifestSrcs, galleryManifestJson, fetchPagedUrls, collectUnloadedUrls } from './page-io';
-import { renderPage } from './render-page';
-import { applyOverlays } from './overlays';
-import { resolveHeadlessDet, preparePage } from './pipeline';
-import { translateRegions, warmPatches, InpaintUnavailable, abortLiveRpcs, type TranslateOutcome } from './ocr';
-import type { Prep } from './pipeline';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, galleryAllUrls, takeOrdered, cooldownMark, cooldownParked, registerSweepWaiter, samePagePath, sweepPhase, sweepPoolSize, abortLookahead, priorityIndices, usableAnchor, matchAnchor } from './page-cache';
-import { cloudConfig, cloudWarm, type DetectResult, type InpaintPatch, type MtOnStatus } from './detection';
-import { computeAiPatches, type AiPatches } from './inpaint';
-import { inpaintMode } from '../llm/pipeline-settings';
-import { failMarks, enqueue, pageKeyOf, viewportOverlap, dropAutoQueued, autoHalted, resumeAuto, keepaliveOpen, queueFind, activeRefGet, paintHas, queueOwnsPath } from './queue';
-import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, autoTranslateOn, logError } from './status-ui';
-import { isDebug } from '../debug';
-
-const SWEEP_WARMUP = 2;
-const SWEEP_MAX_CONSECUTIVE_ERRORS = 3;
-// run watchdog: no dispatch/commit progress for this long = a hung fetch/infer —
-// the run is force-finished so Stop/new starts/auto can never be blocked.
-const SWEEP_STALL_MS = 300000;
-const SWEEP_WATCHDOG_MS = 30000;
-// priority phase serial cap: it runs before the pool opens, so an unbounded window
-// (prefetchN up to 30) or one hung page would delay every other page. Past this the
-// remaining pages fall to the normal ordered walk.
-const PRIORITY_PHASE_MAX_MS = 240000;
-
-interface SweepItem {
-    url: string; // claim key (manifest URL headless, refKey for DOM) — DOM jobs wait on it
-    descramble: boolean; // headless episode puzzles only
-    ref?: PageRef; // DOM readers: translate the live element (blob srcs, taint, canvas blanks)
-}
-interface SweepRun { cancel: boolean; dead: boolean; failed: boolean; done: number; total: number; errors: number; skipped: number; firstErr: string; chapter: string }
-type Commit =
-    | { i: number; url: string; hash: string; w: number; h: number; det: DetectResult; o: TranslateOutcome; ref?: PageRef; ai?: { patches: InpaintPatch[]; patchesGen: number } | null }
-    | { i: number; url: string; hash?: string; cached: true; ref?: PageRef }
-    | { i: number; url: string; skip: true } // blank canvas (translating it poisons) — head advances, counts neither done nor error
-    | { i: number; url: string; pre: true } // already committed by the priority phase — the ordered head just passes it
-    | { i: number; url: string; error: true; msg?: string };
-
-let sweep: SweepRun | null = null;
-let starting = false; // enumeration in flight — no run object yet, cancel must still land
-let startCancel = false;
-let lastProgress = 0; // ms timestamp of the last dispatch/commit (watchdog)
-let watchdog: ReturnType<typeof setInterval> | null = null;
-const inflight = new Map<string, true>(); // claimed urls (DOM jobs wait on these)
-const waiters = new Map<string, Set<() => void>>();
-let translating = 0; // workers inside translateRegions (pill stage honesty)
-let pagesCache: { chapter: string; n: number } | null = null;
-let inpaintReported = false; // one AI-cleanup-unavailable warning per run
-
-// ---- folded hashes: which content hashes already contributed to the live book.
+let progress: ChapterProgress | null = null;
+let starting = false;
+let startCancelled = false;
+let observedChapter = '';
+let refreshBusy = false;
+let discoverAt = 0;
+let notified = '';
 let foldedChapter = '';
-const foldedHashes = new Set<string>();
-function foldedSync(): void {
-    if (foldedChapter !== chapterKey()) { foldedChapter = chapterKey(); foldedHashes.clear(); }
-}
-// ---- session commits: hashes this document's sweep runs committed (fresh or
-// cached). Arrival may paint these WITHOUT auto. Memory-only.
-let committedChapter = '';
-const committedHashes = new Set<string>();
-function committedSync(): void {
-    if (committedChapter !== chapterKey()) { committedChapter = chapterKey(); committedHashes.clear(); }
-}
-// arrival gate (cheap, no hash needed).
-export function sweepArrivable(): boolean {
-    committedSync();
-    return sweepActive() || committedHashes.size > 0;
-}
-// arrival paint permission for one hash (called after the pixels hash)
-export function sweepCommitted(hash: string): boolean {
-    committedSync();
-    return committedHashes.has(hash);
-}
-export function bookHas(hash: string): boolean { foldedSync(); return foldedHashes.has(hash); }
-export function bookAdd(hash: string): void { foldedSync(); foldedHashes.add(hash); }
-export function bookDrop(hash: string): void { foldedHashes.delete(hash); }
+const folded = new Set<string>();
+const refs = new Map<string, PageRef>();
+const attaching = new WeakSet<Element>();
+const applied = new WeakMap<Element, string>();
+const sourceRequests = new Map<string, Promise<string | undefined>>();
 
-// ---- DOM attach: a DOM job for a sweep-owned page waits for the commit
-// instead of paying a duplicate detect + LLM (falls through on timeout).
-function settleUrl(url: string): void {
-    const set = waiters.get(url);
-    if (!set) return;
-    waiters.delete(url);
-    for (const r of set) { try { r(); } catch { /* waiter gone */ } }
+function syncBook(): void {
+    if (foldedChapter !== chapterKey()) { foldedChapter = chapterKey(); folded.clear(); }
+}
+export function bookHas(hash: string): boolean { syncBook(); return folded.has(hash); }
+export function bookAdd(hash: string): void { syncBook(); folded.add(hash); }
+export function bookDrop(hash: string): void { syncBook(); folded.delete(hash); }
+export function sweepArrivable(): boolean { return !!progress && progress.chapter === chapterKey(); }
+export function sweepCommitted(hash: string): boolean {
+    return !!progress?.pages.some(p => p.phase === 'ready' && p.hash === hash);
+}
+export function sweepActive(): boolean {
+    return starting || !!progress && progress.chapter === chapterKey() && ['running', 'waiting', 'stopping'].includes(progress.phase);
+}
+export interface SweepStatus {
+    active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean;
+    done: number; total: number; errors: number; skipped: number; inflight: number;
+}
+export function sweepStatus(): SweepStatus | null {
+    if (starting) return { active: true, phase: 'starting', stopping: false, done: 0, total: 0, errors: 0, skipped: 0, inflight: 0 };
+    if (!progress || progress.chapter !== chapterKey()) return null;
+    return { active: sweepActive(), phase: progress.phase === 'stopping' ? 'stopping' : 'running',
+        stopping: progress.phase === 'stopping', done: progress.done, total: progress.total,
+        errors: progress.errors, skipped: 0, inflight: progress.inflight };
+}
+function original(ref: PageRef): string {
+    return stateFor(ref)?.orig ?? refKey(ref);
+}
+function visible(): PageRef | undefined {
+    return getPages().filter(r => viewportOverlap(r) > 0).sort((a, b) => viewportOverlap(b) - viewportOverlap(a))[0];
+}
+function owned(url: string) {
+    if (progress?.chapter !== chapterKey()) return undefined;
+    return progress.pages.find(p => p.url === url || samePagePath(p.url, url));
 }
 export function sweepHas(url: string): boolean {
-    return !!sweep && !sweep.dead && claimFor(url) !== undefined;
+    return !!owned(url) && sweepActive();
 }
-// claim lookup with host-volatile fallback (same file, different CDN host).
-function claimFor(url: string): string | undefined {
-    if (inflight.has(url)) return url;
-    for (const k of inflight.keys()) if (samePagePath(k, url)) return k;
-    return undefined;
-}
-export function awaitSweep(url: string, onStatus: MtOnStatus): Promise<void> {
-    const s = sweep;
-    const claim = s && !s.dead ? claimFor(url) : undefined;
-    if (!claim) return Promise.resolve();
-    // explicit stage: this wait is a queue position, not a read.
-    onStatus('Waiting for chapter sweep…', 'detect');
-    return new Promise<void>(res => {
-        let set = waiters.get(claim);
-        if (!set) { set = new Set(); waiters.set(claim, set); }
-        set.add(res);
-        // claimed-and-settled between the check and the add — resolve at once.
-        if (!inflight.has(claim)) settleUrl(claim);
-    });
+async function control(command: string, extra: Record<string, unknown> = {}): Promise<any> {
+    return chrome.runtime.sendMessage({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra });
 }
 
-// ---- control + status (popup)
-export interface SweepStatus {
-    active: boolean;
-    phase: 'starting' | 'running' | 'stopping' | 'dead';
-    stopping: boolean;
-    inflight: number;
-    done: number;
-    total: number;
-    errors: number;
-    skipped: number;
-}
-// During enumeration there is no run yet — still report active/starting so the
-// popup offers Stop instead of a second concurrent run.
-export function sweepStatus(): SweepStatus | null {
-    if (sweep) {
-        const phase = sweepPhase(sweep);
-        return {
-            active: true, phase: phase === 'idle' ? 'running' : phase, stopping: sweep.cancel && !sweep.dead,
-            inflight: inflight.size, done: sweep.done, total: sweep.total, errors: sweep.errors, skipped: sweep.skipped,
-        };
+// Manual/auto requests join the chapter owner, including explicit retranslation.
+export function chapterOwnsRequest(ref: PageRef, force: boolean): boolean {
+    const page = owned(original(ref));
+    if (!page) return false;
+    if (!sweepActive() && !force && page.phase !== 'ready') return false;
+    refs.set(page.id, ref);
+    if (force) {
+        // Retranslate through the owner already holding the pixels: a fresh detection and a
+        // fresh answer, folded back in reading order. Re-entering the queue would re-render
+        // the page alone and make the book's pairs depend on which path ran.
+        applied.delete(ref.el);
+        detach(ref);
+        void control('retry', { page: page.id }).catch(reportError);
+    } else {
+        void control('prioritize', { page: page.id }).catch(reportError);
+        if (page.phase === 'ready') void attach(ref, page);
     }
-    if (starting) return { active: true, phase: 'starting', stopping: false, inflight: 0, done: 0, total: 0, errors: 0, skipped: 0 };
-    return null;
+    return true;
 }
-// autoTick consults this — a cancelled-but-draining sweep still counts: its
-// commits are still landing.
-export function sweepActive(): boolean {
-    const s = sweep;
-    return !!s && !s.dead;
+// Drop our rendered state for one element so the owner's redraw is the only one left.
+function detach(ref: PageRef): void {
+    const state = stateFor(ref);
+    if (!state) return;
+    unregPage(state);
+    URL.revokeObjectURL(state.translated);
+}
+
+async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; complete: boolean }> {
+    const live = getPages();
+    const current = visible();
+    let urls = episodeManifestSrcs();
+    let descramble = !!urls?.length;
+    if (!urls?.length) urls = await fetchPagedUrls();
+    if (!urls?.length) {
+        const first = live.find(r => r.kind === 'img' && /^https?:/.test(original(r)));
+        if (first) urls = galleryAllUrls(await galleryManifestJson(), original(first)).urls;
+    }
+    if (urls?.length) {
+        const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble }));
+        return { pages, anchor: current ? matchAnchor(urls, [original(current), refKey(current)]) : -1, complete: true };
+    }
+    descramble = false;
+    const known = new Set(live.map(original));
+    const unloaded = new Set(collectUnloadedUrls(known));
+    const ordered: { url: string; ref?: PageRef }[] = [];
+    for (const el of document.querySelectorAll('img,canvas')) {
+        const ref = live.find(r => r.el === el);
+        const img = el instanceof HTMLImageElement ? el : null;
+        const url = ref ? original(ref) : img && (img.currentSrc || img.src);
+        if (!url || (!ref && !unloaded.has(url)) || ordered.some(p => p.url === url)) continue;
+        ordered.push({ url, ref });
+    }
+    const pages = ordered.map(({ url, ref }, order) => {
+        const id = `url:${url}`;
+        if (ref) refs.set(id, ref);
+        return { id, url, order, descramble };
+    });
+    const anchor = current ? ordered.findIndex(p => p.ref?.el === current.el) : -1;
+    // A paginated/virtualized reader without a manifest is discovery-incomplete.
+    const hasNext = !!document.querySelector('a[rel="next"], link[rel="next"], [data-next-page], [data-infinite-scroll]');
+    const unresolved = live.some(r => r.kind === 'canvas' && !r.el.width);
+    return { pages, anchor, complete: !hasNext && !unresolved };
 }
 export async function sweepPages(): Promise<number> {
-    const ch = chapterKey();
-    if (pagesCache && pagesCache.chapter === ch) return pagesCache.n;
-    const n = (await sweepItems()).items.length;
-    pagesCache = { chapter: ch, n };
-    return n;
+    const result = await enumerate();
+    return remainingPages(result.pages, result.anchor).length;
+}
+function reportError(e: unknown): void {
+    const text = (e as Error).message || String(e);
+    lastMsgSet({ text: `Chapter translation paused — ${text}`, phase: 'error', until: Date.now() + 10000 });
+    renderStatus();
+    void logError(text, undefined, 'chapter');
 }
 export async function startSweep(): Promise<{ ok: boolean; total?: number; error?: string; starting?: boolean; cancelled?: boolean }> {
-    if (sweep) return { ok: true, total: sweep.total };
-    if (starting) return { ok: true, starting: true }; // enumeration already in flight — never a second run
+    if (starting) return { ok: true, starting: true };
+    if (sweepActive()) return { ok: true, total: progress?.total };
     starting = true;
-    startCancel = false;
+    startCancelled = false;
+    const chapter = chapterKey();
     try {
-        // a running lookahead chain would warm the same pages in parallel — the sweep wins.
+        pillUnDismiss();
+        setOverlayChoice('auto');
         abortLookahead();
-        dropAutoQueued(); // queued auto jobs would duplicate sweep workers (manual/force intent survives)
-        resumeAuto(); // the button is explicit user intent — a previous provider halt must not block it
-        resetContextIfNewChapter();
+        dropAutoQueued();
+        resumeAuto();
+        setActivity('sweep', 'Preparing chapter translation…', 'sweep', 'read');
+        // Existing manual work owns its pixels and context until it settles.
+        while (isBusy() || paintBusy() || lookaheadActive()) {
+            if (startCancelled || chapter !== chapterKey()) return { ok: true, cancelled: true };
+            setActivity('sweep', 'Finishing the current page before starting the chapter…', 'sweep', 'llm');
+            await new Promise(r => setTimeout(r, 200));
+        }
         await loadPipeline();
         await loadContext();
-        // cloud engines scale to zero: pay the boot once here (with its own long
-        // cap) instead of letting the first 90s-capped page calls race it.
-        if (pipeline.inferEngine === 'cloud') {
-            const { endpoint, key } = await cloudConfig();
-            if (endpoint && key) {
-                setActivity('sweep', 'Waking cloud GPU…', 'sweep', 'detect');
-                try { await cloudWarm(endpoint, key); } catch (e) {
-                    if (isDebug()) console.log('[mt] cloud warm failed:', (e as Error)?.message);
-                }
-                if (startCancel) return { ok: true, cancelled: true }; // Stop pressed while warming
-            }
+        setActivity('sweep', 'Finding the remaining pages in this chapter…', 'sweep', 'read');
+        const found = await enumerate();
+        const pages = remainingPages(found.pages, found.anchor);
+        if (!pages.length) throw new Error('Could not identify the current page. Open a page image and try again.');
+        const seeds: NonNullable<ChapterStart['seeds']> = [];
+        for (const page of pages) {
+            const ref = getPages().find(r => original(r) === page.url);
+            const state = ref && stateFor(ref);
+            if (!state?.det || !state.hash || !state.outputs) continue;
+            const mask = packMask(state.det.mask);
+            const encoded = await blobDataUrl(new Blob([mask.data]));
+            seeds.push({ page: page.id, image: await blobDataUrl(await (await fetch(state.translated)).blob()),
+                maskData: encoded.split(',')[1], entry: {
+                    key: cacheKey(chapter, state.hash), fp: settingsFingerprint(pipeline), atime: Date.now(),
+                    w: state.det.mask.width, h: state.det.mask.height, boxes: state.det.boxes, panels: state.det.panels ?? [],
+                    outputs: state.outputs, extras: [], mentions: state.mentions, mask,
+                } });
+            page.inBaseContext = bookHas(state.hash);
         }
-        const now = Date.now();
-        const { items, anchor } = await sweepItems();
-        if (startCancel) return { ok: true, cancelled: true }; // Stop pressed mid-enumeration
-        const usable: SweepItem[] = [];
-        const usableFrom: number[] = []; // usable[k] came from items[usableFrom[k]]
-        items.forEach((it, i) => {
-            if (cooldownParked(failMarks, it.url, now)) return;
-            usable.push(it);
-            usableFrom.push(i);
-        });
-        if (!usable.length) {
-            return { ok: false, error: items.length ? 'all pages parked after errors — force one manually to retry' : 'no sweepable pages found' };
-        }
-        // the reader's page plus the pages ahead translate FIRST (out of order, like
-        // the lookahead path) so the visible page is never stuck behind the head;
-        // the ordered walk below still starts at index 0 for a correct book fold.
-        // A parked anchor falls back to the nearest usable page before it.
-        const anchorU = usableAnchor(usableFrom, anchor);
-        const priority = priorityIndices(usable.length, anchorU, Math.min(30, Math.max(1, pipeline.prefetchN ?? 3)));
-        sweep = { cancel: false, dead: false, failed: false, done: 0, total: usable.length, errors: 0, skipped: 0, firstErr: '', chapter: chapterKey() };
-        pagesCache = { chapter: sweep.chapter, n: usable.length };
-        inpaintReported = false;
-        lastProgress = Date.now();
-        watchdog = setInterval(sweepWatchdog, SWEEP_WATCHDOG_MS);
-        pillUnDismiss();
-        pumpSweepStatus();
-        // runSweep owns finishSweep via its finally — a crash mid-run must never
-        // leak a zombie `sweep` that blocks Stop/new starts/auto.
-        void runSweep(usable, priority);
-        return { ok: true, total: usable.length };
-    } finally {
-        starting = false;
-    }
+        // Capture readable opaque pixels before the reader can destroy their document.
+        for (const page of pages) if (!/^https?:/.test(page.url)) page.source = await capture(page);
+        if (startCancelled || chapter !== chapterKey()) return { ok: true, cancelled: true };
+        const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-start', data: {
+            chapter, readerUrl: location.href, pages, completeManifest: found.complete,
+            pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,
+            nextDocument: found.complete ? undefined : nextDocument(document, location.href, chapter),
+            imageSelector: readerImageSelector(),
+        } });
+        if (!response?.ok) throw new Error(response?.error || 'Could not start chapter translation');
+        if (startCancelled) { await control('stop'); return { ok: true, cancelled: true }; }
+        progress = response.status ?? { id: response.id, chapter, phase: 'running', done: 0, total: pages.length,
+            errors: 0, inflight: 0, completeManifest: found.complete,
+            pages: pages.map(p => ({ id: p.id, url: p.url, phase: 'queued' })) };
+        showProgress();
+        return { ok: true, total: pages.length };
+    } catch (e) {
+        reportError(e);
+        return { ok: false, error: (e as Error).message };
+    } finally { starting = false; if (!sweepActive()) removeActivity('sweep'); }
+}
+function readerImageSelector(): string | undefined {
+    const ref = visible();
+    if (ref?.kind !== 'img') return undefined;
+    if (ref.el.id) return `img#${CSS.escape(ref.el.id)}`;
+    if (ref.el.classList.length) return 'img.' + [...ref.el.classList].map(c => CSS.escape(c)).join('.');
+    const parent = ref.el.parentElement;
+    if (parent?.id) return `#${CSS.escape(parent.id)} img`;
+    return undefined;
 }
 export function cancelSweep(): { ok: boolean } {
-    startCancel = true; // enumeration abort (no-op once the run exists)
-    abortLookahead(); // user stop must also stop a warming chain (auto resumes after the drain)
-    // a translate RPC can sit in the adapter's 240s timeout: without this the cancel
-    // flag could not land until that await settled and Stop looked dead for minutes.
-    // The in-flight page's tokens are already spent either way.
-    abortLiveRpcs();
-    if (sweep) {
-        sweep.cancel = true;
-        pumpSweepStatus(); // pill flips to Stopping now, not after the 90s drain
+    startCancelled = true;
+    if (progress && sweepActive()) {
+        progress.phase = 'stopping';
+        showProgress();
+        void control('stop').catch(reportError);
     }
     return { ok: true };
 }
-export function initSweep(): void {
-    registerSweepWaiter(awaitSweep);
-}
-
-// ---- manifest walk: episode canvases → gallery manifest → DOM refs (DOM
-// order). DOM readers sweep the live elements through preparePage — the same
-// read path as DOM jobs. `anchor` is the page the reader is LOOKING AT (-1 when
-// unknown): startSweep translates it plus the pages ahead first, then the
-// ordered walk still starts at index 0 so the book accumulates in reading order.
-function origOf(ref: PageRef): string | null {
-    // callers pass img refs only — the cast is safe.
-    const el = ref.el as HTMLImageElement;
-    const kept = stateFor(ref)?.orig;
-    if (kept && /^https?:/.test(kept)) return kept;
-    return /^https?:/.test(el.src) ? el.src : null;
-}
-// the loaded ref with the largest viewport overlap — the page under the reader's eye.
-function visibleRef(): PageRef | undefined {
-    let best: PageRef | undefined, area = 0;
-    for (const r of getPages()) {
-        const o = viewportOverlap(r);
-        if (o > area) { area = o; best = r; }
-    }
-    return best;
-}
-// Index of `ref`'s page inside the sweep list. `refKey` is the page's ORIGINAL src while
-// untranslated, but after a translate the element shows our blob and on paged readers the
-// API URL differs from the DOM src — both make the exact-key match miss forever (anchor -1,
-// priority window silently degraded to the chapter head). Try the original URL first
-// (`origOf`), then page-path equality for CDN host rotation. Pure given the ref.
-function anchorIn(items: SweepItem[], ref: PageRef | undefined): number {
-    if (!ref) return -1;
-    const cands = [origOf(ref), refKey(ref)].filter((u): u is string => !!u);
-    return matchAnchor(items.map(it => it.url), cands);
-}
-async function sweepItems(): Promise<{ items: SweepItem[]; anchor: number }> {
-    const ref = visibleRef();
-    const ep = episodeManifestSrcs();
-    if (ep?.length) {
-        const items = ep.map(url => ({ url, descramble: true }));
-        return { items, anchor: anchorIn(items, ref) };
-    }
-    // paged readers virtualize the DOM — the chapter API lists every page, so
-    // the count is the chapter, not the window. [] → fall through to DOM branches.
-    const paged = await fetchPagedUrls();
-    if (paged.length) {
-        const items = paged.map(url => ({ url, descramble: false }));
-        return { items, anchor: anchorIn(items, ref) };
-    }
-    const refs = getPages().filter(r => r.kind === 'img');
-    for (const r of refs) {
-        const anchor = origOf(r);
-        if (!anchor) continue;
-        const g = galleryAllUrls(await galleryManifestJson(), anchor);
-        if (g.urls.length) {
-            const items = g.urls.map(url => ({ url, descramble: false }));
-            return { items, anchor: anchorIn(items, ref) };
-        }
-        break; // anchor read, manifest absent — DOM reader, fall through once
-    }
-    // plain DOM reader: sweep the live refs PLUS lazy <img> with an http(s) src
-    // but no pixels yet (deduped against the live refs). Junk fetched this way
-    // dies at the fetch size-gate in workPage (skip, never an LLM call).
-    const live = getPages();
-    const known = new Set<string>();
-    for (const r of live) {
-        known.add(refKey(r));
-        if (r.kind === 'img') { known.add(r.el.src); known.add(r.el.currentSrc); }
-    }
-    const items: SweepItem[] = live.map(ref => ({ url: refKey(ref), descramble: false, ref }));
-    for (const u of collectUnloadedUrls(known)) items.push({ url: u, descramble: false });
-    return { items, anchor: ref ? live.findIndex(r => r.el === ref.el) : -1 };
-}
-
-// ---- the run: N workers, ordered commit, warm-up gate. finishSweep lives in
-// the finally: a commit/context crash must never leak the run.
-async function runSweep(items: SweepItem[], priority: number[]): Promise<void> {
-    const chapter = sweep!.chapter;
-    // pool sized by the machine, not a constant: cloud endpoints serve calls
-    // in parallel; a local CPU detector is ORT-lock-serial anyway (see sweepPoolSize).
-    const pool = sweepPoolSize(pipeline.inferEngine === 'cloud', 'gpu' in navigator, pipeline.detEp === 'wasm');
-    const cloud = pipeline.inferEngine === 'cloud';
-    let next = 0, head = 0, streak = 0;
-    const ready = new Map<number, Commit>();
-    const prio = new Set(priority);
-    // drain the consecutive run from the head (atomic: sync take + head move,
-    // then awaited commits of disjoint sets — workers never double-commit).
-    const commitAhead = async (): Promise<void> => {
-        const r = takeOrdered(ready, head);
-        head = r.head;
-        for (const c of r.items) {
-            const s = sweep;
-            if (!s || s.chapter !== chapter) { // aborted mid-drain — drop (book safety), unblock waiter
-                for (const d of r.items) settleUrl(d.url);
-                return;
-            }
-            let bad = 'error' in c;
-            try {
-                await commitPage(c, s);
-            } catch (e) {
-                // one bad commit must not kill the run: count it, keep the order.
-                bad = true;
-                s.errors++;
-                if (!s.firstErr) s.firstErr = (e as Error)?.message ?? String(e);
-                console.warn('[mt] sweep commit failed:', c.url.slice(-14), e);
-            }
-            lastProgress = Date.now();
-            if (bad) streak++;
-            else streak = 0;
-        }
-    };
-    const worker = async (): Promise<void> => {
-        for (;;) {
-            const s = sweep;
-            if (!s || s.cancel || s.dead || chapterKey() !== chapter) {
-                if (s && !s.dead && chapterKey() !== chapter) s.dead = true; // SPA story change — quiet abort
-                return;
-            }
-            // provider refused (rate limit / auth): the remaining pages would be
-            // refused too — stop dispatch and drain.
-            if (autoHalted()) {
-                s.failed = true;
-                s.cancel = true;
-                if (!s.firstErr) s.firstErr = 'provider refused requests (rate limit / auth) — see the error log';
-                return;
-            }
-            // warm-up serial gate is a local-ORT-ism (2 commits seed the book
-            // before the pool opens); the cloud endpoint serves in parallel.
-            if (inflight.size >= (cloud || s.done >= SWEEP_WARMUP ? pool : 1)) { await sleep(400); continue; }
-            let k = next++;
-            while (k < items.length && prio.has(k)) k = next++; // priority pages are already committed
-            const job = items[k];
-            if (!job) return;
-            inflight.set(job.url, true);
-            lastProgress = Date.now();
-            let res: Commit | null = null;
-            try {
-                res = await workPage({ ...job, i: k }, chapter);
-            } catch (e) {
-                if (isDebug()) console.log('[mt] sweep worker threw:', (e as Error)?.message);
-            } finally {
-                inflight.delete(job.url);
-            }
-            if (!sweep || sweep.chapter !== chapter) { settleUrl(job.url); return; } // dropped, unblock waiter
-            ready.set(k, res ?? { i: k, url: job.url, error: true });
-            await commitAhead();
-            pumpSweepStatus();
-            if (streak >= SWEEP_MAX_CONSECUTIVE_ERRORS) {
-                sweep.failed = true;
-                sweep.cancel = true; // stop dispatch, drain commits
-                return;
-            }
-        }
-    };
-    // priority phase: the visible page and the pages ahead translate before the
-    // pool opens. Committed here (out of order — the book folds by page order in
-    // commitPage) and mirrored into `ready` as `pre` markers so the ordered drain
-    // passes them without double-counting.
-    const priorityPhase = async (): Promise<void> => {
-        if (!priority.length) return;
-        const endKeepalive = keepaliveOpen();
-        // skip an item already done/claimed — never pay a second LLM call for a page
-        // an auto/DOM job or the paint lane already owns (the ordered drain passes it).
-        // Ref-less items (manifest/paged/gallery lists) have no element to key on, so
-        // they match by page path, which also sees host-rotated twins.
-        const owned = (job: SweepItem): boolean => {
-            if (!job.ref) return queueOwnsPath(job.url);
-            const key = refKey(job.ref);
-            return !!queueFind(key) || !!paintHas(key)
-                || (!!activeRefGet() && pageKeyOf(activeRefGet()!) === key)
-                || !!stateFor(job.ref);
-        };
-        try {
-            const phaseStart = Date.now();
-            console.log(`[mt:trace] priorityPhase START n=${priority.length} indices=[${priority.join(',')}]`);
-            for (let j = 0; j < priority.length; j++) {
-                const s = sweep;
-                if (!s || s.cancel || s.dead || chapterKey() !== chapter) { console.log(`[mt:trace] priorityPhase BREAK at j=${j} (cancel/dead/chapter-change)`); break; }
-                if (Date.now() - phaseStart > PRIORITY_PHASE_MAX_MS) { console.log(`[mt:trace] priorityPhase DEADLINE after ${Date.now() - phaseStart}ms at j=${j}`); break; }
-                const k = priority[j];
-                const job = items[k];
-                if (!job) continue; // unreachable: priority indices come from this array
-                setActivity('sweep', `Translating your page (${j + 1}/${priority.length})…`, 'sweep', 'detect');
-                if (owned(job)) {
-                    console.log(`[mt:trace] priority ${j + 1}/${priority.length} idx=${k} SKIP (owned: ${job.url.slice(-30)})`);
-                    ready.set(k, { i: k, url: job.url, pre: true });
-                    continue;
-                }
-                console.log(`[mt:trace] priority ${j + 1}/${priority.length} idx=${k} START ${job.url.slice(-30)}`);
-                const tPage = Date.now();
-                inflight.set(job.url, true);
-                let res: Commit | null = null;
-                try {
-                    res = await workPage({ ...job, i: k }, chapter);
-                } catch (e) {
-                    if (isDebug()) console.log('[mt] sweep priority page threw:', (e as Error)?.message);
-                } finally {
-                    inflight.delete(job.url);
-                }
-                const kind = res && 'error' in res ? 'ERROR' : res && 'skip' in res ? 'SKIP' : res && 'cached' in res ? 'CACHED' : 'OK';
-                console.log(`[mt:trace] priority ${j + 1}/${priority.length} idx=${k} DONE in ${Date.now() - tPage}ms → ${kind}`, (res && 'error' in res && res.msg) ? res.msg.slice(0, 100) : '');
-                lastProgress = Date.now();
-                if (!sweep || sweep.chapter !== chapter) { settleUrl(job.url); break; } // story moved on
-                // Stop pressed while this page was in flight: the run must not commit
-                // behind the user's back. The page is uncommitted, the ordered drain
-                // starts at the head and simply never reaches this marker.
-                if (sweep.cancel || sweep.dead) { console.log(`[mt:trace] priority ${j + 1}/${priority.length} idx=${k} CANCELLED — no marker`); settleUrl(job.url); break; }
-                // the ordered drain must pass this index even when the page failed —
-                // the marker is a no-op, the work (and its error) already landed here.
-                ready.set(k, { i: k, url: job.url, pre: true });
-                try {
-                    await commitPage(res ?? { i: k, url: job.url, error: true }, s);
-                } catch (e) {
-                    s.errors++;
-                    if (!s.firstErr) s.firstErr = (e as Error)?.message ?? String(e);
-                }
-                await commitAhead(); // priority pages sitting at the head settle at once
-                pumpSweepStatus();
-            }
-            console.log('[mt:trace] priorityPhase END');
-        } finally {
-            endKeepalive();
-        }
-    };
-    // the run holds the background alive (FF event page / MV3 SW idle-kill would
-    // otherwise drop every worker's LLM call mid-flight).
-    const endKeepalive = keepaliveOpen();
-    try {
-        await priorityPhase();
-        await Promise.all(Array.from({ length: Math.min(pool, items.length) }, () => worker()));
-        await commitAhead(); // final drain (usually a no-op)
-    } catch (e) {
-        // workers/commitAhead are internally caught — anything landing here is a bug.
-        const s = sweep;
-        if (s && s.chapter === chapter) {
-            s.failed = true;
-            if (!s.firstErr) s.firstErr = (e as Error)?.message ?? String(e);
-        }
-        console.warn('[mt] sweep run crashed:', e);
-    } finally {
-        endKeepalive();
-        finishSweep();
-    }
-}
-
-// stalled run (hung fetch/infer with no timeout): force-finish so the popup,
-// Stop and auto can never be blocked by a wedged worker.
-function sweepWatchdog(): void {
-    const s = sweep;
-    if (!s || s.dead) return;
-    if (Date.now() - lastProgress <= SWEEP_STALL_MS) return;
-    console.warn('[mt] sweep stalled — no progress for', Math.round((Date.now() - lastProgress) / 1000), 's; aborting run');
-    s.failed = true;
-    s.cancel = true;
-    if (!s.firstErr) s.firstErr = 'stalled (no progress for 5 min)';
-    finishSweep();
-}
-
-async function workPage(job: SweepItem & { i: number }, chapter: string): Promise<Commit | null> {
-    if (cooldownParked(failMarks, job.url, Date.now())) return { i: job.i, url: job.url, error: true };
-    if (job.ref) return workDomPage(job as SweepItem & { i: number; ref: PageRef }, chapter);
-    const st: MtOnStatus = () => {}; // the pool shares one pill line (pumpSweepStatus) — per-worker stages would thrash it
-    const tJob = Date.now();
-    const tag = job.url.slice(-24);
-    try {
-        console.log(`[mt:trace] workPage START ${tag} (i=${job.i})`);
-        const tFetch = Date.now();
-        const f = await fetchBitmap(job.url); // direct → SW proxy → DNR retry, same as DOM pages
-        const fetchMs = Date.now() - tFetch;
-        let bitmap = f.bitmap;
-        let aiWarm: Promise<AiPatches | null> | null = null;
-        // fetch size-gate (mirrors the getPages floor): junk below this is skipped.
-        if (bitmap.width < 400 || bitmap.height < 300) return { i: job.i, url: job.url, skip: true };
-        if (job.descramble) {
-            try {
-                const fixed = await unscrambleTiles(bitmap);
-                if (fixed) { bitmap.close(); bitmap = fixed.bitmap; }
-            } catch { /* gate/pixel failure — translate fetched bytes as-is */ }
-        }
-        try {
-            if (chapterKey() !== chapter) return null; // story moved on mid-fetch — drop silently
-            const hash = pageHashFromBitmap(bitmap);
-            const w = bitmap.width, h = bitmap.height;
-            // shared headless resolve (full hit → cached marker, partial → resume,
-            // else detect + order + checkpoint).
-            const tDet = Date.now();
-            const r = await resolveHeadlessDet(bitmap, hash, st);
-            const detMs = Date.now() - tDet;
-            if (!r.det) { console.log(`[mt:trace] workPage ${tag} CACHED in ${Date.now() - tJob}ms (fetch=${fetchMs} det=${detMs})`); return { i: job.i, url: job.url, hash, cached: true }; }
-            translating++;
-            let o: TranslateOutcome;
-            const tLlm = Date.now();
-            try {
-                // fold:false — the commit folds in chapter order (rebase), never here.
-                // afterOcr: the AI cleanup warm (all boxes) overlaps the LLM's network
-                // wait, so the committed page never pays a second inpaint roundtrip.
-                const warm = pipeline.cacheEnabled && inpaintMode(pipeline) === 'local'
-                    ? { afterOcr: (): void => { aiWarm = computeAiPatches(bitmap, r.det!, r.det!.boxes, [], { lo: true, noDownload: true }).catch(() => null); } }
-                    : null;
-                o = await translateRegions(bitmap, r.det, st, { fold: false, progressKey: job.url, continued: r.resumed || !pipeline.cacheEnabled, lo: true, ...warm });
-            } finally {
-                translating--;
-            }
-            if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
-            const llmMs = Date.now() - tLlm;
-            const ai = await warmedPatches(bitmap, r.det, o.outputs, aiWarm);
-            await paintVisibleNow(job, hash, r.det, o, bitmap, undefined, ai);
-            console.log(`[mt:trace] workPage ${tag} OK in ${Date.now() - tJob}ms (fetch=${fetchMs} det=${detMs} llm=${llmMs} regions=${o.outputs.length})`);
-            return { i: job.i, url: job.url, hash, w, h, det: r.det, o, ai };
-        } finally {
-            try { bitmap.close(); } catch { /* already closed */ }
-        }
-    } catch (e) {
-        cooldownMark(failMarks, job.url, Date.now());
-        const msg = (e as Error)?.message ?? String(e);
-        console.warn(`[mt:trace] workPage ${tag} FAILED in ${Date.now() - tJob}ms: ${msg.slice(0, 140)}`);
-        return { i: job.i, url: job.url, error: true as const, msg };
-    }
-}
-
-// DOM flavor: read through preparePage, translate, commit shared.
-// Null prep with existing state = done elsewhere (cached marker); null
-// without state = blank canvas (skip marker).
-async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter: string): Promise<Commit | null> {
-    const st: MtOnStatus = () => {};
-    let aiWarm: Promise<AiPatches | null> | null = null;
-    try {
-        const already = stateFor(job.ref);
-        if (already) return { i: job.i, url: job.url, hash: already.hash, cached: true, ref: job.ref };
-        // a DOM job already owns this page (the user's own Translate / an arriving
-        // paint) — it produces the same cache entry and paints; sweeping it too
-        // would pay a second LLM call. The ordered drain still passes the index.
-        const key = refKey(job.ref);
-        if (queueFind(key) || (activeRefGet() && pageKeyOf(activeRefGet()!) === key) || paintHas(key)) {
-            return { i: job.i, url: job.url, pre: true };
-        }
-        const prep = await preparePage(job.ref, false, st, true);
-        if (!prep) {
-            const done = stateFor(job.ref);
-            return done
-                ? { i: job.i, url: job.url, hash: done.hash, cached: true, ref: job.ref }
-                : { i: job.i, url: job.url, skip: true };
-        }
-        if (prep.cached) return { i: job.i, url: job.url, hash: prep.hash, cached: true, ref: job.ref };
-        if (chapterKey() !== chapter) { try { prep.bitmap.close(); } catch {} return null; }
-        const w = prep.bitmap.width, h = prep.bitmap.height; // before close below
-        translating++;
-        let o: TranslateOutcome;
-        try {
-            const warm = pipeline.cacheEnabled && inpaintMode(pipeline) === 'local'
-                ? { afterOcr: (): void => { aiWarm = computeAiPatches(prep.bitmap, prep.det, prep.det.boxes, [], { lo: true, noDownload: true }).catch(() => null); } }
-                : null;
-            o = await translateRegions(prep.bitmap, prep.det, st, { fold: false, progressKey: job.url, continued: !!prep.resumed || !pipeline.cacheEnabled, lo: true, ...warm });
-        } finally {
-            translating--;
-        }
-        if (o.error) {
-            try { prep.bitmap.close(); } catch { /* already closed */ }
-            throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
-        }
-        // warm AI cleanup + early paint need the original pixels: keep the
-        // bitmap alive until both resolve.
-        const ai = await warmedPatches(prep.bitmap, prep.det, o.outputs, aiWarm);
-        await paintVisibleNow(job, prep.hash, prep.det, o, prep.bitmap, prep.origBytes, ai);
-        try { prep.bitmap.close(); } catch { /* already closed */ }
-        return { i: job.i, url: job.url, hash: prep.hash, w, h, det: prep.det, o, ref: job.ref, ai };
-    } catch (e) {
-        cooldownMark(failMarks, job.url, Date.now());
-        const msg = (e as Error)?.message ?? String(e);
-        console.warn('[mt] sweep page failed:', job.url.slice(-24), msg);
-        return { i: job.i, url: job.url, error: true as const, msg };
-    }
-}
-
-// full commit, in chapter order: rebase fold + cache write + counters.
-// Cached skips count done without folding.
-async function commitPage(c: Commit, s: SweepRun): Promise<void> {
-    settleUrl(c.url);
-    // already counted by the priority phase — the ordered head only passes it.
-    if ('pre' in c) return;
-    if ('error' in c) {
-        s.errors++;
-        if (c.msg && !s.firstErr) s.firstErr = c.msg;
-        return;
-    }
-    if ('skip' in c) { s.skipped++; return; }
-    if ('cached' in c) {
-        s.done++;
-        if (c.hash) { committedSync(); committedHashes.add(c.hash); }
-        // unconditional: the user may be looking at the page right now —
-        // paintIfLoaded resolves loaded refs itself and no-ops otherwise.
-        await paintIfLoaded(c.url, c.hash, c.ref);
-        return;
-    }
-    if (shareContext && !bookHas(c.hash)) {
-        const u = updateContext(context, c.o.outputs, c.o.mentions, pipeline.useCharacters, pipeline.contextPairs);
-        setContext(u.ctx);
-        await saveContext();
-    }
-    bookAdd(c.hash);
-    committedSync(); committedHashes.add(c.hash);
-    if (pipeline.cacheEnabled) {
-        // await, not void: the paintIfLoaded job below must not see the stale
-        // partial checkpoint (or it re-runs translateRegions — a duplicate LLM roundtrip).
-        await cachePut({
-            key: cacheKey(s.chapter, c.hash),
-            fp: settingsFingerprint(pipeline),
-            w: c.w, h: c.h,
-            boxes: c.det.boxes, panels: c.det.panels ?? [],
-            outputs: c.o.outputs, extras: c.o.extras, mentions: c.o.mentions,
-            ...(c.ai ? { patches: c.ai.patches, patchesGen: c.ai.patchesGen } : null),
-            mask: packMask(c.det.mask),
-            splitGen: c.det.splitGen ?? 0,
-            ep: c.det.ep,
-        }, pipeline.cacheMax);
-    } else {
-        void cacheDelete(cacheKey(s.chapter, c.hash)); // cache off: drop the resume checkpoint this commit finished
-    }
-    s.done++;
-    if (c.o.usage) {
-        sessionUsage.pages++;
-        sessionUsage.inTok += c.o.usage.inTok ?? 0;
-        sessionUsage.outTok += c.o.usage.outTok ?? 0;
-        sessionUsage.cachedInTok += c.o.usage.cachedInTok ?? 0;
-    }
-    setLastPageUsage({ inTok: c.o.usage?.inTok, outTok: c.o.usage?.outTok, cachedInTok: c.o.usage?.cachedInTok, ms: c.o.llmMs, calls: c.o.llmCalls });
-    await paintIfLoaded(c.url, c.hash, c.ref);
-}
-
-// The page the user is LOOKING AT must not wait for the ordered commit:
-// paint it now (paintOnly — no fold, no cache write), let the ordered commit
-// fold it later. Serialized through one chain: parallel early paints are jank.
-// Caller keeps the bitmap alive until this resolves.
-let earlyPaintChain: Promise<unknown> = Promise.resolve();
-async function paintVisibleNow(job: SweepItem, hash: string, det: DetectResult, o: TranslateOutcome, bitmap: ImageBitmap, origBytes?: ArrayBuffer,
-    ai?: { patches: InpaintPatch[]; patchesGen: number } | null): Promise<void> {
-    const ref = await resolvePaintRef(job.url, hash, job.ref);
-    if (!ref || stateFor(ref) || viewportOverlap(ref) <= 0) return;
-    const chain = earlyPaintChain.then(async () => {
-        if (stateFor(ref)) return;
-        const prep: Prep = {
-            srcUrl: refKey(ref), bitmap, det, hash, origBytes,
-            cached: {
-                outputs: o.outputs, extras: o.extras, mentions: o.mentions,
-                ...(ai ? { patches: ai.patches, patchesGen: ai.patchesGen } : null),
-            },
-        };
-        await renderPage(ref, prep, () => {}, false, { paintOnly: true });
-        // the paint only reaches the element once shownSrc says "translated".
-        if (overlayChoice === 'auto') setOverlayOn(true);
-        applyOverlays();
-        if (isDebug()) console.log('[mt] sweep early paint', job.url.slice(-14));
-    });
-    earlyPaintChain = chain.catch(() => { /* one bad paint must not stall the chain */ });
-    return chain;
-}
-
-// a commit must paint every copy the user can see — arrival only paints via
-// a DOM job, and headless commits create no state.
-// DOM commits carry their ref; headless ones resolve it by claim key, with
-// samePagePath fallback for CDN host rotation and content-hash fallback for
-// opaque-src readers (verify by exact bytes, never paint blind).
-async function resolvePaintRef(url: string, hash: string | undefined, direct?: PageRef): Promise<PageRef | undefined> {
-    return (direct && direct.el.isConnected && !stateFor(direct) ? direct : undefined)
-        ?? getPages().find(r => pageKeyOf(r) === url && !stateFor(r))
-        ?? getPages().find(r => !stateFor(r) && samePagePath(pageKeyOf(r), url))
-        ?? (hash ? await viewedByHash(url, hash) : undefined);
-}
-
-async function paintIfLoaded(url: string, hash: string | undefined, direct?: PageRef): Promise<void> {
-    if (!sweep) return;
-    const ref = await resolvePaintRef(url, hash, direct);
-    if (!ref) { if (isDebug()) console.log('[mt] sweep paint miss: no ref', url.slice(-24)); return; }
-    if (stateFor(ref)) return; // painted while resolving
-    // zero-rect only (hidden placeholders arrive-paint when the reader shows
-    // them): offscreen-but-loaded pages paint too.
-    const b = ref.el.getBoundingClientRect();
-    if (b.width === 0 && b.height === 0) { if (isDebug()) console.log('[mt] sweep paint miss: zero-rect', url.slice(-24)); return; }
-    enqueue(ref, false, true);
-}
-
-// top-3 visible loaded stateless imgs by content hash. Decoded from the
-// ELEMENT (createImageBitmap) — content-script fetch() of a page-minted blob:
-// URL is unreliable. Bounded: at most 3 local decodes per commit.
-async function viewedByHash(url: string, hash: string): Promise<PageRef | undefined> {
-    const cands = getPages()
-        .filter(r => {
-            if (r.kind !== 'img' || stateFor(r)) return false;
-            const img = r.el as HTMLImageElement;
-            return img.complete && img.naturalWidth > 0 && img.getBoundingClientRect().width > 0;
-        })
-        .sort((a, b) => viewportOverlap(b) - viewportOverlap(a))
-        .slice(0, 3);
-    let compared = 0, unreadable = 0;
-    for (const c of cands) {
-        let bmp: ImageBitmap | null = null;
-        try {
-            bmp = await createImageBitmap(c.el as HTMLImageElement);
-        } catch { unreadable++; continue; }
-        try {
-            compared++;
-            if (pageHashFromBitmap(bmp) === hash) return c;
-        } catch { unreadable++; compared--; }
-        finally { try { bmp.close(); } catch { /* already closed */ } }
-    }
-    if (!isDebug()) return undefined;
-    if (compared) console.log('[mt] sweep paint hash-mismatch', `${compared} tried`, url.slice(-24));
-    else if (unreadable || cands.length) console.log('[mt] sweep paint hash-unreadable', `${unreadable}/${cands.length}`, url.slice(-24));
-    return undefined;
-}
-
-function pumpSweepStatus(): void {
-    const s = sweep;
-    if (!s) return;
-    // auto yields to the sweep by design — say so, or an enabled-but-silent
-    // auto reads as broken.
-    const paused = autoTranslateOn() ? ' · auto paused' : '';
-    if (s.cancel && !s.dead) {
-        // Stop was pressed — the in-flight pages still drain (no mid-LLM
-        // abort), and this line is the only proof the press landed.
-        const finishing = inflight.size || translating ? ` — finishing ${Math.max(inflight.size, 1)} page${Math.max(inflight.size, 1) > 1 ? 's' : ''}…` : '…';
-        setActivity('sweep', `Stopping sweep ${s.done}/${s.total}${finishing}${paused}`, 'sweep', translating > 0 ? 'llm' : 'detect');
-        return;
-    }
-    const tail = [s.errors ? `${s.errors} failed` : '', s.skipped ? `${s.skipped} skipped` : ''].filter(Boolean).join(' · ');
-    setActivity('sweep', `Sweeping chapter ${s.done}/${s.total}${paused}…${tail ? ` (${tail})` : ''}`,
-        'sweep', translating > 0 ? 'llm' : 'detect');
-}
-
-function finishSweep(): void {
-    const s = sweep;
-    sweep = null;
-    if (watchdog) { clearInterval(watchdog); watchdog = null; }
-    removeActivity('sweep');
-    for (const url of [...waiters.keys()]) settleUrl(url); // undispatched claims never exist — belt & braces
-    if (!s) { renderStatus(); return; }
-    if (s.dead) { renderStatus(); return; } // chapter moved on — quiet, the new chapter owns the pill
-    if (!s.failed && !s.cancel) {
-        // best-effort paint pass (natural finish only — cancel/error must not
-        // start new work): elements that appeared after their commit translate
-        // solo here. Parked pages are skipped.
-        const now = Date.now();
-        for (const ref of getPages()) {
-            if (!stateFor(ref) && ref.el.isConnected && !cooldownParked(failMarks, pageKeyOf(ref), now)) enqueue(ref, false, true);
-        }
-    }    const gaps = [s.errors ? `${s.errors} failed` : '', s.skipped ? `${s.skipped} skipped` : ''].filter(Boolean).join(', ');
-    const until = Date.now() + 6000;
-    if (s.failed) lastMsgSet({ text: `Sweep stopped after errors — ${s.done}/${s.total} ready (${(s.firstErr || 'unknown').slice(0, 90)})`, phase: 'error', until: Date.now() + 10000 });
-    else if (s.cancel) lastMsgSet({ text: `Sweep stopped — ${s.done}/${s.total} ready`, phase: 'done', until });
-    else lastMsgSet({
-        text: gaps ? `Chapter ready with gaps — ${s.done}/${s.total} pages (${gaps})` : `Chapter ready — ${s.done}/${s.total} pages`,
-        phase: 'done', until,
-    });
-    renderStatus();
-}
-
-const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-
-// A missing AI-cleanup model is a configuration error, not a page failure: warn
-// once per run (toast + error log) and fall back to the built-in fill so the
-// chapter still finishes. Any other warm failure stays silent (best-effort).
-function warmedPatches(bitmap: ImageBitmap, det: DetectResult, outputs: TranslateOutcome['outputs'], warm: Promise<AiPatches | null> | null) {
-    return warmPatches(bitmap, det, outputs, warm ?? undefined).catch((e: unknown) => {
-        if (e instanceof InpaintUnavailable && !inpaintReported) {
-            inpaintReported = true;
-            lastMsgSet({ text: `AI text cleanup unavailable — ${e.message.slice(0, 90)}`, phase: 'error', until: Date.now() + 15000 });
+function showProgress(): void {
+    if (!progress || progress.chapter !== chapterKey()) return;
+    const text = chapterMessage(progress);
+    if (sweepActive()) setActivity('sweep', text, 'sweep', progress.inflight ? 'llm' : 'read');
+    else {
+        removeActivity('sweep');
+        const token = progress.id + ':' + text;
+        if (notified !== token) {
+            notified = token;
+            lastMsgSet({ text, phase: progress.phase === 'error' ? 'error' : 'done', until: Date.now() + 8000 });
             renderStatus();
-            void logError(e.message, e.hint, 'inpaint');
-        } else if (isDebug()) {
-            console.log('[mt] warm patches unavailable:', String((e as Error)?.message ?? e).slice(0, 140));
         }
-        return null;
-    });
+        if (progress.phase === 'error') haltAuto('chapter');
+    }
 }
-
+async function capture(page: Pick<ChapterPage, 'id' | 'url'>): Promise<string | undefined> {
+    const pending = sourceRequests.get(page.id);
+    if (pending) return pending;
+    const task = (async () => {
+        const ref = refs.get(page.id) ?? getPages().find(r => original(r) === page.url);
+        if (!ref?.el.isConnected) return undefined;
+        const old = stateFor(ref);
+        let bitmap: ImageBitmap;
+        if (old?.origBytes) bitmap = await createImageBitmap(new Blob([old.origBytes]));
+        else if (old?.origOwn) bitmap = await createImageBitmap(await (await fetch(old.origOwn)).blob());
+        else if (old) return undefined;
+        else bitmap = await createImageBitmap(ref.el);
+        try {
+            if (await bitmapBlank(bitmap)) return undefined;
+            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+            canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
+            return blobDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
+        } finally { bitmap.close(); }
+    })().catch(() => undefined).finally(() => sourceRequests.delete(page.id));
+    sourceRequests.set(page.id, task);
+    return task;
+}
+async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Promise<void> {
+    if (!progress || attaching.has(ref.el) || document.hidden || viewportOverlap(ref) <= 0) return;
+    const stamp = `${progress.id}:${page.id}:${page.revision ?? 0}`;
+    if (applied.get(ref.el) === stamp && stateFor(ref)) return;
+    const chapter = chapterKey();
+    const src = original(ref);
+    attaching.add(ref.el);
+    let bitmap: ImageBitmap | undefined;
+    try {
+        const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter, page: page.id });
+        const result = response?.result;
+        if (!result || chapterKey() !== chapter || !ref.el.isConnected || original(ref) !== src) return;
+        if (result.signature !== JSON.stringify(pipeline) + ':' + RENDER_GEN) return;
+        const old = stateFor(ref);
+        // Unknown/recycled bindings are verified from the original pixels before painting.
+        if (old?.hash !== page.hash) {
+            if (old) return;
+            try {
+                bitmap = await createImageBitmap(ref.el);
+                if (pageHashFromBitmap(bitmap) !== page.hash) return;
+            } catch {
+                bitmap?.close();
+                bitmap = undefined;
+                if (!/^https?:/.test(src)) return;
+                bitmap = (await fetchBitmap(src)).bitmap;
+                if (pageHashFromBitmap(bitmap) !== page.hash) return;
+            }
+        }
+        const imageBlob = await (await fetch(result.image)).blob();
+        const packed = result.mask ? { w: result.mask.w, h: result.mask.h,
+            data: Uint8Array.from(atob(result.mask.data.split(',')[1]), c => c.charCodeAt(0)).buffer } : undefined;
+        const entry = { ...result.entry, mask: packed } as CachedPage;
+        if (!packed || entry.fp !== settingsFingerprint(pipeline)) return;
+        const translated = URL.createObjectURL(imageBlob);
+        let origBytes = old?.origBytes;
+        let origOwn: string | undefined;
+        if (old?.origOwn) origOwn = URL.createObjectURL(await (await fetch(old.origOwn)).blob());
+        else if (ref.kind === 'img' && src.startsWith('blob:') && bitmap) {
+            const originalCanvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+            originalCanvas.getContext('2d')!.drawImage(bitmap, 0, 0);
+            origOwn = URL.createObjectURL(await originalCanvas.convertToBlob({ type: 'image/png' }));
+        }
+        if (ref.kind === 'canvas' && !origBytes && bitmap) {
+            const originalCanvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+            originalCanvas.getContext('2d')!.drawImage(bitmap, 0, 0);
+            const data = await blobDataUrl(await originalCanvas.convertToBlob({ type: 'image/png' }));
+            origBytes = Uint8Array.from(atob(data.split(',')[1]), c => c.charCodeAt(0)).buffer;
+        }
+        const translatedBmp = ref.kind === 'canvas' ? await createImageBitmap(imageBlob) : undefined;
+        if (chapterKey() !== chapter || !ref.el.isConnected || original(ref) !== src) {
+            URL.revokeObjectURL(translated); if (origOwn) URL.revokeObjectURL(origOwn); translatedBmp?.close(); return;
+        }
+        const state = { orig: src, origOwn, translated, translatedBmp, origBytes, outputs: entry.outputs,
+            mentions: entry.mentions, hash: page.hash,
+            det: { boxes: entry.boxes, panels: entry.panels, inferMs: 0, ep: 'cache',
+                mask: { width: entry.w, height: entry.h, data: unpackMask(packed, entry.w, entry.h) } } };
+        if (old) { unregPage(old); URL.revokeObjectURL(old.translated); }
+        regPage(state);
+        if (pipeline.cacheEnabled) await cachePut({ ...entry, key: cacheKey(chapter, page.hash!) }, pipeline.cacheMax);
+        bookAdd(page.hash!);
+        applied.set(ref.el, stamp);
+        if (overlayChoice === 'auto') setOverlayOn(true);
+        writePage(ref, state);
+    } catch (e) { console.debug('[mt] chapter image attach deferred', e); }
+    finally { bitmap?.close(); attaching.delete(ref.el); }
+}
+async function refresh(): Promise<void> {
+    if (refreshBusy) return;
+    refreshBusy = true;
+    const chapter = chapterKey();
+    try {
+        if (observedChapter !== chapter) { observedChapter = chapter; progress = null; refs.clear(); removeActivity('sweep'); }
+        const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-status', chapter });
+        if (chapterKey() !== chapter) return;
+        if (response?.status) { progress = response.status; showProgress(); }
+        if (!progress) return;
+        for (const ref of getPages()) {
+            if (viewportOverlap(ref) <= 0) continue;
+            const page = owned(original(ref));
+            if (!page) continue;
+            refs.set(page.id, ref);
+            if (page.phase === 'ready') void attach(ref, page);
+            else if (page.phase === 'waiting') {
+                const source = await capture(page);
+                if (source) await control('append', { pages: [{ id: page.id, url: page.url, order: 0, descramble: false, source }] });
+            }
+            else if (sweepActive()) void control('prioritize', { page: page.id }).catch(() => {});
+        }
+        if (sweepActive() && !progress.completeManifest && Date.now() - discoverAt > 5000) {
+            discoverAt = Date.now();
+            const found = await enumerate();
+            const pages = found.pages.filter(p => !progress!.pages.some(old => old.id === p.id));
+            // New DOM pages append after the known sequence; never insert before the start anchor.
+            const last = progress.pages.at(-1);
+            const lastIndex = found.pages.findIndex(p => p.id === last?.id);
+            const added = lastIndex >= 0 ? pages.filter(p => found.pages.indexOf(p) > lastIndex) : [];
+            for (const page of added) if (!/^https?:/.test(page.url)) page.source = await capture(page);
+            if (added.length || found.complete) await control('append', { pages: added, completeManifest: found.complete });
+        }
+    } catch { /* navigation/extension startup: next heartbeat reconnects */ }
+    finally { refreshBusy = false; }
+}
+export function initSweep(): void {
+    registerSweepWaiter(async () => {});
+    chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+        if (sender.id !== chrome.runtime.id) return;
+        if (msg?.type === 'mt:chapter-update' && msg.status.chapter === chapterKey()) {
+            progress = msg.status;
+            showProgress();
+            void refresh();
+        }
+        if (msg?.type === 'mt:chapter-context-updated' && msg.chapter === chapterKey()) acceptChapterContext(msg.context);
+        if (msg?.type === 'mt:chapter-source' && msg.chapter === chapterKey()) {
+            capture(msg.page).then(source => respond({ source }));
+            return true;
+        }
+    });
+    setInterval(() => void refresh(), 1000);
+    void refresh();
+}

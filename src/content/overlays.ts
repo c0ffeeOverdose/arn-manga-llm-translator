@@ -8,7 +8,7 @@ import { cacheGet, cacheKey, pageHashFromBitmap } from './page-cache';
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
 import { autoOn } from './auto';
-import { sweepArrivable, sweepCommitted } from './sweep';
+import { sweepArrivable, sweepCommitted, chapterOwnsRequest } from './sweep';
 import { isDebug } from '../debug';
 
 export function applyOverlays(): void {
@@ -48,6 +48,7 @@ function arrivalStuck(el: Element, src: string, dims: string): boolean {
     return !!m && m.src === src && m.dims === dims && Date.now() - m.at < ARRIVAL_RETRY_MS;
 }
 async function arrivalPaint(ref: PageRef): Promise<void> {
+    if (chapterOwnsRequest(ref, false)) return;
     const el = ref.el;
     // explicit intent only: a reopened page shows originals until the user
     // presses Translate chapter / enables auto. This session's own sweep

@@ -4,6 +4,7 @@
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
 import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
+import { chapterReaderUrl } from './chapter-broker';
 
 // content scripts can't touch storage.session by default — open it up.
 // ?. chain: setAccessLevel doesn't exist on older Firefox, and a sync throw
@@ -455,7 +456,8 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         (async () => {
             try {
                 const { fetchImageBlocked } = await import('../content/page-cache');
-                const blocked = fetchImageBlocked(msg.url, sender.url ?? '');
+                const readerUrl = await chapterReaderUrl(sender);
+                const blocked = fetchImageBlocked(msg.url, readerUrl);
                 if (blocked) { sendResponse({ ok: false, error: `proxy fetch blocked: ${blocked}` }); return; }
                 // hard cap: a CDN that accepts the connection and never answers
                 // would pend this fetch forever — the content side has no timeout.
@@ -463,7 +465,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 // re-check the FINAL url: fetch follows redirects, and a public URL
                 // 302-ing to a loopback host would otherwise resurrect the
                 // local-network readback the pre-fetch check exists to block.
-                const blocked2 = fetchImageBlocked(resp.url, sender.url ?? '');
+                const blocked2 = fetchImageBlocked(resp.url, readerUrl);
                 if (blocked2) { sendResponse({ ok: false, error: `proxy fetch blocked (redirect): ${blocked2}` }); return; }
                 if (!resp.ok) { sendResponse({ ok: false, error: `image HTTP ${resp.status}` }); return; }
                 sendResponse({ ok: true, b64: b64encode(await resp.arrayBuffer()) });
@@ -593,7 +595,6 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     cacheKey: session ?? '', imagesB64: msg.imagesB64 ?? [],
                     regions: msg.regions, context: msgCtx,
                     vision, textOnly: !!msg.textOnly, ocr: !!msg.ocr, split,
-                    pageW: msg.pageW, pageH: msg.pageH,
                 },
                 {
                     provider: settings.provider, model: settings.model, baseUrl: settings.baseUrl ?? '',

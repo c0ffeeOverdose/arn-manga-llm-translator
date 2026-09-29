@@ -57,6 +57,7 @@ export function idleStatus(): string {
     // a provider halt outranks the counts: nothing else runs until the user acts (see haltAuto)
     const halted = autoHalted();
     if (halted) {
+        if (halted.kind === 'chapter') return 'Chapter translation paused — start chapter translation to continue';
         if (halted.kind !== 'ratelimit') return 'Auth/quota error — fix the key, then press Translate';
         const left = halted.until > Date.now() ? ` (${Math.ceil((halted.until - Date.now()) / 1000)}s)` : '';
         return `Rate limited${left} — stopped; press Translate to resume`;

@@ -516,13 +516,15 @@ async function cloudflareChat(base: string, s: LLMSettings, prompt: string, imag
 
 // ---- in-flight adoption identity: everything that can change the model's output is in;
 // routing-only hints stay out. A miss costs only the optimization (fresh call).
+// pageW/pageH are deliberately ABSENT: this id gates a shared LLM call, and page dimensions
+// are not the page's content. Including them let two different pages with no images (OCR
+// mode) hash identically and share one translation.
 export interface TranslateRequestFingerprint {
     cacheKey: string;
     imagesB64: string[];
     regions: RegionInput[];
     context: ContextState;
     vision: boolean; textOnly: boolean; ocr: boolean; split: boolean;
-    pageW: number; pageH: number;
 }
 export interface TranslateFingerprintSettings {
     provider: string; model: string; baseUrl: string; ocrModel: string;
@@ -543,7 +545,7 @@ export function translateRequestParts(
         st.ocrTemperature ?? -1,
         st.useOcrModel, st.stylePrompt, st.targetLang,
         st.useCharacters, st.contextPairs, st.transcribeSrc, st.vlmAssisted,
-        req.vision, req.textOnly, req.ocr, req.split, req.pageW, req.pageH,
+        req.vision, req.textOnly, req.ocr, req.split,
         JSON.stringify(req.regions), JSON.stringify(req.context),
         ...req.imagesB64,
     ];

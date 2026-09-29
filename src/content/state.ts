@@ -4,7 +4,7 @@
 import { EMPTY_CONTEXT, type ContextState, type CharacterEntry, type Mention, type RegionOutput } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { fontStackFor, setRenderTuning } from './render';
-import { sessGet, sessSet } from '../storage-session';
+import { sessGet } from '../storage-session';
 import { normalizeChapterKey, type EpisodeManifest } from './page-cache';
 import type { DetectResult } from './detection';
 
@@ -130,6 +130,7 @@ export let pipeline: PipelineSettings = { ...DEFAULT_PIPELINE_SETTINGS };
 let customFontLoaded = ''; // font-store id whose FontFace is already on document.fonts
 
 export async function loadPipeline(): Promise<PipelineSettings> {
+    if (hostIdentity) return pipeline;
     const { mtPipeline } = await chrome.storage.local.get('mtPipeline');
     pipeline = loadPipelineSettings(mtPipeline);
     setRenderTuning({
@@ -173,13 +174,30 @@ export async function loadPipeline(): Promise<PipelineSettings> {
 // so queue + context survive flipping pages, while a new story gets a fresh key.
 // Pure logic lives in normalizeChapterKey (unit-tested).
 export function chapterKey(): string {
+    if (hostIdentity) return hostIdentity.chapter;
     return normalizeChapterKey(location.origin, location.pathname, location.search, location.hash);
 }
 
 export let context: ContextState = EMPTY_CONTEXT;
+let savedContext: ContextState = structuredClone(EMPTY_CONTEXT);
+let hostIdentity: { chapter: string; bookKey: string } | null = null;
+export function configureChapterHost(chapter: string, book: string, settings: PipelineSettings, ctx: ContextState): void {
+    hostIdentity = { chapter, bookKey: book };
+    pipeline = settings;
+    context = structuredClone(ctx);
+    savedContext = structuredClone(ctx);
+    contextChapter = chapter;
+    contextLoaded = true;
+    setRenderTuning({ minFont: pipeline.minFont, letterSpacing: pipeline.letterSpacing,
+        verticalThreshold: pipeline.verticalThreshold, font: fontStackFor(pipeline.targetLang),
+        textColor: pipeline.textColor, strokeColor: pipeline.strokeColor,
+        textStroke: pipeline.textStroke, textScale: pipeline.textScale });
+}
 export function setContext(c: ContextState): void { context = c; }
 export let contextChapter = chapterKey();
 let contextLoaded = false;
+let contextLoading: { chapter: string; promise: Promise<void> } | null = null;
+let contextSaveRevision = 0;
 export let shareContext = true; // in-page toggle; off = translate each page standalone
 export function setShareContext(v: boolean): void { shareContext = v; }
 
@@ -206,55 +224,72 @@ export async function resolveMangaId(): Promise<string | null> {
 
 // The book is manga-scoped (storage.local, survives restarts) when cross-chapter is on and
 // the manga resolved; otherwise per-chapter session.
-function bookKey(): string {
+export function bookKey(): string {
+    if (hostIdentity) return hostIdentity.bookKey;
     return pipeline.crossChapter && mangaId ? `mtBook:${mangaId}` : `mtCtx:${chapterKey()}`;
 }
 
 export async function loadContext(): Promise<void> {
     if (contextLoaded) return;
-    contextLoaded = true;
+    const chapter = chapterKey();
+    if (contextLoading?.chapter === chapter) return contextLoading.promise;
+    const promise = readContext(chapter).finally(() => {
+        if (contextLoading?.promise === promise) contextLoading = null;
+    });
+    contextLoading = { chapter, promise };
+    return promise;
+}
+async function readContext(chapter: string): Promise<void> {
     await resolveMangaId();
-    const key = `mtCtx:${chapterKey()}`;
-    const stored = await sessGet([key, `mtShare:${chapterKey()}`]);
-    if (stored[`mtShare:${chapterKey()}`] === false) shareContext = false;
+    if (chapterKey() !== chapter) return;
+    const key = `mtCtx:${chapter}`;
+    const bk = bookKey();
+    const stored = await sessGet([key, `mtShare:${chapter}`]);
     // pairs (narrative flow) are ALWAYS chapter-scoped — they die with the chapter
     let pairs: [string, string][] = [];
     if (stored[key]) {
         try {
-            const v = JSON.parse(stored[key] as string) as { ctx: ContextState };
-            if (Array.isArray(v.ctx?.pairs)) pairs = v.ctx.pairs;
+            const v = JSON.parse(stored[key] as string) as { ctx?: ContextState; context?: ContextState };
+            const ctx = v.context ?? v.ctx;
+            if (Array.isArray(ctx?.pairs)) pairs = ctx.pairs;
         } catch { /* corrupt — start fresh */ }
     }
     // the character book follows bookKey()
     let characters: CharacterEntry[] = [];
     try {
-        const bk = bookKey();
+        const entry = bk.startsWith('mtBook:') ? null : JSON.parse((await sessGet(bk))[bk] as string ?? '{}');
         const raw = bk.startsWith('mtBook:')
             ? (await chrome.storage.local.get(bk))[bk]
-            : JSON.parse((await sessGet(bk))[bk] as string ?? '{}')?.ctx?.characters;
+            : (entry.context ?? entry.ctx)?.characters;
         const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
         if (Array.isArray(parsed)) characters = parsed as CharacterEntry[];
     } catch { /* corrupt — start fresh */ }
+    if (chapterKey() !== chapter) return;
+    if (stored[`mtShare:${chapter}`] === false) shareContext = false;
     context = { pairs, characters };
+    savedContext = structuredClone(context);
+    contextLoaded = true;
 }
 
 export async function saveContext(): Promise<void> {
-    const key = `mtCtx:${chapterKey()}`;
-    // pairs stay chapter-scoped; the book follows bookKey()
-    await sessSet({
-        [key]: JSON.stringify({ chapter: chapterKey(), context: { pairs: context.pairs, characters: [] } }),
-        [`mtShare:${chapterKey()}`]: shareContext,
-    });
-    const bk = bookKey();
-    if (bk.startsWith('mtBook:')) {
-        await chrome.storage.local.set({ [bk]: JSON.stringify(context.characters) });
-    } else {
-        await sessSet({ [bk]: JSON.stringify({ chapter: chapterKey(), context }) });
-    }
+    const chapter = chapterKey();
+    const revision = ++contextSaveRevision;
+    const result = await chrome.runtime.sendMessage({ type: 'mt:context-save', chapter,
+        bookKey: bookKey(), before: savedContext, context, share: shareContext });
+    if (!result?.ok) throw new Error(result?.error || 'Could not save character context');
+    if (chapterKey() !== chapter || revision !== contextSaveRevision) return;
+    context = result.context;
+    savedContext = structuredClone(context);
     // surface the character book to the options page
     if (context.characters.length) {
         chrome.runtime.sendMessage({ type: 'mt:char-book', book: context.characters }).catch(() => {});
     }
+}
+
+export function acceptChapterContext(ctx: ContextState): void {
+    context = structuredClone(ctx);
+    savedContext = structuredClone(ctx);
+    contextLoaded = true;
 }
 
 export function resetContextIfNewChapter() {
@@ -264,7 +299,10 @@ export function resetContextIfNewChapter() {
         const keepBook = pipeline.crossChapter && !!mangaId ? context.characters : [];
         context = { pairs: [], characters: keepBook };
         contextLoaded = false;
+        contextSaveRevision++;
         shareContext = true;
+        mangaId = null;
+        mangaIdTried = false;
         resolveMangaId(); // resolve for the new chapter (async, non-blocking)
     }
 }

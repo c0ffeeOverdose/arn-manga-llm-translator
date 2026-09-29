@@ -1,25 +1,21 @@
-// Static guards for the "Stop does nothing" incident.
-//
-// Symptoms: after pressing Stop during a chapter sweep the pill sat on
-// "Stopping…" for minutes; a hung translator RPC ran out its full 240s adapter
-// timeout because nothing could reach it, and the priority phase committed a page
-// after the user had already cancelled. A later reload was required to clear the
-// stuck detector iframe. These read the source because background/sweep cannot be
-// unit-tested (chrome ports, DOM, ORT) — pinning the contract is the next best thing.
+// Cancellation leases fence off late results without waiting for a hung stage.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'fs';
+import { build } from 'esbuild';
 
 const read = (p) => readFileSync(new URL(`../src/${p}`, import.meta.url), 'utf8');
-const sweep = read('content/sweep.ts');
+await build({ entryPoints: ['src/chapter/lifecycle.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-lifecycle.mjs' });
+const { Attempt } = await import('../.test-build/chapter-lifecycle.mjs');
 const ocr = read('content/ocr.ts');
 const detection = read('content/detection.ts');
 
-test('cancelSweep aborts in-flight translate RPCs', () => {
-  const body = sweep.slice(sweep.indexOf('export function cancelSweep'));
-  const end = body.indexOf('\n}');
-  assert.ok(body.slice(0, end).includes('abortLiveRpcs()'),
-    'cancelSweep must call abortLiveRpcs() — a hung RPC otherwise holds Stop for its full timeout');
+test('Stop releases a hung stage immediately', async () => {
+    const attempt = new Attempt(60000);
+    const waiting = Promise.race([new Promise(() => {}), attempt.cancelled.then(() => 'stopped')]);
+    attempt.cancel();
+    assert.equal(await waiting, 'stopped');
+    assert.equal(attempt.valid(), false);
 });
 
 test('translate RPC registers an abort handle and honours it', () => {
@@ -29,20 +25,27 @@ test('translate RPC registers an abort handle and honours it', () => {
   assert.match(ocr, /aborted/, 'a user abort must not be reported as a generic disconnect');
 });
 
-test('priority phase re-checks cancel after the awaited page and never commits behind Stop', () => {
-  // the check must sit AFTER the workPage await, before ready.set/commitPage
-  const phase = sweep.slice(sweep.indexOf('const priorityPhase = async'));
-  const afterAwait = phase.indexOf('res = await workPage');
-  const cancelCheck = phase.indexOf('sweep.cancel || sweep.dead');
-  const marker = phase.indexOf('ready.set(k, { i: k, url: job.url, pre: true });', afterAwait);
-  assert.ok(afterAwait > 0 && cancelCheck > afterAwait, 'cancel must be re-checked after the awaited page');
-  assert.ok(marker > cancelCheck, 'the pre marker must not be written for a cancelled page');
+test('late results from a cancelled attempt cannot acquire a new attempt lease', async () => {
+    const old = new Attempt(60000);
+    let resolve;
+    const page = new Promise(r => { resolve = r; });
+    const committed = [];
+    const late = page.then(value => { if (old.valid()) committed.push(value); });
+    old.cancel();
+    const next = new Attempt(60000);
+    resolve('old result');
+    await late;
+    assert.deepEqual(committed, []);
+    assert.equal(next.valid(), true);
+    next.finish();
 });
 
-test('priority phase is bounded by a deadline', () => {
-  assert.match(sweep, /PRIORITY_PHASE_MAX_MS/);
-  const phase = sweep.slice(sweep.indexOf('const priorityPhase = async'));
-  assert.match(phase, /PRIORITY_PHASE_MAX_MS/, 'the serial phase needs a total-time cap');
+test('a deadline revokes the lease before reporting timeout, exactly once', async () => {
+    let calls = 0;
+    const attempt = new Attempt(5, () => { assert.equal(attempt.valid(), false); calls++; });
+    await attempt.cancelled;
+    attempt.cancel();
+    assert.equal(calls, 1);
 });
 
 test('a timed-out detector iframe is torn down so the next call can rebuild', () => {

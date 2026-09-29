@@ -439,7 +439,7 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState },
 ): Promise<TranslateOutcome> {
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
     // ponytail: region cap 150 — dense art pages can drown a single LLM call.
@@ -530,11 +530,12 @@ export async function translateRegions(
         // build what we send: shareContext off = standalone page (ablation);
         // toggles strip pairs / characters independently (also ablation arms)
         let ctxToSend: ContextState;
+        const snapshot = opts?.context ?? context;
         if (!shareContext) ctxToSend = EMPTY_CONTEXT;
-        else if (pipeline.useContext && pipeline.useCharacters) ctxToSend = context;
+        else if (pipeline.useContext && pipeline.useCharacters) ctxToSend = snapshot;
         else ctxToSend = {
-            pairs: pipeline.useContext ? context.pairs : [],
-            characters: pipeline.useCharacters ? context.characters : [],
+            pairs: pipeline.useContext ? snapshot.pairs : [],
+            characters: pipeline.useCharacters ? snapshot.characters : [],
         };
         // live status during the LLM call — it can take tens of seconds and the
         // previous status would otherwise look stuck.

@@ -15,7 +15,7 @@ import { trySeam, type Job } from './seam';
 import { renderPage } from './render-page';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logError, pillUnDismiss, setStatus } from './status-ui';
 import { applyOverlays } from './overlays';
-import { bookHas } from './sweep'; // paint-lane divert decision — queue↔sweep calls stay in function bodies only, like the queue↔seam cycle
+import { bookHas, chapterOwnsRequest } from './sweep';
 
 export const queue: Job[] = [];
 let running = false;
@@ -116,6 +116,7 @@ export function replayPagesAfter(target: PageState): void {
 // not element: readers swap <img> elements under us, so the same page on a fresh element
 // must still hit 'dup' instead of paying a second LLM call.
 export function enqueue(ref: PageRef, force = false, auto = false): 'queued' | 'dup' | 'active' {
+    if (chapterOwnsRequest(ref, force)) return 'active';
     if (ref.el === activeRef?.el) return 'active';
     const key = pageKeyOf(ref);
     if (force) cooldownClear(failMarks, key); // manual retranslate retries immediately

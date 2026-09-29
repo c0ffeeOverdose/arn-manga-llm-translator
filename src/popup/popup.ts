@@ -129,7 +129,7 @@ async function refreshStatus(): Promise<void> {
         dirBtn.textContent = lastDir.toUpperCase();
         charsBtn.textContent = resp.charsOpen ? 'Hide characters' : 'Characters';
         lastChars = resp.charsOpen;
-        // chapter sweep: whole-chapter background run. stopping = in-flight pages still drain (no mid-LLM abort).
+        // Chapter execution continues independently of reader navigation.
         const sw = resp.sweep as { active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean; done: number; total: number; errors: number } | null;
         sweepRunning = !!sw?.active;
         if (sw?.stopping) {
@@ -139,15 +139,15 @@ async function refreshStatus(): Promise<void> {
             sweepBtn.textContent = 'Cancel start';
             sweepBtn.disabled = false;
         } else if (sw?.phase === 'dead') {
-            sweepBtn.textContent = 'Finishing previous sweep…';
+            sweepBtn.textContent = 'Finishing the previous chapter session…';
             sweepBtn.disabled = true;
         } else if (sw?.active) {
-            sweepBtn.textContent = `Stop sweep (${sw.done}/${sw.total})`;
+            sweepBtn.textContent = `Stop translation (${sw.done}/${sw.total} ready)`;
             sweepBtn.disabled = false;
         } else {
             const sc = await send({ type: 'mt:sweep-count' }) as { ok?: boolean; count?: number } | null;
             const n = sc?.count ?? 0;
-            sweepBtn.textContent = n > 0 ? `Translate chapter (${n} pages)` : 'Translate chapter';
+            sweepBtn.textContent = n > 0 ? `Translate to end of chapter (${n} pages)` : 'Translate to end of chapter';
             sweepBtn.disabled = !sc?.ok || n === 0;
         }
         // translation cache size (separate message — IDB read, not part of mt:status)
@@ -180,12 +180,13 @@ cancelAllBtn.onclick = async () => {
 
 sweepBtn.onclick = async () => {
     if (sweepRunning) {
-        statusEl.textContent = 'Stopping sweep…';
+        statusEl.textContent = 'Stopping chapter translation…';
         await send({ type: 'mt:sweep-cancel' });
     } else {
-        statusEl.textContent = 'Starting chapter sweep…';
+        statusEl.textContent = 'Preparing chapter translation…';
         const resp = await send({ type: 'mt:sweep-start' }) as { ok?: boolean; total?: number; error?: string; starting?: boolean; cancelled?: boolean } | null;
-        statusEl.textContent = resp?.starting ? 'Starting…' : resp?.ok ? `Sweeping ${resp.total} pages…` : (resp?.error ?? 'failed');
+        statusEl.textContent = resp?.cancelled ? 'Chapter translation cancelled.' : resp?.starting ? 'Preparing chapter translation…'
+            : resp?.ok ? `Translating ${resp.total ?? 0} remaining pages…` : (resp?.error ?? 'Could not start chapter translation');
     }
     refreshStatus();
 };

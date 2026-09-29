@@ -1072,6 +1072,17 @@ const ADOPT_ST = {
   useCharacters: true, contextPairs: 40, transcribeSrc: false, vlmAssisted: false,
 };
 
+test('flight adoption: the request key ignores the page argument, so two different pages never share one call', async () => {
+  // Regression: pageW/pageH used to be part of the key. Two different page IMAGES at the
+  // same dimensions therefore hashed identically when the images were not sent (OCR mode),
+  // and the second page silently received the first page's translation.
+  const a = await translateRequestId(translateRequestParts(
+    { ...ADOPT_REQ, imagesB64: [], pageW: 600, pageH: 800 }, ADOPT_ST));
+  const b = await translateRequestId(translateRequestParts(
+    { ...ADOPT_REQ, imagesB64: [], pageW: 600, pageH: 800, regions: [{ index: 1, source: 'Bye' }] }, ADOPT_ST));
+  assert.notEqual(a, b, 'different page content must never adopt another page flight');
+});
+
 test('translateRequestId: stable 64-hex, sensitive to every output-shaping input', async () => {
   const id = await translateRequestId(translateRequestParts(ADOPT_REQ, ADOPT_ST));
   assert.match(id, /^[0-9a-f]{64}$/);

@@ -66,7 +66,17 @@ await Promise.all([
     define: { 'process.env.NODE_ENV': '"production"' },
     loader: { '.ts': 'ts' },
   }),
+  esbuild.build({
+    entryPoints: { host: join(root, 'src/chapter/host.ts') },
+    bundle: true,
+    format: 'esm',
+    target: 'chrome120',
+    minify: true,
+    outfile: join(dist, 'chapter/host.js'),
+    define: { 'process.env.NODE_ENV': '"production"', '__BUILD_ID__': JSON.stringify(buildId) },
+  }),
 ]);
+cpSync(join(root, 'src/chapter/host.html'), join(dist, 'chapter/host.html'));
 
 // manifest gets a unique patch version per build: Chrome caches MV3 service-worker code per version.
 import { readFileSync, writeFileSync } from 'fs';

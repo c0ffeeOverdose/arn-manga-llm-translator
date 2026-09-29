@@ -11,7 +11,7 @@ import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
 import { toggleCharsPanel, charsPanelOpen } from './chars-ui';
 import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
-import { startSweep, cancelSweep, sweepStatus, sweepPages } from './sweep';
+import { startSweep, cancelSweep, sweepStatus, sweepPages, chapterOwnsRequest } from './sweep';
 
 export function toggleOverlay(): void {
     setOverlayOn(!overlayOn);
@@ -183,9 +183,12 @@ export function installMessageListener(): void {
             const ref = imgInViewport();
             if (!ref) { sendResponse({ ok: false, error: 'no manga image in view' }); return; }
             if (pageKeyOf(ref) === activeKeyGet()) { sendResponse({ ok: false, error: 'page is rendering right now' }); return; }
+            // The chapter owner holds this page's pixels and book position: a queue job would
+            // duplicate the render and fold the page twice. Let the owner redo it instead.
+            if (chapterOwnsRequest(ref, true)) { sendResponse({ ok: true, viaChapter: true }); return; }
             dequeue(ref); // re-click replaces the queued twin (keyed by page, no-op if absent)
             const r = enqueue(ref, true);
-            sendResponse(r === 'queued' ? { ok: true } : { ok: false, error: 'could not queue re-translate' });
+            sendResponse(r === 'queued' ? { ok: true } : r === 'active' ? { ok: true, active: true } : { ok: false, error: 'could not queue re-translate' });
             return;
         }
         if (msg?.type === 'mt:toggle-original') {
