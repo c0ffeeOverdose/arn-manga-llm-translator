@@ -39,9 +39,9 @@ export async function callLLM(
     thinkingLevel: string = 'auto', // preset, custom text, or a numeric token budget
     cacheKey?: string, // stable per conversation (manga) — routes provider-side prompt caching
     temperature?: number | null, // pinned sampling temperature; null/undefined = provider default
-    maxTokens?: number, // output cap; undefined = adapter default. Transcribe calls use a small
-                        // cap so a model that drifts past the format can't generate for minutes
-                        // at slow-inference providers (live: 4096-token drift = 106s on CF)
+    maxTokens?: number, // output cap; undefined = adapter default. Transcribe calls pass a
+                        // small cap so a model that drifts past the format cannot generate a
+                        // very long response at a slow provider
 ): Promise<LlmResult> {
     if (!s.apiKey) throw new MtError('auth', 'No API key configured — open the extension options');
     if (!s.model) throw new MtError('auth', 'No model configured — open the extension options');

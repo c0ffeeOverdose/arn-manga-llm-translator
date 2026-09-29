@@ -437,9 +437,9 @@ function galleryPaths(manifestJson: string | null): string[] {
     } catch { return []; }
 }
 
-// caller-side wiring, kept pure so the translated-blob regression stays locked by test: the
-// live element src is a blob: URL after translation, so siblings must derive from the STORED
-// original (https) — never the live src. Non-https input yields [] by construction.
+// Sibling URLs for the lookahead window. Siblings derive from the STORED original (https):
+// the live element src is a blob: URL once translated, so deriving from it yields nothing.
+// Non-https input yields [] by construction.
 export function galleryLookaheadUrls(manifestJson: string | null, origSrc: string, max: number): string[] {
     const m = origSrc.match(/^(https?:\/\/[^/]+)\/(.+)$/);
     if (!m) return [];
