@@ -14,10 +14,10 @@ import { Attempt } from './lifecycle';
 import { nextDocument, documentImages, sameChapterDocument } from './discovery';
 import { nextBatch, pagePhase } from './plan';
 
-const id = location.hash.slice(1);
-// Bounded breadcrumb for debugging a stalled run from DevTools on the host tab.
+let id = '';
+// Bounded breadcrumb for debugging a stalled run.
 const diagnostics: string[] = [];
-(window as unknown as { __mtLog: string[] }).__mtLog = diagnostics;
+(globalThis as unknown as { __mtLog: string[] }).__mtLog = diagnostics;
 const note = (m: string): void => {
     diagnostics.push(m);
     if (diagnostics.length > 200) diagnostics.shift();
@@ -65,8 +65,8 @@ function publish(): Promise<void> {
     status.done = status.pages.filter(p => p.phase === 'ready').length;
     status.errors = status.pages.filter(p => p.phase === 'failed').length;
     status.inflight = status.pages.filter(p => ['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)).length;
-    document.querySelector('#status')!.textContent = chapterMessage(status);
-    (document.querySelector('#stop') as HTMLButtonElement).disabled = !['running', 'waiting'].includes(status.phase);
+    const statusEl = document.querySelector('#status');
+    if (statusEl) statusEl.textContent = chapterMessage(status);
     const snapshot = structuredClone(status);
     const checkpoint: HostCheckpoint = { config: structuredClone(config), progress: snapshot };
     const next = publishChain.then(async () => {
@@ -86,8 +86,13 @@ function stop(message?: string): void {
     void publish().catch(showFatal);
 }
 function showFatal(e: unknown): void {
-    document.querySelector('#status')!.textContent = `Translation paused — ${(e as Error).message || String(e)}`;
-    console.error('[mt] chapter host', e);
+    const msg = `Translation paused — ${(e as Error).message || String(e)}`;
+    const el = document.querySelector('#status');
+    if (el) el.textContent = msg;
+    console.error('[mt] chapter runner', e);
+    // Persist the reason: an offscreen document has no console a user can open, so a crash
+    // would otherwise be invisible and the reader would only see "no chapter session".
+    if (id) void writeRecord(`error:${id}`, { message: msg, stack: (e as Error)?.stack ?? '' }).catch(() => {});
 }
 async function contextFor(entries?: Contribution[], beforeOrder?: number): Promise<ContextState> {
     if (!config.shareContext) return { pairs: [], characters: [] };
@@ -302,7 +307,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     respond({ ok: true });
 });
 
-async function main(): Promise<void> {
+async function attach(runnerId: string): Promise<void> {
+    id = runnerId;
     const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-host-init', id });
     if (!response?.ok) throw new Error(response?.error || 'Chapter session expired');
     config = response.config;
@@ -316,11 +322,32 @@ async function main(): Promise<void> {
         inflight: 0, errors: 0, completeManifest: config.completeManifest,
         pages: config.pages.map(p => ({ id: p.id, url: p.url, phase: 'queued' })) };
     for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
-    document.querySelector('#stop')!.addEventListener('click', () => stop());
     chrome.storage.onChanged.addListener((changes, area) => {
         if (area === 'local' && (changes.mtPipeline || changes.mtSettings || changes.mtOcrSettings)) stop('Translation paused — settings changed; start again to use them');
     });
     await publish();
     pumpCheck();
 }
-void main().catch(showFatal);
+
+// The broker decides when a runner exists and which session it belongs to. A runner that
+// reloads (event page wake, devtools reload) re-asks for the live session and resumes from
+// the stored checkpoint, so a restart costs at most the page in flight.
+export async function bootChapterRunner(): Promise<void> {
+    if (status) return;
+    const boot = await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-boot' }) as
+        { ok?: boolean; id?: string } | undefined;
+    if (boot?.id) await attach(boot.id);
+}
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+    if (sender.id !== chrome.runtime.id) return;
+    // Firefox starts a run by telling the background page (which IS the runner) to attach.
+    if (msg?.type === 'mt:chapter-runner-attach') {
+        if (status) { respond({ ok: true, already: true }); return; }
+        attach(String(msg.id)).then(() => respond({ ok: true }), e => { showFatal(e); respond({ ok: false }); });
+        return true;
+    }
+    if (msg?.type === 'mt:chapter-runner-stop') { stop(); respond({ ok: true }); return; }
+});
+
+void bootChapterRunner().catch(showFatal);
+

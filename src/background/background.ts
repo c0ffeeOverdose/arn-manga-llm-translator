@@ -5,6 +5,7 @@ import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError
 import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl } from './chapter-broker';
+import { bootChapterRunner } from '../chapter/page';
 
 // content scripts can't touch storage.session by default — open it up.
 // ?. chain: setAccessLevel doesn't exist on older Firefox, and a sync throw
@@ -477,6 +478,33 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         })();
         return true;
     }
+    // Offscreen documents have only the runtime API, so the chapter runner proxies its
+    // storage reads/writes here. Restricted to the runner context, like every other
+    // privileged handler in this file.
+    const raw = msg as unknown as { type?: string; area?: string; keys?: unknown; items?: unknown };
+    if (typeof raw?.type === 'string' && raw.type.startsWith('mt:storage-')) {
+        (async () => {
+            const { isChapterRunnerSender } = await import('./chapter-broker');
+            if (!isChapterRunnerSender(sender)) { sendResponse({ ok: false, error: 'not a chapter runner' }); return; }
+            const area = raw.area === 'session' ? 'session' : 'local';
+            const store = (chrome.storage as unknown as Record<string, chrome.storage.StorageArea>)[area];
+            try {
+                if (raw.type === 'mt:storage-get') {
+                    sendResponse(await store.get(raw.keys as string | string[] | null));
+                } else if (raw.type === 'mt:storage-set') {
+                    await store.set(raw.items as Record<string, unknown>);
+                    sendResponse({ ok: true });
+                } else if (raw.type === 'mt:storage-remove') {
+                    await store.remove(raw.keys as string | string[]);
+                    sendResponse({ ok: true });
+                } else {
+                    await store.clear();
+                    sendResponse({ ok: true });
+                }
+            } catch (e) { sendResponse({ ok: false, error: String((e as Error)?.message ?? e) }); }
+        })();
+        return true;
+    }
     if (msg?.type !== 'mt:translate') return;
 
     runTranslate(msg, sendResponse);
@@ -847,3 +875,8 @@ chrome.contextMenus?.onClicked.addListener((info, tab) => {
     if (info.menuItemId !== 'mt-translate-image' || !tab?.id) return;
     chrome.tabs.sendMessage(tab.id, { type: 'mt:translate-image', srcUrl: info.srcUrl }).catch(() => {});
 });
+
+// Firefox has no offscreen API: its MV3 background is an event page with a DOM, so the
+// chapter runner lives in this very context. Chromium's offscreen document boots itself
+// and this call is a no-op there.
+bootChapterRunner().catch(() => {});

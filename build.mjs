@@ -67,16 +67,18 @@ await Promise.all([
     loader: { '.ts': 'ts' },
   }),
   esbuild.build({
-    entryPoints: { host: join(root, 'src/chapter/host.ts') },
+    entryPoints: { page: join(root, 'src/chapter/page.ts') },
     bundle: true,
     format: 'esm',
     target: 'chrome120',
     minify: true,
-    outfile: join(dist, 'chapter/host.js'),
+    outfile: join(dist, 'chapter/page.js'),
     define: { 'process.env.NODE_ENV': '"production"', '__BUILD_ID__': JSON.stringify(buildId) },
   }),
 ]);
-cpSync(join(root, 'src/chapter/host.html'), join(dist, 'chapter/host.html'));
+cpSync(join(root, 'src/chapter/page.html'), join(dist, 'chapter/page.html'));
+// Classic pre-module script: installs the storage shim before the runner module evaluates.
+cpSync(join(root, 'src/chapter/shim.js'), join(dist, 'chapter/shim.js'));
 
 // manifest gets a unique patch version per build: Chrome caches MV3 service-worker code per version.
 import { readFileSync, writeFileSync } from 'fs';

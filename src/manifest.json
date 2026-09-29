@@ -2,12 +2,13 @@
   "manifest_version": 3,
   "name": "Arn Manga LLM Translator",
   "version": "1.0.0",
-  "description": "Read manga, manhwa & webtoons in your language — detection, OCR & rendering run on-device; translate with your own LLM key (BYOK)",
+  "description": "Read manga, manhwa & webtoons in your language \u2014 detection, OCR & rendering run on-device; translate with your own LLM key (BYOK)",
   "permissions": [
     "storage",
     "activeTab",
     "contextMenus",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "offscreen"
   ],
   "optional_host_permissions": [
     "http://*/*"

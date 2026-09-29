@@ -1,39 +1,64 @@
 import { sessGet, sessSet, sessRemove } from '../storage-session';
 import { readRecord, writeRecord, blobDataUrl } from '../chapter/store';
-import { hostUrl, artifactKey, type HostConfig, type ChapterArtifact } from '../chapter/protocol';
+import { artifactKey, runnerHtml, type HostConfig, type ChapterArtifact } from '../chapter/protocol';
 import type { ChapterProgress, ChapterStart } from '../chapter/model';
 import { chapterContext } from './chapter-context';
 import { RENDER_GEN } from '../content/render';
+import { createRunner, runnerKind, runnerUrl, type ChapterRunner } from '../chapter/runner';
 
-interface Binding { id: string; hostTab?: number; chapter: string }
+interface Binding { id: string; kind: 'offscreen' | 'background'; chapter: string }
 const bindingKey = (tab: number) => `mtChapterTab:${tab}`;
 const starts = new Map<number, Promise<unknown>>();
-// The reader's frame request must be the ONLY init attempt, or a duplicate
-// overrides the real host's id in storage.session and orphans it.
+// The reader's frame request must be the ONLY init attempt, or a duplicate overrides the
+// real session id in storage.session and orphans the runner.
 const frameAttempts = new Map<number, string>();
+let runner: ChapterRunner = createRunner();
+let liveId = '';
 async function binding(tab: number): Promise<Binding | undefined> {
     return (await sessGet(bindingKey(tab)))[bindingKey(tab)] as Binding | undefined;
 }
-async function authenticatedHost(sender: chrome.runtime.MessageSender, id: string): Promise<HostConfig | undefined> {
-    if (sender.id !== chrome.runtime.id || !sender.url?.startsWith(hostUrl() + '#')) return;
+// Only a runner context may speak for a session. The id must name a stored config, and the
+// sender must be either the offscreen document or our own background page (Firefox) — a
+// content script or another page is rejected. Offscreen documents have no sender.tab, so
+// the check is on the URL/context, never on a tab.
+async function authenticatedRunner(sender: chrome.runtime.MessageSender, msg: { id?: unknown }): Promise<HostConfig | undefined> {
+    const id = String(msg?.id ?? '');
+    if (!id) return;
+    if (!isRunnerSender(sender)) return;
     const config = await readRecord<HostConfig>(`host:${id}`);
-    if (config && sender.url === hostUrl() + '#' + id && (config.hostTab === undefined || !sender.tab || sender.tab.id === config.hostTab)) return config;
+    return config && config.id === id ? config : undefined;
+}
+export function isChapterRunnerSender(sender: chrome.runtime.MessageSender): boolean {
+    return isRunnerSender(sender);
+}
+function isRunnerSender(sender: chrome.runtime.MessageSender): boolean {
+    if (sender.id !== chrome.runtime.id) return false;
+    const contexts = (chrome.runtime as unknown as { getContexts?: (f?: unknown) => Promise<{ contextType?: string; documentUrl?: string }[]> }).getContexts;
+    // Chromium: the offscreen document is the only allowed non-tab context.
+    if (sender.tab) return false;
+    if (runnerKind() === 'background') return true; // Firefox: our background page IS the runner
+    return !contexts || sender.url?.startsWith(runnerUrl()) === true;
 }
 export async function chapterReaderUrl(sender: chrome.runtime.MessageSender): Promise<string> {
-    if (!sender.url?.startsWith(hostUrl() + '#')) return sender.url ?? '';
-    return (await authenticatedHost(sender, sender.url.slice(hostUrl().length + 1)))?.readerUrl ?? '';
+    // A fetch proxied on behalf of the runner has no tab: it must inherit the reader's
+    // origin so the private-network policy compares against the page the user is reading.
+    if (isRunnerSender(sender)) {
+        const id = liveId;
+        return id ? (await readRecord<HostConfig>(`host:${id}`))?.readerUrl ?? '' : '';
+    }
+    return sender.url ?? '';
 }
 async function start(tab: number, data: ChapterStart): Promise<unknown> {
     const old = await binding(tab);
     if (old) {
         const status = await readRecord<ChapterProgress>(`status:${old.id}`);
-        if (old.chapter === data.chapter && status && ['running', 'waiting'].includes(status.phase)) {
-            try { if (old.hostTab !== undefined) { await chrome.tabs.get(old.hostTab); return { ok: true, id: old.id, status }; } } catch { /* host was closed */ }
+        if (old.chapter === data.chapter && status && ['running', 'waiting'].includes(status.phase) && await runner.live(old.id)) {
+            return { ok: true, id: old.id, status };
         }
-        if (old.hostTab !== undefined) await chrome.tabs.remove(old.hostTab).catch(() => {});
+        await runner.stop(old.id);
     }
     const id = crypto.randomUUID();
-    const config: HostConfig = { ...data, id, readerTab: tab };
+    const config: HostConfig = { ...data, id, readerTab: tab, kind: runnerKind() };
     for (const seed of data.seeds ?? []) {
         const entry = { ...seed.entry, mask: seed.entry.mask ? { ...seed.entry.mask,
             data: Uint8Array.from(atob(seed.maskData), c => c.charCodeAt(0)).buffer } : undefined };
@@ -42,21 +67,25 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
     }
     delete config.seeds;
     await writeRecord(`host:${id}`, config);
-    await sessSet({ [bindingKey(tab)]: { id, chapter: data.chapter } });
-    const host = await chrome.tabs.create({ url: hostUrl() + '#' + id, active: false, openerTabId: tab });
-    config.hostTab = host.id;
-    await writeRecord(`host:${id}`, config);
-    await sessSet({ [bindingKey(tab)]: { id, hostTab: host.id, chapter: data.chapter } });
-    if (host.id !== undefined) void chrome.tabs.update(host.id, { autoDiscardable: false }).catch(() => {});
+    liveId = id;
+    await sessSet({ [bindingKey(tab)]: { id, kind: config.kind, chapter: data.chapter } });
+    await runner.ensure(id);
     return { ok: true, id, total: data.pages.length };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-    if (sender.id !== chrome.runtime.id || typeof msg?.type !== 'string' || !msg.type.startsWith('mt:chapter-') || msg.type === 'mt:chapter-command') return;
+    if (sender.id !== chrome.runtime.id || typeof msg?.type !== 'string' || !msg.type.startsWith('mt:chapter-')) return;
+    // The runner asks which session it owns; the answer is also what starts it pumping.
+    if (msg.type === 'mt:chapter-runner-boot') {
+        if (!isRunnerSender(sender)) return;
+        respond({ ok: true, id: liveId || undefined });
+        return true;
+    }
+    if (msg.type === 'mt:chapter-command') return;
     const work = async () => {
         if (msg.type === 'mt:chapter-host-init' || msg.type === 'mt:chapter-publish' || msg.type === 'mt:chapter-context') {
-            const config = await authenticatedHost(sender, msg.id);
-            if (!config) return { ok: false, error: 'Unknown chapter host' };
+            const config = await authenticatedRunner(sender, msg);
+            if (!config) return { ok: false, error: 'Unknown chapter session' };
             if (msg.type === 'mt:chapter-host-init') return { ok: true, config };
             if (msg.type === 'mt:chapter-context') {
                 const context = await chapterContext(config.chapter, config.bookKey, config.pipeline.useCharacters,
@@ -83,10 +112,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             const previous = frameAttempts.get(tab);
             if (previous === sender.url) return { ok: false, error: 'Chapter translation is already running in this reader' };
             if (previous) {
-                // new document in the same tab — the old frame's request is stale
                 const stale = await binding(tab);
-                if (stale?.hostTab !== undefined) await chrome.tabs.remove(stale.hostTab).catch(() => {});
-            }            frameAttempts.set(tab, sender.url);
+                if (stale) await runner.stop(stale.id);
+            }
+            frameAttempts.set(tab, sender.url);
             const pending = starts.get(tab);
             if (pending) return pending;
             const p = start(tab, data).finally(() => starts.delete(tab));
@@ -97,13 +126,11 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         if (!b || b.chapter !== msg.chapter) return { ok: true, status: null };
         if (msg.type === 'mt:chapter-status') {
             const status = await readRecord<ChapterProgress>(`status:${b.id}`);
-            if (b.hostTab !== undefined && status && ['running', 'waiting', 'stopping'].includes(status.phase)) {
-                try { await chrome.tabs.get(b.hostTab); } catch {
-                    status.phase = 'error';
-                    status.message = 'Translation paused — the processing tab was closed; start again to continue';
-                    status.inflight = 0;
-                    await writeRecord(`status:${b.id}`, status);
-                }
+            if (status && ['running', 'waiting', 'stopping'].includes(status.phase) && !(await runner.live(b.id))) {
+                status.phase = 'error';
+                status.message = 'Translation paused — the background task stopped; start again to continue';
+                status.inflight = 0;
+                await writeRecord(`status:${b.id}`, status);
             }
             return { ok: true, status, id: b.id };
         }
@@ -115,6 +142,11 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                 mask: mask ? { w: mask.w, h: mask.h, data: await blobDataUrl(new Blob([mask.data])) } : undefined } };
         }
         if (msg.type === 'mt:chapter-control') {
+            if (msg.command === 'stop') {
+                // The runner owns the cancel; closing it early would strand the drain.
+                await chrome.runtime.sendMessage({ type: 'mt:chapter-command', id: b.id, command: msg.command }).catch(() => {});
+                return { ok: true };
+            }
             return await chrome.runtime.sendMessage({ type: 'mt:chapter-command', id: b.id,
                 command: msg.command, page: msg.page, pages: msg.pages, completeManifest: msg.completeManifest });
         }
@@ -128,8 +160,11 @@ chrome.tabs.onRemoved.addListener(tab => {
     void (async () => {
         const b = await binding(tab);
         if (b) {
-            if (b.hostTab !== undefined) await chrome.tabs.remove(b.hostTab).catch(() => {});
+            await runner.stop(b.id);
             await sessRemove(bindingKey(tab));
         }
     })();
 });
+
+// A runner URL change on hot reload must not leave two live runners.
+export function chapterRunnerPageUrl(): string { return runnerHtml(); }

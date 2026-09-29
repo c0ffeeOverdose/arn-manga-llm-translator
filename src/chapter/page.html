@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Chapter translation</title></head>
+<body>
+    <!-- Headless in normal use (Chromium offscreen document / Firefox event page):
+         the status element exists so the runner code has one place to write, and so a
+         developer who opens this page directly can see what the run is doing. -->
+    <p id="status" role="status" aria-live="polite">Preparing chapter translation…</p>
+    <!-- Classic script, and before the module: an offscreen document only gets `runtime`,
+         so `chrome.storage` must exist before any bundled module touches it. A module
+         import would be evaluated after this file's other imports. -->
+    <script src="shim.js"></script>
+    <script type="module" src="page.js"></script>
+</body>
+</html>
