@@ -1,18 +1,5 @@
-# Cloud inference for the manga translator: CTD text detection + Baberu OCR
-# over HTTP, CPU-only (fits the HuggingFace free tier).
-#
-# Recipes ported 1:1 from src/iframe/worker.ts — same thresholds, same gates,
-# same decode loop. Resize uses bilinear like canvas drawImage; exact pixels
-# may differ from the browser path, so parity is VERIFIED (not assumed) by
-# comparing boxes/texts against the local pipeline on real pages.
-#
-# Panels: v1 returns [] — the client falls back to banding ordering, the same
-# path it takes when the panel model file is missing. No fidelity risk.
-# Splits: run_detect runs the same splitMergedBoxes family as the on-device
-# worker (lane 1/2, twin-balloon cut, short-first, 10px split-input floor),
-# and OCR crops grow past edge-cut glyphs like the client's expandCropToInk.
-# /v1/page reports SPLIT_GEN so the client re-detects entries from older
-# servers instead of rendering their fused boxes from cache.
+# Cloud inference: CTD detection + Baberu OCR over HTTP, CPU-only. Recipes mirror src/iframe/worker.ts.
+# Panels: v1 returns [] (client banding fallback). Splits mirror the on-device worker; /v1/page reports SPLIT_GEN.
 import asyncio
 import base64
 import io
@@ -102,8 +89,7 @@ def load_models():
             content.add(i)
     baberu = {"vis": vis, "pre": pre, "stp": stp, "bos": 1, "eos": 2,
               "id2ch": id2ch, "contentIds": content}
-    # optionally loadable: a server without the 112MB cleanup model still
-    # serves detection/OCR, /v1/inpaint answers 503
+    # optional: without the cleanup model the server still serves detection/OCR; /v1/inpaint answers 503
     try:
         inpaint = _sess(f"{MODEL_DIR}/lama-manga-512-fp16w.onnx", ORT_PROVIDERS)
     except Exception as e:
@@ -124,9 +110,7 @@ def _startup():
 
 @app.get("/health")
 def health():
-    # splitGen is here (not just /v1/page) so a remote client can verify the
-    # server runs the split/mask logic its cache gate expects — a stale Colab
-    # process otherwise fails silently back to fused boxes.
+    # splitGen rides here too so clients verify the server's split/mask logic — stale servers fail back to fused boxes.
     return {"ok": bool(ctd and baberu), "device": os.environ.get("ORT_DEVICE", "cpu"),
             "panels": "client-fallback", "ep": EPS or None, "splitGen": SPLIT_GEN}
 
@@ -300,9 +284,7 @@ def run_detect(pil, conf_thr, min_size):
                 return True
         return False
 
-    # Same text-likelihood definition everywhere a mask component must claim
-    # to be text: mean raw mask prob, corroborated by any low-confidence
-    # box-head prediction overlapping it.
+    # Text-likelihood for mask components: mean raw mask prob, corroborated by any overlapping low-conf box.
     def comp_box_conf(c):
         box_conf = 0.0
         c_area = (c["x2"] - c["x1"]) * (c["y2"] - c["y1"])
@@ -324,12 +306,7 @@ def run_detect(pil, conf_thr, min_size):
             comps.append({"x1": x, "y1": y, "x2": x + bw, "y2": y + bh,
                           "count": int(area), "psum": float(prob_sum[lab]),
                           "labs": {lab}})
-    # Split-input comps: raw text clusters snapshotted BEFORE the merge below
-    # (a merged bbox would hide the gap between two balloons) and filtered by
-    # the same text-likelihood gate pass 3 uses — mirrors worker.ts, including
-    # the 10px split-evidence floor (pass 3 keeps its own >=14 floor, so no
-    # new junk regions are created by this). box_comps is the stricter set the
-    # child BOXES are measured from (mean prob >= 0.75).
+    # Split-input comps: raw clusters BEFORE merge (merged bbox hides balloon gaps), same text-likelihood gate + 10px floor.
     texty_comps, box_comps = [], []
     for c in comps:
         bw, bh = c["x2"] - c["x1"], c["y2"] - c["y1"]
@@ -392,8 +369,7 @@ def run_detect(pil, conf_thr, min_size):
             mask_boxes.append({"x1": float(x1), "y1": float(y1),
                                "x2": float(x2), "y2": float(y2), "conf": 0.5})
             continue
-        # sole killer was the overlap gate — second chance via split: pieces
-        # outside all boxes survive as their own regions (see rescue_split_comp)
+        # overlap-gate kills get a second chance via split: outside pieces survive as own regions
         labs = c["labs"]
 
         def count_in(rx1, ry1, rx2, ry2, _labs=labs):
@@ -411,14 +387,9 @@ def run_detect(pil, conf_thr, min_size):
             mask_boxes.append({"x1": float(r["x1"]), "y1": float(r["y1"]),
                                "x2": float(r["x2"]), "y2": float(r["y2"]),
                                "conf": 0.5})
-    # split AFTER the mask-only pass: a merged box's generous coverage must
-    # still suppress mask clusters it swallowed (pre-split list feeds the
-    # overlap gate), and only then does each balloon become its own box —
-    # mirrors worker.ts.
+    # split AFTER the mask-only pass: merged coverage still suppresses swallowed clusters, then each balloon splits.
     boxes = split_merged_boxes(out_boxes + mask_boxes, texty_comps, COMP_GAP, box_comps)
-    # packed is 0/1 — packMask mirrors the client's byte mask (0/255); the bool
-    # mask rides along for the merged /v1/page inpaint pass (same source the
-    # mask b64 is built from, so erase windows match what the client renders)
+    # packed is 0/1 — packMask mirrors the client byte mask; the bool mask rides along for the merged inpaint pass
     mask_img = packed.astype(bool)
     mw, mh, mbytes = pack_mask(w, h, (packed * 255).ravel())
     return boxes, infer_ms, {"w": mw, "h": mh,
@@ -582,8 +553,7 @@ def run_inpaint(pil, boxes, pad_ratio, mask=None):
             continue
         buf = io.BytesIO()
         Image.fromarray(crop).save(buf, format="PNG")
-        # i = box index — /v1/page's merged patches map 1:1 to the response
-        # boxes so the client can filter to its erase plan by index
+        # i = box index: merged patches map 1:1 to response boxes for client filtering
         patches.append({"i": i, "x1": px1, "y1": py1, "x2": px2, "y2": py2,
                         "png": base64.b64encode(buf.getvalue()).decode("ascii")})
     ms = (time.perf_counter() - t0) * 1000
@@ -642,11 +612,7 @@ async def page(req: Request,
                 t, ms = "", 0.0
             texts.append(t)
             ocr_ms += ms
-        # merged cleanup pass: the client asked for patches in the same
-        # roundtrip (saves a second full-image upload + lock wait). run_inpaint
-        # uses the real CTD mask — identical pixels to the mask b64 shipped
-        # above — and emits one patch per box (i = box index) so the client can
-        # filter to its erase plan without re-mapping anything.
+        # merged cleanup pass: patches in the same roundtrip (saves an upload + lock wait). One patch per box (i = index).
         patches, windows, inpaint_ms = [], 0, 0.0
         if inpaint_flag:
             try:

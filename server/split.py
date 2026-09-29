@@ -1,32 +1,13 @@
-# Pure box-splitting + OCR-crop expansion for the cloud server — ported
-# 1:1 from src/content/detection.ts (splitMergedBoxes family) and
-# src/content/render.ts (expandCropToInk). Standard library only, so
-# unit tests import this without the server's third-party deps; app.py
-# is the only runtime importer (Modal/Colab/Docker all colocate it).
+# Box-splitting + OCR-crop expansion for the cloud server — ported 1:1 from detection.ts / render.ts.
+# Stdlib only; app.py is the only runtime importer.
 import math
 
 
 # ---- box splitting (ported 1:1 from src/content/detection.ts) ----
-# The box head fuses stacked/kissing balloons into one box; the mask
-# components are the evidence that splits them back apart. Same lanes, same
-# constants, same decisions. Two JS-isms to preserve:
-#   - Math.round rounds half UP on positives; Python round() is banker's, so
-#     _r() is used everywhere the TS calls Math.round (inputs here are >= 0).
-#   - medians are the UPPER middle (sorted[floor(n/2)]), same in _med().
-# Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on split children);
-# comps are plain rect dicts (the SplitComp shape — no count/psum).
+# Preserve two JS-isms: Math.round halves UP on positives (use _r) and medians are the UPPER middle (use _med).
+# Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on children); comps are plain rects (no count/psum).
 SPLIT_GEN = 4  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
-# gen 2: OCR crops grow past edge-cut glyphs + /v1/page ships the packed CTD
-# mask (gen 1 split without it — the client's box-filled stand-in mask forced
-# white text on every leaked area).
-# gen 3: pass-3 rescue — a merged comp killed only by the overlap gate is
-# split and re-gated per piece (live /14: the merge chained the left はむ
-# into a super-comp that box 5 swallowed whole).
-# gen 4: lane-2 first-pair — a detached FIRST group of comparable size splits
-# despite nesting (live /14 right group: 3-row hamu 34px above its EN block).
-# Stragglers (small group under a big block, the dropped-line family) stay
-# fused via the size ratio.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
 SPLIT_PAD_CAP = 40
@@ -297,14 +278,8 @@ def _split_box_lane2(box, cs, box_comps):
             return _emit_split(box, merged, axis, cs, box_comps)
     return None
 
-# ---- OCR-crop expansion (ported 1:1 from expandCropToInk in
-# src/content/render.ts) ----
-# A detection box can clip its own glyphs, so after padding any side whose
-# edge still touches ink grows outward to the last ink plus a small margin,
-# capped at half the box's smaller side. Split children stay inside their
-# clip. Only the READ window grows: crops stay tight when nothing is cut.
-# rgb is a full-page uint8 HxWx3 array; box holds the detection bounds (+clip
-# on split children); rect is the padded crop {x,y,w,h}.
+# ---- OCR-crop expansion (ported 1:1 from expandCropToInk) ----
+# Padded sides touching ink grow to last ink + margin, capped at half the smaller side. Split children stay in clip.
 def _crop_expand_cap(box):
     return max(16, _r(min(box["x2"] - box["x1"], box["y2"] - box["y1"]) * 0.5))
 
@@ -441,14 +416,8 @@ def expand_crop_to_ink(rgb, box, rect):
             "w": bounds["x2"] - bounds["x1"], "h": bounds["y2"] - bounds["y1"]}
 
 
-# ---- mask packing (mirrors packMask in src/content/page-cache.ts) ----
-# Block-max downscale of the binary text mask to <=256 on the long side;
-# the client restores it with unpackMask. /v1/page ships this so cloud
-# entries carry a REAL mask (text-color sampling, inpaint and the debug view
-# all read it) instead of the client's old box-filled stand-in, which
-# excluded every whole box from sampling and forced white text. Standard
-# library only: flat is any row-major byte sequence (bytes, bytearray, or a
-# ravelled numpy array).
+# ---- mask packing (mirrors packMask) ----
+# Block-max downscale to <=256 on the long side; the client restores with unpackMask.
 def pack_mask(w, h, flat, max_side=256):
     step = max(1, max(w, h) // max_side)
     ow, oh = (w + step - 1) // step, (h + step - 1) // step
@@ -471,11 +440,8 @@ def pack_mask(w, h, flat, max_side=256):
     return ow, oh, bytes(out)
 
 
-# ---- pass-3 rescue (mirrors rescueSplitComp in src/content/detection.ts) ----
-# A merged comp killed ONLY by the overlap gate may still hold a text group
-# outside every kept box: split it with the lane machinery on the raw texty
-# comps and re-gate each piece. count_in recounts the parent comp's labels
-# inside a piece bbox; overlaps_box and box_conf are the caller's gates.
+# ---- pass-3 rescue (mirrors rescueSplitComp) ----
+# An overlap-killed comp may hold a text group outside every box: split on raw texty comps and re-gate each piece.
 def rescue_split_comp(c, texty, strict, same_block_gap, page_area,
                       count_in, overlaps_box, box_conf):
     pieces = split_merged_boxes(

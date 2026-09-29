@@ -1,6 +1,5 @@
-// Content-script shared state: page registry, context/book, pipeline settings,
-// theme palettes, session usage. Every module imports from here; nothing here
-// imports from another content module (no cycles).
+// Shared state hub: page registry, context/book, pipeline settings, theme, usage.
+// Every module imports from here; nothing here imports from another content module.
 
 import { EMPTY_CONTEXT, type ContextState, type CharacterEntry, type Mention, type RegionOutput } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
@@ -14,67 +13,52 @@ declare const __BUILD_ID__: string; // injected by build.mjs — which build is 
 export interface PageState {
     orig: string;
     translated: string;
-    // blob-origin readers (MangaDex etc.): extension-owned PNG copy of the
-    // original pixels. The reader's blob URL is dead or unassignable (the
-    // dead-orig guard), so this is the only reliable way back for
-    // "Show original" — minted while the pixels are still readable.
+    // extension-owned PNG copy of the original pixels for blob-URL readers (their URLs
+    // die) — the only reliable way back for "Show original", minted while pixels are readable.
     origOwn?: string;
     debug?: string; // full-res boxes+badges+conf view on the TRANSLATED image
     debugOrig?: string; // same boxes on the ORIGINAL (Show original keeps its debug)
     det?: DetectResult;
     outputs?: RegionOutput[];
     mentions?: Mention[]; // page-level named people (folded into the book with outputs)
-    // book/pairs exactly as they were BEFORE this page folded (references to
-    // the immutable context arrays). rewindContextBefore restores the snapshot
-    // on re-translate: it is exact and survives a fresh session, where the
-    // loaded book cannot be re-derived from page states at all.
+    // book/pairs exactly as they were BEFORE this page folded. rewindContextBefore restores
+    // the snapshot on re-translate — exact, and survives a fresh session.
     bookBefore?: CharacterEntry[];
     pairsBefore?: [string, string][];
     hash?: string; // content hash of the ORIGINAL pixels — element-identity fallback
-    // canvas pages only: the page has no URL to re-read, so the first read is
-    // stashed (original bytes for re-translate, translated bitmap for write-back)
+    // canvas pages only: no URL to re-read, so the first read is stashed (original bytes
+    // for re-translate, translated bitmap for write-back)
     origBytes?: ArrayBuffer;
     translatedBmp?: ImageBitmap;
-    // decoded-on-demand paint sources (Show original + debug frames have no URL
-    // to swap like img — closed with the page in unregPage)
+    // decoded-on-demand paint sources (Show original + debug frames) — closed with the page
     origBmp?: ImageBitmap;
     debugBmp?: ImageBitmap;
     debugOrigBmp?: ImageBitmap;
 }
 
-// A page is an <img> or a reader <canvas> — the pipeline only needs pixels
-// in and pixels out, keyed by a stable identity string either way.
+// A page is an <img> or a reader <canvas> — pixels in and pixels out, keyed by identity.
 export type PageRef = { kind: 'img'; el: HTMLImageElement } | { kind: 'canvas'; el: HTMLCanvasElement; key: string; pageSrc?: string };
 
 export const pages = new Map<string, PageState>();
-// element binding: blob-rotating readers (MM mints a fresh blob: URL per
-// display and revokes the old one) break URL-keyed identity — the state is
-// filed under blobA while the live element already shows blobB, so the sweep
-// can never paint it and auto re-translates forever (log churns, screen
-// unchanged). The element itself is the stable identity: every successful
-// write binds element→state, and an unknown src is verified by content hash
-// (match = same page under a new URL → alias + paint; mismatch = recycled
-// node showing another page → drop the binding). WeakMap — dead nodes vanish.
+// element binding: blob-rotating readers mint a fresh blob: URL per display, breaking
+// URL-keyed identity. The element itself is the stable identity: every successful write
+// binds element→state, and an unknown src is verified by content hash (match → alias +
+// paint; mismatch = recycled node showing another page → drop the binding). WeakMap.
 export const elStates = new WeakMap<Element, PageState>();
-// in-flight / failed hash verifications per element+src (sweep is 1s —
-// without these every sweep re-decodes + re-hashes the same mismatch)
+// in-flight / failed hash verifications per element+src (the 1s sweep must not re-hash them)
 export const verifying = new WeakMap<Element, string>();
 export const verifyFailed = new WeakMap<Element, string>();
-// content index: original-pixel hash → translated state, for the fast repaint
-// lane (back-nav: known content under an unknown URL repaints with no queue,
-// no prep, no book fold — it folded on first translation). Same lifecycle as
-// the pages map (reg/unreg together); memory-only, dies with the tab.
+// content index: original-pixel hash → translated state, for the fast repaint lane
+// (known content under an unknown URL repaints with no queue/prep/fold). Same lifecycle
+// as the pages map; memory-only, dies with the tab.
 export const hashStates = new Map<string, { state: PageState; w: number; h: number }>();
-// hash repaints already attempted per element+src with no index hit —
-// genuinely-new pages stay on the queue path instead of re-hashing every
-// sweep. Re-arms on src change; a later translation covers via pages.has.
+// hash repaints already attempted per element+src with no index hit — genuinely-new pages
+// stay on the queue path instead of re-hashing every sweep. Re-arms on src change.
 export const hashMiss = new WeakMap<Element, string>();
 export const hashPending = new WeakMap<Element, string>();
 
-// fastest truth first: a KNOWN url (orig, our translated blob, retired alias)
-// always wins over a possibly-stale element binding (recycled node showing a
-// different page whose url we already know paints THAT page, then rebinds).
-// refKey logic duplicated (one-liner) — importing page-io here would cycle.
+// fastest truth first: a KNOWN url (orig, translated blob, retired alias) always wins over
+// a possibly-stale element binding. refKey logic duplicated (one-liner) — no page-io import (cycle).
 export function stateFor(ref: PageRef): PageState | undefined {
     let key: string;
     if (ref.kind === 'canvas') key = ref.pageSrc ?? ref.key;
@@ -85,10 +69,8 @@ export function stateFor(ref: PageRef): PageState | undefined {
     return pages.get(key) ?? (ref.kind === 'img' ? elStates.get(ref.el) : undefined);
 }
 
-// retired blob URLs: unregPage deletes live keys, but elements still showing
-// an old blob (preload twins, recycled mobile DOM) must keep resolving to
-// their page — otherwise re-translate fetches the dead blob ("Failed to
-// fetch") and the sweep can never heal them. String-only, bounded.
+// retired blob URLs: unregPage deletes live keys, but elements still showing an old blob
+// must keep resolving to their page — else re-translate fetches the dead blob. Bounded.
 export const retiredBlobs = new Map<string, string>();
 const RETIRED_MAX = 50;
 export function retireBlob(blob: string | undefined, orig: string): void {
@@ -104,8 +86,7 @@ export function regPage(state: PageState): void {
     if (state.origOwn) pages.set(state.origOwn, state);
     if (state.debug) pages.set(state.debug, state);
     if (state.debugOrig) pages.set(state.debugOrig, state);
-    // content index for the fast repaint lane (back-nav after blob rotation):
-    // same-pixel pages repaint from here without queue/prep/fold
+    // content index for the fast repaint lane: same-pixel pages repaint without queue/prep/fold
     const m = state.det?.mask;
     if (state.hash && m) hashStates.set(state.hash, { state, w: m.width, h: m.height });
 }
@@ -135,12 +116,11 @@ export function uniquePages(): PageState[] {
 
 export let overlayOn = false;
 export function setOverlayOn(v: boolean): void { overlayOn = v; }
-// debug overlay (detection boxes + badges + conf): session-level like the
-// popup toggles, persisted under its own key so it never touches presets
+// debug overlay (boxes + badges + conf): session-level, persisted under its own key
 export let debugOn = false;
 export function setDebugOn(v: boolean): void { debugOn = v; }
-// 'auto' = show translations as pages finish (default); 'original' = the user
-// explicitly asked for originals — jobs finishing later must NOT flip it back
+// 'auto' = show translations as pages finish (default); 'original' = the user asked for
+// originals — jobs finishing later must NOT flip it back
 export let overlayChoice: 'auto' | 'original' = 'auto';
 export function setOverlayChoice(v: 'auto' | 'original'): void { overlayChoice = v; }
 export let ui: HTMLDivElement | null = null;
@@ -162,9 +142,8 @@ export async function loadPipeline(): Promise<PipelineSettings> {
         textStroke: pipeline.textStroke,
         textScale: pipeline.textScale,
     });
-    // user-selected render font: fetch bytes from the background (they live in
-    // the extension-origin IndexedDB), register a FontFace, and put it FIRST in
-    // the stack — missing glyphs fall through to the per-language default
+    // user-selected render font: fetch bytes from the background, register a FontFace FIRST
+    // in the stack — missing glyphs fall through to the per-language default
     if (pipeline.renderFont !== 'default' && pipeline.renderFont !== customFontLoaded) {
         const resp = await chrome.runtime.sendMessage({ type: 'mt:font-get', id: pipeline.renderFont }) as
             { ok: boolean; name?: string; b64?: string; error?: string } | null;
@@ -190,10 +169,9 @@ export async function loadPipeline(): Promise<PipelineSettings> {
 
 // ---- chapter-scoped memory ----
 
-// Context is chapter-scoped — but "chapter" means STORY, not URL: page-turns
-// (/chapter/{id}/{page}, trailing /N, ?page=) share one key so queue +
-// context survive flipping 1→2→3, while a new story (path/query/hash) gets
-// a fresh key. Pure logic lives in normalizeChapterKey (unit-tested).
+// Context is chapter-scoped — but "chapter" means STORY, not URL: page-turns share one key
+// so queue + context survive flipping pages, while a new story gets a fresh key.
+// Pure logic lives in normalizeChapterKey (unit-tested).
 export function chapterKey(): string {
     return normalizeChapterKey(location.origin, location.pathname, location.search, location.hash);
 }
@@ -213,8 +191,7 @@ let mangaIdTried = false;
 export async function resolveMangaId(): Promise<string | null> {
     if (mangaIdTried) return mangaId;
     mangaIdTried = true;
-    // MangaDex-only: anywhere else the regex misses and the book stays
-    // chapter-scoped — skip the network call entirely instead of trying it
+    // MangaDex-only: anywhere else the regex misses and the book stays chapter-scoped
     if (!/(^|\.)mangadex\./.test(location.hostname)) return null;
     const m = location.pathname.match(/^\/chapter\/([^/]+)/);
     if (!m) return null;
@@ -227,8 +204,8 @@ export async function resolveMangaId(): Promise<string | null> {
     return mangaId;
 }
 
-// The book is manga-scoped (storage.local, survives restarts) when
-// cross-chapter is on and the manga resolved; otherwise per-chapter session.
+// The book is manga-scoped (storage.local, survives restarts) when cross-chapter is on and
+// the manga resolved; otherwise per-chapter session.
 function bookKey(): string {
     return pipeline.crossChapter && mangaId ? `mtBook:${mangaId}` : `mtCtx:${chapterKey()}`;
 }
@@ -294,12 +271,8 @@ export function resetContextIfNewChapter() {
 
 // ---- theme (shared by pill, chars panel, toasts) ----
 
-// In-page UI shares the popup/options theme so all surfaces read as one
-// product on any host site. `mtTheme` storage ('system' = OS default) picks
-// the palette; options page saves it, this module applies it live.
-// No shadow DOM on purpose:
-// ponytail: three fixed divs with inline styles; isolate fully if a host's
-// CSS is ever proven to break them.
+// In-page UI shares the popup/options theme. `mtTheme` storage ('system' = OS default).
+// No shadow DOM: three fixed divs with inline styles.
 export const MT_DARK = {
     bg: '#151722', border: 'rgba(255,255,255,.12)', text: '#e8eaf2',
     muted: '#a3a8c0', accent: '#8b5cf6', ok: '#4ade80', err: '#f87171',
@@ -315,8 +288,7 @@ export type MtState = 'busy' | 'done' | 'error' | 'idle';
 export const mtDot = (st: MtState): string =>
     st === 'busy' ? mtPal.accent : st === 'done' ? mtPal.ok : st === 'error' ? mtPal.err : mtPal.muted;
 
-// theme application: swap the palette + repaint the pill; module-level
-// listener list (chars panel registers for its own repaint)
+// theme application: swap the palette + repaint the pill (chars panel registers its own repaint)
 const themeListeners: (() => void)[] = [];
 export function onThemeChange(fn: () => void): void { themeListeners.push(fn); }
 export function applyTheme(t: string): void {

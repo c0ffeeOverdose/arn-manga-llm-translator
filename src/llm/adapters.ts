@@ -1,11 +1,8 @@
-// BYOK LLM adapters — 4 protocols, plain fetch, no SDKs.
-// All run in the background service worker (host_permissions cover CORS).
+// BYOK LLM adapters — 4 protocols, plain fetch, no SDKs. Run in the background service worker.
 
 import { splitStablePrefix, type ContextState, type RegionInput } from './core';
 
-// a page can legitimately think for minutes (responses models reason internally,
-// and the output cap is user-set) — 120s used to abort mid-generation, which the
-// content then re-ran via the fallback channel (billed twice)
+// A page can think for minutes — 240s timeout, shorter aborts mid-generation and double-bills via fallback.
 const LLM_TIMEOUT_MS = 240_000;
 
 export interface LLMSettings {
@@ -65,7 +62,6 @@ export async function callLLM(
         return { ...r, ms: Date.now() - t0 };
     } catch (e) {
         // refused by the provider: arm the window for this provider|baseUrl
-        // before the retry-without branches below (a 429 is neither 400 nor 422)
         if (e instanceof LlmHttpError && e.status === 429) noteRateLimit(s, e.retryAfterMs ?? RATE_LIMIT_DEFAULT_MS);
         // some models reject the thinking param entirely — retry once without it
         if (thinking && e instanceof LlmHttpError && (e.status === 400 || e.status === 422)) {
@@ -80,8 +76,7 @@ export async function callLLM(
                 return { ...r, ms: Date.now() - t0, tempDropped: true, thinkingDropped: true };
             }
         }
-        // reasoning-first models (GPT-5/o-series chat) may reject any non-default
-        // temperature — error-driven, no model-name table
+        // reasoning-first models may reject any non-default temperature — error-driven, no model-name table
         if (temp != null && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /temperature/i.test(e.message)) {
             console.warn('[mt:bg] model rejected pinned temperature, retrying without');
             const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, null, maxTokens);
@@ -101,12 +96,7 @@ function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] |
     }
 }
 
-// provider-visible session id: an opaque digest, never the raw reader URL.
-// The chapter key is origin+path+query (query strings can carry tokens) — a
-// provider field like prompt_cache_key/x-opencode-session must not be a
-// browsable URL, and the salt (per install, background-owned) keeps the same
-// chapter from hashing to the same id on another install. Same cyrb53 family
-// as page-cache.hashPixels (byte domain, unseeded — cache keys stay as they are).
+// Provider-visible session id: opaque digest, never the raw reader URL (per-install salt).
 export function sessionKey(raw: string, salt = 0): string {
     let h1 = 0xdeadbeef ^ salt, h2 = 0x41c6ce57 ^ salt;
     for (let i = 0; i < raw.length; i++) {
@@ -124,17 +114,14 @@ export function sessionKey(raw: string, salt = 0): string {
 export type MtErrorKind = 'auth' | 'ratelimit' | 'network' | 'server' | 'parse';
 
 export class MtError extends Error {
-    // set when the provider rejected the REQUEST's image COUNT (not its image
-    // support): the split-OCR stage falls back to one-image-per-region calls
-    // and remembers the verdict for the model
+    // set when the provider rejected the REQUEST's image COUNT (not image support):
+    // split-OCR falls back to one-image-per-region calls and remembers the verdict
     constructor(public kind: MtErrorKind, msg: string, public hint?: string, public imageCap?: boolean,
-        // 429 only: how long the provider asked us to wait. The content script
-        // arms its auto-halt window from this.
+        // 429 only: providers asked wait time; content arms its auto-halt window from this.
         public retryAfterMs?: number) { super(msg); }
 }
-// "too many images for this model" classification: tagged by our own adapters
-// when they know the shape (CF 3030), keyword-matched otherwise. Must NOT match
-// "this model can't read images" (that needs Local OCR, not per-region calls).
+// "too many images" classification: tagged by adapters (CF 3030) or keyword-matched.
+// Must NOT match "can't read images" (that needs Local OCR, not per-region calls).
 export function isImageCapError(e: unknown): boolean {
     if (!(e instanceof MtError)) return false;
     if (e.imageCap) return true;
@@ -153,10 +140,8 @@ export interface LlmResult {
     thinkingDropped?: boolean; // the model rejected the thinking param; retried without (OCR memoizes this per model)
 }
 
-// provider JSON is untrusted (BYOK baseUrl can be http:// or a MITM'd proxy):
-// coerce usage counters to numbers here or a crafted "prompt_tokens":
-// "<img onerror=…>" rides into the popup's usage box (innerHTML) and runs in
-// the extension origin, where storage.local (API keys) is readable
+// Provider JSON is untrusted (BYOK baseUrl can be a proxy): coerce usage counters
+// here or crafted values ride into the popup usage box and run in extension origin.
 const num = (v: unknown): number | undefined => { const n = Number(v); return Number.isFinite(n) ? n : undefined; };
 
 class LlmHttpError extends Error {
@@ -167,12 +152,8 @@ class LlmHttpError extends Error {
 export { LlmHttpError };
 
 // ---- provider rate-limit breaker ----
-// A 429 is a refusal, not a hiccup: retrying inside the window only burns the
-// allowance that is left. Live case: three stacked retry layers (per-call
-// attempts x page cooldown x sweep/lookahead workers) turned one OpenRouter
-// 429 into 24 identical requests in three minutes. Once a provider refuses,
-// every further call to that provider is refused locally until the window
-// passes — the content script halts auto and the user decides what to do next.
+// A 429 is a refusal, not a hiccup: refuse locally until the window passes —
+// content halts auto and the user decides what to do next.
 const RATE_LIMIT_DEFAULT_MS = 45_000;
 const RATE_LIMIT_MAX_MS = 300_000;
 const rateLimitedUntil = new Map<string, number>();
@@ -208,10 +189,7 @@ export function toMtError(e: unknown): MtError {
     if (e instanceof MtError) return e;
     if (e instanceof LlmHttpError) {
         if (e.status === 401 || e.status === 403) {
-            // Cloudflare Workers AI gates some models (Meta llama-3.2-11b-vision)
-            // behind a one-time license agreement — the 403 body says exactly
-            // that, but the generic key hint sent users to re-check a working
-            // key (live-reported).
+            // Some CF models gate behind a one-time license agreement — point at the agree call.
             if (/model agreement|[Cc]ommunity [Ll]icense|submit the prompt/i.test(e.message))
                 return new MtError('auth', e.message, 'Model license not accepted — send {"prompt":"agree"} once to the model\'s /ai/run URL (Cloudflare), then Test again');
             return new MtError('auth', e.message, 'API key is wrong or expired — check the key in Settings');
@@ -230,10 +208,8 @@ export function toMtError(e: unknown): MtError {
     return m;
 }
 
-// Thinking levels: one combobox in the options page (free-text allowed —
-// custom text/numbers go out verbatim). Mapped per provider at send time;
-// the API is the authority on what each model accepts, rejects fall back
-// down the chain (modern scheme → legacy scheme → omitted).
+// Thinking levels: one combobox in options (free-text allowed). Mapped per provider;
+// the API is the authority, rejections fall back down the chain.
 export type ThinkingPreset = 'auto' | 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 const FULL_LEVELS: ThinkingPreset[] = ['auto', 'none', 'low', 'medium', 'high', 'xhigh', 'max'];
 // Gemini 3 levels stop at high (no xhigh/max/none — none maps to minimal)
@@ -255,21 +231,14 @@ export const THINKING_HINTS: Record<ThinkingPreset, string> = {
 };
 
 const isNumericLevel = (s: string) => /^\d+$/.test(s);
-// error smells like a rejected thinking param (as opposed to e.g. an image error)
-// exported: the Test-connection probe classifies rejections with it
+// error smells like a rejected thinking param (not e.g. an image error); the Test probe classifies with it
 export function thinkingSmell(e: unknown): boolean {
     return e instanceof LlmHttpError && (e.status === 400 || e.status === 422)
         && /thinking|budget|effort|adaptive|reasoning/i.test(e.message);
 }
 
-// single-shot thinking probe for the Test button: one direct dispatch with NO
-// fallback (callLLM's omit-retry would mask a rejection as success).
-// Resolves 'accepted'; rejects with the provider error for the caller to
-// classify (thinkingSmell = rejected level, anything else = real problem).
-// cacheKey is forwarded so session-affinity headers (x-opencode-session)
-// ride along — without it some proxies 400 the probe for a missing session.
-// Caveat: silent-ignore providers (old OpenAI models dropping reasoning_effort)
-// report accepted without effect — rejection, not effect, is what's probed.
+// Single-shot thinking probe for Test: direct dispatch with NO fallback (omit-retry would mask rejection).
+// Silent-ignore providers report accepted without effect — rejection, not effect, is what's probed.
 export async function checkThinking(s: LLMSettings, thinking: string, cacheKey?: string): Promise<'accepted'> {
     const base = (s.baseUrl || DEFAULT_BASES[s.provider]).replace(/\/$/, '');
     await dispatch(base, s, 'Reply with exactly: pong', undefined, thinking, cacheKey);
@@ -313,12 +282,8 @@ async function responses(base: string, s: LLMSettings, prompt: string, images?: 
     const body: Record<string, unknown> = { model: s.model, input: [{ role: 'user', content }] };
     if (thinking) body.reasoning = { effort: thinking };
     if (temperature != null) body.temperature = temperature;
-    // max_output_tokens rides only when explicitly set (transcribe/Test caps,
-    // user-configured max) — never as a main-translate default: this cap
-    // INCLUDES reasoning tokens and these models reason even without a
-    // `reasoning` param, so a 4096 default came back `status: incomplete` with
-    // an EMPTY output (reasoning_tokens 4093/4096 — live: 6 of 11 calls on one
-    // page), which read downstream as "the model ignored the output format".
+    // max_output_tokens only when explicitly set — the cap INCLUDES reasoning tokens,
+    // so a default would truncate to an empty `status: incomplete` output.
     if (maxTokens != null) body.max_output_tokens = maxTokens;
     if (cacheKey) body.prompt_cache_key = cacheKey;
     const resp = await fetch(`${base}/responses`, {
@@ -340,16 +305,11 @@ async function responses(base: string, s: LLMSettings, prompt: string, images?: 
         }
     }
     const answer = out.join('\n');
-    // truncated before the message item even started: the whole budget went to
-    // reasoning (incomplete_details.reason === 'max_output_tokens' when the cap
-    // is explicit — a provider-side default otherwise). An empty string would
-    // die downstream as "No usable text regions parsed (the model ignored the
-    // output format)", pointing at the wrong thing entirely.
+    // truncated before the message started: whole budget went to reasoning.
+    // Empty string would misread downstream as "ignored the output format".
     if (!answer && data.status === 'incomplete') {
         const reason = String(data.incomplete_details?.reason ?? 'unknown');
-        // how much of the budget the model burned before answering: tells the
-        // user whether it ran out while thinking (no fixed cap can fix that —
-        // the model or its Thinking level has to change)
+        // how much budget burned before answering: no fixed cap fixes thinking-exhaustion — change model or Thinking level
         const reasoning = num(data.usage?.output_tokens_details?.reasoning_tokens);
         if (reasoning) console.warn(`[mt:bg] model ran out of output tokens while reasoning (${reasoning} reasoning tokens)`);
         throw new MtError('parse', `Model response incomplete (${reason}) with no output${reasoning ? ` (reasoning ${reasoning} tokens)` : ''}`,
@@ -369,9 +329,8 @@ const ANTHROPIC_MAXTOK: Record<string, number> = { low: 8192, medium: 8192, high
 
 // Anthropic messages API (direct browser access header)
 async function anthropic(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
-    // cache requires an explicit breakpoint on the STABLE part: split the
-    // prompt at <regions> (everything before it repeats across pages of the
-    // same manga). Text-first so the volatile images can't cut the prefix.
+    // cache needs explicit breakpoint on the STABLE part: split at <regions>.
+    // Text-first so volatile images can't cut the prefix.
     const split = splitStablePrefix(prompt);
     const content: unknown[] = [];
     if (split) {
@@ -384,8 +343,7 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
         content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } });
     }
     const baseBody: Record<string, unknown> = { model: s.model, max_tokens: maxTokens ?? 4096, messages: [{ role: 'user', content }] };
-    // temperature and extended thinking are mutually exclusive (API 400) —
-    // keep talking to the model rather than let the knob break the page
+    // temperature and extended thinking are mutually exclusive (API 400) — drop temperature, keep talking
     if (temperature != null && (!thinking || thinking === 'none')) baseBody.temperature = temperature;
     const send = async (patch: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage }> => {
         const body = { ...baseBody, ...patch };
@@ -409,8 +367,7 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
         };
     };
     if (!thinking || thinking === 'none') return send({});
-    // modern scheme first: adaptive thinking + effort (Opus 4.6+/Sonnet 4.6+/5.x).
-    // thinking counts toward max_tokens, so xhigh/max need large headroom.
+    // modern scheme first: adaptive thinking + effort. Thinking counts toward max_tokens, so xhigh/max need headroom.
     try {
         return await send({
             max_tokens: ANTHROPIC_MAXTOK[thinking] ?? 16384,
@@ -420,8 +377,7 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
     } catch (e) {
         if (!thinkingSmell(e)) throw e;
     }
-    // legacy scheme: fixed budget (4.5 and earlier). Custom numbers go verbatim;
-    // custom strings can't map to a budget — rethrow into the omit-retry.
+    // legacy scheme: fixed budget. Custom numbers go verbatim; custom strings rethrow into the omit-retry.
     const budget = isNumericLevel(thinking)
         ? Math.min(32000, Math.max(1024, parseInt(thinking, 10)))
         : ANTHROPIC_BUDGET[thinking];
@@ -478,16 +434,8 @@ async function gemini(base: string, s: LLMSettings, prompt: string, images?: str
     return send({ thinkingBudget: budget });
 }
 
-// Cloudflare Workers AI (native run endpoint). The `/ai/v1` OpenAI-compatible
-// endpoint routes images per model and dies on some of them — llama-3.2-11b-vision
-// 400s with "Unable to add image when there are no user-supplied nor
-// system-supplied messages" even for a single image, while llama-4-scout works
-// there (all live-probed) — so vision goes through /ai/run/<model> with
-// OpenAI-style image_url parts (live-probed working for both models).
-// Some models cap images per request (llama-3.2-11b-vision: exactly 1 —
-// live-probed 2+ → HTTP 400 code 3030); that cap is NOT hardcoded here — the
-// request goes out and the 3030 maps to an actionable hint, so renamed or new
-// single-image models degrade to the same hint instead of a raw 400.
+// Cloudflare Workers AI (native run endpoint). Vision goes through /ai/run/<model>;
+// the /ai/v1 compat endpoint dies on some models. Caps are NOT hardcoded — 3030 maps to a hint.
 export function cfRunUrl(base: string, model: string): string {
     // accept both bases: .../ai and the OpenAI-compatible .../ai/v1
     const b = base.replace(/\/+$/, '').replace(/\/v1$/, '');
@@ -496,16 +444,9 @@ export function cfRunUrl(base: string, model: string): string {
 export function cfBody(prompt: string, images?: string[], thinking?: string | null, temperature?: number | null, maxTokens?: number): Record<string, unknown> {
     const content: unknown[] = [{ type: 'text', text: prompt }];
     for (const b64 of images ?? []) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
-    // max_tokens is explicit on purpose: the native default is 256 (truncated
-    // translations). temperature defaults to 0 (not the CF 0.6 default): at 0.6
-    // the transcribe prompt's XML format drifts to bare text in ~1/3 of calls
-    // (live-probed 2/3 vs 3/3 compliant) and translations wobble run to run;
-    // an explicit user setting overrides.
+    // max_tokens explicit: native default 256 truncates. Temperature defaults 0 (CF 0.6 drifts); explicit setting overrides.
     const body: Record<string, unknown> = { messages: [{ role: 'user', content }], max_tokens: maxTokens ?? 4096, temperature: temperature ?? 0 };
-    // 'none' = no reasoning, i.e. omit the param entirely (CF rejects the
-    // literal "none" with a validation 400 — live-probed — and callLLM's
-    // retry-without would double every request); other levels ride along and
-    // fall back the same way when a model doesn't take them
+    // 'none' = omit the param (CF 400s the literal); other levels ride along with the same fallback
     if (thinking && thinking !== 'none') body.reasoning_effort = thinking;
     return body;
 }
@@ -528,8 +469,7 @@ export function cfParse(data: {
         },
     };
 }
-// CF reports model errors as errors[] — sometimes with HTTP 200 (success:false).
-// providerCode carries the first numeric code so callers can map known buckets.
+// CF reports model errors as errors[] — sometimes with HTTP 200. providerCode carries the first numeric code.
 export function cfError(data: { errors?: Array<{ message?: unknown; code?: unknown }> } | null, status: number): LlmHttpError | null {
     const errs = data?.errors;
     if (!errs?.length) return null;
@@ -537,9 +477,7 @@ export function cfError(data: { errors?: Array<{ message?: unknown; code?: unkno
     const code = typeof errs[0]?.code === 'number' ? errs[0].code : undefined;
     return new LlmHttpError(status, msg, code);
 }
-// CF's 3030 is the AiError bucket; on a well-formed native request that
-// carried images it is the multi-image rejection (live-probed). Soft wording —
-// the code can cover other AiErrors — but it turns an opaque 400 into a fix.
+// CF 3030 is the AiError bucket; on an image-carrying request it is the multi-image rejection.
 export function cfImageCapHint(providerCode: number | undefined, imageCount: number): string | undefined {
     if (providerCode !== 3030 || imageCount < 2) return undefined;
     return `This Cloudflare model may not accept ${imageCount} images in one request — switch "How the model reads text" to OCR text (local Baberu), or pick a model that takes multiple images`;
@@ -553,18 +491,13 @@ async function cloudflareChat(base: string, s: LLMSettings, prompt: string, imag
         headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${s.apiKey}`,
-            // prefix-cache affinity: models that support Workers AI prompt
-            // caching only hit when requests route to the same instance; the
-            // session id is stable per conversation (vision models report 0
-            // cached tokens — live-probed — text models do use it)
+            // prefix-cache affinity: cacheable models only hit on the same instance (vision models report 0)
             ...(cacheKey ? { 'x-opencode-session': cacheKey, 'x-session-affinity': cacheKey } : {}),
         },
         body: JSON.stringify(cfBody(prompt, images, thinking, temperature, maxTokens)),
         signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
     });
-    // read the body FIRST: CF signals model errors as errors[] on both 2xx
-    // (success:false) and 4xx — checkOk would throw before the code-based hint
-    // mapping ever runs (live-probed: multi-image 3030 arrives as HTTP 400)
+    // read body FIRST: CF signals model errors as errors[] on 2xx and 4xx — checkOk would throw before hint mapping
     const text = await resp.text();
     let data: unknown = null;
     try { data = JSON.parse(text); } catch { /* non-JSON below */ }
@@ -581,16 +514,8 @@ async function cloudflareChat(base: string, s: LLMSettings, prompt: string, imag
     return cfParse(data as Parameters<typeof cfParse>[0]);
 }
 
-// ---- in-flight adoption identity: which request fingerprints must match for
-// two mt:translate calls to share one provider roundtrip. Everything that can
-// change the model's output is in (images, regions, context snapshot, mode
-// flags incl. split, both models, thinking levels, prompt-shaping settings,
-// manga scope); routing-only hints (prompt_cache_key, session affinity) stay
-// out. Raw msg values + split (effective flags derive from those — no logic
-// duplication). Deterministic by construction (fixed-order array).
-// A miss only costs the optimization (fresh call, today's behavior); a hit
-// across documents is safe because equal inputs mean an equally valid output
-// (same content-identity philosophy as the page cache).
+// ---- in-flight adoption identity: everything that can change the model's output is in;
+// routing-only hints stay out. A miss costs only the optimization (fresh call).
 export interface TranslateRequestFingerprint {
     cacheKey: string;
     imagesB64: string[];

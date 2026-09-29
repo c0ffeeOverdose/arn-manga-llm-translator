@@ -1,29 +1,6 @@
 // Chapter sweep: explicit whole-chapter background translation (popup button,
 // not auto). A pool of headless workers walks the chapter manifest in reading
-// order; slow stages (fetch/detect/translate) overlap, but the book folds
-// strictly in page order (commit pointer + takeOrdered buffer — updateContext
-// is order-sensitive: pairs append, names are first-wins). A serial warm-up
-// (2 commits) seeds the book before the pool opens, so parallel pages still
-// see real context; pages dispatched ahead of unfinished predecessors see
-// dispatch-time snapshots (thinner context), but the book END STATE stays
-// exactly ordered — the documented price of parallelism.
-//
-// Arrival never pays twice: claimed URLs make DOM jobs wait (sweepWait, wired
-// into preparePage via the page-cache registry at initSweep), commits write
-// full cache entries, and the viewed page gets a paint job on commit.
-// Same-chapter tab only — closing/reopening resumes from IDB for free
-// (completed cached, partials resumable); a chapter change aborts quietly.
-//
-// Folded-hash set (bookHas/bookAdd/bookDrop): a folded page must not refold
-// on arrival (cached-path fold would duplicate its pairs — the same dup the
-// lookahead path always had). Fresh folds register, rewind unregisters,
-// chapter change resets lazily. render-page/seam/prefetch join the scheme.
-//
-// Module edges, function bodies only, no top-level cross-calls: sweep →
-// pipeline (headless detect), page-io (pixels/manifests), ocr (translate),
-// queue (fail marks + paint enqueue), status-ui (pill), state + llm/core
-// (book). Reverse edges (auto, render-page, seam, commands, content) import
-// FROM here — never the other way.
+// order; slow stages overlap, but the book folds strictly in page order.
 
 import { updateContext } from '../llm/core';
 import { pipeline, context, setContext, shareContext, loadContext, loadPipeline, resetContextIfNewChapter, saveContext, chapterKey, sessionUsage, setLastPageUsage, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
@@ -41,9 +18,8 @@ import { isDebug } from '../debug';
 
 const SWEEP_WARMUP = 2;
 const SWEEP_MAX_CONSECUTIVE_ERRORS = 3;
-// run watchdog: no dispatch/commit progress for this long = a hung fetch/infer
-// (no per-stage timeout can cover every ORT stall) — the run is force-finished
-// so Stop/new starts/auto can never be blocked by a wedged worker.
+// run watchdog: no dispatch/commit progress for this long = a hung fetch/infer —
+// the run is force-finished so Stop/new starts/auto can never be blocked.
 const SWEEP_STALL_MS = 300000;
 const SWEEP_WATCHDOG_MS = 30000;
 
@@ -69,24 +45,20 @@ const waiters = new Map<string, Set<() => void>>();
 let translating = 0; // workers inside translateRegions (pill stage honesty)
 let pagesCache: { chapter: string; n: number } | null = null;
 
-// ---- folded hashes: which content hashes already contributed to the live book
+// ---- folded hashes: which content hashes already contributed to the live book.
 let foldedChapter = '';
 const foldedHashes = new Set<string>();
 function foldedSync(): void {
     if (foldedChapter !== chapterKey()) { foldedChapter = chapterKey(); foldedHashes.clear(); }
 }
 // ---- session commits: hashes this document's sweep runs committed (fresh or
-// cached). Arrival may paint these WITHOUT auto — the sweep press is explicit
-// chapter-wide intent, unlike stale cache from previous sessions (which stays
-// blank until press/auto, per user verdict). Memory-only: a reopened page
-// starts blank again. Same lifecycle rules as the folded set above.
+// cached). Arrival may paint these WITHOUT auto. Memory-only.
 let committedChapter = '';
 const committedHashes = new Set<string>();
 function committedSync(): void {
     if (committedChapter !== chapterKey()) { committedChapter = chapterKey(); committedHashes.clear(); }
 }
-// arrival gate (cheap, no hash needed): a sweep is running, or this chapter
-// already has session commits worth painting on arrival
+// arrival gate (cheap, no hash needed).
 export function sweepArrivable(): boolean {
     committedSync();
     return sweepActive() || committedHashes.size > 0;
@@ -101,7 +73,7 @@ export function bookAdd(hash: string): void { foldedSync(); foldedHashes.add(has
 export function bookDrop(hash: string): void { foldedHashes.delete(hash); }
 
 // ---- DOM attach: a DOM job for a sweep-owned page waits for the commit
-// instead of paying a duplicate detect + LLM (falls through on timeout)
+// instead of paying a duplicate detect + LLM (falls through on timeout).
 function settleUrl(url: string): void {
     const set = waiters.get(url);
     if (!set) return;
@@ -111,7 +83,7 @@ function settleUrl(url: string): void {
 export function sweepHas(url: string): boolean {
     return !!sweep && !sweep.dead && claimFor(url) !== undefined;
 }
-// claim lookup with host-volatile fallback (same file, different CDN host)
+// claim lookup with host-volatile fallback (same file, different CDN host).
 function claimFor(url: string): string | undefined {
     if (inflight.has(url)) return url;
     for (const k of inflight.keys()) if (samePagePath(k, url)) return k;
@@ -121,15 +93,13 @@ export function awaitSweep(url: string, onStatus: MtOnStatus): Promise<void> {
     const s = sweep;
     const claim = s && !s.dead ? claimFor(url) : undefined;
     if (!claim) return Promise.resolve();
-    // explicit stage: the caller's pill keeps whatever stage it had otherwise
-    // (typically 'read') and the stepper reads as frozen mid-read for the
-    // whole wait — this wait is a queue position, not a read
+    // explicit stage: this wait is a queue position, not a read.
     onStatus('Waiting for chapter sweep…', 'detect');
     return new Promise<void>(res => {
         let set = waiters.get(claim);
         if (!set) { set = new Set(); waiters.set(claim, set); }
         set.add(res);
-        // claimed-and-settled between the check and the add — resolve at once
+        // claimed-and-settled between the check and the add — resolve at once.
         if (!inflight.has(claim)) settleUrl(claim);
     });
 }
@@ -146,8 +116,7 @@ export interface SweepStatus {
     skipped: number;
 }
 // During enumeration there is no run yet — still report active/starting so the
-// popup offers Stop instead of Translate-chapter (a second press used to
-// launch a second concurrent run while the first was still enumerating).
+// popup offers Stop instead of a second concurrent run.
 export function sweepStatus(): SweepStatus | null {
     if (sweep) {
         const phase = sweepPhase(sweep);
@@ -159,8 +128,7 @@ export function sweepStatus(): SweepStatus | null {
     if (starting) return { active: true, phase: 'starting', stopping: false, inflight: 0, done: 0, total: 0, errors: 0, skipped: 0 };
     return null;
 }
-// autoTick consults this (auto jobs would duplicate sweep work and clobber
-// its ordered book) — a cancelled-but-draining sweep still counts: its
+// autoTick consults this — a cancelled-but-draining sweep still counts: its
 // commits are still landing.
 export function sweepActive(): boolean {
     const s = sweep;
@@ -179,16 +147,15 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
     starting = true;
     startCancel = false;
     try {
-        // a running lookahead chain would warm the same pages in parallel (and
-        // fold them out of the sweep's commit order) — the sweep wins
+        // a running lookahead chain would warm the same pages in parallel — the sweep wins.
         abortLookahead();
         dropAutoQueued(); // queued auto jobs would duplicate sweep workers (manual/force intent survives)
         resumeAuto(); // the button is explicit user intent — a previous provider halt must not block it
         resetContextIfNewChapter();
         await loadPipeline();
         await loadContext();
-        // cloud engines scale to zero: pay the boot once here (with its own
-        // long cap) instead of letting the first 90s-capped page calls race it
+        // cloud engines scale to zero: pay the boot once here (with its own long
+        // cap) instead of letting the first 90s-capped page calls race it.
         if (pipeline.inferEngine === 'cloud') {
             const { endpoint, key } = await cloudConfig();
             if (endpoint && key) {
@@ -212,8 +179,8 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         watchdog = setInterval(sweepWatchdog, SWEEP_WATCHDOG_MS);
         pillUnDismiss();
         pumpSweepStatus();
-        // runSweep owns finishSweep via its finally — a crash mid-run can no
-        // longer leak a zombie `sweep` that blocks Stop/new starts/auto forever
+        // runSweep owns finishSweep via its finally — a crash mid-run must never
+        // leak a zombie `sweep` that blocks Stop/new starts/auto.
         void runSweep(usable);
         return { ok: true, total: usable.length };
     } finally {
@@ -234,14 +201,11 @@ export function initSweep(): void {
 }
 
 // ---- manifest walk: episode canvases → gallery manifest → DOM refs (DOM
-// order). DOM readers (whole chapter in DOM, blob srcs, canvases) sweep the
-// live elements through preparePage — the same read path as DOM jobs
-// (taint/screenshot fallbacks, blank guards) instead of URL fetching.
-// Always from chapter start (index 0): the book must accumulate in reading
-// order, and partially-cached chapters fast-forward through the cache checks
-// anyway.
+// order). DOM readers sweep the live elements through preparePage — the same
+// read path as DOM jobs. Always from chapter start (index 0): the book must
+// accumulate in reading order.
 function origOf(ref: PageRef): string | null {
-    // callers pass img refs only (filtered by kind) — the cast is safe
+    // callers pass img refs only — the cast is safe.
     const el = ref.el as HTMLImageElement;
     const kept = stateFor(ref)?.orig;
     if (kept && /^https?:/.test(kept)) return kept;
@@ -250,9 +214,8 @@ function origOf(ref: PageRef): string | null {
 async function sweepItems(): Promise<SweepItem[]> {
     const ep = episodeManifestSrcs();
     if (ep?.length) return ep.map(url => ({ url, descramble: true }));
-    // paged readers virtualize the DOM (loaded window only) — the chapter
-    // API lists every page, so the count is the chapter, not the window.
-    // [] off-host or on any failure → fall through to the DOM branches.
+    // paged readers virtualize the DOM — the chapter API lists every page, so
+    // the count is the chapter, not the window. [] → fall through to DOM branches.
     const paged = await fetchPagedUrls();
     if (paged.length) return paged.map(url => ({ url, descramble: false }));
     const refs = getPages().filter(r => r.kind === 'img');
@@ -263,11 +226,9 @@ async function sweepItems(): Promise<SweepItem[]> {
         if (g.urls.length) return g.urls.map(url => ({ url, descramble: false }));
         break; // anchor read, manifest absent — DOM reader, fall through once
     }
-    // plain DOM reader: sweep the live refs (blob srcs are document-local but
-    // fetchable in-session; claim = refKey, same key DOM jobs wait on) PLUS
-    // lazy <img> with an http(s) src but no pixels yet — headless URL items,
-    // deduped against the live refs. Junk fetched this way dies at the fetch
-    // size-gate in workPage (skip, never an LLM call).
+    // plain DOM reader: sweep the live refs PLUS lazy <img> with an http(s) src
+    // but no pixels yet (deduped against the live refs). Junk fetched this way
+    // dies at the fetch size-gate in workPage (skip, never an LLM call).
     const live = getPages();
     const known = new Set<string>();
     for (const r of live) {
@@ -280,19 +241,17 @@ async function sweepItems(): Promise<SweepItem[]> {
 }
 
 // ---- the run: N workers, ordered commit, warm-up gate. finishSweep lives in
-// the finally: a commit/context crash must never leak the run (a zombie sweep
-// blocked Stop, new starts and auto forever until reload).
+// the finally: a commit/context crash must never leak the run.
 async function runSweep(items: SweepItem[]): Promise<void> {
     const chapter = sweep!.chapter;
     // pool sized by the machine, not a constant: cloud endpoints serve calls
-    // in parallel (keep 3), a local CPU detector is ORT-lock-serial anyway and
-    // extra workers only multiply main-thread spikes (see sweepPoolSize)
+    // in parallel; a local CPU detector is ORT-lock-serial anyway (see sweepPoolSize).
     const pool = sweepPoolSize(pipeline.inferEngine === 'cloud', 'gpu' in navigator, pipeline.detEp === 'wasm');
     const cloud = pipeline.inferEngine === 'cloud';
     let next = 0, head = 0, streak = 0;
     const ready = new Map<number, Commit>();
     // drain the consecutive run from the head (atomic: sync take + head move,
-    // then awaited commits of disjoint sets — workers never double-commit)
+    // then awaited commits of disjoint sets — workers never double-commit).
     const commitAhead = async (): Promise<void> => {
         const r = takeOrdered(ready, head);
         head = r.head;
@@ -306,7 +265,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
             try {
                 await commitPage(c, s);
             } catch (e) {
-                // one bad commit must not kill the run: count it, keep the order
+                // one bad commit must not kill the run: count it, keep the order.
                 bad = true;
                 s.errors++;
                 if (!s.firstErr) s.firstErr = (e as Error)?.message ?? String(e);
@@ -325,7 +284,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
                 return;
             }
             // provider refused (rate limit / auth): the remaining pages would be
-            // refused too — stop dispatch and drain (same path as the error cap)
+            // refused too — stop dispatch and drain.
             if (autoHalted()) {
                 s.failed = true;
                 s.cancel = true;
@@ -333,8 +292,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
                 return;
             }
             // warm-up serial gate is a local-ORT-ism (2 commits seed the book
-            // before the pool opens — inference is lock-serial on-device); the
-            // cloud endpoint serves requests in parallel, so open the pool now
+            // before the pool opens); the cloud endpoint serves in parallel.
             if (inflight.size >= (cloud || s.done >= SWEEP_WARMUP ? pool : 1)) { await sleep(400); continue; }
             const k = next++;
             const job = items[k];
@@ -361,14 +319,13 @@ async function runSweep(items: SweepItem[]): Promise<void> {
         }
     };
     // the run holds the background alive (FF event page / MV3 SW idle-kill would
-    // otherwise drop every worker's LLM call mid-flight — see keepaliveOpen)
+    // otherwise drop every worker's LLM call mid-flight).
     const endKeepalive = keepaliveOpen();
     try {
         await Promise.all(Array.from({ length: Math.min(pool, items.length) }, () => worker()));
         await commitAhead(); // final drain (usually a no-op)
     } catch (e) {
-        // workers/commitAhead are internally caught — anything landing here is
-        // a bug; report it and let the finally release the run
+        // workers/commitAhead are internally caught — anything landing here is a bug.
         const s = sweep;
         if (s && s.chapter === chapter) {
             s.failed = true;
@@ -382,8 +339,7 @@ async function runSweep(items: SweepItem[]): Promise<void> {
 }
 
 // stalled run (hung fetch/infer with no timeout): force-finish so the popup,
-// Stop and auto can never be blocked by a wedged worker. The worker's late
-// commit is dropped by the `!sweep` guard.
+// Stop and auto can never be blocked by a wedged worker.
 function sweepWatchdog(): void {
     const s = sweep;
     if (!s || s.dead) return;
@@ -402,8 +358,7 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
     try {
         const f = await fetchBitmap(job.url); // direct → SW proxy → DNR retry, same as DOM pages
         let bitmap = f.bitmap;
-        // fetch size-gate (mirrors the getPages floor): unloaded-URL items
-        // arrive unsized — junk below this is skipped, never an LLM call
+        // fetch size-gate (mirrors the getPages floor): junk below this is skipped.
         if (bitmap.width < 400 || bitmap.height < 300) return { i: job.i, url: job.url, skip: true };
         if (job.descramble) {
             try {
@@ -415,14 +370,14 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
             if (chapterKey() !== chapter) return null; // story moved on mid-fetch — drop silently
             const hash = pageHashFromBitmap(bitmap);
             const w = bitmap.width, h = bitmap.height;
-            // shared headless resolve (full hit → cached marker, partial →
-            // resume, else detect + order + checkpoint)
+            // shared headless resolve (full hit → cached marker, partial → resume,
+            // else detect + order + checkpoint).
             const r = await resolveHeadlessDet(bitmap, hash, st);
             if (!r.det) return { i: job.i, url: job.url, hash, cached: true };
             translating++;
             let o: TranslateOutcome;
             try {
-                // fold:false — the commit folds in chapter order (rebase), never here
+                // fold:false — the commit folds in chapter order (rebase), never here.
                 o = await translateRegions(bitmap, r.det, st, { fold: false, progressKey: job.url, continued: r.resumed || !pipeline.cacheEnabled, lo: true });
             } finally {
                 translating--;
@@ -442,10 +397,9 @@ async function workPage(job: SweepItem & { i: number }, chapter: string): Promis
     }
 }
 
-// DOM flavor: read through preparePage (blob srcs, taint, screenshot
-// fallbacks, canvas blanks — all handled there), translate, commit shared.
+// DOM flavor: read through preparePage, translate, commit shared.
 // Null prep with existing state = done elsewhere (cached marker); null
-// without state = blank canvas (skip marker — translating it poisons).
+// without state = blank canvas (skip marker).
 async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter: string): Promise<Commit | null> {
     const st: MtOnStatus = () => {};
     try {
@@ -473,7 +427,7 @@ async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter
             throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
         }
         // warm AI cleanup + early paint need the original pixels: keep the
-        // bitmap alive until both resolve (paintVisibleNow's contract)
+        // bitmap alive until both resolve.
         const ai = await warmPatches(prep.bitmap, prep.det, o.outputs);
         await paintVisibleNow(job, prep.hash, prep.det, o, prep.bitmap, prep.origBytes, ai);
         try { prep.bitmap.close(); } catch { /* already closed */ }
@@ -486,10 +440,8 @@ async function workDomPage(job: SweepItem & { i: number; ref: PageRef }, chapter
     }
 }
 
-// full commit, in chapter order: rebase fold (serial-equivalent by induction —
-// the live book holds exactly pages <i when i commits) + cache write +
-// counters. Cached skips count done without folding (their paint job folds on
-// arrival and registers — later arrivals divert to the paint lane instead).
+// full commit, in chapter order: rebase fold + cache write + counters.
+// Cached skips count done without folding.
 async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     settleUrl(c.url);
     if ('error' in c) {
@@ -501,9 +453,8 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     if ('cached' in c) {
         s.done++;
         if (c.hash) { committedSync(); committedHashes.add(c.hash); }
-        // unconditional (like the fresh branch below): headless cached commits
-        // carry no ref, but the user may be looking at the page right now —
-        // paintIfLoaded resolves loaded refs itself and no-ops otherwise
+        // unconditional: the user may be looking at the page right now —
+        // paintIfLoaded resolves loaded refs itself and no-ops otherwise.
         await paintIfLoaded(c.url, c.hash, c.ref);
         return;
     }
@@ -515,10 +466,8 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     bookAdd(c.hash);
     committedSync(); committedHashes.add(c.hash);
     if (pipeline.cacheEnabled) {
-        // await, not void: the paintIfLoaded job below builds its prep at
-        // enqueue time and its cacheGet must not see the stale partial
-        // checkpoint (isResumable) or it re-runs translateRegions — a full
-        // duplicate LLM roundtrip for a page the user is looking at
+        // await, not void: the paintIfLoaded job below must not see the stale
+        // partial checkpoint (or it re-runs translateRegions — a duplicate LLM roundtrip).
         await cachePut({
             key: cacheKey(s.chapter, c.hash),
             fp: settingsFingerprint(pipeline),
@@ -544,13 +493,10 @@ async function commitPage(c: Commit, s: SweepRun): Promise<void> {
     await paintIfLoaded(c.url, c.hash, c.ref);
 }
 
-// The page the user is LOOKING AT must not wait for the ordered commit: on a
-// CPU-only machine the prefix pages can be minutes of inference away, and the
-// commit only paints when the whole run up to that index has folded. Paint it
-// now (paintOnly — no fold, no cache write), let the ordered commit fold it
-// later. Serialized through one chain: parallel early paints are pure jank.
-// Caller keeps the bitmap alive until this resolves (the worker awaits it
-// before its finally-close).
+// The page the user is LOOKING AT must not wait for the ordered commit:
+// paint it now (paintOnly — no fold, no cache write), let the ordered commit
+// fold it later. Serialized through one chain: parallel early paints are jank.
+// Caller keeps the bitmap alive until this resolves.
 let earlyPaintChain: Promise<unknown> = Promise.resolve();
 async function paintVisibleNow(job: SweepItem, hash: string, det: DetectResult, o: TranslateOutcome, bitmap: ImageBitmap, origBytes?: ArrayBuffer,
     ai?: { patches: InpaintPatch[]; patchesGen: number } | null): Promise<void> {
@@ -566,8 +512,7 @@ async function paintVisibleNow(job: SweepItem, hash: string, det: DetectResult, 
             },
         };
         await renderPage(ref, prep, () => {}, false, { paintOnly: true });
-        // the paint only reaches the element once shownSrc says "translated" —
-        // same flip the solo/arrival paths do for choice=auto
+        // the paint only reaches the element once shownSrc says "translated".
         if (overlayChoice === 'auto') setOverlayOn(true);
         applyOverlays();
         if (isDebug()) console.log('[mt] sweep early paint', job.url.slice(-14));
@@ -577,15 +522,10 @@ async function paintVisibleNow(job: SweepItem, hash: string, det: DetectResult, 
 }
 
 // a commit must paint every copy the user can see — arrival only paints via
-// a DOM job, and headless commits create no state, so without this the user
-// stares at finished pages until they click each one (or enable auto).
-// Cache-hit job (fold skipped when already registered — bookAdd covered it).
-// DOM commits carry their ref directly; headless ones resolve it by claim key
-// (only the viewed page has an element — the rest don't exist yet). Exact key
-// first, samePagePath fallback for CDN host rotation, content-hash fallback
-// for opaque-src readers (blob: elements never match any URL — verify the top
-// visible candidates by exact bytes, never paint blind: recycled nodes
-// mismatch and fall through; quality variants correctly miss like before).
+// a DOM job, and headless commits create no state.
+// DOM commits carry their ref; headless ones resolve it by claim key, with
+// samePagePath fallback for CDN host rotation and content-hash fallback for
+// opaque-src readers (verify by exact bytes, never paint blind).
 async function resolvePaintRef(url: string, hash: string | undefined, direct?: PageRef): Promise<PageRef | undefined> {
     return (direct && direct.el.isConnected && !stateFor(direct) ? direct : undefined)
         ?? getPages().find(r => pageKeyOf(r) === url && !stateFor(r))
@@ -599,20 +539,15 @@ async function paintIfLoaded(url: string, hash: string | undefined, direct?: Pag
     if (!ref) { if (isDebug()) console.log('[mt] sweep paint miss: no ref', url.slice(-24)); return; }
     if (stateFor(ref)) return; // painted while resolving
     // zero-rect only (hidden placeholders arrive-paint when the reader shows
-    // them): offscreen-but-loaded pages paint too — a committed page the user
-    // scrolls to must already carry its translation, not paint on arrival.
+    // them): offscreen-but-loaded pages paint too.
     const b = ref.el.getBoundingClientRect();
     if (b.width === 0 && b.height === 0) { if (isDebug()) console.log('[mt] sweep paint miss: zero-rect', url.slice(-24)); return; }
     enqueue(ref, false, true);
 }
 
-// top-3 visible loaded stateless imgs by content hash (see above). Decoded
-// from the ELEMENT (createImageBitmap) — the proven blob mechanism readPage
-// uses: same-origin blobs are never tainted, while content-script fetch() of
-// a page-minted blob: URL is unreliable (failed silently under a misleading
-// 'hash-mismatch' label for 72 straight commits — never again: decode
-// failures log as hash-unreadable, mismatches only after a real comparison).
-// Bounded: exact+path already missed, so at most 3 local decodes per commit.
+// top-3 visible loaded stateless imgs by content hash. Decoded from the
+// ELEMENT (createImageBitmap) — content-script fetch() of a page-minted blob:
+// URL is unreliable. Bounded: at most 3 local decodes per commit.
 async function viewedByHash(url: string, hash: string): Promise<PageRef | undefined> {
     const cands = getPages()
         .filter(r => {
@@ -643,15 +578,12 @@ async function viewedByHash(url: string, hash: string): Promise<PageRef | undefi
 function pumpSweepStatus(): void {
     const s = sweep;
     if (!s) return;
-    // auto yields to the sweep by design (its jobs would duplicate sweep work
-    // and clobber the ordered book) — say so, or an enabled-but-silent auto
-    // reads as broken.
+    // auto yields to the sweep by design — say so, or an enabled-but-silent
+    // auto reads as broken.
     const paused = autoTranslateOn() ? ' · auto paused' : '';
     if (s.cancel && !s.dead) {
         // Stop was pressed — the in-flight pages still drain (no mid-LLM
-        // abort), and this line is the only proof the press landed. Without
-        // it the pill read "Sweeping x/36…" for the whole ~90s drain and the
-        // stop looked broken.
+        // abort), and this line is the only proof the press landed.
         const finishing = inflight.size || translating ? ` — finishing ${Math.max(inflight.size, 1)} page${Math.max(inflight.size, 1) > 1 ? 's' : ''}…` : '…';
         setActivity('sweep', `Stopping sweep ${s.done}/${s.total}${finishing}${paused}`, 'sweep', translating > 0 ? 'llm' : 'detect');
         return;
@@ -671,11 +603,8 @@ function finishSweep(): void {
     if (s.dead) { renderStatus(); return; } // chapter moved on — quiet, the new chapter owns the pill
     if (!s.failed && !s.cancel) {
         // best-effort paint pass (natural finish only — cancel/error must not
-        // start new work): elements that appeared after their commit (lazy
-        // canvases) otherwise wait for a manual click. Uncached leftovers
-        // translate solo here — the user asked for the whole chapter;
-        // failures park via the normal cooldown. Parked pages are skipped so a
-        // persistent failure isn't retried by the finish pass itself.
+        // start new work): elements that appeared after their commit translate
+        // solo here. Parked pages are skipped.
         const now = Date.now();
         for (const ref of getPages()) {
             if (!stateFor(ref) && ref.el.isConnected && !cooldownParked(failMarks, pageKeyOf(ref), now)) enqueue(ref, false, true);

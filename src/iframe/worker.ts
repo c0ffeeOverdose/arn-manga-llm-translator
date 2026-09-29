@@ -1,6 +1,5 @@
 // Inference worker page (extension origin) — runs CTD ONNX via ORT here because
 // the host page's CSP blocks wasm compilation in every world.
-// Receives PNG bytes via postMessage, returns boxes + packed mask.
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -14,7 +13,6 @@ const MASK_THR = 0.3;
 const MIN_SIZE = 12; // px — configurable via mt:detect message
 
 // ORT loaded natively (never bundled through esbuild — it breaks Emscripten glue).
-// Path is built at runtime so esbuild leaves the import alone.
 const ORT_URL = new URL('../ort/ort.webgpu.bundle.min.mjs', import.meta.url).href;
 const ort: any = await import(/* @vite-ignore */ ORT_URL).catch((e: unknown) => {
     throw new Error(`ORT runtime load failed (${ORT_URL}): ${String((e as Error)?.message ?? e)}`);
@@ -28,13 +26,9 @@ let creating: Promise<void> | null = null;
 let sessionInitMs = 0; // one-time cost (model upload + shader compile) — 0 on reuse
 let ctdEvictedOnce = false; // corrupt-download eviction fires once per page lifetime (never loop re-downloads on tiny devices)
 
-// Concurrent detects (queue: next page's CTD runs while the current page's
-// LLM call is in flight) must not both create a session — ORT throws
+// Concurrent detects must not both create a session — ORT throws
 // "Session already started". Memoize the creation promise.
-// Model sources, in order: IndexedDB cache → dist bundle (dev/E2E builds
-// only — production dist ships no models) → HF runtime mirror (pinned,
-// downloaded once per install). Same IDB keys as before ('ctd'/'panel').
-// URLs live in ocr-models (DET_URL) — single source for worker + options.
+// Model sources, in order: IndexedDB cache → dist bundle (dev only) → HF mirror.
 
 function idbStore(db: IDBDatabase, mode: IDBTransactionMode) {
     return db.transaction('m', mode).objectStore('m');
@@ -51,9 +45,8 @@ async function openModelsDb(): Promise<IDBDatabase> {
 
 // one model file through the whole chain (throws with a user-actionable message).
 // Returns whether the bytes were freshly downloaded — a session.create failure
-// on fresh bytes means a corrupt download (evict so the next retry re-fetches
-// instead of re-reading poison); on cached bytes it means an environment
-// problem (keep the cache, retrying must not re-download 40MB).
+// on fresh bytes means a corrupt download (evict); on cached bytes it means an
+// environment problem (keep the cache).
 async function loadModelFile(key: string, bundlePath: string, hfFile: string, label: string, noDownload = false): Promise<{ buf: ArrayBuffer; fresh: boolean }> {
     const db = await openModelsDb();
     const cached = await new Promise<ArrayBuffer | undefined>(res => {
@@ -70,9 +63,7 @@ async function loadModelFile(key: string, bundlePath: string, hfFile: string, la
         buf = await dl(chrome.runtime.getURL(bundlePath));
     } catch { /* production dist ships no models — fall through to HF */ }
     if (!buf) {
-        // warm/background callers must never start a surprise download: the
-        // dev bundle above covers local testing, release users get the model
-        // from the options download (or their first real page, which may)
+        // warm/background callers must never start a surprise download.
         if (noDownload) throw new Error(`${label} not downloaded yet`);
         if (isDebug()) console.log(`[mt] downloading ${label} (once per install)…`);
         try {
@@ -98,11 +89,7 @@ async function evictModelFile(key: string): Promise<void> {
 
 async function ensureSession(forceWasm = false): Promise<void> {
     // evict ONLY when the user demands wasm but we hold a webgpu session —
-    // 'auto' accepts its own wasm fallback (a GPU-less machine would otherwise
-    // rebuild the session on every single detect). Release INSIDE the infer
-    // lock: an in-flight run of this session may still be executing, and
-    // releasing under it kills the run (runDetect holds its own ref, but ORT
-    // may reject the call outright).
+    // 'auto' accepts its own wasm fallback. Release INSIDE the infer lock.
     if (session && forceWasm && !sessionWasm) {
         const old = session;
         session = null; sessionEp = '';
@@ -115,23 +102,16 @@ async function ensureSession(forceWasm = false): Promise<void> {
             const { buf, fresh } = await loadModelFile('ctd', 'models/ctd-int8.onnx', 'ctd-int8.onnx', 'CTD model (~40MB)');
             try {
                 if (forceWasm) throw new Error('forced wasm');
-                // inside the lock: the evicted session's in-flight run may still be
-                // executing — an unlocked create here hits the global "Session
-                // already started" guard (live-proven class of failure)
                 session = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }));
                 sessionEp = 'webgpu';
             } catch {
-                // wasm create shares the runtime-wide session guard with every other
-                // wasm run/create — ride the chain or a concurrent inference throws
-                // "Session already started" at us
+                // wasm create shares the runtime-wide session guard — ride the chain.
                 try {
                     session = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['wasm'] }));
                     sessionEp = 'wasm';
                 } catch (e) {
-                    // fresh bytes that don't parse are a corrupt download, not a bad
-                    // device — evict so the next retry re-fetches instead of re-reading
-                    // poison (cached bytes are kept: that failure is environmental).
-                    // Once per lifetime: a too-small device must not loop re-downloads.
+                    // fresh bytes that don't parse are a corrupt download (evict so
+                    // the next retry re-fetches); cached bytes are kept. Once per lifetime.
                     if (fresh && !ctdEvictedOnce) { ctdEvictedOnce = true; await evictModelFile('ctd'); }
                     throw e;
                 }
@@ -143,8 +123,7 @@ async function ensureSession(forceWasm = false): Promise<void> {
     }
     await creating;
     // race guard: a concurrent caller with the OTHER forceWasm value may have
-    // owned the create we just awaited — re-check instead of running on the
-    // wrong EP (bounded recursion: the second create matches some waiter)
+    // owned the create we just awaited — re-check instead of running on the wrong EP.
     if (session && forceWasm && !sessionWasm) return ensureSession(forceWasm);
 }
 
@@ -167,28 +146,19 @@ function nms(boxes: number[][], confs: number[]): number[] {
     return keep;
 }
 
-// ORT's wasm glue throws "Session already started" if two inferences hit the
-// same session concurrently — the session object handles one run at a time.
-// Mutex JUST the inference call: decode/preprocess/mask/NMS stay parallel,
-// ORT's "Session already started" guard turned out to be GLOBAL across the
-// whole Emscripten runtime — every session, every EP, creates AND runs
-// (live-proven twice: wasm-create vs wasm-run, then gpu-vision vs
-// gpu-prefill on separate chains). ONE chain for everything ORT. The
-// pipeline overlap lives on the CPU side (crops, preprocess, LLM calls).
+// ORT's "Session already started" guard is GLOBAL across the whole Emscripten
+// runtime — every session, every EP, creates AND runs. ONE chain for everything
+// ORT. Mutex JUST the inference call: decode/preprocess/mask/NMS stay parallel.
 //
 // Scheduling: FIFO with a background lane — RPCs tagged prio 1 (lookahead /
-// chapter sweep, which now precompute AI cleanup too) yield to the page the
-// user is waiting on (prio 0), which would otherwise queue behind a
-// multi-second background OCR. A running task is never preempted; ties keep
-// FIFO.
+// chapter sweep) yield to the page the user is waiting on (prio 0). A running
+// task is never preempted; ties keep FIFO.
 type InferPrio = 0 | 1;
 interface InferTask { fn: () => Promise<unknown>; prio: InferPrio; t0: number; ok: (v: unknown) => void; fail: (e: unknown) => void }
 const inferQ: InferTask[] = [];
 let inferBusy = false;
-// lock contention meter: cumulative ms ORT runs spent queued on the infer
-// lock behind other models' runs. Handlers snapshot per-RPC deltas into
-// their replies — the page-result dump shows whether detect/panel/ocr
-// actually blocked on each other (0 = the lock was free).
+// lock contention meter: cumulative ms ORT runs spent queued on the infer lock.
+// Handlers snapshot per-RPC deltas into their replies.
 let lockWaitMs = 0;
 function pumpInfer(): void {
     if (inferBusy || !inferQ.length) return;
@@ -211,8 +181,6 @@ async function metered<T>(fn: () => Promise<T>): Promise<{ v: T; lockWait: numbe
 
 // One model pass over a bitmap region (full page or one tile): box-head
 // predictions in REGION coords + the raw text-probability mask at region size.
-// Extracted verbatim from the old monolithic runDetect — same pixels in,
-// same numbers out; tiling just calls it N times.
 async function inferOnce(bmp: ImageBitmap, confThr: number, prio: InferPrio = 0): Promise<{  boxes: number[][]; confs: number[]; lowBoxes: number[][]; lowConfs: number[];
     prob: Float32Array; inferMs: number;
 }> {
@@ -235,8 +203,7 @@ async function inferOnce(bmp: ImageBitmap, confThr: number, prio: InferPrio = 0)
 
     const t0 = performance.now();
     // local ref: a concurrent detEp flip may evict the global between passes
-    // of the tile loop — this inference still runs on the session it started
-    // with (the evict's release waits on the infer lock this run holds)
+    // of the tile loop — this inference still runs on the session it started with.
     const sess = session;
     if (!sess) throw new Error('CTD session unavailable');
     const res: any = await withInferLock(() => sess.run({ image: new ort.Tensor('float32', x, [1, 3, INPUT, INPUT]) }), prio);
@@ -246,8 +213,7 @@ async function inferOnce(bmp: ImageBitmap, confThr: number, prio: InferPrio = 0)
     const n = raw.length / 7;
     const boxes: number[][] = [];
     const confs: number[] = [];
-    // ALL box-head predictions ≥0.05 (pre-threshold) — corroboration signal for
-    // mask components: "the box head also thinks something texty is here"
+    // ALL box-head predictions ≥0.05 (pre-threshold) — corroboration signal for mask components.
     const lowBoxes: number[][] = [];
     const lowConfs: number[] = [];
     for (let i = 0; i < n; i++) {
@@ -261,8 +227,7 @@ async function inferOnce(bmp: ImageBitmap, confThr: number, prio: InferPrio = 0)
         boxes.push(bx); confs.push(conf);
     }
 
-    // mask [1,1,1024,1024] -> region size. Keep the RAW probability 0-1 —
-    // the mean prob inside each component is the free text-likelihood signal.
+    // mask [1,1,1024,1024] -> region size. Keep the RAW probability 0-1.
     const mraw = res.mask.data as Float32Array;
     const mCanvas = new OffscreenCanvas(nw, nh);
     const mCtx = mCanvas.getContext('2d', { willReadFrequently: true })!;
@@ -288,8 +253,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     const w = bitmap.width, h = bitmap.height;
     // strips tile (splitTiles [] unless aspect>3): each tile infers at near-
-    // natural scale, then boxes seam-merge + masks max-stitch below. Single
-    // path for normal pages — byte-identical behavior to before.
+    // natural scale, then boxes seam-merge + masks max-stitch below.
     const tiles = splitTiles(w, h);
     let boxes: number[][], confs: number[], lowBoxes: number[][], lowConfs: number[];
     let prob: Float32Array, inferMs = 0;
@@ -323,9 +287,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
             inferMs += r.inferMs;
         }
     }
-    // binary text mask from the stitched/single probability field — the
-    // component passes below (mask-only SFX recovery, overlap gate) run on
-    // this exactly as before, tiled or not
+    // binary text mask from the stitched/single probability field.
     const keep = nms(boxes, confs).filter(i => {
         const b = boxes[i];
         return (b[2] - b[0]) > minSize && (b[3] - b[1]) > minSize; // kills window-texture false positives
@@ -334,16 +296,11 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     for (let i = 0; i < packed.length; i++) packed[i] = prob[i] > MASK_THR ? 255 : 0;
 
     // Mask-only text: connected components of the text mask that no detected
-    // box covers (handwriting/SFX the box head missed — the mask head sees it).
-    // Nearby components merge first (handwriting breaks into per-line fragments;
-    // merging keeps the translation complete instead of line-partial). Each
-    // merged region becomes a regular region: badged, cropped, sent to the LLM,
-    // whose keep rule neutralizes non-text components (windows, texture noise).
-    // Containment gate for CTD boxes themselves: a low-conf sub-box drowned
-    // inside a bigger box (the box head splitting one bubble's first line off,
-    // seen at conf 0.22 fully inside a 0.46 bubble when detConf is lowered)
-    // renders the same text twice. If ≥80% of a box is inside another, drop
-    // whichever has lower confidence.
+    // box covers. Nearby components merge first (handwriting breaks into
+    // per-line fragments). Each merged region becomes a regular region; the
+    // LLM's keep rule neutralizes non-text components.
+    // Containment gate for CTD boxes themselves: if ≥80% of a box is inside
+    // another, drop whichever has lower confidence.
     const contained = new Set<number>();
     for (let i = 0; i < keep.length; i++) {
         for (let j = 0; j < keep.length; j++) {
@@ -371,10 +328,9 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
             const ix = Math.max(0, Math.min(o.x2, b.x2) - Math.max(o.x1, b.x1));
             const iy = Math.max(0, Math.min(o.y2, b.y2) - Math.max(o.y1, b.y1));
             const inter = ix * iy;
-            // two-way gate: the two model heads disagree on box edges, so a mask
-            // component of the SAME text can pass a one-sided check (saw 48%) and
-            // render the translation twice. Cut on EITHER small overlap — touching
-            // edges is enough evidence they're the same text.
+            // two-way gate: the two model heads disagree on box edges, so cut on
+            // EITHER small overlap — touching edges is enough evidence they're
+            // the same text.
             return inter > 0.05 * (b.x2 - b.x1) * (b.y2 - b.y1)
                 || inter > 0.15 * (o.x2 - o.x1) * (o.y2 - o.y1);
         });
@@ -382,9 +338,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     type Comp = { x1: number; y1: number; x2: number; y2: number; count: number; probSum: number; ids: number[] };
     // Same text-likelihood definition everywhere a mask component must claim
     // to be text: mean raw mask prob, corroborated by any low-confidence
-    // box-head prediction overlapping it (FREE — evidence: 8-page sweep — p4
-    // handwriting 4/4 survive, p7 window false-positives 0/12 pass, junk cut 70%).
-    // compBoxConf takes the SplitComp shape so split-rescue pieces re-gate directly.
+    // box-head prediction overlapping it.
     const compBoxConf = (c: SplitComp): number => {
         let boxConf = 0;
         const cArea = (c.x2 - c.x1) * (c.y2 - c.y1);
@@ -419,36 +373,24 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         }
         if (maxX - minX + 1 >= 8 && maxY - minY + 1 >= 8) comps.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1, count, probSum, ids: [id] });
     }
-    // Split-input comps: raw text clusters snapshotted BEFORE pass 2 merges (a
-    // merged bbox would hide the gap between two balloons) and filtered by the
-    // same text-likelihood gate pass 3 uses. A box-head box can cover two
-    // balloons when their clusters sit close in the model's receptive field —
-    // these clusters are the evidence that splits it (splitMergedBoxes).
+    // Split-input comps: raw text clusters snapshotted BEFORE pass 2 merges and
+    // filtered by the same text-likelihood gate pass 3 uses.
     const textyComps: SplitComp[] = [];
     const boxComps: SplitComp[] = [];
     for (const c of comps) {
         const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
-        // split evidence goes smaller than emitted regions: a lobe's ~10px
-        // fragments still split reliably (the lanes' own guards hold the
-        // lines together — live md2 YES lobe). Pass-3 emission keeps its own
-        // ≥14 floor, so no new junk regions are created by this.
+        // split evidence goes smaller than emitted regions: pass-3 emission keeps
+        // its own ≥14 floor, so no new junk regions are created by this.
         if (bw < 10 || bh < 10) continue;
-        // pass 3's fill upper bound (solid blocks like windows) is wrong for
-        // raw per-line clusters: bold lines (white-on-black dialogue, the "EM"
-        // in an overlapping pair) fill their tight bbox past 0.6 and would be
-        // dropped — a dropped middle line turns its bubble's real line spacing
-        // into a fake 60px+ gap and splits the bubble in half (live). Dust
-        // stays out via the floor, solid impostors via the prob/corroboration
-        // gate below.
+        // pass 3's fill upper bound is wrong for raw per-line clusters: bold lines
+        // fill their tight bbox past 0.6 and would be dropped. Dust stays out via
+        // the floor, solid impostors via the prob/corroboration gate below.
         if (c.count / (bw * bh) < 0.02) continue;
         if (c.probSum / c.count < 0.75 && compBoxConf(c) < 0.20) continue;
         const comp = { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 };
         textyComps.push(comp);
-        // …and the stricter set the child BOXES are measured from: the
-        // corroboration rescue is free for the cut decision, but a texture
-        // patch the box head also boxed (a screentone area: mean prob ~0.35-0.4
-        // against 0.8+ for text) must not widen a child box into the artwork
-        // (live page 4: caption box 4 grew 109px over the hatch).
+        // …and the stricter set the child BOXES are measured from: a texture
+        // patch the box head also boxed must not widen a child box into the artwork.
         if (c.probSum / c.count >= 0.75) boxComps.push(comp);
     }
     // pass 2: merge components whose boxes touch when padded (line spacing)
@@ -500,9 +442,8 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         if (maskBoxes.length >= 16) break;
         const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
         const fill = c.count / (bw * bh);
-        // text strokes are sparse-but-present (not solid blocks like windows,
-        // not dust); min bbox side keeps single pixels out; cap area stops
-        // GAP-merges that swallow whole panels
+        // text strokes are sparse-but-present; min bbox side keeps single pixels
+        // out; cap area stops GAP-merges that swallow whole panels.
         if (bw < 14 || bh < 14 || fill < 0.02 || fill > 0.6) continue;
         if (bw * bh > 0.2 * pageArea) continue;
         const maskProb = c.probSum / c.count;
@@ -521,9 +462,9 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     const initMs = sessionInitMs; // reported once — reset so later pages show steady-state 0
     sessionInitMs = 0;
     return {
-        // split AFTER the mask-only pass: a merged box's generous coverage must
-        // still suppress mask clusters it swallowed (pre-split list feeds the
-        // overlap gate), and only then does each balloon become its own box.
+        // split AFTER the mask-only pass: a merged box's coverage must still
+        // suppress mask clusters it swallowed, and only then does each balloon
+        // become its own box.
         boxes: splitMergedBoxes([...outBoxes, ...maskBoxes], textyComps, GAP, boxComps),
         dropped: nearMisses(lowBoxes, lowConfs, outBoxes, confThr, minSize, w, h),
         mask: { width: w, height: h, data: packed.buffer },
@@ -533,9 +474,9 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     };
 }
 
-// below-threshold box-head predictions (0.05 floor lives in runDetect) that
-// no kept box covers — the "model saw it, threshold cut it" set for debug.
-// Capped: a noisy page could otherwise dump hundreds of overlapping rects.
+// below-threshold box-head predictions that no kept box covers — the "model saw
+// it, threshold cut it" set for debug. Capped: a noisy page could otherwise
+// dump hundreds of overlapping rects.
 function nearMisses(lowBoxes: number[][], lowConfs: number[], kept: { x1: number; y1: number; x2: number; y2: number }[], confThr: number, minSize: number, w: number, h: number): DetBox[] {
     const out: DetBox[] = [];
     for (const i of nms(lowBoxes, lowConfs)) {
@@ -552,11 +493,8 @@ function nearMisses(lowBoxes: number[][], lowConfs: number[], kept: { x1: number
     return out;
 }
 
-// ---- Panel + text detection (YOLO26n nano, Apache-2.0 leoxs22,
-// .pt exported to ONNX — see scripts/export-panel-onnx.sh).
-// Same IDB-cached pattern as CTD (bundle → HF mirror). Output [1,300,6] is already NMS'd:
-// x1,y1,x2,y2 (0-640 space), conf, class (0=panel, 1=text).
-// Direct 640 resize, no letterbox — matches the offline probe.
+// ---- Panel + text detection (YOLO26n nano — see scripts/export-panel-onnx.sh).
+// Same IDB-cached pattern as CTD (bundle → HF mirror). Output [1,300,6] is already NMS'd.
 const PANEL_INPUT = 640;
 let panelSession: any = null;
 let panelCreating: Promise<void> | null = null;
@@ -565,10 +503,10 @@ async function ensurePanelSession(): Promise<boolean> {
     if (panelSession) return true;
     if (!panelCreating) {
         panelCreating = (async () => {
-            // no latch on failure: bundle-absent is normal now (HF mirror), and a
-            // transient download failure must retry next page, not stay dead
+            // no latch on failure: bundle-absent is normal (HF mirror), and a
+            // transient download failure must retry next page, not stay dead.
             const buf = await loadModelFile('panel', 'models/panel-yolo26n.onnx', 'panel-yolo26n.onnx', 'panel model (~10MB)');
-            // ponytail: wasm-only — ~40ms on CPU for this nano model, no webgpu dance
+            // ponytail: wasm-only — ~40ms on CPU for this nano model, no webgpu dance.
             panelSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['wasm'] }));
         })().finally(() => { panelCreating = null; });
     }
@@ -599,8 +537,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 }
 
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
-// scripts in extension pages; only the language data is user-managed,
-// downloaded from CDN on demand and cached in IndexedDB via ocr-models.ts) ----
+// scripts; only the language data is downloaded on demand and cached in IDB).
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
 import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
 import { windowIndex } from '../content/inpaint';
@@ -609,19 +546,15 @@ import { initDebug, isDebug } from '../debug';
 
 await initDebug();
 
-// ---- Baberu OCR (JA/EN/ZH, 115M, int4 vision tier) — ported from the published
-// onnx_infer.py (pure numpy loop → TS). Vision → decoder prefill → KV-cache
-// step, greedy + repetition penalty 1.2 + symbol-aware content-run cap 12.
+// ---- Baberu OCR (JA/EN/ZH) — Vision → decoder prefill → KV-cache step,
+// greedy + repetition penalty 1.2 + symbol-aware content-run cap 12.
 
 const BABERU_MEAN = [0.485, 0.456, 0.406];
 const BABERU_STD = [0.229, 0.224, 0.225];
 const BABERU_PAST_IN = [...Array(6)].map((_, i) => `past_k${i}`).concat([...Array(6)].map((_, i) => `past_v${i}`));
 const BABERU_PRESENT_OUT = [...Array(6)].map((_, i) => `present_k${i}`).concat([...Array(6)].map((_, i) => `present_v${i}`));
 
-// logits come out as [1, seq, V] — the decode loop only wants the LAST
-// position (the reference reads out[0][0, -1]). Reading the flat buffer as
-// one row made argmax land on cross-position garbage (token ids past the
-// vocab bound → Gather crash / nonsense text).
+// logits come out as [1, seq, V] — the decode loop only wants the LAST position.
 function baberuLastLogits(out: Record<string, any>): Float32Array {
     const dims: number[] = out.logits.dims;
     const V = dims[dims.length - 1];
@@ -637,11 +570,8 @@ interface BaberuVocab {
 
 let baberuVocab: BaberuVocab | null = null;
 let baberuSessions: { vis: any; pre: any; stp: any; ep: string } | null = null;
-// ORT's "Session already started" guard turned out to be GLOBAL across the
-// whole Emscripten runtime — webgpu included (live-proven: vision on the
-// gpu chain raced a prefill on another chain and blew up). All Baberu runs
-// ride ONE chain; the pipeline overlap survives via the CPU-side crop and
-// the fast GPU vision (239ms/crop).
+// ORT's "Session already started" guard is global — all Baberu runs ride ONE
+// chain (see the infer-lock note above).
 let baberuCreating: Promise<void> | null = null;
 
 function baberuParseVocab(text: string): BaberuVocab {
@@ -651,15 +581,13 @@ function baberuParseVocab(text: string): BaberuVocab {
     for (let i = 0; i < charset.length; i++) {
         const ch = charset[i];
         id2ch.set(i + 4, ch);
-        // content-run cap only tracks single letters/digits/numbers (like the
-        // reference: unicodedata category L* or N*), not punctuation runs
+        // content-run cap only tracks single letters/digits/numbers, not punctuation runs.
         if ([...ch].length === 1 && !'ーｰ〜~'.includes(ch) && /[A-Za-z0-9]/.test(ch)) contentIds.add(i + 4);
     }
     return { id2ch, bos: 1, eos: 2, contentIds };
 }
 
-// CJK content chars also count for the run cap — extend the reference's
-// L/N filter with the CJK/kana ranges the reference gets from unicodedata
+// CJK content chars also count for the run cap.
 function isContentChar(ch: string): boolean {
     const cp = ch.codePointAt(0) ?? 0;
     return /[A-Za-z0-9]/.test(ch)
@@ -681,18 +609,12 @@ async function ensureBaberu(): Promise<void> {
                 throw new Error('Baberu OCR model not installed — download it in Settings');
             }
             baberuVocab = baberuParseVocab(new TextDecoder().decode(vocabBuf));
-            // extend content-run set with CJK ranges (reference uses unicodedata)
+            // extend content-run set with CJK ranges.
             for (const [id, ch] of baberuVocab.id2ch) {
                 if (isContentChar(ch)) baberuVocab.contentIds.add(id);
             }
-            // EP split per graph (live-proven on ORT-Web 1.29): vision_int4 runs
-            // on webgpu (weight-only → fp32 activations, no shader-f16 needed)
-            // at ~0.2s/crop vs ~2s wasm; int8 decoders stay on wasm (12ms/step vs
-            // 153ms/step on gpu). All create/run ride ONE chain — ORT's "Session
-            // already started" guard is global across the whole runtime, any EP.
-            // History: on ORT-Web 1.20 the fp16 vision graph silently produced
-            // all-zero embeds on webgpu and int8 decoders gave NaN logits — both
-            // fixed by the 1.29 upgrade + vision_int4.
+            // EP split per graph: vision on webgpu (~0.2s/crop vs ~2s wasm), int8
+            // decoders on wasm. All create/run ride ONE chain (global session guard).
             const mk = async (buf: ArrayBuffer, eps: string[]) =>
                 withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: eps }));
             let vis: any;
@@ -709,12 +631,12 @@ async function ensureBaberu(): Promise<void> {
     await baberuCreating;
 }
 
-// one bubble crop → text. Ported 1:1 from BaberuOnnxOCR.__call__
+// one bubble crop → text.
 async function runBaberu(png: ArrayBuffer, prio: InferPrio = 0): Promise<string> {
     await ensureBaberu();
     const v = baberuVocab!;
     const { vis, pre, stp } = baberuSessions!;
-    // preprocess: RGB 224×224 bicubic + ImageNet norm → [1,3,224,224]
+    // preprocess: RGB 224×224 bicubic + ImageNet norm → [1,3,224,224].
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     const c = new OffscreenCanvas(224, 224);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
@@ -731,15 +653,13 @@ async function runBaberu(png: ArrayBuffer, prio: InferPrio = 0): Promise<string>
     const t0 = performance.now();
     const visOut = await withInferLock(async () => vis.run({ pixel_values: new ort.Tensor('float32', x, [1, 3, 224, 224]) }), prio) as Record<string, any>;
     const rawEmbeds = visOut.vision_embeds;
-    // GPU→CPU bridge: when vision ran on webgpu the tensor is gpu-resident;
-    // feeding it to the wasm prefill produced all-NaN logits (empty OCR for
-    // every box). Materialize plain CPU float32 data first — getData()
-    // downloads GPU tensors, .data is already CPU.
+    // GPU→CPU bridge: when vision ran on webgpu the tensor is gpu-resident —
+    // materialize plain CPU float32 data first (getData() downloads GPU tensors).
     let embedsData: Float32Array;
     if (rawEmbeds.cpuData) embedsData = rawEmbeds.cpuData;
     else if (rawEmbeds.getData) embedsData = await rawEmbeds.getData();
     else embedsData = rawEmbeds.data;
-    // sanity: NaN check — one bad value means the whole page reads empty
+    // sanity: NaN check — one bad value means the whole page reads empty.
     for (let i = 0; i < Math.min(16, embedsData.length); i++) {
         if (!Number.isFinite(embedsData[i])) throw new Error('baberu vision produced non-finite embeds');
     }
@@ -748,7 +668,7 @@ async function runBaberu(png: ArrayBuffer, prio: InferPrio = 0): Promise<string>
         vision_embeds: embeds,
         input_ids: new ort.Tensor('int64', BigInt64Array.from([BigInt(v.bos)]), [1, 1]),
     }), prio) as Record<string, any>;
-    // outputs: logits [1,seq,V] (use last position) + present_k/v caches
+    // outputs: logits [1,seq,V] (use last position) + present_k/v caches.
     let logits = baberuLastLogits(preOut);
     let present = BABERU_PRESENT_OUT.map(n => preOut[n]);
     const seq: number[] = [v.bos];
@@ -825,7 +745,7 @@ async function ensureTesseract(langs: string[]): Promise<void> {
         corePath: TESS_CORE_URL,
         langData,
         // direct worker (no blob wrapper): blob workers inherit the page CSP and
-        // their importScripts back into chrome-extension:// URLs gets blocked
+        // their importScripts back into chrome-extension:// URLs gets blocked.
         workerBlobURL: false,
         errorHandler: (e: unknown) => console.warn('[mt:tess]', e),
     });
@@ -838,12 +758,10 @@ async function runOcr(png: ArrayBuffer, langs: string[]): Promise<string> {
     return data?.text ?? '';
 }
 
-// ---- text-cleanup inpainting (manga-LaMa, fp16 weights, fixed 512) --------
-// Per-region windows are cut from the ORIGINAL page (never from a neighbour's
-// fresh paint), edge-extended to a square, resized to 512, and composited
-// back only where the caller's mask says text was. WebGPU only: the wasm
-// fallback measures ~22s/window, so a machine without a working WebGPU
-// session is reported unavailable and the caller keeps the built-in fill.
+// ---- text-cleanup inpainting (manga-LaMa, fp16 weights, fixed 512).
+// Per-region windows are cut from the ORIGINAL page, edge-extended to a square,
+// resized to 512, and composited back only where the caller's mask says text
+// was. WebGPU only: without a working WebGPU session the caller keeps the fill.
 type InpaintBox = { x1: number; y1: number; x2: number; y2: number };
 const INPAINT_SIZE = 512;
 let inpaintSession: any = null;
@@ -859,9 +777,8 @@ async function ensureInpaintSession(noDownload = false): Promise<void> {
             try {
                 inpaintSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }));
             } catch (e) {
-                // EP-level failure: retrying on every page would only re-pay the
-                // upload before failing again. Download errors above are NOT
-                // sticky (a flaky network must be retryable).
+                // EP-level failure is sticky (retrying would only re-pay the upload).
+                // Download errors above are NOT sticky.
                 inpaintNoGpu = true;
                 throw e;
             }
@@ -920,7 +837,7 @@ async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[
         i512.drawImage(sq, 0, 0, INPAINT_SIZE, INPAINT_SIZE);
         const imgData = i512.getImageData(0, 0, INPAINT_SIZE, INPAINT_SIZE).data;
         // nearest-sample the caller's full-res binary mask through the same
-        // square geometry — smoothed mask edges would invent half-covered pixels
+        // square geometry — smoothed mask edges would invent half-covered pixels.
         const scale = side / INPAINT_SIZE;
         for (let y = 0; y < INPAINT_SIZE; y++) {
             const my = Math.min(H - 1, Math.max(0, Math.floor(sy + (y + 0.5) * scale)));
@@ -954,7 +871,7 @@ async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[
         bctx.imageSmoothingQuality = 'high';
         bctx.drawImage(out512, 0, 0, side, side);
         const backData = bctx.getImageData(0, 0, side, side).data;
-        // composite only where the caller's mask had text (page resolution)
+        // composite only where the caller's mask had text (page resolution).
         const cx1 = Math.max(0, Math.floor(b.x1) - 2), cy1 = Math.max(0, Math.floor(b.y1) - 2);
         const cx2 = Math.min(W, Math.ceil(b.x2) + 2), cy2 = Math.min(H, Math.ceil(b.y2) + 2);
         for (let yy = cy1; yy < cy2; yy++) {
@@ -971,7 +888,7 @@ async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[
         }
     }
     // patches: one crop per box (+4px bleed so the caller can draw them under
-    // the translated text without seams) — same shape the cache stores
+    // the translated text without seams).
     const patches: { i: number; x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] = [];
     const pc = new OffscreenCanvas(1, 1);
     const pctx = pc.getContext('2d', { willReadFrequently: true })!;
@@ -990,16 +907,11 @@ async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[
 }
 
 // Handshake token: postMessage into this iframe carries the PAGE origin (the
-// content script shares it), so origin checks can't separate our content
-// script from hostile page JS — and worker.html is web-accessible, meaning
-// any visited site can also embed its own copy and drive it directly. The
-// token travels over chrome.runtime (invisible to the page); detection.ts
-// fetches it from the SW before any RPC. Without it a page could delete the
-// user's OCR models, force ~50MB model downloads, and burn CPU/GPU at will.
-// Keyed by a public NONCE (not sender.tab — extension pages have no tab, so
-// a tab key would collapse to one global slot that a second tab or a hostile
-// WAR embed could clobber): registration and lookup agree on the nonce, and
-// collisions across iframes are impossible.
+// content script shares it), so origin checks can't separate our content script
+// from hostile page JS — and worker.html is web-accessible. The token travels
+// over chrome.runtime (invisible to the page). Without it a page could delete
+// models, force ~50MB downloads, and burn CPU/GPU at will.
+// Keyed by a public NONCE (not sender.tab — extension pages have no tab).
 const rnd = (n: number) => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => b.toString(16).padStart(2, '0')).join('');
 const TOKEN = rnd(16);
 const NONCE = rnd(8);
@@ -1058,6 +970,6 @@ window.addEventListener('message', async (ev: MessageEvent) => {
 });
 
 // register the token with the SW under the public nonce and only THEN signal
-// readiness, so the content script's token fetch can never race the registration
+// readiness, so the token fetch can never race the registration.
 try { await chrome.runtime.sendMessage({ type: 'mt:worker-token', nonce: NONCE, token: TOKEN }); } catch { /* SW hiccup — RPCs will fail loudly */ }
 window.parent.postMessage({ type: 'mt:ready', nonce: NONCE }, '*');

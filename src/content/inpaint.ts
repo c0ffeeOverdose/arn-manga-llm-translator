@@ -1,7 +1,5 @@
-// Inpaint: erase original text using CTD's text mask.
-// Fill = per-box median background color sampled from a ring just outside the box.
-// The raw mask is conservative (anti-aliased glyph edges survive) — dilate it
-// a few px instead of color-distance heuristics (those eat bubble outlines).
+// Inpaint: erase original text using CTD's text mask (dilated — the raw mask
+// leaves anti-aliased glyph edges). Fill = per-box median background from a ring outside the box.
 import type { DetBox, DetectResult } from './detection';
 import { inpaintPage, type InpaintPatch } from './detection';
 import { dropContainedBoxes } from './page-cache';
@@ -29,14 +27,9 @@ function dilate(mask: Uint8Array, w: number, h: number, passes = DILATE_PASSES):
     return cur;
 }
 
-// Erase box for one region: the CTD box plus mask ink that touches it from
-// outside. CTD boxes can stop a few px short of the glyphs (live: a narration
-// box cut the last line in half, leaving "SAO…" visible under the translation
-// — the box bottom crossed the glyphs at y2077 while the ink ran to y2102).
-// The mask says where text really is, so follow it out with a gap allowance
-// (glyphs have inter-row gaps) up to `pad`. Sides perpendicular to the scan
-// stay inside the side's span, so the walk cannot wander sideways into a
-// neighbour's text. Pure-ish (mask reads only) — exported for tests.
+// Erase box for one region: the CTD box plus mask ink touching it from
+// outside (CTD boxes can stop short of the glyphs). Gap allowance covers
+// inter-row gaps, up to `pad`. Pure-ish (mask reads only) — exported for tests.
 export function eraseBox(m: Uint8Array, W: number, H: number, box: { x1: number; y1: number; x2: number; y2: number }, pad: number): { x1: number; y1: number; x2: number; y2: number } {
     const x1 = Math.max(0, Math.floor(box.x1)), y1 = Math.max(0, Math.floor(box.y1));
     const x2 = Math.min(W - 1, Math.ceil(box.x2)), y2 = Math.min(H - 1, Math.ceil(box.y2));
@@ -58,16 +51,9 @@ export function eraseBox(m: Uint8Array, W: number, H: number, box: { x1: number;
     };
 }
 
-// Mask for the AI cleanup (manga-LaMa). The raw CTD mask is glyph-tight and
-// anti-aliased, and cleanup windows sample it nearest-neighbour at 512px — with
-// a tight mask the model still sees the leftover white glyphs between the
-// strokes and fills the whole window with paper white instead of the art behind
-// (live: a caption box on black speedlines came back as a white blob, and one
-// extra pixel of dilation flipped it back — the strokes must merge into a solid
-// region). Dilation radius therefore scales with the page (a bigger scan has
-// bigger glyph gaps): 4px at 1600px, capped at 10. Restricting to the erase
-// boxes keeps neighbours' glyphs untouched, and keep-box interiors are cleared
-// after dilation (SFX stays visible for the model). Pure.
+// Mask for the AI cleanup (manga-LaMa). Dilation must merge strokes into a
+// solid region, so the radius scales with the page (4px at 1600px, cap 10).
+// Restricted to the erase boxes; keep-box interiors are cleared after. Pure.
 export function aiCleanupDilate(w: number, h: number): number {
     return Math.min(10, Math.max(4, Math.round(4 * Math.max(w, h) / 1600)));
 }
@@ -82,10 +68,7 @@ export function aiCleanupMask(
     const out = new Uint8Array(W * H);
     const r = aiCleanupDilate(W, H);
     // Dilation only changes pixels within `r` px of box ink, so bound the
-    // passes to the boxes' union bbox (grown by the radius): the full-page
-    // walk was ~5 passes of 3MP x 9 neighbours of pure main-thread work per
-    // page. A union covering most of the page keeps the full-page extent —
-    // same output either way, just no savings.
+    // passes to the boxes' union bbox (grown by the radius) — same output, less work.
     let ux1 = W, uy1 = H, ux2 = 0, uy2 = 0;
     for (const b of boxes) {
         ux1 = Math.min(ux1, Math.floor(b.x1)); uy1 = Math.min(uy1, Math.floor(b.y1));
@@ -117,11 +100,9 @@ export function aiCleanupMask(
 }
 
 // One AI-cleanup pass over the original page: erase boxes → mask → worker
-// windows → patch PNGs. Shared by the render path and the warm paths
-// (lookahead / chapter sweep precompute the patches into the cache entry, so
-// arrival paints without paying the model). Patch `i` indexes the `erase`
-// array, so a warm run over ALL boxes can be filtered to the erase set once
-// the LLM has marked the 'keep' regions.
+// windows → patch PNGs. Shared by the render path and the warm paths.
+// Patch `i` indexes the `erase` array, so a warm run over ALL boxes can be
+// filtered to the erase set once the LLM marks the 'keep' regions.
 export interface AiPatches { patches: InpaintPatch[]; windows: number; ms: number; maskMs: number; lockWaitMs: number; encodeMs: number }
 // Erase boxes (mask-led walk per region) + the dilated cleanup mask — the
 // pixels the cleaner is allowed to touch. Shared by the local worker call and
@@ -141,10 +122,8 @@ export function eraseBoxesAndMask(
 }
 
 // Throws on model/worker failure — callers fall back to the built-in fill
-// (render) or skip (warm). `noDownload`: availability comes from the model
-// DB / dev bundle only — a background warm must not start a surprise 112MB
-// download (the worker enforces it; a content-side IDB peek cannot see the
-// extension-origin model DB).
+// (render) or skip (warm). `noDownload`: a background warm must not start
+// a surprise 112MB download.
 export async function computeAiPatches(
     bitmap: ImageBitmap,
     det: DetectResult,
@@ -160,10 +139,8 @@ export async function computeAiPatches(
 }
 
 // Page pixel -> its index inside a cleanup window at page resolution.
-// Callers composite through canvases sized `side` (the 512x512 model output
-// upscaled back), so the index is the page-space offset from the window origin
-// — NOT the 512-space offset (live bug: dividing by `side / 512` sampled art
-// from above the box and smeared it over the masked text). Pure.
+// The index is the page-space offset from the window origin — NOT the
+// 512-space offset. Pure.
 export function windowIndex(coord: number, origin: number, side: number): number {
     return Math.min(side - 1, Math.max(0, Math.floor(coord + 0.5 - origin)));
 }
@@ -175,8 +152,8 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
     const { width: W, height: H } = canvas;
     const m = new Uint8Array(det.mask.data);
     const md = dilate(m, W, H);
-    // regions that keep their source text (SFX, contained dups): the erase
-    // walk must not eat their glyphs when a neighbouring box expands into them
+    // regions that keep their source text: the erase walk must not eat their
+    // glyphs when a neighbouring box expands into them.
     const skip = (det.keepBoxes ?? []).map(k => ({
         x1: Math.floor(Math.max(0, k.x1)) - 2, y1: Math.floor(Math.max(0, k.y1)) - 2,
         x2: Math.ceil(Math.min(W - 1, k.x2)) + 2, y2: Math.ceil(Math.min(H - 1, k.y2)) + 2,
@@ -189,10 +166,8 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
         const bg = eraseBgColor(d, W, H, m, md, b);
 
         // fill strategy: masked pixels + connected faint text the mask missed.
-        // Scan each row: rows with meaningful mask coverage are text rows —
-        // fill the WHOLE row span across the erase region (long disclaimers
-        // render tiny faint glyphs the network under-masks, leaving smears
-        // otherwise). Runs over the EXPANDED region (see eraseBox) so glyphs
+        // Rows with meaningful mask coverage are text rows — fill the whole row
+        // span across the erase region. Runs over the EXPANDED region so glyphs
         // the CTD box clipped are erased too; keep-box interiors are skipped.
         for (let y = ex.y1; y <= ex.y2; y++) {
             const rowStart = y * W;
@@ -214,14 +189,9 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
 }
 
 // Background color for the built-in erase: the surface the glyphs sit on.
-// Priority is glyph-adjacent background (dilated-halo pixels that are not ink
-// themselves), then the box interior (post-mask), then the outside ring — a
-// side is PICKED, never averaged: averaging a black outside with a white
-// inside paints gray on both (live /14: a white caption on the black banner
-// erased to #808080). The ring exists only as a fallback for boxes with no
-// background pixels of their own (dense text); the inside median covers the
-// comment's old case too (dark scan bands poisoning the ring — the text still
-// sits on paper). Pure — unit tested.
+// A side is PICKED, never averaged (averaging black outside with white inside
+// paints gray on both). Priority: glyph-adjacent background, then box
+// interior, then the outside ring. Pure — unit tested.
 export function eraseBgColor(
     data: Uint8ClampedArray, W: number, H: number,
     maskRaw: Uint8Array, maskDilated: Uint8Array,
@@ -277,10 +247,8 @@ function isFaintText(d: Uint8ClampedArray, p: number, bg: number[]): boolean {
 
 // Fill a VLM-reported extra region (no CTD mask available): estimate the box
 // background from its border ring, then clear every pixel that differs from
-// it. Bounded to the box — hand-written signs live on flat-ish areas.
-// Returns the bounding box of actually-erased pixels (where the ink really
-// was — VLM coords are approximate), or null when nothing qualifies. The
-// caller renders the translation onto that box, so text lands on the ink.
+// it. Bounded to the box. Returns the bbox of actually-erased pixels, or null
+// when nothing qualifies.
 export function inpaintBoxRegion(
     canvas: OffscreenCanvas,
     box: { x1: number; y1: number; x2: number; y2: number },
@@ -308,9 +276,8 @@ export function inpaintBoxRegion(
         return ch.length ? ch[Math.floor(ch.length / 2)] : 255;
     });
 
-    // gates: a real handwritten sign sits on LIGHT paper, has actual ink, and
-    // isn't mostly-artwork. Wrong boxes (faces, screentone, bubbles) fail these
-    // and get skipped instead of being erased into a dark rectangle.
+    // gates: a real sign sits on LIGHT paper, has actual ink, and isn't
+    // mostly-artwork. Wrong boxes fail these and are skipped.
     const bgLum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
     if (bgLum < 140) return null;
 
@@ -332,8 +299,7 @@ export function inpaintBoxRegion(
             }
         }
     }
-    // no ink found, too sparse to be writing, or the box is mostly "ink"
-    // (= artwork, not a sign on paper) — all wrong-box signals, skip
+    // no ink, too sparse, or mostly "ink" (= artwork, not a sign) — skip.
     if (inkCount === 0 || inkCount / total < 0.03 || inkCount / total > 0.25) return null;
 
     // pass 2: erase the ink pixels
@@ -355,24 +321,20 @@ export function inpaintBoxRegion(
     };
 }
 
-// Which boxes get erased vs kept — shared by the paint path and the AI
-// cleanup call (both must agree on the set). Pure.
+// Which boxes get erased vs kept — shared by paint + AI cleanup (must agree). Pure.
 export function erasePlan(det: DetectResult, outputs: RegionOutput[]): {
     boxesToErase: DetBox[]; keepBoxes: DetBox[]; keepIdx: Set<number>; dupIdx: Set<number>; missedIdx: number[];
 } {
-    // inpaint only regions the LLM didn't mark 'keep' (SFX/signatures stay as-is)
+    // inpaint only regions the LLM didn't mark 'keep'.
     const keepIdx = new Set(
         outputs.filter(o => o.translation === 'keep').map(o => o.index),
     );
-    // erase ONLY boxes with a real translation — a skipped region (no output
-    // even after the retry) keeps its source text instead of ending up wiped
-    // and untranslated while the page registers as Done.
+    // erase ONLY boxes with a real translation — a skipped region keeps its
+    // source text instead of ending up wiped and untranslated.
     const translatedIdx = new Set(
         outputs.filter(o => o.translation && o.translation !== 'keep').map(o => o.index),
     );
-    // contained-duplicate guard (heals old cache entries on revisit, and
-    // confident dups the detection gate keeps): the lower-conf box is treated
-    // as keep — its source text stays instead of a second colliding paint.
+    // contained-duplicate guard: the lower-conf box is treated as keep.
     const keptBoxes = new Set(dropContainedBoxes(det.boxes));
     const dupIdx = new Set(det.boxes.map((b, i) => keptBoxes.has(b) ? -1 : i + 1).filter(i => i > 0));
     const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && !dupIdx.has(i + 1));

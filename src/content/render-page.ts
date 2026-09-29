@@ -52,12 +52,9 @@ function dumpAreas(
     });
 }
 
-// paintOnly: paint + register a page WITHOUT folding it into the book — the
-// sweep paints the page the user is looking at the moment its worker finishes,
-// while the ordered commit still folds it later (the commit's own
-// !bookHas guard makes the eventual double-visit harmless). The book snapshot
-// is skipped too: context is still mid-chapter at paint time, and a stale
-// snapshot would poison a later re-translate's rewind.
+// paintOnly: paint + register WITHOUT folding into the book — the sweep's
+// ordered commit still folds later (its !bookHas guard makes the double-visit
+// harmless). The book snapshot is skipped too (context is mid-chapter at paint time).
 export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean,
     opts: { paintOnly?: boolean } = {}): Promise<PageState> {
     const paintOnly = opts.paintOnly === true;
@@ -65,7 +62,6 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     const { srcUrl, bitmap, det } = prep;
     const existing = stateFor(ref) ?? pages.get(srcUrl);
     // twin prep made before the first job finished — reuse it, don't pay twice.
-    // (force still re-translates; the twin's context contribution gets rewound below.)
     if (existing && !force) return existing;
     if (existing && shareContext) await rewindContextBefore(existing);
     // the rebuilt book excludes this page — its hash must refold (fresh fold
@@ -74,10 +70,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     if (existing?.hash) bookDrop(existing.hash);
     if (existing) dropProgressT0(srcUrl);
     // the book as it was just before THIS page folds (after any rewind above):
-    // a later re-translate restores it instead of replaying page states it may
-    // not have (single-page readers keep one <img> — the replay wiped the book
-    // down to user entries, live-proven). MUST load first: translateRegions
-    // loads lazily, and a snapshot taken before that captures the empty default.
+    // a later re-translate restores it. MUST load first: translateRegions loads
+    // lazily, and a snapshot taken before that captures the empty default.
     await loadContext();
     const bookBefore = paintOnly ? undefined : context.characters;
     const pairsBefore = paintOnly ? undefined : context.pairs;
@@ -88,9 +82,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     let annWCache: number, annHCache: number, rawLLM: string | undefined;
     let usage: { inTok?: number; outTok?: number; cachedInTok?: number } | undefined;
     let llmCalls: number | undefined, llmMs: number | undefined, ocrStatus: ('ok' | 'empty')[] | undefined, ocrMs: number | undefined, ocrLockWaitMs: number | undefined, badgeR: number | undefined;
-    // AI cleanup rides the LLM wait: the mask and the model windows depend only
-    // on detection, not on the translation, so compute patches for every box
-    // while the LLM is in flight and drop the 'keep' ones once outputs land.
+    // AI cleanup rides the LLM wait: mask + model windows depend only on
+    // detection, so compute patches for every box while the LLM is in flight.
     let aiWarm: Promise<AiPatches | null> | null = null;
     if (prep.cached) {
         // persistent cache hit: identical image bytes + identical settings — the
@@ -100,9 +93,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         usedLLM = false;
         annWCache = bitmap.width; annHCache = bitmap.height;
         rawLLM = '(cached — no LLM call)';
-        // already folded by whoever produced this entry (sweep commit, an
-        // earlier visit, prefetch) — refolding would duplicate its pairs.
-        // Otherwise fold + register (later arrivals skip via the divert lane).
+        // already folded by whoever produced this entry — refolding would duplicate
+        // its pairs. Otherwise fold + register.
         if (shareContext && !paintOnly && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
     } else {
         onStatus('Translating…');
@@ -130,9 +122,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     ctx.drawImage(bitmap, 0, 0);
 
     // AI text cleanup: patches from the cache when valid, otherwise generated
-    // once from the original bitmap and written back to the entry. Any failure
-    // (no model, no WebGPU, download error) falls back to the built-in fill —
-    // a page must never fail here. Cloud mode rides the same shape (P6).
+    // once from the original bitmap. Any failure falls back to the built-in
+    // fill — a page must never fail here.
     const aiMode = inpaintMode(pipeline);
     let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
     let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiPre = false, aiError: string | undefined;
@@ -146,10 +137,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             if (plan.boxesToErase.length) {
                 onStatus('Cleaning text…', 'render');
                 if (aiMode === 'local') {
-                    // Warm patches (computed while the LLM was in flight) cover
-                    // every box with no keep clearing — usable only when no keep
-                    // box sits inside an erase window, else the model would have
-                    // eaten glyphs that must stay. Patch `i` indexes det.boxes.
+                    // Warm patches cover every box with no keep clearing — usable only
+                    // when no keep box sits inside an erase window. Patch `i` indexes det.boxes.
                     const warm: AiPatches | null = aiWarm ? await (aiWarm as Promise<AiPatches | null>) : null;
                     let r: AiPatches | null = null;
                     if (warm) {
@@ -174,25 +163,20 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                     }
                 } else {
                     // cloud engine: prefer the patches merged into the detect
-                    // roundtrip (server already had the CTD mask — no second
-                    // upload, no second queue wait). Same contract as the local
-                    // warm path: unusable when a keep box sits inside an erase
-                    // window (the model would have eaten glyphs that must stay)
-                    // → fall through to the dedicated /v1/inpaint POST.
+                    // roundtrip; fall through to /v1/inpaint when a keep box
+                    // sits inside an erase window.
                     const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
                         a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
                     if (det.cloudPatches?.length && !plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
                         const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
                         const pre = det.cloudPatches.filter(p => idx.has(p.i ?? -1));
-                        // full coverage only — paintRegions skips the fill when
-                        // ANY patches exist, so a partial set would strand the
-                        // uncovered boxes with visible source text
+                        // full coverage only — paintRegions skips the fill when ANY
+                        // patches exist, so a partial set would strand boxes.
                         if (pre.length && pre.length === plan.boxesToErase.length) { aiPatches = pre; aiWindows = pre.length; aiPre = true; }
                     }
                     if (!aiPatches) {
-                        // same client-side mask rides along, so local and cloud
-                        // erase the same pixels (the server falls back to its own
-                        // CTD pass for old clients)
+                        // the same client-side mask rides along, so local and cloud
+                        // erase the same pixels.
                         const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes);
                         aiMaskMs = maskMs;
                         const cfg = await cloudConfig();
@@ -225,13 +209,10 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
     onStatus('Rendering…', 'render');
-    // paint translated regions (shared helper — the seam path paints the whole
-    // stitch, then slices per member)
     const tRender0 = performance.now();
     const layouts = paintRegions(canvas, frame, det, outputs, paintPatches);
     for (const p of paintPatches ?? []) p.bmp.close();
 
-    // VLM extras (shared helper — the seam path paints them on the stitch too)
     paintExtras(canvas, frame, det, extras);
     const renderMs = Math.round(performance.now() - tRender0); // paint only (excludes PNG encode + overlays)
 
@@ -273,13 +254,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         })),
         panels: (det.panels ?? []).map(p => ({ x1: Math.round(p.x1), y1: Math.round(p.y1), x2: Math.round(p.x2), y2: Math.round(p.y2), conf: +p.conf.toFixed(2) })),
         ...(det.panelSkipped ? { panelSkipped: det.panelSkipped } : null),
-        // placement areas the renderer actually used (layoutArea: flood-fill
-        // clamped at bubble borders, shrunk to ink on near-empty boxes —
-        // compare against boxes to spot either failure). Resolved through the
-        // same effective boxes the paint used (divider clips), with dark growth
-        // replayed where the layout grew (g) — what you see is what painted.
-        // (A plain method call: an IIFE here once lost its parens and shipped
-        // a function value that JSON.stringify silently drops.)
+        // placement areas the renderer actually used (same effective boxes the
+        // paint used — what you see is what painted).
         areas: dumpAreas(ctx, frame, det, outputs, layouts),
         // chosen layout per region: {i, fontSize, line count} — null layout
         // (skipped/degenerate) is simply absent
@@ -304,9 +280,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         origBytes: prep.origBytes ?? existing?.origBytes,
         translatedBmp: ref.kind === 'canvas' ? canvas.transferToImageBitmap() : undefined,
     };
-    // blob-origin readers: keep an extension-owned copy of the original now —
-    // once we swap in the translated blob the reader's URL may be dead and
-    // "Show original" has nothing to restore from (see ownOriginalUrl)
+    // blob-origin readers: keep an extension-owned copy now — once we swap in
+    // the translated blob the reader's URL may be dead (see ownOriginalUrl).
     if (ownCopyNeeded(srcUrl, bitmap.width, bitmap.height)) {
         state.origOwn = await ownOriginalUrl(bitmap);
         if (isDebug() && state.origOwn) console.log('[mt] orig copy', JSON.stringify({ src: srcUrl.slice(-14), px: bitmap.width * bitmap.height }));
@@ -328,12 +303,10 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         if (existing.debugOrig) URL.revokeObjectURL(existing.debugOrig);
     }
     regPage(state);
-    // store fresh translations for the next visit (force re-translates
-    // overwrite). Fire-and-forget — a slow IDB write never blocks the sweep.
-    // Never cache a void result (boxes but zero outputs — e.g. a stale
-    // background that still returns ok:true on total parse failure): it would
-    // sit "translated" with nothing on it until force. Zero-box pages cache
-    // fine (nothing to find twice).
+    // store fresh translations for the next visit (force overwrites).
+    // Fire-and-forget — a slow IDB write never blocks the sweep.
+    // Never cache a void result (boxes but zero outputs): it would sit
+    // "translated" with nothing on it until force.
     if (!prep.cached && pipeline.cacheEnabled && (det.boxes.length === 0 || outputs.length > 0)) {
         void cachePut({
             key: cacheKey(chapterKey(), prep.hash),
@@ -347,12 +320,10 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             ...(aiPatches?.length ? { patches: aiPatches, patchesGen: INPAINT_PATCH_GEN } : null),
         }, pipeline.cacheMax);
     } else if (!prep.cached) {
-        // cache off: the resume checkpoint this job may have resumed from is
-        // in-flight work, and the job is done — leave nothing behind
+        // cache off: drop the resume checkpoint this finished job may have used.
         void cacheDelete(cacheKey(chapterKey(), prep.hash));
     } else if (aiGenerated && aiPatches?.length && pipeline.cacheEnabled) {
-        // cache hit that had to regenerate crops (headless prefetch/arrival
-        // wrote the entry) — persist so the next visit paints without the model
+        // cache hit that regenerated crops — persist so the next visit skips the model.
         void cachePut({
             key: cacheKey(chapterKey(), prep.hash),
             fp: settingsFingerprint(pipeline),
@@ -369,7 +340,6 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         replayPagesAfter(state);
         await saveContext();
     }
-    // session usage counters for the popup box
     if (usage) {
         sessionUsage.pages++;
         sessionUsage.inTok += usage.inTok ?? 0;

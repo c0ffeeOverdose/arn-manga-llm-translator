@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-# Generates both deploy notebooks from the live server sources — the
-# notebooks are build artifacts (single source of truth stays in server/).
-#   cloud-setup.ipynb  — deploy the server to Modal (stable URL, account)
-#   colab-server.ipynb — run the server IN Colab (free T4, cloudflared URL)
-# Both let a normal user (browser only, no terminal) end up with the two
-# values the extension needs: endpoint URL + API key.
+# Generates both deploy notebooks from live server sources (single source of truth stays in server/).
+# cloud-setup.ipynb = Modal deploy; colab-server.ipynb = run IN Colab. Both print endpoint URL + API key.
 import json
 import os
 import re
@@ -23,13 +19,11 @@ def read(name):
         return f.read()
 
 
-# App + secret names live in modal_app.py only — the notebook derives them so
-# a rename touches exactly one file.
+# App + secret names live in modal_app.py only — notebooks derive them so a rename touches one file.
 _modal_src = read("modal_app.py")
 APP_NAME = re.search(r'modal\.App\("([^"]+)"', _modal_src).group(1)
 SECRET_NAME = re.search(r'from_name\("([^"]+)"', _modal_src).group(1)
-# Modal web URL = {workspace}--{app}-{function}.modal.run — the function name
-# ("api") lands as a suffix, so tolerate it instead of anchoring at the app name.
+# Modal web URL = {workspace}--{app}-{function}.modal.run — tolerate the "api" function suffix.
 URL_RE = (r"https://[a-z0-9-]+--" + re.escape(APP_NAME)
           + r"(?:-[a-z0-9-]+)?\.modal\.run")
 
@@ -44,7 +38,7 @@ def code(lines):
 
 
 def writefile_cell(name, content):
-    # %%writefile avoids every quoting problem the 400-line app.py would cause
+    # %%writefile avoids every quoting problem the server sources would cause
     return code(["%%writefile " + name + "\n"] + [l + "\n" for l in content.splitlines()])
 
 
@@ -223,9 +217,7 @@ def code_text(text):
 
 
 # ---- colab-server.ipynb: run the server on Colab's own GPU ----------------
-# cloudflared quick tunnel = public https URL, no account needed; the URL is
-# new every session and dies with the VM — the notebook says so where it
-# matters.
+# cloudflared quick tunnel = public https URL, no account; new every session (the notebook says so).
 _models = [("ctd.onnx", CTD_URL), ("lama-manga-512-fp16w.onnx", INPAINT_URL)] + [(dst, f"{BABERU}/{src}?download=true")
                                     for src, dst in BABERU_FILES]
 _FILES = textwrap.indent("FILES = [\n" + "".join(

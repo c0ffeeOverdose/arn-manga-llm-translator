@@ -6,19 +6,14 @@ import { unpackMask } from './page-cache';
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
     conf: number;
-    // Split children only: the side of the cut this child owns. The render's
-    // flood-fill area finder can cross into a sibling region through an outline
-    // hole (two balloons touch, an anti-aliased border has a gap, a caption
-    // block shares one connected white field) — the area bbox then spans both
-    // regions and the text lays out across them. The renderer clamps its fill
-    // window/runs/area to this rect — on the CUT axis only (see cutAxis).
-    // Absent on unsplit boxes.
+    // Split children only: the side of the cut this child owns. The render's flood-fill area
+    // finder can cross into a sibling region through an outline hole — the area bbox then spans
+    // both regions and the text lays out across them. The renderer clamps its fill
+    // window/runs/area to this rect — on the CUT axis only (see cutAxis). Absent on unsplit boxes.
     clip?: { x1: number; y1: number; x2: number; y2: number };
-    // Which axis the parent was cut along ('y' = siblings stacked vertically, so
-    // the clip's top/bottom edges are the sibling sides). The renderer clamps
-    // the clip on this axis only; the cross axis stays free so the flood can
-    // still reach the bubble's own walls — clamping both trapped it inside the
-    // parent's box and every split child fell to the rect path.
+    // Which axis the parent was cut along ('y' = siblings stacked vertically). The renderer
+    // clamps the clip on this axis only; the cross axis stays free so the flood can still reach
+    // the bubble's own walls — clamping both traps children inside the parent's box.
     cutAxis?: 'x' | 'y';
 }
 
@@ -31,32 +26,28 @@ export interface DetectResult {
     ep: string;
     lockWaitMs?: number; // ms this page's detect runs waited on the shared ORT lock (0 = uncontended)
     cloudTexts?: string[]; // cloud path: OCR texts aligned 1:1 with boxes (raw — caller trims)
-    // cloud path: server-side breakdown — detect/ocr are server inference,
-    // total is the server wall clock; enc/net are client-side (JPEG encode,
-    // message+upload+download roundtrip minus server total)
+    // cloud path: server-side breakdown — detect/ocr are server inference, total is the
+    // server wall clock; enc/net are client-side (JPEG encode, roundtrip minus server total)
     cloudMs?: { detect: number; ocr: number; enc?: number; net?: number; total?: number };
-    // cloud path: cleanup patches computed server-side in the same /v1/page
-    // call (inpaint=1) — one patch per box (full-res coords), filtered to the
-    // erase plan at render; clouds without the flag return nothing here
+    // cloud path: cleanup patches computed server-side in the same /v1/page call (inpaint=1) —
+    // one patch per box (full-res coords), filtered to the erase plan at render
     cloudPatches?: InpaintPatch[];
-    // cloud path: the server's box-split generation (0/absent = pre-split
-    // server) — entries below CLOUD_SPLIT_GEN re-detect instead of rendering
-    // fused boxes from cache
+    // cloud path: the server's box-split generation (0/absent = pre-split server) — entries
+    // below CLOUD_SPLIT_GEN re-detect instead of rendering fused boxes from cache
     splitGen?: number;
     panelMs?: number;   // YOLO panel infer ms (0/absent when skipped) — timing breakdown only
     panels?: DetBox[];      // YOLO panel boxes (empty when the model is missing)
     panelSkipped?: string;  // why panel ordering was skipped (strip aspect / gate) — page-result log only
     dropped?: DetBox[];     // CTD near-misses below threshold — debug overlay only
     panelDropped?: DetBox[]; // YOLO panels below threshold — debug overlay only
-    // regions that keep their source text (SFX, contained dups) — inpaint must
-    // not erase their glyphs while expanding a neighbour's erase region
+    // regions that keep their source text (SFX, contained dups) — inpaint must not erase
+    // their glyphs while expanding a neighbour's erase region
     keepBoxes?: DetBox[];
 }
 
-// ---- strip tiling: CTD letterboxes the long side to 1024, so an 800×13650
-// strip feeds the model ~3px-tall text (nothing detects that). Split extreme-
-// aspect pages into overlapping near-natural-scale tiles, detect per tile,
-// merge. Pure geometry — unit tested.
+// ---- strip tiling: CTD letterboxes the long side to 1024, so a long strip feeds the model
+// ~3px-tall text (nothing detects that). Split extreme-aspect pages into overlapping
+// near-natural-scale tiles, detect per tile, merge. Pure geometry — unit tested.
 
 export const STRIP_ASPECT = 3;   // above this (either axis) a page is a strip
 export const TILE_SIZE = 1200;   // tile long-side target at natural scale
@@ -85,10 +76,9 @@ export function splitTiles(w: number, h: number): Tile[] {
 }
 
 // Merge per-tile boxes (tile coords) into page coords. Two rules, in order:
-// 1. seam-union: boxes from DIFFERENT tiles that touch across a seam (gap ≤
-//    8px) with x/y-overlap ≥50% of the smaller side union into one — a text
-//    cut by the seam is fully visible in the neighbor tile, so the pair is
-//    one text, never two translations. Fixpoint (giant SFX can span tiles).
+// 1. seam-union: boxes from DIFFERENT tiles that touch across a seam (gap ≤ 8px) with
+//    x/y-overlap ≥50% of the smaller side union into one — a seam-cut text is fully visible
+//    in the neighbor tile, so the pair is one text, never two. Fixpoint (giant SFX can span tiles).
 // 2. same-tile overlaps are NOT touched — worker-side NMS owns those.
 // Returns page-coord boxes; confidences ride along (max on union).
 export function mergeTileBoxes(tiled: { tile: Tile; boxes: DetBox[] }[]): DetBox[] {
@@ -128,41 +118,27 @@ export function mergeTileBoxes(tiled: { tile: Tile; boxes: DetBox[] }[]): DetBox
     return all.map(({ x1, y1, x2, y2, conf }) => ({ x1, y1, x2, y2, conf }));
 }
 
-// CTD sometimes puts ONE box over two balloons whose text clusters sit close
-// in its receptive field (box-head conf stays high, so no gate drops it) —
-// the text mask still separates them: clusters divided by a gap the
-// same-block merge (worker GAP) would never bridge are two regions. Split at
-// each qualifying gap so every balloon gets its own crop, translation and
-// render area. Two lanes: lane 1 (diagonal balloons, wide gaps) needs BOTH a
-// gap multiple and cross-axis disjointness; lane 2 (tightly packed balloons
-// and slash-separated caption blocks) cuts on cluster evidence with a
-// glyph-scaled floor — see splitBoxLane2. Children of either lane are the
-// cluster extents padded by half the adjacent gap and clamped to the parent
-// (the fill/render stage then finds each balloon interior on its own).
-// Pure geometry — unit tested.
+// CTD sometimes puts ONE box over two balloons whose text clusters sit close in its
+// receptive field — the text mask still separates them: clusters divided by a gap the
+// same-block merge (worker GAP) would never bridge are two regions. Split at each qualifying
+// gap so every balloon gets its own crop, translation and render area. Two lanes: lane 1
+// (diagonal balloons, wide gaps) needs BOTH a gap multiple and cross-axis disjointness; lane 2
+// (tightly packed balloons and slash-separated caption blocks) cuts on cluster evidence with
+// a glyph-scaled floor — see splitBoxLane2. Children of either lane are the cluster extents
+// padded by half the adjacent gap and clamped to the parent. Pure geometry — unit tested.
 export const SPLIT_GAP_FACTOR = 2;  // × same-block gap — a cut is never tighter
 export const SPLIT_GAP_RATIO = 0.8; // × median cluster extent along the cut axis
-                                    // (line gaps run ~0.5–0.6× glyph height, a
-                                    // balloon boundary ≥1×; live merge measured
-                                    // gap 63px vs in-block max 33px)
+                                    // (line gaps run ~0.5–0.6× glyph height; a balloon boundary ≥1×)
 export const SPLIT_PAD_CAP = 40;    // px — max half-gap padding of a child box
-// Lane 2 (live: two side-by-side balloons 27px apart with a 22px y-overlap;
-// two balloons 15px apart with a 72px y-overlap; two caption blocks 37px
-// apart whose x-spans overlapped only through a texture false-positive).
 export const SPLIT2_FLOOR_RATIO = 0.5; // × median cluster minor extent (glyph size)
 export const SPLIT2_FLOOR_MIN = 8;     // px — absolute floor on small pages
 export const SPLIT2_OVERLAP_MAX = 0.5; // cross-span overlap / smaller span
 export const SPLIT2_STRONG_FACTOR = 2; // × floor — cuts despite cross overlap
-// Stacked twin groups (live p7: a one-line "WHOA!" 69px above its block;
-// live /14: a 3-row hamu 34px above its EN block — nested, so the strong
-// factor vetoes both like the dropped-line case): a detached FIRST group is
-// its own text, not a paragraph fragment — paragraphs never start with a
-// detached top group. Direction matters — a detached LAST group is the
-// dropped-line case and stays fused. y-axis only: columns are twinCut's
-// territory, and a mid-paragraph line gap would be indistinguishable there.
-// The size ratio keeps stragglers fused: a small bottom group under a big top
-// block is a dropped line (live: bold 70px line 72px under its 380px block),
-// while comparable stacked groups are twin balloons.
+// Stacked twin groups: a detached FIRST group is its own text, not a paragraph fragment —
+// paragraphs never start with a detached top group. Direction matters — a detached LAST group
+// is the dropped-line case and stays fused. y-axis only: columns are twinCut's territory.
+// The size ratio keeps stragglers fused: a small bottom group under a big top block is a
+// dropped line, while comparable stacked groups are twin balloons.
 export const SPLIT2_FIRST_GAP_MULT = 3; // × floor — far beyond line spacing
 export const SPLIT2_FIRST_MIN_RATIO = 0.5; // second group ≥ half the first
 
@@ -175,11 +151,8 @@ export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[
         const cs = comps.filter(c =>
             (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
             (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2);
-        // Strict set (higher text likelihood): the cut evidence may include a
-        // texture false positive (the box head corroborates it), but the child
-        // BOX must hug the text — a screentone patch merged into a caption
-        // group dragged its box 109px over the hatch and the translation laid
-        // out across it (live page 4, region 4).
+        // Strict set (higher text likelihood): the cut evidence may include a texture false
+        // positive (the box head corroborates it), but the child BOX must hug the text.
         const bs = boxComps === comps ? cs : boxComps.filter(c =>
             (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
             (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2);
@@ -191,19 +164,15 @@ export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[
 
 type SplitGroup = { x1: number; y1: number; x2: number; y2: number };
 
-// children = group extents padded by half the adjacent gap, clamped to the
-// parent box (siblings then never overlap on the cut axis). Each child also
-// gets a `clip` = its own side of the cut axis (slack on the cut side so the
-// child's outline stays reachable): the render's fill flood may cross into a
-// sibling region through an outline hole and lay the text out over both
-// (live: a balloon pair's areas merged 145px past the cut and the translation
-// sprawled across the panel border). Pure.
+// children = group extents padded by half the adjacent gap, clamped to the parent box
+// (siblings then never overlap on the cut axis). Each child also gets a `clip` = its own side
+// of the cut axis (slack on the cut side so the child's outline stays reachable): the render's
+// fill flood may cross into a sibling region through an outline hole and lay the text out over
+// both. Pure.
 export const SPLIT_CLIP_SLACK = 12; // px — max leash past the cut toward the sibling
-// How far a loose cluster may sit from the strict text core and still extend
-// the child box (see emitSplit). Strict-only boxes drift sideways when soft
-// glyph edges fall below the strict probability (live: a merged balloon pair
-// split into two children, both frames shifted left/right of their balloon);
-// 16px re-admits them while a texture patch 41px away stays out (page 4).
+// How far a loose cluster may sit from the strict text core and still extend the child box
+// (see emitSplit). Strict-only boxes drift sideways when soft glyph edges fall below the
+// strict probability; 16px re-admits them while a distant texture patch stays out.
 export const SPLIT_CORE_LEASH = 16; // px
 function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | 'y', loose: SplitComp[], boxComps: SplitComp[]): T[] {
     const lo = (g: SplitGroup) => (axis === 'y' ? g.y1 : g.x1);
@@ -215,24 +184,18 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
         return { at: (hi(groups[i]) + lo(g)) / 2, slack: Math.min(SPLIT_CLIP_SLACK, Math.max(4, Math.floor(gap / 2))) };
     });
     return groups.map((g, i) => {
-        // Pad faces only the CUT (the sibling side): half the gap we split in,
-        // capped. Padding the cross axis too dragged the box to the parent's
-        // edge — asymmetric on whichever side the clamp bit (live: a merged
-        // balloon pair, upper frame 456..542 for a 486..539 text block, lower
-        // 438..525 for 441..495; the frames looked shifted left/right).
+        // Pad faces only the CUT (the sibling side): half the gap we split in, capped.
+        // Padding the cross axis too dragged the box to the parent's edge — asymmetric on
+        // whichever side the clamp bit.
         const padTo = (gap: number) => gap > 0 && Number.isFinite(gap) ? Math.min(SPLIT_PAD_CAP, Math.floor(gap / 2)) : 0;
         const padBefore = padTo(gapBefore(i));
         const padAfter = padTo(gapBefore(i + 1));
-        // Child box = the group's text clusters, seeded by the strict comps so
-        // a texture patch the box head corroborated stays out (page 4: a
-        // screentone comp dragged the caption box 109px over the hatch), but
-        // not limited to them: soft glyph edges drop out of the strict set and
-        // a strict-only box (plus the layout area it floors) drifts sideways
-        // off the balloon's text block. Keep every loose comp within
-        // SPLIT_CORE_LEASH of the strict core; the cut positions, pads and
-        // clips still come from the loose groups, so the split decision and the
-        // sibling leash are unchanged. Fall back to the whole group bbox when
-        // the strict set has nothing usable in this group.
+        // Child box = the group's text clusters, seeded by the strict comps so a corroborated
+        // texture patch stays out, but not limited to them: soft glyph edges drop out of the
+        // strict set and a strict-only box (plus the layout area it floors) drifts sideways off
+        // the balloon's text block. Keep every loose comp within SPLIT_CORE_LEASH of the strict
+        // core; cut positions, pads and clips still come from the loose groups. Fall back to the
+        // whole group bbox when the strict set is empty here.
         const inGroup = (c: SplitComp) =>
             (c.x1 + c.x2) / 2 >= g.x1 && (c.x1 + c.x2) / 2 <= g.x2 &&
             (c.y1 + c.y2) / 2 >= g.y1 && (c.y1 + c.y2) / 2 <= g.y2;
@@ -263,11 +226,9 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
             if (before) clip.x1 = Math.round(before.at - before.slack);
             if (after) clip.x2 = Math.round(after.at + after.slack);
         }
-        // Siblings never cross the cut: pads face the cut but a strict-core
-        // recovery can pull an edge past it (live md4: right child x1 554 over
-        // the 558.5 cut), and overlapping siblings disable the dividerClips
-        // safety net (boxes that overlap are read as one text mass and
-        // skipped) — a longer translation on either side could then paint
+        // Siblings never cross the cut: pads face the cut but a strict-core recovery can pull an
+        // edge past it, and overlapping siblings disable the dividerClips safety net (overlapping
+        // boxes are read as one text mass and skipped) — a longer translation could then paint
         // into the shared strip. Clips (with their slack) still own the paint.
         const r = axis === 'y'
             ? { x1: Math.max(box.x1, ext.x1), y1: Math.max(box.y1, ext.y1 - padBefore), x2: Math.min(box.x2, ext.x2), y2: Math.min(box.y2, ext.y2 + padAfter) }
@@ -291,21 +252,18 @@ function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: numbe
     return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps) ?? splitTwinCut(box, cs, boxComps);
 }
 
-// Twin-balloon cut (live md4: a names lobe 8px from its body lobe — under
-// lane 2's floor and nested, so both lanes fuse them): a straight ink-free
-// avenue across the box with wide multi-row text on both sides splits,
-// whatever the gap width. The avenue must be crossed by ZERO comps — a word
-// gap always has another line's comps crossing it, and a headline spanning
-// both columns unites the block. Sides need ≥2 WIDE (w>h) comps spanning
-// ≥48px: vertical-text columns (tall comps) and single lines can never pass.
-// x-axis only: stacked blocks are lane 2's strong-factor territory, and a
-// mid-paragraph line gap would be indistinguishable there. Pure — unit tested.
+// Twin-balloon cut: a straight ink-free avenue across the box with wide multi-row text on
+// both sides splits, whatever the gap width. The avenue must be crossed by ZERO comps — a word
+// gap always has another line's comps crossing it, and a headline spanning both columns unites
+// the block. Sides need ≥2 WIDE (w>h) comps spanning ≥48px: vertical-text columns (tall comps)
+// and single lines can never pass. x-axis only: stacked blocks are lane 2's territory.
+// Pure — unit tested.
 export const TWIN_GUTTER_MIN = 4; // px — dust margin on the avenue
 export const TWIN_SIDE_MIN = 2;   // wide comps per side
 export const TWIN_SPAN_MIN = 48;  // px of y per side (~2 text lines)
 function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
-    // clamp to the box, then sweep for avenues no comp crosses (closes sort
-    // before opens at ties, so touching comps leave no avenue)
+    // clamp to the box, then sweep for avenues no comp crosses (closes sort before opens at
+    // ties, so touching comps leave no avenue)
     const cl = cs.map(c => ({ ...c, x1: Math.max(c.x1, box.x1), x2: Math.min(c.x2, box.x2) }));
     const edges: { x: number; open: boolean }[] = [];
     for (const c of cl) {
@@ -353,8 +311,8 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
         const sorted = [...cs].sort((a, b) => lo(a) - lo(b));
         const exts = sorted.map(c => hi(c) - lo(c)).sort((a, b) => a - b);
         const thr = Math.max(SPLIT_GAP_FACTOR * sameBlockGap, SPLIT_GAP_RATIO * exts[Math.floor(exts.length / 2)]);
-        // cluster runs: gap measured from the running max, so words on one
-        // line / columns of vertical text (overlapping on the axis) never cut
+        // cluster runs: gap measured from the running max, so words on one line / columns of
+        // vertical text (overlapping on the axis) never cut
         type Group = { x1: number; y1: number; x2: number; y2: number };
         const groups: Group[] = [];
         for (const c of sorted) {
@@ -369,12 +327,8 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
             }
         }
         if (groups.length < 2) continue;
-        // Two runs sharing cross-axis space are one text block: a paragraph's
-        // lines share a span, and a partially-dropped mask invents fake gaps
-        // inside it (live: a bold last line 72px under its own block split off
-        // as "หา!?" while the block stayed put; the dropped-line case split a
-        // region whose middle line the mask missed). Only diagonal runs split —
-        // the overlapping-balloon pair is x-disjoint with a 25px margin.
+        // Two runs sharing cross-axis space are one text block: a paragraph's lines share a
+        // span, and a partially-dropped mask invents fake gaps inside it. Only diagonal runs split.
         for (;;) {
             const k = groups.findIndex((g, i) => i + 1 < groups.length && Math.min(cHi(g), cHi(groups[i + 1])) > Math.max(cLo(g), cLo(groups[i + 1])));
             if (k < 0) break;
@@ -391,19 +345,13 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
     return null;
 }
 
-// Lane 2: same two-balloon problem on tightly packed pages — the clusters sit
-// only ~15–40px apart (under lane 1's gap floor) and side-by-side balloons
-// share cross-axis space, so lane 1's disjointness guard rejects them too.
-// Cut on cluster evidence: the floor gap scales with the box's glyph size
-// (median cluster minor extent) and a cut needs EITHER strongly disjoint cross
-// spans OR twice the floor with the cross spans not nested in each other. The
-// nested guard is what keeps a paragraph's separated last line fused (it sits
-// inside the block's span) while the caption-block case passes (a texture
-// false-positive merged into the upper cluster widened its span past the
-// lower block's edge). Same-span lines of one block merge through the overlap
-// ratio; a diagonal pair of two-line groups is a real cut (live page: two
-// balloons 27px apart sharing 22px of y; 15px apart sharing 72px; caption
-// blocks 37px apart). Pure — unit tested on live comps.
+// Lane 2: same two-balloon problem on tightly packed pages — clusters sit ~15–40px apart
+// (under lane 1's gap floor) and side-by-side balloons share cross-axis space, so lane 1's
+// disjointness guard rejects them too. Cut on cluster evidence: the floor gap scales with the
+// box's glyph size (median cluster minor extent) and a cut needs EITHER strongly disjoint cross
+// spans OR twice the floor with the cross spans not nested in each other. The nested guard keeps
+// a paragraph's separated last line fused while the caption-block case passes. Same-span lines
+// of one block merge through the overlap ratio. Pure — unit tested.
 function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
     if (cs.length < 2) return null;
     const dims = cs.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
@@ -453,13 +401,11 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
     return null;
 }
 
-// Pass-3 rescue for mask-component pipelines (see worker runDetect): a merged
-// comp killed ONLY by the overlap gate may still hold a text group outside
-// every kept box (live /14: the 28px merge chained the left はむ into a
-// super-comp overlapping box 5, which swallowed it whole and the split never
-// saw it). Split it with the lane machinery on the raw texty comps and
-// re-gate each piece: pieces outside all boxes survive as their own regions
-// (clips stripped — fresh regions, adjacency is the divider's job). Pure.
+// Pass-3 rescue for mask-component pipelines (see worker runDetect): a merged comp killed
+// ONLY by the overlap gate may still hold a text group outside every kept box. Split it with
+// the lane machinery on the raw texty comps and re-gate each piece: pieces outside all boxes
+// survive as their own regions (clips stripped — fresh regions, adjacency is the divider's job).
+// Pure.
 export interface RescueCounts { count: number; probSum: number }
 export function rescueSplitComp(
     c: SplitComp,
@@ -485,15 +431,12 @@ export function rescueSplitComp(
     return out;
 }
 
-// Region numbering order: the detector emits confidence order, so sort into
-// reading order before anything numbers the boxes. Row bands by y-center
-// gaps (top to bottom), x-columns within each band from the reading-start
-// side. Pure geometry on the boxes themselves — no pixels, so backgrounds
-// can never fool it. Pure — unit tested.
-// ponytail: flat bands, not XY-cut — pixel panel segmentation died in
-// prototyping (window lines, text gaps and screentone fake every gutter
-// threshold). Residual miss: vertically-overlapping staggered rows merge
-// into one band and fall back to RTL; upgrade only if seen live.
+// Region numbering order: the detector emits confidence order, so sort into reading order
+// before anything numbers the boxes. Row bands by y-center gaps (top to bottom), x-columns
+// within each band from the reading-start side. Pure geometry on the boxes — no pixels, so
+// backgrounds can never fool it. Pure — unit tested.
+// Flat bands, not XY-cut. Residual miss: vertically-overlapping staggered rows merge into one
+// band and fall back to RTL.
 export function sortReadingOrder(boxes: DetBox[], dir: 'rtl' | 'ltr', page?: { w: number; h: number }, defer = true): DetBox[] {
     return sortReadingOrderBy(boxes, b => b, dir, page, defer);
 }
@@ -563,9 +506,9 @@ export function parsePanelOutput(data: Float32Array | number[], w: number, h: nu
     return { panels, dropped };
 }
 
-// Each box joins the smallest panel containing its center (inset beats
-// host), else the nearest panel. Panels order with the same banding rules;
-// boxes inside each panel band again. No panels → plain banding.
+// Each box joins the smallest panel containing its center (inset beats host), else the
+// nearest panel. Panels order with the same banding rules; boxes inside each panel band again.
+// No panels → plain banding.
 function nearestPanel(b: DetBox, panels: DetBox[]): number {
     const cx = (b.x1 + b.x2) / 2, cy = (b.y1 + b.y2) / 2;
     let best = 0, bestArea = Infinity, found = false;
@@ -585,12 +528,10 @@ function nearestPanel(b: DetBox, panels: DetBox[]): number {
     return best;
 }
 
-// Descriptive labels (room plates, signs) read after a panel's balloon
-// dialogue. Proxy, not balloon detection — leoxs22 has no balloon class:
-// small boxes (area < SMALL_FRAC of the page) clustered with another small
-// box nearby sink to the end, stably. Isolated small boxes (short replies)
-// are untouched.
-// ponytail: replace with balloon containment if a balloon-class model lands
+// Descriptive labels (room plates, signs) read after a panel's balloon dialogue. Proxy, not
+// balloon detection — the model has no balloon class: small boxes (area < SMALL_FRAC of the
+// page) clustered with another small box nearby sink to the end, stably. Isolated small boxes
+// (short replies) are untouched. Replace with balloon containment if a balloon-class model lands.
 const SMALL_FRAC = 0.005;
 const CLUSTER_GAP_FRAC = 0.05; // of page diagonal
 export function splitDeferred(boxes: DetBox[], pageW: number, pageH: number): { main: DetBox[]; deferred: DetBox[] } {
@@ -608,12 +549,10 @@ export function splitDeferred(boxes: DetBox[], pageW: number, pageH: number): { 
     return { main: boxes.filter(b => !linked.has(b)), deferred: boxes.filter(b => linked.has(b)) };
 }
 
-// Panel sanity gate: YOLO was trained on whole pages — on extreme-aspect
-// strips (manhwa long-strip OR stitched manga pages, same thing geometrically)
-// the 640-resize crushes what it learned and it returns sliver soup. Blind
-// trust (nearestPanel) then scrambles reading order; banding is correct for
-// both cases (pages flow top-to-bottom, in-band order follows readingDir).
-// Pure — the caller skips the model call on aspect alone, this gates output.
+// Panel sanity gate: YOLO was trained on whole pages — on extreme-aspect strips (long-strip
+// or stitched pages, same thing geometrically) the 640-resize crushes what it learned and it
+// returns sliver soup. Blind trust (nearestPanel) then scrambles reading order; banding is
+// correct for both (pages flow top-to-bottom). Pure.
 export function panelsUsable(panels: DetBox[], pageW: number, pageH: number): boolean {
     if (!panels.length) return false;
     if (panels.length > 25) return false; // no real page has 25 panels
@@ -652,12 +591,10 @@ let nextId = 1;
 const waiters: { resolve: () => void; reject: (e: Error) => void }[] = [];
 let listenerInstalled = false;
 
-// the iframe lives in the PAGE's DOM, so the page can remove it (dead
-// contentWindow → RPCs time out forever) or swap in a srcdoc document that
-// passes a bare source check. Two guards: only messages from OUR extension
-// origin count (srcdoc/contentWindow of a hijacked frame carries the page
-// origin), and a detached iframe resets the handshake so the next call
-// recreates it instead of dying permanently.
+// the iframe lives in the PAGE's DOM, so the page can remove it (dead contentWindow → RPCs
+// time out forever) or swap in a srcdoc document that passes a bare source check. Two guards:
+// only messages from OUR extension origin count, and a detached iframe resets the handshake so
+// the next call recreates it instead of dying permanently.
 function iframeAlive(): boolean {
     if (iframe?.isConnected && iframe.contentWindow) return true;
     if (iframe && !iframe.isConnected) { iframe = null; ready = false; workerToken = null; }
@@ -671,16 +608,12 @@ function installListener(): void {
         if (ev.source !== iframe?.contentWindow) return;
         if (ev.origin !== chrome.runtime.getURL('/').slice(0, -1)) return; // our extension origin only
         if (ev.data?.type === 'mt:ready') {
-            // worker registers its token with the SW under the public nonce
-            // before signalling ready — fetch it before resolving so no RPC can
-            // race the handshake (nonce-keyed: a second tab's or a hostile page's
-            // embedded worker registers under a different key, no clobbering).
-            // Never overwrite a good token with null (a failed fetch must not
-            // poison a working handshake).
-            // mt:ready is posted with '*' — the PAGE sees it and can time an
-            // iframe removal into the await below. Generation guard: if this
-            // frame was torn down while we fetched, its result is void (the
-            // replacement frame's own mt:ready installs its token + resolves).
+            // worker registers its token with the SW under the public nonce before signalling
+            // ready — fetch it before resolving so no RPC can race the handshake. Never overwrite
+            // a good token with null (a failed fetch must not poison a working handshake).
+            // mt:ready is posted with '*' — the PAGE sees it and can time an iframe removal into
+            // the await below. Generation guard: if this frame was torn down while we fetched,
+            // its result is void.
             const fr = iframe;
             if (!fr || !fr.isConnected) return;
             try {
@@ -693,13 +626,10 @@ function installListener(): void {
         } else if (ev.data?.type === 'mt:detect-result' || ev.data?.type === 'mt:rpc-result') {
             const p = pending.get(ev.data.id);
             pending.delete(ev.data.id);
-            // Firefox delivers worker replies that carried a transfer list as
-            // LIVE Xray wrappers, not clones (proven live: assigning onto det
-            // throws "cross-origin object ... XrayWrapper", while plain replies
-            // clone fine). Materialize our own realm's copy at the boundary so
-            // every downstream read AND write is same-realm. On Chromium the
-            // payload is already plain — one extra copy per page, negligible
-            // next to inference. Fall back to the raw payload if cloning fails.
+            // Firefox delivers worker replies that carried a transfer list as LIVE Xray wrappers,
+            // not clones. Materialize our own realm's copy at the boundary so every downstream
+            // read AND write is same-realm. On Chromium the payload is already plain — one extra
+            // copy per page, negligible next to inference.
             if (ev.data.ok) {
                 let out: unknown = ev.data.result ?? ev.data;
                 try { out = structuredClone(out); } catch { /* keep original */ }
@@ -729,8 +659,8 @@ function ensureIframe(): Promise<void> {
     });
 }
 
-// pipeline stage for the status pill's stepper (typed so phases never ride
-// inside message strings). Order = read → detect → ocr → llm → render.
+// pipeline stage for the status pill's stepper (typed so phases never ride inside message
+// strings). Order = read → detect → ocr → llm → render.
 export type MtStage = 'read' | 'detect' | 'ocr' | 'llm' | 'render';
 export type MtOnStatus = (s: string, stage?: MtStage) => void;
 
@@ -739,10 +669,9 @@ export async function ensureDetector(onStatus?: MtOnStatus): Promise<void> {
     await ensureIframe();
 }
 
-// Full-page canvas encodes are the heaviest main-thread work in a page job
-// (multi-MP draw + encode on the page's renderer). Sweep/paint jobs run up to
-// three at once; without this they spike together and jank the reader. No
-// throughput is lost — inference itself is already serialized in the worker.
+// Full-page canvas encodes are the heaviest main-thread work in a page job. Sweep/paint jobs
+// run up to three at once; without this they spike together and jank the reader. No throughput
+// is lost — inference itself is already serialized in the worker.
 let encodeChain: Promise<unknown> = Promise.resolve();
 export function withEncodeLock<T>(fn: () => Promise<T>): Promise<T> {
     const p = encodeChain.then(fn, fn);
@@ -756,8 +685,8 @@ export async function detect(
     thresholds?: { confThr?: number; minSize?: number; forceWasm?: boolean; lo?: boolean },
     attempt = 0, // page can tear the iframe down on every mt:ready — cap rebuilds
 ): Promise<DetectResult> {
-    // alive-check BEFORE the PNG encode: a hostile remove-loop must not earn
-    // a full-page re-encode per cycle
+    // alive-check BEFORE the PNG encode: a hostile remove-loop must not earn a full-page
+    // re-encode per cycle
     if (!iframeAlive()) await ensureIframe();
     const w = 'naturalWidth' in img ? img.naturalWidth : img.width;
     const h = 'naturalHeight' in img ? img.naturalHeight : img.height;
@@ -847,9 +776,9 @@ export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_TH
 }
 
 // ---- AI text cleanup (manga-LaMa in the iframe worker, WebGPU only) -------
-// The worker windows the page per erase box and returns one PNG crop per box;
-// callers draw the crops in place of the built-in fill. Boxes are the ones
-// already expanded by eraseBox (mask-led walk), so clipped glyphs are covered.
+// The worker windows the page per erase box and returns one PNG crop per box; callers draw
+// the crops in place of the built-in fill. Boxes are the ones already expanded by eraseBox
+// (mask-led walk), so clipped glyphs are covered.
 export interface InpaintPatch { i?: number; x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }
 
 export async function inpaintPage(
@@ -876,12 +805,10 @@ export async function inpaintPage(
     return { patches, windows: resp.windows ?? patches.length, ms: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0, encodeMs };
 }
 
-// AI cleanup on the user's own endpoint (cloud engine): the client sends the
-// page as base64 JPEG plus the prepared erase mask as base64 PNG (1 byte/px
-// binary, compresses to a few KB), and gets back the same per-box PNG patches
-// the local worker produces, so the paint/cache path is shared. Bodies ride as
-// base64 through the SW (content-script fetch is CORS-gated on the page origin;
-// the server falls back to its own CTD pass when no mask is sent).
+// AI cleanup on the user's own endpoint (cloud engine): the client sends the page as base64
+// JPEG plus the prepared erase mask as base64 PNG, and gets back the same per-box PNG patches
+// the local worker produces, so the paint/cache path is shared. Bodies ride as base64 through
+// the SW (content-script fetch is CORS-gated on the page origin).
 export async function cloudInpaint(
     bitmap: ImageBitmap, boxes: { x1: number; y1: number; x2: number; y2: number }[],
     opts: { quality: number; gray: boolean; endpoint: string; key: string; mask: { width: number; height: number; data: Uint8Array } },
@@ -900,14 +827,12 @@ export async function cloudInpaint(
     return { patches, windows: +(j.windows ?? patches.length), ms: +(j.ms?.total ?? 0) };
 }
 
-// ---- Cloud: panel+detect+OCR on your own endpoint (opt-in, Modal).
-// Same boxes+texts the local pipeline produces; ordering/rendering stay
-// client-side. The mask is synthesized from boxes (inpaint + cache work;
-// mask-only SFX recovery is local-only).
+// ---- Cloud: panel+detect+OCR on your own endpoint (opt-in, Modal). Same boxes+texts the
+// local pipeline produces; ordering/rendering stay client-side. The mask is synthesized from
+// boxes (inpaint + cache work; mask-only SFX recovery is local-only).
 
-// Binary erase mask -> base64 PNG for the cloud call (a 1600x1126 mask rides as
-// 1 byte/px; PNG squeezes it to tens of KB, where raw base64 would be ~2.4MB).
-// FileReader, not blob.arrayBuffer() — Firefox Xray trap (see the note below).
+// Binary erase mask -> base64 PNG for the cloud call (PNG squeezes 1 byte/px to tens of KB,
+// where raw base64 would be ~2.4MB). FileReader, not blob.arrayBuffer() — Firefox Xray trap.
 async function maskToPngB64(mask: { width: number; height: number; data: Uint8Array }): Promise<string> {
     return withEncodeLock(async () => {
         const c = new OffscreenCanvas(mask.width, mask.height);
@@ -930,10 +855,8 @@ async function maskToPngB64(mask: { width: number; height: number; data: Uint8Ar
     });
 }
 
-// JPEG encode + data-URL read, shared by both cloud upload encoders. FileReader,
-// not blob.arrayBuffer(): on Firefox that throws "Permission denied to access
-// property constructor" (Xray wrapper on canvas blobs; same trap ocr.ts's
-// toJpegB64 documents, live-proven there). Returns the payload after the comma.
+// JPEG encode + data-URL read, shared by both cloud upload encoders. FileReader, not
+// blob.arrayBuffer() — Firefox Xray trap on canvas blobs. Returns the payload after the comma.
 async function jpegDataUrl(c: OffscreenCanvas, quality: number, gray: boolean): Promise<string> {
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
     if (gray) {
@@ -964,13 +887,10 @@ export async function bitmapToJpegB64(bitmap: ImageBitmap, quality: number, gray
     });
 }
 
-// Cloud uploads from weak devices pay the mobile uplink per byte, while CTD
-// resizes any input into its fixed 1024 field and Baberu crops shrink to
-// 224x224 — a capped long side costs detection nothing and OCR a sliver of
-// sharpness on very large scans. Returns the downscale factor
-// (fullPage / sent) so callers can map response coords back to full-page
-// space; 1 when nothing was scaled (also used by parity tests: scale 1 must
-// be byte-identical to bitmapToJpegB64).
+// Cloud uploads from weak devices pay the mobile uplink per byte, while CTD resizes any input
+// into its fixed 1024 field and Baberu crops shrink to 224x224 — a capped long side costs
+// detection nothing and OCR a sliver of sharpness on very large scans. Returns the downscale
+// factor (fullPage / sent) so callers map response coords back; 1 when nothing was scaled.
 export const CLOUD_MAX_SIDE = 1600;
 export async function bitmapToJpegB64Capped(
     bitmap: ImageBitmap, quality: number, gray: boolean, maxSide: number,
@@ -992,8 +912,8 @@ export async function bitmapToJpegB64Capped(
     });
 }
 
-// Cloud endpoint/key live in mtSettings (llm/adapters), same place detectPage
-// reads them; sweep prewarms from here too.
+// Cloud endpoint/key live in mtSettings (llm/adapters), same place detectPage reads them;
+// sweep prewarms from here too.
 export async function cloudConfig(): Promise<{ endpoint: string; key: string }> {
     const { mtSettings } = await chrome.storage.local.get('mtSettings');
     const s = mtSettings as { cloudEndpoint?: unknown; cloudKey?: unknown } | undefined;
@@ -1003,10 +923,9 @@ export async function cloudConfig(): Promise<{ endpoint: string; key: string }> 
     };
 }
 
-// Modal scales to zero: the first request after idle pays the container boot +
-// model load (tens of seconds). A sweep should pay that ONCE up front (with a
-// long cap of its own) instead of letting the first 90s-capped page calls race
-// the boot. /health is auth-exempt and returns only after the models are up.
+// Modal scales to zero: the first request after idle pays the container boot + model load.
+// A sweep pays that ONCE up front instead of letting the first page calls race the boot.
+// /health is auth-exempt and returns only after the models are up.
 export async function cloudWarm(endpoint: string, key: string): Promise<number> {
     const r = await chrome.runtime.sendMessage({ type: 'mt:cloud-warm', endpoint, key }) as { ok: boolean; ms?: number; error?: string };
     if (!r?.ok) throw new Error(r?.error ?? 'cloud warm failed');
@@ -1018,16 +937,14 @@ export async function cloudDetect(
     endpoint: string, key: string,
     opts: { confThr: number; minSize: number; quality: number; gray: boolean; inpaint?: boolean },
 ): Promise<DetectResult> {
-    // capped upload (mobile uplink): CTD/Baberu inputs are resize-invariant,
-    // so anything above CLOUD_MAX_SIDE is pure wire cost — response coords
-    // come back in sent space and are mapped back with `scale` below
+    // capped upload (mobile uplink): CTD/Baberu inputs are resize-invariant, so anything above
+    // CLOUD_MAX_SIDE is pure wire cost — response coords come back in sent space and are mapped
+    // back with `scale` below
     const tEnc = performance.now();
     const { b64: jpegB64, scale } = await bitmapToJpegB64Capped(bitmap, opts.quality, opts.gray, CLOUD_MAX_SIDE);
     const encMs = Math.round(performance.now() - tEnc);
-    // via the SW: content-script fetch is CORS-gated on the page origin
-    // (host permissions don't lift it — same trap as image fetch). The
-    // channel JSON-serializes, so the JPEG rides as base64 (an ArrayBuffer
-    // arrives as {} — proven live by a 15-byte "[object…]" body)
+    // via the SW: content-script fetch is CORS-gated on the page origin. The channel
+    // JSON-serializes, so the JPEG rides as base64 (an ArrayBuffer arrives as {}).
     const tUp = performance.now();
     const resp = await chrome.runtime.sendMessage({
         type: 'mt:cloud-page', endpoint, key,
@@ -1039,19 +956,17 @@ export async function cloudDetect(
     {
         const j = resp.page;
         if (!j?.ok) throw new Error(String(j?.error ?? 'cloud failed'));
-        // response coords are in SENT-image space (capped upload) — scale
-        // everything back to full-page space here; every consumer downstream
-        // (paint, erase plan, VLM badges, cache) works in full-page coords
+        // response coords are in SENT-image space (capped upload) — scale everything back to
+        // full-page space here; every consumer downstream works in full-page coords
         const boxes: DetBox[] = (j.boxes ?? []).map((b: any) => ({
             x1: +b.x1 * scale, y1: +b.y1 * scale, x2: +b.x2 * scale, y2: +b.y2 * scale, conf: +b.conf,
         }));
         const w = bitmap.width, h = bitmap.height;
         const serverTotal = Math.round(j.ms?.total ?? 0);
-        // Real CTD mask when the server ships one (gen 2+): text-color
-        // sampling, inpaint and the debug view all read it. Older servers send
-        // nothing — fall back to box-filled stand-in (whole boxes read as ink,
-        // so leaked areas resolve white text; those entries miss the freshness
-        // gate and re-detect anyway).
+        // Real CTD mask when the server ships one (gen 2+): text-color sampling, inpaint and the
+        // debug view all read it. Older servers send nothing — fall back to box-filled stand-in
+        // (whole boxes read as ink, so leaked areas resolve white text; those entries miss the
+        // freshness gate and re-detect anyway).
         let maskData: ArrayBuffer;
         const pm = j.mask as { w?: unknown; h?: unknown; b64?: unknown } | undefined;
         if (pm && typeof pm.b64 === 'string' && +pm.w! > 0 && +pm.h! > 0) {
@@ -1068,11 +983,10 @@ export async function cloudDetect(
             }
             maskData = packed.buffer as ArrayBuffer;
         }
-        // cleanup patches computed server-side in the same roundtrip (one per
-        // box, coords in sent space) — scale back to full-page space here so
-        // every consumer (render paint, cache entry) sees full-res coords.
-        // The render filters to the erase plan and falls back to the dedicated
-        // /v1/inpaint roundtrip when the keep-overlap guard rejects them.
+        // cleanup patches computed server-side in the same roundtrip (one per box, coords in sent
+        // space) — scale back to full-page space here so every consumer sees full-res coords. The
+        // render filters to the erase plan and falls back to the dedicated /v1/inpaint roundtrip
+        // when the keep-overlap guard rejects them.
         const cloudPatches: InpaintPatch[] = (j.patches ?? []).map((p: any) => ({
             i: +(p.i ?? -1),
             x1: Math.round(+p.x1 * scale), y1: Math.round(+p.y1 * scale),
@@ -1107,9 +1021,8 @@ function b64buf(s: string): ArrayBuffer {
 
 // generic request/response over the iframe postMessage channel
 async function iframeRpc(msg: object, transfer?: Transferable[]): Promise<unknown> {
-    // null token = handshake failed (e.g. Firefox session-storage fallback lost
-    // the SW's memory between register and fetch) — the worker would silently
-    // drop the RPC and we'd wait out the full 180s per call. Fail fast instead.
+    // null token = handshake failed — the worker would silently drop the RPC and we'd wait out
+    // the full 180s per call. Fail fast instead.
     if (workerToken === null) throw new Error('worker auth token missing — reload the page');
     if (!iframeAlive()) await ensureIframe(); // page tore the iframe down — rebuild
     if (workerToken === null) throw new Error('worker auth token missing — reload the page');

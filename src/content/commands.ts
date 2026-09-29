@@ -36,11 +36,8 @@ function imgInViewport(): PageRef | null {
     return best;
 }
 
-// last right-clicked element + point + time (capture) — the context-menu
-// translate hits the exact image even if the reader swapped elements/src
-// since discovery. One-shot AND time-boxed: a popup press long after a
-// dismissed menu must not reuse its stale point (recycled elements live
-// there now) — menu picks happen within seconds of the right-click.
+// One-shot + time-boxed right-click capture: the context-menu translate hits
+// the exact image even if the reader swapped elements since.
 let lastRightClicked: Element | null = null;
 let lastRightClickXY: { x: number; y: number } | null = null;
 let lastRightClickT = 0;
@@ -50,10 +47,8 @@ document.addEventListener('contextmenu', e => {
     lastRightClickT = Date.now();
 }, true);
 
-// overlay-piercing pick: some readers lay a transparent div over each page
-// (overlay readers), so a right-click lands on the div and the image menu
-// target is never the <img>. Scan the stack at the click point for the
-// topmost page-candidate img instead. Generic — no site rules.
+// overlay-piercing pick: some readers lay a transparent div over each page,
+// so scan the stack at the click point for the topmost page-candidate img.
 function imgAtPoint(x: number, y: number): PageRef | null {
     let els: Element[];
     try { els = document.elementsFromPoint(x, y); } catch { return null; }
@@ -68,12 +63,8 @@ function imgAtPoint(x: number, y: number): PageRef | null {
 }
 
 // popup-button press (no click behind it): translate the whole visible
-// spread, most-visible first — a 2-page spread otherwise leaves one page
-// English and reads as "the button did nothing". Visibility is by AREA:
-// a vertical-only overlap would also catch offscreen preloads stacked at
-// the same y (spread keeps 2 hidden twins). Slivers under 20% of the
-// viewport are skipped; with nothing passing, the dominant page alone keeps
-// the old single-page behavior.
+// spread, most-visible first. Visibility is by area; slivers under 20% of the
+// viewport are skipped, with nothing passing the dominant page alone keeps going.
 function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => void): void {
     const vh = window.innerHeight || 1;
     const vw = window.innerWidth || 1;
@@ -122,10 +113,8 @@ function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => void): 
     }
 }
 
-// no page for the job: the right-click menu path has no UI of its own
-// (background drops the response) — a toast is the only way this failure
-// is ever seen (the popup surfaces resp.error itself, a duplicate toast
-// there is harmless)
+// no page for the job: the menu path has no UI of its own — a toast is the
+// only way this failure is ever seen.
 function missPage(sendResponse: (r: unknown) => void): void {
     makeToast('No manga page found here', 'error');
     void logError('no manga image found', undefined, 'parse');
@@ -136,9 +125,8 @@ export function installMessageListener(): void {
     chrome.runtime.onMessage.addListener((msg: { type: string; srcUrl?: string }, _sender, sendResponse) => {
         if (msg?.type === 'mt:translate-image') {
             const refs = getPages();
-            // click-directed (context menu) vs spread (popup button): a menu pick
-            // arrives seconds after its right-click with or without srcUrl; a bare
-            // popup press carries neither and means "everything I'm looking at"
+            // click-directed (menu pick / srcUrl) vs spread (bare popup press means
+            // "everything I'm looking at").
             const clickFresh = !!lastRightClicked && Date.now() - lastRightClickT < 30000;
             const directed = clickFresh || !!msg.srcUrl;
             // right-clicked element first (precise), browser-attested srcUrl, the img
@@ -178,10 +166,8 @@ export function installMessageListener(): void {
             return;
         }
         if (msg?.type === 'mt:cancel-all') {
-            // drop everything queued (the in-flight page runs out — aborting mid-LLM
-            // wastes spent tokens and corrupts the book). Background engines stop
-            // too: the chapter sweep (own stop otherwise) and the lookahead chain
-            // (drains after its current page — same no-mid-LLM-abort rule).
+            // drop everything queued — the in-flight page runs out (mid-LLM abort
+            // wastes tokens and corrupts the book). Background engines stop too.
             const n = queue.length + paintQueued();
             const stopping = !!sweepStatus()?.active || cancelLookahead();
             clearQueue();
@@ -252,8 +238,8 @@ export function installMessageListener(): void {
                 charsOpen: charsPanelOpen(),
                 usage: sessionUsage,
                 lastUsage: lastPageUsage,
-                // viewed-page state: for the popup's main button (keyed by page — the
-                // reader swaps elements, so element identity lies)
+                // viewed-page state for the popup's main button (keyed by page —
+                // the reader swaps elements, so element identity lies).
                 viewedTranslated: viewed ? !!stateFor(viewed)?.det : false,
                 viewedQueued: viewed ? queue.some(j => j.key === pageKeyOf(viewed)) : false,
                 viewedActive: viewed ? pageKeyOf(viewed) === activeKeyGet() : false,
@@ -266,7 +252,7 @@ export function installMessageListener(): void {
         if (msg?.type === 'mt:auto-translate') {
             const m = msg as { type: string; on?: boolean; origin?: string };
             // popup toggles one tab's site — a tab switch between open and click
-            // must not flip some other site's loop
+            // must not flip some other site's loop.
             if (typeof m.origin === 'string' && m.origin !== location.origin) {
                 sendResponse({ ok: true, ignored: true });
                 return;

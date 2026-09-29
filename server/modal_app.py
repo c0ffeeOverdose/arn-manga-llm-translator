@@ -1,15 +1,12 @@
-# Modal deployment of server/app.py: T4 GPU, scale-to-zero, Bearer auth.
-# Deploy from inside server/: modal deploy modal_app.py
-# (needs MODAL_TOKEN_ID/SECRET). app.py bakes into the image — each deploy
-# is immutable, no runtime mounts.
+# Modal deployment of server/app.py: T4 GPU, scale-to-zero, Bearer auth. Deploy from inside server/.
+# app.py bakes into the image — each deploy is immutable, no runtime mounts.
 import os
 import sys
 
 import modal
 
 sys.path.insert(0, os.environ.get("PKG_DIR", os.path.dirname(os.path.abspath(__file__))))
-# NOTE: top-level sibling import — resolved locally at deploy parse time
-# (needs the full deps installed where you deploy from), baked copy used remotely.
+# NOTE: sibling import resolved locally at deploy parse time; baked copy used remotely.
 from app import app as fastapi_app
 from models_manifest import CTD_URL, BABERU, BABERU_FILES, INPAINT_URL
 
@@ -20,10 +17,8 @@ dl += [f'curl -fL -o /models/{dst} "{BABERU}/{src}?download=true"'
 dl.append(f'curl -fL -o /models/lama-manga-512-fp16w.onnx "{INPAINT_URL}"')
 
 image = (
-    # nvidia runtime base: onnxruntime-gpu needs CUDA 13 + cuDNN 9 system
-    # libs (libcublasLt.so.13) that debian_slim lacks — plain pip is not enough.
-    # onnxruntime-gpu stays pinned: a future wheel requiring a newer CUDA would
-    # fail the CUDA provider and silently fall back to CPU on a GPU bill.
+    # nvidia runtime base: onnxruntime-gpu needs CUDA 13 + cuDNN 9 system libs plain pip lacks.
+    # Pin the wheel: a newer CUDA requirement would silently fall back to CPU on a GPU bill.
     modal.Image.from_registry("nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04",
                               add_python="3.12")
     .apt_install("curl")
@@ -32,8 +27,7 @@ image = (
     .env({"ORT_PROVIDERS": "CUDAExecutionProvider,CPUExecutionProvider",
           "ORT_DEVICE": "cuda", "PKG_DIR": "/pkg"})
     .run_commands(*dl)
-    # single file, not add_local_dir("."): deploy sources like Colab's /content
-    # hold mutating internal files (.config/gce) that abort the build mid-snapshot
+    # single file, not add_local_dir: deploy sources can hold mutating files that abort the build
     .add_local_file("app.py", remote_path="/pkg/app.py")
     .add_local_file("split.py", remote_path="/pkg/split.py")
     # the container re-imports modal_app.py, which imports this
@@ -43,9 +37,7 @@ image = (
 app = modal.App("arn-manga")
 
 
-# scaledown_window=90 (default 60): reading bursts run nonstop so the window
-# only matters after a batch finishes — 90s covers page-to-page manual pauses
-# without billing a long idle tail. Longer gaps always pay a cold boot anyway.
+# scaledown_window=90: reading bursts run nonstop; 90s covers page-to-page pauses without a long idle tail.
 @app.function(image=image, gpu=["T4", "L4"], timeout=600, scaledown_window=90,
               secrets=[modal.Secret.from_name("arn-manga-key")])
 @modal.asgi_app()

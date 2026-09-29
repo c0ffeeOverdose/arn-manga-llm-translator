@@ -197,8 +197,7 @@ export async function renderFontManager(): Promise<void> {
 
 export async function drawFontPreview(): Promise<void> {
     const canvas = $('fontPreview') as HTMLCanvasElement;
-    // the Appearance tab may be hidden (offsetWidth 0) when this runs at load —
-    // skip the zero-size paint; the tab handler repaints on open
+    // skip zero-size paint when the tab is hidden (offsetWidth 0); the tab handler repaints on open
     if (canvas.offsetWidth === 0) return;
     const text = ($('fontPreviewText') as HTMLInputElement).value || ' ';
     const ctx = canvas.getContext('2d')!;

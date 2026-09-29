@@ -1,7 +1,5 @@
-// Content script: find page images on any manga site, run pipeline, draw over them.
-// detect (iframe) → translate (background LLM, BYOK) → inpaint → render Thai.
-// Pipeline tuning comes from mtPipeline settings (options page / presets).
-// Orchestrator logic lives in the sibling modules; this entry only boots.
+// Content script entry: pipeline is detect (iframe) → translate (background LLM) → inpaint → render.
+// This module only boots; orchestration lives in the sibling modules.
 
 import { ensureDetector } from './detection';
 import { setUi, ui, loadPipeline, loadTheme, applyTheme, onThemeChange } from './state';
@@ -14,11 +12,8 @@ import { onThemeChanged } from './chars-ui';
 
 declare const __BUILD_ID__: string; // injected by build.mjs — which build is this?
 
-// Single-execution guard: reloading the extension re-injects this script
-// into open tabs while the old instance keeps running (timers, listeners,
-// pill) — two instances fight over the DOM (revoke wars, double LLM calls,
-// greyed-out image menu). The newcomer dies on the spot; the survivor keeps
-// working until the tab reloads (its [mt] build stamp shows stale).
+// Single-execution guard: a re-injected copy must die — two instances
+// fight over the DOM (revoke wars, double LLM calls).
 if ((window as any).__mtContentLoaded) throw new Error('[mt] duplicate content script — old instance still owns this tab');
 (window as any).__mtContentLoaded = true;
 
@@ -45,11 +40,8 @@ async function main() {
             document.body.append(pill);
             clearInterval(t);
             renderStatus();
-            // overlay sweeper: re-apply overlays when the reader swaps/replaces
-            // page elements (paged navigation mid-queue was drawing into dead ones).
-            // 1s rhythm: the fast repaint lane (back-nav onto known content) must
-            // feel instant — the pass itself is cheap (a handful of imgs, sync map
-            // hits; hashing only fires for unknown URLs, once per src).
+            // Overlay sweeper: the reader can swap page elements mid-queue —
+            // re-apply overlays every 1s (cheap sync map hits).
             setInterval(applyOverlays, 1000);
         }
     }, 500);

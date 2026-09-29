@@ -1,18 +1,14 @@
-// Persistent translation cache: reopen a chapter → already-translated pages
-// render from cache instead of paying detect + LLM again. Identity is the
-// IMAGE CONTENT (downscaled hash), never the URL or page index — re-uploaded
-// art, quality variants and spread-mode reshuffles all fail safe to a miss.
-// Entries also carry a settings fingerprint so a changed target language (or
-// threshold) re-translates instead of showing a stale page.
-// ponytail: one tiny store, LRU by access time, hard cap — no versioning,
-// no migrations, corrupt entries just miss.
+// Persistent translation cache: reopen a chapter → already-translated pages render from
+// cache instead of paying detect + LLM again. Identity is the IMAGE CONTENT (downscaled
+// hash), never the URL or page index — variants fail safe to a miss. Entries carry a
+// settings fingerprint so changed settings re-translate instead of showing a stale page.
+// One tiny store, LRU by access time, hard cap — no versioning, corrupt entries just miss.
 
 import type { DetBox, DetectResult, InpaintPatch, MtOnStatus } from './detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
 
-// ORT inference-queue picker (worker-side, pure): first hi-priority task
-// (0), else the oldest — used by the iframe scheduler so background
-// lookahead/sweep inference yields to the page the user is waiting on.
+// ORT inference-queue picker (worker-side, pure): first hi-priority task (0), else the
+// oldest — background lookahead/sweep inference yields to the page the user is waiting on.
 export function pickInferIndex(q: { prio: 0 | 1 }[]): number {
     const i = q.findIndex(t => t.prio === 0);
     return i < 0 ? 0 : i;
@@ -21,21 +17,18 @@ export function pickInferIndex(q: { prio: 0 | 1 }[]): number {
 export const CACHE_MAX = 200;
 const HASH_SIZE = 48;
 
-// Sliding-window canvas readers keep every page canvas in the
-// DOM from load; pages outside the render window are uniform placeholders
-// that draw real pixels only when approached. Each byte is compared to the
-// first pixel's channel (±2 for downscale ringing). Pure — unit-tested below.
+// Sliding-window canvas readers keep placeholder pages that draw real pixels only when
+// approached. Each byte is compared to the first pixel's channel (±2 for downscale ringing).
+// Pure — unit-tested below.
 export function uniformPixels(d: Uint8ClampedArray): boolean {
     for (let i = 4; i < d.length; i++) if (Math.abs(d[i] - d[i & 3]) > 2) return false;
     return true;
 }
 
-// Status ownership: the pill is a VIEW of live activities, not a public
-// write slot — parallel jobs / queued preps each own an entry, and this
-// picker decides which one the user sees. Priority: user intent (force) →
-// the page they're looking at (max viewport overlap) → background work
-// (lookahead, chapter sweep — tied, insertion order wins). Pure —
-// unit-tested below.
+// Status ownership: the pill is a VIEW of live activities, not a public write slot —
+// parallel jobs / queued preps each own an entry, and this picker decides which one the user
+// sees. Priority: user intent (force) → the page they're looking at (max viewport overlap)
+// → background work (lookahead, sweep — tied, insertion order wins). Pure — unit-tested below.
 export interface ActivityEntry {
     key: string;          // page key, or 'lookahead' / 'sweep'
     kind: 'force' | 'view' | 'lookahead' | 'sweep';
@@ -52,9 +45,8 @@ export function pickActivity<T extends ActivityEntry>(entries: T[]): T | null {
     return best;
 }
 
-// ---- chapter-sweep waiter registry: neutral ground so pipeline.ts can await
-// a sweep-owned page without importing sweep.ts (which imports pipeline.ts
-// for detection — a direct edge would cycle). Registered once at load.
+// ---- chapter-sweep waiter registry: neutral ground so pipeline.ts can await a sweep-owned
+// page without importing sweep.ts (which imports pipeline.ts — a direct edge would cycle).
 let sweepWaiter: ((url: string, onStatus: MtOnStatus) => Promise<void>) | null = null;
 export function registerSweepWaiter(fn: (url: string, onStatus: MtOnStatus) => Promise<void>): void {
     sweepWaiter = fn;
@@ -63,9 +55,9 @@ export function sweepWait(url: string, onStatus: MtOnStatus): Promise<void> {
     return sweepWaiter ? sweepWaiter(url, onStatus) : Promise.resolve();
 }
 
-// ---- lookahead-abort registry (same neutral-ground pattern): sweep.ts must
-// not import auto.ts (one-way edge — auto imports sweep), but starting/stopping
-// a sweep must stop a lookahead chain that is warming the same pages.
+// ---- lookahead-abort registry (same neutral-ground pattern): sweep.ts must not import
+// auto.ts (auto imports sweep), but starting/stopping a sweep must stop a lookahead chain
+// warming the same pages.
 let lookaheadAbort: (() => boolean) | null = null;
 export function registerLookaheadAbort(fn: () => boolean): void {
     lookaheadAbort = fn;
@@ -74,12 +66,11 @@ export function abortLookahead(): boolean {
     return lookaheadAbort ? lookaheadAbort() : false;
 }
 
-// ---- ordered commit: parallel workers finish out of order, but the book
-// must fold page-by-page (updateContext is order-sensitive: pairs append,
-// names are first-wins). Buffer results by chapter index and drain only the
-// consecutive run from the head — every skipped/failed index still buffers a
-// marker, or the head stalls behind it forever. Mutates the map (consumes).
-// Pure — unit-tested below.
+// ---- ordered commit: parallel workers finish out of order, but the book must fold
+// page-by-page (updateContext is order-sensitive: pairs append, names are first-wins).
+// Buffer results by chapter index and drain only the consecutive run from the head — every
+// skipped/failed index still buffers a marker, or the head stalls behind it forever.
+// Mutates the map (consumes). Pure — unit-tested below.
 export function takeOrdered<T>(ready: Map<number, T>, head: number): { items: T[]; head: number } {
     const items: T[] = [];
     while (ready.has(head)) {
@@ -90,9 +81,8 @@ export function takeOrdered<T>(ready: Map<number, T>, head: number): { items: T[
     return { items, head };
 }
 
-// Sweep lifecycle phase (pure — popup/pill label + unit tests). `starting` is
-// the enumeration window before a run object exists: cancel must be possible
-// there too (it used to be a silent no-op and the run started anyway).
+// Sweep lifecycle phase (pure — popup/pill label + unit tests). `starting` is the
+// enumeration window before a run object exists: cancel must be possible there too.
 export function sweepPhase(s: { cancel: boolean; dead: boolean; starting?: boolean } | null): 'idle' | 'starting' | 'running' | 'stopping' | 'dead' {
     if (!s) return 'idle';
     if (s.dead) return 'dead';
@@ -100,12 +90,11 @@ export function sweepPhase(s: { cancel: boolean; dead: boolean; starting?: boole
     return s.starting ? 'starting' : 'running';
 }
 
-// ---- pool sizing: canvas work is bound by the page's renderer thread, not by
-// the provider. Cloud mode keeps the sweep pool (the endpoint serves requests
-// in parallel — live-probed); local CPU inference is serialized behind the
-// worker's ORT lock anyway, so extra workers only multiply main-thread decode/
-// encode spikes on machines that can least afford them. Painting is local CPU
-// everywhere: parallel lanes are pure jank without a GPU. Pure — unit-tested.
+// ---- pool sizing: canvas work is bound by the page's renderer thread, not by the provider.
+// Cloud mode keeps the sweep pool (the endpoint serves requests in parallel); local CPU
+// inference is serialized behind the worker's ORT lock anyway, so extra workers only multiply
+// main-thread decode/encode spikes. Painting is local CPU everywhere: parallel lanes are pure
+// jank without a GPU. Pure — unit-tested.
 export function sweepPoolSize(cloud: boolean, gpu: boolean, detEpWasm: boolean): number {
     if (cloud) return 3;
     return !gpu || detEpWasm ? 2 : 3;
@@ -124,61 +113,48 @@ export interface CachedPage {
     outputs: RegionOutput[];
     extras: ExtraRegion[];
     mentions?: Mention[]; // page-level named people — absent on entries written before mentions existed
-    // downscaled CTD mask (see packMask) — without it a cache hit renders with
-    // an empty mask and inpaint erases nothing (ghost source text). Optional so
-    // pre-mask entries just miss once and heal on overwrite.
+    // downscaled CTD mask (see packMask) — without it a cache hit renders with an empty mask
+    // and inpaint erases nothing. Optional so pre-mask entries just miss once and heal.
     mask?: { w: number; h: number; data: ArrayBuffer };
-    // detect checkpoint (no outputs yet): a page-turn kills the translating
-    // document mid-job (full-load readers) — the next load resumes at
-    // translation from this entry instead of re-paying detect. Overwritten by
-    // the full entry under the same key; never renders as Done (cache).
+    // detect checkpoint (no outputs yet): a page-turn kills the translating document mid-job —
+    // the next load resumes at translation from this entry instead of re-paying detect.
+    // Overwritten by the full entry under the same key; never renders as Done.
     partial?: true;
-    // OCR texts aligned 1:1 with boxes (cloud path carries them at checkpoint
-    // time — local OCR runs later, inside translateRegions).
+    // OCR texts aligned 1:1 with boxes (cloud path carries them at checkpoint time).
     texts?: string[];
     // detector EP at checkpoint time — restored so the Done line stays honest
     ep?: string;
-    // cloud path: the server's box-split generation (server/split.py SPLIT_GEN)
-    // — cache entries from older servers hold fused boxes and must re-detect
+    // cloud path: the server's box-split generation (server/split.py SPLIT_GEN) — cache
+    // entries from older servers hold fused boxes and must re-detect
     splitGen?: number;
-    // AI text cleanup output: one erased-background crop per erase box, drawn
-    // in place of the built-in fill. patchesGen tags the pipeline version so
-    // old crops are ignored (regenerated) instead of painting stale pixels.
+    // AI text cleanup output: one erased-background crop per erase box, drawn in place of
+    // the built-in fill. patchesGen tags the pipeline version so old crops are regenerated.
     patches?: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[];
     patchesGen?: number;
-    // partial-only: cloud cleanup patches checkpointed with the detection (i =
-    // index into `boxes`) — restored by detFromPartial so a resumed job skips
-    // the /v1/inpaint roundtrip. Full entries never carry this (their patches
-    // ride `patches` after the erase-plan filter).
+    // partial-only: cloud cleanup patches checkpointed with the detection (i = index into
+    // `boxes`) — restored by detFromPartial so a resumed job skips the /v1/inpaint roundtrip.
+    // Full entries never carry this.
     cpatches?: InpaintPatch[];
 }
 
-// Bump when the AI-cleanup crop pipeline changes (window geometry, model,
-// mask recipe, composite) — cached patches with a different generation are
-// regenerated. v2: page-scaled mask dilation (v1's glyph-tight mask made the
-// model paint paper white over the leftover white glyphs). v3: composite
-// window indices fixed (v2 sampled the upscaled output in 512-space and
-// smeared neighbouring art over the erased text).
+// Bump when the AI-cleanup crop pipeline changes (window geometry, model, mask recipe,
+// composite) — cached patches with a different generation are regenerated.
 export const INPAINT_PATCH_GEN = 3;
 
-// Bump when the server's box-splitting changes (server/split.py SPLIT_GEN):
-// cloud cache entries below this hold fused boxes (gen 0), box-filled
-// stand-in masks that force white text (gen 1), miss overlap-swallowed
-// text the rescue would have saved (gen 2), or fuse comparable stacked
-// groups the first-pair rule now splits (gen 3) — all re-detect instead of
-// rendering from cache. Local entries never carry splitGen (their tile
-// fingerprint already forces re-detect) — isCloud scopes the gate to cloud
-// mode so local caches never pay for it.
+// Bump when the server's box-splitting changes (server/split.py SPLIT_GEN): cloud entries
+// below this hold fused boxes (gen 0), box-filled stand-in masks (gen 1), missed
+// overlap-swallowed text (gen 2), or fused stacked groups (gen 3) — all re-detect instead of
+// rendering from cache. Local entries never carry splitGen (their tile fingerprint already
+// forces re-detect) — isCloud scopes the gate to cloud mode.
 export const CLOUD_SPLIT_GEN = 4;
 export function cloudSplitFresh(hit: { ep?: string; splitGen?: number } | undefined, isCloud: boolean): boolean {
     return !isCloud || (hit?.splitGen ?? 0) >= CLOUD_SPLIT_GEN;
 }
 
-// CTD masks are full-page 1 byte/px (~MBs) — too big for IDB at 200 pages.
-// packMask block-maxes it to ≤maxSide (~45KB/page); unpackMask nearest-
-// neighbor upscales back to full res. inpaint's row-fill + faint-text
-// fallback tolerates the coarse mask — it only needs to know WHICH rows
-// carry text, and block-max never drops a text pixel the full mask had.
+// CTD masks are full-page 1 byte/px (~MBs) — too big for IDB at 200 pages. packMask
+// block-maxes it to ≤maxSide (~45KB/page); unpackMask nearest-neighbor upscales back.
+// inpaint tolerates the coarse mask — it only needs to know WHICH rows carry text, and
+// block-max never drops a text pixel the full mask had.
 export function packMask(
     mask: { width: number; height: number; data: ArrayBuffer }, maxSide = 256,
 ): { w: number; h: number; data: ArrayBuffer } {
@@ -217,20 +193,19 @@ export function unpackMask(
     return out.buffer as ArrayBuffer;
 }
 
-// ---- detect checkpoints: a partial entry (boxes, no outputs) is resumable
-// when fingerprint + dims still match and it carries a mask. Full entries
-// never resume (they render from cache); stale partials re-detect. Pure.
+// ---- detect checkpoints: a partial entry (boxes, no outputs) is resumable when fingerprint
+// + dims still match and it carries a mask. Full entries never resume (they render from
+// cache); stale partials re-detect. Pure.
 export function isResumable(hit: CachedPage | undefined, fp: string, w: number, h: number, isCloud: boolean): hit is CachedPage {
     return !!hit && hit.partial === true && hit.fp === fp
         && hit.w === w && hit.h === h && hit.boxes.length > 0 && !!hit.mask
         && cloudSplitFresh(hit, isCloud);
 }
 
-// rebuild a live DetectResult from a resumable partial — ordered boxes,
-// panels, mask and texts come back as detect produced them (ordering is NOT
-// re-run: it already ran before the checkpoint). Texts ride the cloudTexts
-// slot: translateRegions treats any present texts as ready and skips local
-// OCR. Returns null on a maskless entry (callers check isResumable first).
+// rebuild a live DetectResult from a resumable partial — ordered boxes, panels, mask and
+// texts come back as detect produced them (ordering is NOT re-run: it already ran before the
+// checkpoint). Texts ride the cloudTexts slot: translateRegions treats any present texts as
+// ready and skips local OCR. Returns null on a maskless entry.
 export function detFromPartial(hit: CachedPage, w: number, h: number): DetectResult | null {
     if (!hit.mask) return null;
     return {
@@ -238,23 +213,21 @@ export function detFromPartial(hit: CachedPage, w: number, h: number): DetectRes
         mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
         inferMs: 0, ep: hit.ep ?? 'cache', dropped: [], panelDropped: [],
         ...(hit.texts?.length ? { cloudTexts: hit.texts } : null),
-        // server-computed cleanup patches already paid for in the detect
-        // roundtrip — a resumed job must not re-pay /v1/inpaint for them
+        // server-computed cleanup patches already paid for in the detect roundtrip — a resumed
+        // job must not re-pay /v1/inpaint for them
         ...(hit.cpatches?.length ? { cloudPatches: hit.cpatches } : null),
         ...(hit.splitGen != null ? { splitGen: hit.splitGen } : null),
     };
 }
 
-// split-pipeline fallback: the transcribe already ran when the channel died —
-// stamp its texts onto the regions so the re-sent call is a text-only
-// translate instead of a second (billed) transcription. Short lists keep the
-// caller's own source. Pure.
+// split-pipeline fallback: the transcribe already ran when the channel died — stamp its texts
+// onto the regions so the re-sent call is a text-only translate instead of a second (billed)
+// transcription. Short lists keep the caller's own source. Pure.
 export function withSources<T extends { source: string }>(regions: T[], texts: string[]): T[] {
     return regions.map((r, i) => ({ ...r, source: texts[i] ?? r.source }));
 }
 
-// checkpoint writer input (same key the full entry later overwrites — LRU
-// and force-overwrite need no partial awareness). Pure.
+// checkpoint writer input (same key the full entry later overwrites). Pure.
 export function partialEntry(key: string, fp: string, det: DetectResult, w: number, h: number): Omit<CachedPage, 'atime'> {
     return {
         key, fp, w, h,
@@ -284,8 +257,7 @@ export function hashPixels(data: ArrayLike<number>): string {
     return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
 }
 
-// content hash of a page: downscale to 48x48 gray, hash the bytes.
-// ~1-2ms — preparePage already decoded the bitmap for rendering anyway.
+// content hash of a page: downscale to 48x48 gray, hash the bytes (~1-2ms).
 export function pageHashFromBitmap(bitmap: ImageBitmap): string {
     const c = new OffscreenCanvas(HASH_SIZE, HASH_SIZE);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
@@ -302,29 +274,23 @@ export function cacheKey(chapter: string, hash: string): string {
     return `${chapter}#${hash}`;
 }
 
-// Story identity for multi-site use: origin + path + query + hash, minus
-// obvious page-turn suffixes. Page-turns share a key (queue + context
-// survive flipping 1→2→3); anything else differing = a new story.
-// Pure — unit-tested below; chapterKey() is the thin location wrapper.
+// Story identity for multi-site use: origin + path + query + hash, minus obvious page-turn
+// suffixes. Page-turns share a key (queue + context survive flipping pages); anything else
+// differing = a new story. Pure — unit-tested below; chapterKey() is the thin location wrapper.
 export function normalizeChapterKey(origin: string, path: string, search: string, hash: string): string {
-    // Chapter readers fold page-turns to the chapter: the segment after
-    // /chapter/ names the CHAPTER, never the page (MangaDex pushStates page
-    // numbers, title-page readers putting the id in the path never touch
-    // the URL on page turns at all — live-proven). Keep it, drop the rest.
+    // Chapter readers fold page-turns to the chapter: the segment after /chapter/ names the
+    // CHAPTER, never the page. Keep it, drop the rest.
     const m = path.match(/^(.*\/chapter\/[^/]+)/);
     if (m) return origin + m[1];
-    // Purely-numeric hashes (#2, #2-3 spread) are page turns — but only when
-    // the path already carries an identifier (a digit: story/chapter ids are
-    // numeric in every reader design seen). A digit-less path with a numeric
-    // hash may BE using the hash as the story id, so those still compare
-    // exactly: fail-split stands, no per-site rules.
+    // Purely-numeric hashes (#2, #2-3 spread) are page turns — but only when the path already
+    // carries an identifier (a digit). A digit-less path with a numeric hash may BE using the
+    // hash as the story id, so those still compare exactly: fail-split stands, no per-site rules.
     if (/\d/.test(path) && /^#\d+(-\d*)?$/.test(hash)) {
         hash = '';
     }
-    // generic paged readers: a trailing /N under a nested path is a page turn
-    // (/manga/x/1 → /manga/x). Depth guard: a shallow /manga/1 may BE the story
-    // id — only strip at depth ≥3, where a story parent exists. Fail direction
-    // is a split (lost continuity), never a merge (mixed stories).
+    // generic paged readers: a trailing /N under a nested path is a page turn. Depth guard: a
+    // shallow /manga/1 may BE the story id — only strip at depth ≥3. Fail direction is a split
+    // (lost continuity), never a merge (mixed stories).
     const segs = path.split('/').filter(Boolean);
     let p = (segs.length >= 3 && /^\d+$/.test(segs[segs.length - 1]))
         ? '/' + segs.slice(0, -1).join('/')
@@ -334,20 +300,16 @@ export function normalizeChapterKey(origin: string, path: string, search: string
     const sp = new URLSearchParams(search);
     sp.delete('page'); sp.delete('p'); sp.delete('pg');
     const q = sp.toString();
-    // SPA hash routes name the story (#/reader/123 vs #/reader/456) — compared
-    // EXACTLY, never stripped: a numeric tail may be the story id, and a split
-    // only loses continuity while a merge contaminates.
+    // SPA hash routes name the story — compared EXACTLY, never stripped: a numeric tail may be
+    // the story id, and a split only loses continuity while a merge contaminates.
     return origin + p + (q ? '?' + q : '') + hash;
 }
 
-// ---- hotlink Referer rule: some image CDNs (*.2xstorage.com)
-// 403 any request without a page Referer — and an MV3 service worker cannot
-// send one (Chrome strips referrer/unsafe-url from SW fetch silently), so the
-// SW proxy 403s where a plain <img> loads fine (proven: 403→200 on the same
-// URL by adding a page Referer). Fix at the network
-// layer: a declarativeNetRequest session rule sets the header for SW fetches
-// to these hosts. Pure builder — the background installs it via
-// updateSessionRules; unit-tested below.
+// ---- hotlink Referer rule: some image CDNs 403 any request without a page Referer — and an
+// MV3 service worker cannot send one (Chrome strips referrer from SW fetch silently), so the
+// SW proxy 403s where a plain <img> loads fine. Fix at the network layer: a
+// declarativeNetRequest session rule sets the header for SW fetches to these hosts.
+// Pure builder — the background installs it via updateSessionRules; unit-tested below.
 export const HOTLINK_RULE_ID = 1001;
 export function hotlinkRule(origin: string): object {
     return {
@@ -365,14 +327,11 @@ export function hotlinkRule(origin: string): object {
     };
 }
 
-// ---- mt:fetch-image policy: the SW fetch is CORS-exempt under
-// host_permissions, so without a guard it doubles as a read-anything proxy
-// for whatever URL a page plants in an <img> — including local-network
-// services (http://127.0.0.1:8080/…) whose response pixels flow back into
-// the rendered page. http(s) only; private/loopback targets only when the
-// requesting page itself sits on that host (self-hosted readers stay
-// working). Pure — the background enforces it (on BOTH the request URL and
-// the post-redirect response URL); unit-tested below.
+// ---- mt:fetch-image policy: the SW fetch is CORS-exempt under host_permissions, so without
+// a guard it doubles as a read-anything proxy for whatever URL a page plants in an <img> —
+// including local-network services whose response pixels flow back into the rendered page.
+// http(s) only; private/loopback targets only when the requesting page itself sits on that host.
+// Pure — enforced on BOTH the request URL and the post-redirect response URL; unit-tested below.
 function privHost(h: string): boolean {
     if (h === 'localhost' || h.endsWith('.localhost')) return true;
     if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) {
@@ -400,8 +359,7 @@ export function fetchImageBlocked(url: string, senderUrl: string): string | null
     let u: URL;
     try { u = new URL(url); } catch { return 'invalid url'; }
     if (u.protocol !== 'https:' && u.protocol !== 'http:') return 'scheme';
-    // lowercase + strip brackets + strip trailing dot ("localhost." resolves
-    // to loopback; WHATWG URL already normalizes decimal/octal/hex IPv4)
+    // lowercase + strip brackets + trailing dot (WHATWG URL already normalizes exotic IPv4 forms)
     const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
     if (!privHost(host)) return null;
     let pageHost = '';
@@ -410,16 +368,12 @@ export function fetchImageBlocked(url: string, senderUrl: string): string | null
     return norm(pageHost) === norm(host) ? null : 'local network';
 }
 
-// ---- single-image-reader off-DOM lookahead: these readers keep ONE <img> in
-// the DOM (the current page — their "preload" is in-memory, invisible to
-// querySelectorAll), so a DOM-driven prefetch window can never see ahead.
-// But they embed the whole gallery manifest in the page (a
-// script[type="application/json"][data-url="/api/v2/galleries/{id}"] whose
-// body is itself a JSON string with pages[].path), so sibling URLs are
-// derivable with zero extra fetches: current-img host + manifest path.
-// Pure — caller passes the script text (or null when absent); returns
-// absolute URLs AFTER the current page only (forward-only — prefetch never
-// burns LLM on pages behind). Unit-tested below.
+// ---- single-image-reader off-DOM lookahead: these readers keep ONE <img> in the DOM (the
+// current page), so a DOM-driven prefetch window can never see ahead. But they embed the whole
+// gallery manifest in the page (a JSON script whose body holds pages[].path), so sibling URLs
+// are derivable with zero extra fetches: current-img host + manifest path. Pure — caller passes
+// the script text (or null when absent); returns absolute URLs AFTER the current page only
+// (forward-only — prefetch never burns LLM on pages behind). Unit-tested below.
 export function galleryAheadUrls(manifestJson: string | null, imgHost: string, curPath: string, max: number): string[] {
     if (!manifestJson || !imgHost || !curPath || max <= 0) return [];
     const paths = galleryPaths(manifestJson);
@@ -428,11 +382,9 @@ export function galleryAheadUrls(manifestJson: string | null, imgHost: string, c
     return paths.slice(i + 1, i + 1 + max).map((p) => `${imgHost}/${p}`);
 }
 
-// ---- paged-chapter enumeration: paged readers virtualize the DOM (only the
-// loaded window stays — the rest are lazy <img> with no pixels yet, or absent
-// entirely), so DOM refs undercount the chapter. Paged-reader APIs return the
-// full page list; the parse + URL builder stay pure for tests, the fetch +
-// DOM walk live in page-io (untestable — document/chrome access).
+// ---- paged-chapter enumeration: paged readers virtualize the DOM, so DOM refs undercount
+// the chapter. Paged-reader APIs return the full page list; the parse + URL builder stay pure
+// for tests, the fetch + DOM walk live in page-io (untestable — document/chrome access).
 export function pagedChapterUuid(pathname: string, hostname: string): string | null {
     if (!/(^|\.)mangadex\./.test(hostname)) return null;
     const m = pathname.match(/^\/chapter\/([^/]+)/);
@@ -450,10 +402,9 @@ export function buildPagedUrls(baseUrl: unknown, hash: unknown, files: unknown, 
     }
     return out;
 }
-// unloaded-but-addressable pages: lazy <img> with an http(s) src and no
-// pixels yet. Loaded ones are covered by getPages refs (element path handles
-// blob/taint); known dedupes against those + each other. data:/empty/blob:
-// srcs are unusable headless — skip.
+// unloaded-but-addressable pages: lazy <img> with an http(s) src and no pixels yet. Loaded
+// ones are covered by getPages refs; known dedupes against those + each other. data:/empty/
+// blob: srcs are unusable headless — skip.
 export function unloadedPageUrls(cands: { src: string; loaded: boolean }[], known: Set<string>): string[] {
     const out: string[] = [];
     for (const c of cands) {
@@ -465,9 +416,8 @@ export function unloadedPageUrls(cands: { src: string; loaded: boolean }[], know
     return out;
 }
 
-// chapter sweep needs the WHOLE list in reading order (not just forward of
-// an anchor), plus where the current page sits in it. Same parser, same
-// bails — index -1 when the anchor matches nothing (sweep from page 0).
+// chapter sweep needs the WHOLE list in reading order (not just forward of an anchor), plus
+// where the current page sits in it. Same parser, same bails — index -1 on no match.
 export function galleryAllUrls(manifestJson: string | null, origSrc: string): { urls: string[]; index: number } {
     const m = origSrc.match(/^(https?:\/\/[^/]+)\/(.+)$/);
     if (!m) return { urls: [], index: -1 };
@@ -487,27 +437,23 @@ function galleryPaths(manifestJson: string | null): string[] {
     } catch { return []; }
 }
 
-// caller-side wiring, kept pure so the translated-blob regression stays
-// locked by test: the live element src is a blob: URL after translation, so
-// siblings must derive from the STORED original (https) — never the live
-// src. Non-https input (blob:, empty, garbage) yields [] by construction.
+// caller-side wiring, kept pure so the translated-blob regression stays locked by test: the
+// live element src is a blob: URL after translation, so siblings must derive from the STORED
+// original (https) — never the live src. Non-https input yields [] by construction.
 export function galleryLookaheadUrls(manifestJson: string | null, origSrc: string, max: number): string[] {
     const m = origSrc.match(/^(https?:\/\/[^/]+)\/(.+)$/);
     if (!m) return [];
     return galleryAheadUrls(manifestJson, m[1], m[2], max);
 }
 
-// ---- episode-manifest canvas readers (gigaviewer-style): the reader
-// draws pages into <canvas> (tainted — no pixel readback, so canvas identity
-// AND pixels must come from elsewhere), but embeds the whole episode in
-// <script id="episode-json" data-value='{"readableProduct":{"pageStructure":
-// {readingDirection, pages:[{type,src}...]}}}'>. The DOM holds one
-// .js-page-area per manifest entry IN ORDER (1:1, including non-main), each
-// growing its <canvas> when scrolled near — so area index → manifest src is
-// the stable page identity (survives canvas recreation, needs zero reads).
-// Pure: caller passes the data-value string (or null). srcs align 1:1 with
-// .js-page-area order; non-main entries (link/ad/backMatter) are null —
-// never queued, never stitched. Unit-tested below.
+// ---- episode-manifest canvas readers: the reader draws pages into <canvas> (tainted — no
+// pixel readback, so canvas identity AND pixels must come from elsewhere), but embeds the whole
+// episode in <script id="episode-json" data-value='...'>. The DOM holds one .js-page-area per
+// manifest entry IN ORDER (1:1, including non-main), each growing its <canvas> when scrolled
+// near — so area index → manifest src is the stable page identity (survives canvas recreation,
+// needs zero reads). Pure: caller passes the data-value string (or null). srcs align 1:1 with
+// .js-page-area order; non-main entries (link/ad/backMatter) are null — never queued, never
+// stitched. Unit-tested below.
 export interface EpisodeManifest { dir: 'rtl' | 'ltr' | null; srcs: (string | null)[] }
 export function episodeManifest(manifestJson: string | null): EpisodeManifest | null {
     if (!manifestJson) return null;
@@ -529,13 +475,11 @@ export function manifestAheadUrls(srcs: (string | null)[], anchor: string, max: 
     return srcs.slice(i + 1).filter((s): s is string => !!s).slice(0, max);
 }
 
-// ---- gigaviewer tile descramble: cdn-img serves 4x4-TRANSPOSED puzzles and
-// the viewer reassembles in JS (chunk.1819: DIVIDE_NUM=4, MULTIPLE=8, tile =
-// 8*floor(dim/32), dst index = 4*(a%4)+floor(a/4), full-draw first so the
-// sub-tile remainder strip survives, smoothing off) — then deliberately
-// taints the canvas (makeTainted: 1px no-CORS draw). Mirror it exactly:
-// fetch → untranspose → pipeline. Transpose is an involution, so the same
-// map solves both directions. Pure geometry — pixel ops live in content.ts.
+// ---- tile descramble: the CDN serves 4x4-TRANSPOSED puzzles and the viewer reassembles in
+// JS (tile = 8*floor(dim/32), dst index = 4*(a%4)+floor(a/4), full-draw first so the sub-tile
+// remainder strip survives, smoothing off) — then deliberately taints the canvas. Mirror it
+// exactly: fetch → untranspose → pipeline. Transpose is an involution, so the same map solves
+// both directions. Pure geometry — pixel ops live in content.ts.
 export interface PuzzleTile { sx: number; sy: number; dx: number; dy: number }
 export function puzzleTileMap(w: number, h: number): { tw: number; th: number; tiles: PuzzleTile[] } {
     const tw = 8 * Math.floor(w / 32), th = 8 * Math.floor(h / 32);
@@ -547,8 +491,8 @@ export function puzzleTileMap(w: number, h: number): { tw: number; th: number; t
     return { tw, th, tiles };
 }
 
-// ---- failure cooldown: a failed page parks instead of burning tokens in
-// a retry loop (autoTick re-enqueues anything stateless every 2.5s). Pure.
+// ---- failure cooldown: a failed page parks instead of burning tokens in a retry loop
+// (autoTick re-enqueues anything stateless every 2.5s). Pure.
 export interface FailMark { n: number; nextOk: number }
 export const COOLDOWN_MS = 60000;
 export const COOLDOWN_MAX = 3; // attempts, then parked until manual force
@@ -569,25 +513,20 @@ export function cooldownParked(marks: Map<string, FailMark>, key: string, now: n
     return now < m.nextOk;
 }
 
-// auto pre-translate window budget: refill only up to `ahead` AUTO jobs
-// waiting — a per-tick slice without this grows unbounded on full-DOM long
-// strips (long-strip readers hold 36 imgs at once; virtualized readers self-limit
-// and hid the bug). Manual jobs don't consume the budget. Pure.
+// auto pre-translate window budget: refill only up to `ahead` AUTO jobs waiting — a per-tick
+// slice without this grows unbounded on full-DOM long strips. Manual jobs don't consume it. Pure.
 export function autoBudget(autoQueued: number, ahead: number): number {
     return Math.max(0, ahead - autoQueued);
 }
 
-// ---- seam chains: one scene sliced into consecutive same-width images with
-// a bubble cut at the shared edge (long-strip readers slice tall scenes ~1500px;
-// taming-my-master-mage ch1 p8/p9 cut "BLOO[D...!]" mid-word). Per-page jobs
-// see half-boxes and translate fragments — the fix stitches the chain into
-// one logical page (detect/OCR/LLM once, render whole, slice write-back).
+// ---- seam chains: one scene sliced into consecutive same-width images with a bubble cut at
+// the shared edge. Per-page jobs see half-boxes and translate fragments — the fix stitches the
+// chain into one logical page (detect/OCR/LLM once, render whole, slice write-back).
 // This gate decides whether two stacked pages share a cut bubble. Pure.
 export interface SeamBox { x1: number; y1: number; x2: number; y2: number }
 export function seamLinked(upper: SeamBox[], upperH: number, lower: SeamBox[], lowerH: number): boolean {
-    // boxes live in bitmap coords — the cut edge is exact but CTD boxes on
-    // truncated text end well short of it (23px on a 378px slice, live-proven),
-    // so the touch band is generous; the conjunction (BOTH sides edge-touching
+    // boxes live in bitmap coords — the cut edge is exact but CTD boxes on truncated text end
+    // well short of it, so the touch band is generous; the conjunction (BOTH sides edge-touching
     // the SAME seam + horizontal overlap) is what keeps it strict
     const epsU = Math.max(24, Math.round(upperH * 0.06));
     const epsL = Math.max(24, Math.round(lowerH * 0.06));
@@ -601,11 +540,10 @@ export function seamLinked(upper: SeamBox[], upperH: number, lower: SeamBox[], l
         })()));
 }
 
-// Cut text the box gate misses entirely (CTD drops truncated edge text —
-// taming-my-master-mage p8's "BLOO[D" made zero boxes): the TEXT mask still
-// flags ink rows at the cut. Same verdict from ink columns: both sides show
-// text ink at the seam with horizontal overlap. Mask-only art (panel borders
-// crossing the cut) never enters the text mask, so art can't false-link.
+// Cut text the box gate misses entirely (CTD drops truncated edge text): the TEXT mask still
+// flags ink rows at the cut. Same verdict from ink columns: both sides show text ink at the seam
+// with horizontal overlap. Mask-only art (panel borders crossing the cut) never enters the text
+// mask, so art can't false-link.
 export interface SeamMask { width: number; height: number; data: ArrayBuffer }
 export function seamInkLinked(upper: SeamMask, lower: SeamMask): boolean {
     if (!upper || !lower || upper.width !== lower.width) return false;
@@ -632,10 +570,8 @@ export function seamInkLinked(upper: SeamMask, lower: SeamMask): boolean {
     return ov >= 60 && ov >= narrow * 0.3;
 }
 
-// Containment of two boxes (intersection over the SMALLER area): catches a
-// near-threshold fragment inside a real box that IoU lets through (live:
-// conf 0.36 box fully inside a conf 0.95 one, IoU only 0.30 — both painted,
-// double text). Pure.
+// Containment of two boxes (intersection over the SMALLER area): catches a near-threshold
+// fragment inside a real box that IoU lets through. Pure.
 export function boxContained(a: SeamBox, b: SeamBox): number {
     const inter = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
         * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
@@ -643,10 +579,9 @@ export function boxContained(a: SeamBox, b: SeamBox): number {
     return minA > 0 ? inter / minA : 0;
 }
 
-// Drop near-fully-contained boxes, loser = lower conf (tie: smaller area).
-// loserCap gates the drop: detection passes 0.5 (marginal fragments only —
-// a confident nested box like a sign in a bubble survives), paint passes the
-// default (heals every old cache entry on revisit). Pure — same refs, order kept.
+// Drop near-fully-contained boxes, loser = lower conf (tie: smaller area). loserCap gates
+// the drop: detection passes 0.5 (marginal fragments only — a confident nested box like a sign
+// in a bubble survives), paint passes the default (heals old cache entries). Pure — order kept.
 export function dropContainedBoxes<T extends SeamBox & { conf: number }>(boxes: T[], ratio = 0.9, loserCap = Infinity): T[] {
     const drop = new Set<T>();
     for (let i = 0; i < boxes.length; i++) {
@@ -672,13 +607,10 @@ export function boxIoU(a: SeamBox, b: SeamBox): number {
     return ua > 0 ? inter / ua : 0;
 }
 
-// Single-sided truncation: text ink running UNDER a near-edge box into the
-// cut (live: p8's box ended at y2=355 on H=378 while glyph strokes ≥8px wide
-// reach y=377 — the "BLOO[D" bottoms CTD didn't box). Fires without any
-// evidence from the neighbor side: unboxed ink spanning ≥8 rows below the box
-// and touching the edge is cut text, not a bubble curve (curves are 2-4 rows
-// tall). Needs only a same-width neighbor to exist — the stitch detector
-// decides truth, the safety net preserves solo boxes either way.
+// Single-sided truncation: text ink running UNDER a near-edge box into the cut. Fires without
+// any evidence from the neighbor side: unboxed ink spanning ≥8 rows below the box and touching
+// the edge is cut text, not a bubble curve (curves are 2-4 rows tall). Needs only a same-width
+// neighbor to exist — the stitch detector decides truth, the safety net preserves solo boxes.
 export function seamTruncated(boxes: SeamBox[], mask: SeamMask | null | undefined, H: number, side: 'bottom' | 'top'): boolean {
     if (!mask || mask.height !== H || mask.data.byteLength < mask.width * H) return false;
     const d = new Uint8Array(mask.data);
@@ -689,8 +621,8 @@ export function seamTruncated(boxes: SeamBox[], mask: SeamMask | null | undefine
         for (let x = a; x <= b; x++) if (d[y * MW + x] > 127) return true;
         return false;
     };
-    // ink rows must form a glyph-tall run CONTAINING the edge — NOT a curve
-    // (a run only counts if it spans rows within 2px of the edge)
+    // ink rows must form a glyph-tall run CONTAINING the edge — NOT a curve (a run only counts
+    // if it spans rows within 2px of the edge)
     const runTouchesEdge = (yFrom: number, yTo: number, x1: number, x2: number, edgeY: number): boolean => {
         let start = -1;
         const counts = (end: number): boolean =>
@@ -704,26 +636,23 @@ export function seamTruncated(boxes: SeamBox[], mask: SeamMask | null | undefine
     };
     return boxes.some(b => side === 'bottom'
         ? (H - b.y2 <= 48 && runTouchesEdge(Math.floor(b.y2), H - 1, b.x1, b.x2, H - 1))
-        // +30 past y1: the run's LENGTH counts (it starts at the edge and dives
-        // under the box) — the start≤edge+2 clause keeps the anchor honest
+        // +30 past y1: the run's LENGTH counts (it starts at the edge and dives under the box) —
+        // the start≤edge+2 clause keeps the anchor honest
         : (b.y1 <= 48 && runTouchesEdge(0, Math.ceil(b.y1) + 30, b.x1, b.x2, 0)));
 }
 
-// Band verification (seam suspicion second stage): a band bitmap stacks the
-// bottom quarter of the upper page over the top quarter of the lower one —
-// does any detected box span the band seam? The band shows CTD the whole
-// local bubble (slices show it fragments), so this is near-deterministic
-// where whole-slice edge boxes are stochastic. Pure.
+// Band verification (seam suspicion second stage): a band bitmap stacks the bottom quarter of
+// the upper page over the top quarter of the lower one — does any detected box span the band
+// seam? The band shows CTD the whole local bubble, so this is near-deterministic where
+// whole-slice edge boxes are stochastic. Pure.
 export function bandSpan(boxes: SeamBox[], seamY: number, margin = 8): boolean {
     return boxes.some(b => b.y1 < seamY - margin && b.y2 > seamY + margin);
 }
 
-// Seam pixel-continuity: true slices continue each other row-exact (live
-// 8/9: 95.7% of seam pixels within 100/255 — the rest is independent webp
-// ringing per slice). Unrelated scenes differ massively. Guards wrong-pair
-// stitches from lazy-load DOM gaps regardless of filenames: the gate proves
-// a bubble crosses, THIS proves the slices continue each other. Pure — rows
-// are RGBA (getImageData), compared per-channel-max per pixel.
+// Seam pixel-continuity: true slices continue each other row-exact (independent webp ringing
+// per slice aside). Unrelated scenes differ massively. Guards wrong-pair stitches from
+// lazy-load DOM gaps regardless of filenames: the gate proves a bubble crosses, THIS proves the
+// slices continue each other. Pure — rows are RGBA (getImageData), compared per-channel-max.
 export function seamRowsMatch(top: Uint8ClampedArray, bottom: Uint8ClampedArray, w: number): boolean {
     if (top.length < w * 4 || bottom.length < w * 4) return false;
     let bad = 0;
@@ -739,11 +668,10 @@ export function seamRowsMatch(top: Uint8ClampedArray, bottom: Uint8ClampedArray,
     return true;
 }
 
-// write-back guard for revoked-blob readers (MM/M+): state.orig points at a
-// dead blob: URL while the live element shows something else. Assigning the
-// dead URL blanks the page — block the assignment IFF we want the original
-// (a blob:) on an element showing something else. Every other combination
-// (translated blob, https orig, already-correct src) assigns normally. Pure.
+// write-back guard for revoked-blob readers: state.orig points at a dead blob: URL while the
+// live element shows something else. Assigning the dead URL blanks the page — block the
+// assignment IFF we want the original (a blob:) on an element showing something else. Every
+// other combination assigns normally. Pure.
 export function srcAssignBlocked(elSrc: string, wantSrc: string, origUrl: string): boolean {
     return wantSrc === origUrl && origUrl.startsWith('blob:') && elSrc !== wantSrc;
 }
@@ -764,12 +692,9 @@ export function cropPixels(r: { x: number; y: number; w: number; h: number }, dp
     return { sx, sy, sw, sh };
 }
 
-// Region-badge number size on the VLM-annotated page, in annotated-image px
-// (the drawn disc radius is 0.9× this). Badges exist only to map region
-// numbers to the crops — the crops carry the readable text — so they must stay
-// small: the old formula doubled the size on top of the downscale (56×scale
-// with scale ≤ 1) and drew 54px discs on a 907px-wide page (6% of the width),
-// covering corner text on dense pages (live-reported). Pure, unit-tested.
+// Region-badge number size on the VLM-annotated page, in annotated-image px (the drawn disc
+// radius is 0.9× this). Badges exist only to map region numbers to the crops — the crops carry
+// the readable text — so they must stay small. Pure, unit-tested.
 export function annotFont(scale: number): number {
     return Math.max(16, Math.round(28 * scale));
 }
@@ -785,52 +710,9 @@ export interface FingerprintOpts {
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
-    // trailing detector-generation tag: entries detected before tiled-strip
-    // CTD miss once and heal on overwrite (old entries hold fewer boxes).
-    // Bumped to tile2: pre-fix entries may hold EMPTY outputs (total parse
-    // failures used to come back ok:true and get cached) — orphan them all at
-    // once instead of making the user Clear by hand.
-    // Bumped to tile3: splitMergedBoxes now splits a CTD box that covered two
-    // balloons — pre-split entries hold one merged region (one translation
-    // spread across both balloons) and must re-detect + re-translate.
-    // Bumped to tile4: splitMergedBoxes lane 2 splits tightly packed pairs
-    // (side-by-side balloons, stacked caption blocks) that tile3 kept merged.
-    // Bumped to tile5: split children carry a render clip (their side of the
-    // cut) — entries whose boxes lack it keep rendering leaked areas.
-    // Bumped to tile6: split child boxes are measured from the strict
-    // text-likelihood comps, so a texture patch no longer widens them.
-    // Bumped to tile7: the render's leak guard (RUN_JUMP) clamps runs/rects
-    // where a flood escaped an open bubble outline — placement areas change,
-    // so cached pages must re-render.
-    // Bumped to tile8: split child boxes are seeded by the strict comps but
-    // keep adjacent loose clusters (SPLIT_CORE_LEASH) — strict-only boxes
-    // drifted sideways off the balloon text.
-    // Bumped to tile9: split padding faces the cut axis only (cross-axis pad
-    // stretched child boxes to the parent's edges — shifted frames).
-    // Bumped to tile10: split children carry the cut axis, so the render clamps
-    // the sibling guard on that axis only and the flood can reach the bubble's
-    // own walls on the cross axis (areas/fonts change) — old entries lack the
-    // field and would keep the both-sides clamp until a re-detect, so they miss.
-    // Bumped to tile11: OCR crops grow past edge-cut glyphs (expandCropToInk) —
-    // old entries' translations may miss edge text (a lobe's "YES" sticking
-    // past its box), so cached pages must re-read + re-translate.
-    // Bumped to tile12: split-input comps go down to 10px (were 14) — a small
-    // lobe fragment ("YES" 31x13 over its balloon) now splits its box instead
-    // of painting blank. Old entries hold the merged box and must re-detect.
-    // Bumped to tile13: twin-balloon cut splits a box at a straight ink-free
-    // avenue with wide multi-row text both sides (live md4: names lobe 8px
-    // from its body lobe, nested + under lane 2's floor) — old entries hold
-    // the merged box and must re-detect.
-    // Bumped to tile14: split children never cross the cut (emitSplit clamps
-    // each child at the cut line — overlapping siblings disabled the
-    // dividerClips safety net, so a longer translation could paint into the
-    // shared strip) — old entries hold crossing boxes and must re-detect.
-    // Bumped to tile15: lane-2 short-first split detaches a one-line balloon
-    // far above its block (live p7 WHOA!) — old entries hold the merged box
-    // and must re-detect.
-    // Bumped to tile16: lane-2 first-pair split detaches a comparable-size
-    // top group despite nesting (live /14: 3-row hamu 34px above its EN
-    // block) — old entries hold the fused box and must re-detect.
+    // trailing detector-generation tag (currently tile16): entries from older split/render/OCR
+    // pipeline versions miss once and heal on overwrite — bump it whenever touching the
+    // split, layout, or mask recipe, or old entries keep rendering stale regions.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
         o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile16'].join('|');
 }
@@ -896,8 +778,8 @@ export async function cachePut(entry: Omit<CachedPage, 'atime'>, max = CACHE_MAX
     } catch { /* cache stays best-effort */ }
 }
 
-// drop one entry (resume checkpoints are written even with the cache off —
-// a finished job must leave nothing behind in that mode)
+// drop one entry (resume checkpoints are written even with the cache off — a finished job
+// must leave nothing behind in that mode)
 export async function cacheDelete(key: string): Promise<void> {
     try {
         const d = await db();
@@ -920,8 +802,8 @@ export async function cacheCount(): Promise<number> {
     } catch { return 0; }
 }
 
-// entries for one chapter (prefix `chapter#`) — the global count above spans
-// every story ever visited, which reads as "unstable" on a 30-page chapter
+// entries for one chapter (prefix `chapter#`) — the global count above spans every story
+// ever visited, which reads as "unstable" on a 30-page chapter
 export async function cacheCountPrefix(prefix: string): Promise<number> {
     try {
         const d = await db();
@@ -933,12 +815,11 @@ export async function cacheCountPrefix(prefix: string): Promise<number> {
     } catch { return 0; }
 }
 
-// ---- host-volatile CDN identity: some image CDNs serve the same file from
-// different hosts per image (round-robin i-subdomains), so URL-keyed
-// mechanisms (warming trace, progress handoff, sweep claims) miss across
-// loads while content-hash mechanisms (cache/resume) hit fine. Match by
-// origin + path instead — generic, no per-site rules (exact match first, so
-// same-host behavior never changes). Pure — unit-tested below.
+// ---- host-volatile CDN identity: some image CDNs serve the same file from different hosts
+// per image, so URL-keyed mechanisms (warming trace, progress handoff, sweep claims) miss
+// across loads while content-hash mechanisms (cache/resume) hit fine. Match by origin + path
+// instead — generic, no per-site rules (exact match first, so same-host behavior never changes).
+// Pure — unit-tested below.
 export function samePagePath(a: string, b: string): boolean {
     if (a === b) return true;
     try {
@@ -949,12 +830,11 @@ export function samePagePath(a: string, b: string): boolean {
     } catch { return false; }
 }
 
-// ---- cross-load warming trace: which page key started translating, in the
-// TAB's sessionStorage (survives same-tab full loads, dies with the tab —
-// unlike every in-memory structure). Lets the next document say "warming was
-// interrupted — restarting" instead of silently redoing. The page shares this
-// storage, so the value shape is validated on read — worst case a bogus pill
-// line, never a logic decision (resume still needs a real partial entry).
+// ---- cross-load warming trace: which page key started translating, in the TAB's
+// sessionStorage (survives same-tab full loads, dies with the tab — unlike every in-memory
+// structure). Lets the next document say "warming was interrupted — restarting" instead of
+// silently redoing. The page shares this storage, so the value shape is validated on read —
+// worst case a bogus pill line, never a logic decision (resume still needs a real partial entry).
 const WARM_KEY = 'mt-warming';
 export const WARM_TTL_MS = 15 * 60 * 1000;
 export function parseWarming(raw: string | null): { key: string; ts: number } | null {
@@ -980,14 +860,12 @@ export function writeWarming(key: string): void {
     } catch { /* private mode etc — the trace just stays off */ }
 }
 
-// ---- cross-document LLM progress handoff: the pill counter dies with its
-// document on full-load readers while the SW-side call survives (adoption).
-// Writers stamp {pageKey → t0} at LLM dispatch; arrivals continue counting
-// from the earliest fresh stamp instead of restarting at 1s. Hints only —
-// readers continue only with corroboration (resumed checkpoint, or cache off
-// where no checkpoint exists), so a dead SW never inflates the counter; the
-// 5-minute TTL bounds the worst overcount to a rare race. Force-starts drop
-// the entry (fresh work counts fresh). Tab-session scoped like warming.
+// ---- cross-document LLM progress handoff: the pill counter dies with its document on
+// full-load readers while the SW-side call survives (adoption). Writers stamp {pageKey → t0}
+// at LLM dispatch; arrivals continue counting from the earliest fresh stamp instead of
+// restarting at 1s. Hints only — readers continue only with corroboration (resumed checkpoint,
+// or cache off where no checkpoint exists), so a dead SW never inflates the counter; the
+// 5-minute TTL bounds the worst overcount. Force-starts drop the entry. Tab-session scoped like warming.
 const LLP_KEY = 'mt-llm-prog';
 export const LLP_TTL_MS = 5 * 60 * 1000;
 const LLP_CAP = 40;
@@ -1015,11 +893,9 @@ function progressMap(): Record<string, unknown> {
         return o && typeof o === 'object' && !Array.isArray(o) ? o as Record<string, unknown> : {};
     } catch { return {}; }
 }
-// pure core (unit-tested): earliest fresh stamp for this page across the
-// exact key AND host-volatile twins. Min, not direct-first: the caller stamps
-// its own dispatch before reading, and a fresh exact entry must not shadow
-// the older twin the fallback exists for (live-proven i4→i2: direct-first
-// counted local every time while the twin sat unused in the map).
+// pure core (unit-tested): earliest fresh stamp for this page across the exact key AND
+// host-volatile twins. Min, not direct-first: the caller stamps its own dispatch before reading,
+// and a fresh exact entry must not shadow the older twin the fallback exists for.
 export function handoffRead(map: Record<string, unknown>, key: string, now: number, ttlMs = LLP_TTL_MS): number | null {
     let best: number | null = null;
     for (const k of Object.keys(map)) {

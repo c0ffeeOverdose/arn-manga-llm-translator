@@ -13,17 +13,9 @@ import { lookaheadActive } from './auto';
 import { sweepActive } from './sweep';
 
 // ---- status ownership: one pill, many writers ----
-// Parallel jobs, fire-and-forget preps and lookahead all used to write the
-// pill directly — whoever wrote last won, so progress jumped between pages
-// mid-run ("LLM 3s" A → "OCR 4/8" B → …). Now the pill is a VIEW:
-//  - activities: live jobs keyed by page, each with a kind for priority
-//    (force > most-visible > background sweep/lookahead — the user reads the
-//    page they're looking at, not FIFO). Stale writes from dropped jobs are
-//    ignored.
-//  - lastMsg: the most recent settled job (Done/Error) — lingers like the
-//    old single-job behavior until the next job replaces it.
-//  - override: one-shot user feedback (click acks), wins briefly over
-//    running jobs so a click response is never eaten by background work.
+// The pill is a VIEW: activities (live jobs keyed by page, kind = priority:
+// force > most-visible > background), lastMsg (most recent settled job),
+// override (one-shot user feedback, briefly wins). Stale dropped-job writes are ignored.
 export interface Activity { text: string; kind: 'force' | 'view' | 'lookahead' | 'sweep'; stage?: MtStage }
 const activities = new Map<string, Activity>();
 let lastMsg: { text: string; phase: MtState; until?: number } | null = null;
@@ -40,8 +32,7 @@ function jobLive(key: string): boolean {
     return key === activeKeyGet() || queue.some(j => j.key === key) || paintHas(key);
 }
 export function setActivity(key: string, text: string, kind: Activity['kind'], stage: MtStage | undefined): void {
-    // background work (lookahead, sweep) owns no queue entry — exempt from
-    // the liveness gate like lookahead always was
+    // background work (lookahead, sweep) owns no queue entry — exempt from the liveness gate
     if (kind !== 'lookahead' && kind !== 'sweep' && !jobLive(key)) return;
     activities.set(key, { text, kind, stage });
     renderStatus();
@@ -54,8 +45,7 @@ export function lastMsgSet(m: { text: string; phase: MtState; until?: number } |
     lastMsg = m;
 }
 
-// page-count status for the pill/popup: how many of the reader's currently
-// loaded pages have translations, and whether the viewed page is queued
+// page-count status for the pill/popup: loaded pages with translations + queued count
 export function pageCounts(): { loaded: number; translated: number; queued: number } {
     const refs = getPages();
     let translated = 0;
@@ -64,8 +54,7 @@ export function pageCounts(): { loaded: number; translated: number; queued: numb
 }
 
 export function idleStatus(): string {
-    // a provider halt outranks the counts: nothing else will run until the user
-    // acts, and that is the one thing the pill should be saying (see haltAuto)
+    // a provider halt outranks the counts: nothing else runs until the user acts (see haltAuto)
     const halted = autoHalted();
     if (halted) {
         if (halted.kind !== 'ratelimit') return 'Auth/quota error — fix the key, then press Translate';
@@ -73,8 +62,7 @@ export function idleStatus(): string {
         return `Rate limited${left} — stopped; press Translate to resume`;
     }
     const { loaded, translated, queued } = pageCounts();
-    // pages parked after errors — shown only while auto is on (the mode that
-    // would otherwise retry them silently). Counts loaded pages only.
+    // pages parked after errors — shown only while auto is on. Counts loaded pages only.
     let parked = 0;
     if (autoTranslateFlag()) {
         const now = Date.now();
@@ -82,16 +70,13 @@ export function idleStatus(): string {
         for (const k of failMarks.keys()) if (loadedKeys.has(k) && cooldownParked(failMarks, k, now)) parked++;
     }
     const pause = parked ? ` · ${parked} paused after errors` : '';
-    // complete and quiet → empty: a "1/1 pages" pill says nothing the user
-    // can't already see (the page in front of them is translated). The counts
-    // only earn the pixels when work remains (partial progress / queue / parks)
+    // complete and quiet → empty: the counts only earn the pixels when work remains
     if (translated >= loaded && !queued && !parked) return '';
     if (!translated) return parked ? `${parked} paused after errors` : '';
     return (queued ? `${translated}/${loaded} pages · ${queued} queued` : `${translated}/${loaded} pages`) + pause;
 }
 
-// stage stepper: 5 dots (read → detect → ocr → llm → render), done stages
-// lit, current one accent, unrun ones gray. Hidden outside busy-with-stage.
+// stage stepper: 5 dots (read → detect → ocr → llm → render). Hidden outside busy-with-stage.
 function renderSteps(stage: MtStage | undefined): void {
     const el = ui?.querySelector('#mt-ui-steps') as HTMLElement | null;
     if (!el) return;
@@ -111,10 +96,8 @@ export function renderStatus(): void {
     if (overrideMsg && overrideMsg.until < now) overrideMsg = null;
     if (lastMsg?.until && lastMsg.until < now) lastMsg = null;
     const list = [...activities.entries()]
-        // render-time liveness re-check: the write-time gate can't catch
-        // entries orphaned AFTER being written (runJob's chapter-change
-        // return, a wedged lookahead epilogue) — without this a dead
-        // "Reading page…" is picked as primary forever
+        // render-time liveness re-check: entries orphaned AFTER being written would
+        // otherwise stick as primary forever
         .filter(([key, a]) =>
             a.kind === 'lookahead' ? lookaheadActive()
                 : a.kind === 'sweep' ? sweepActive()
@@ -150,22 +133,19 @@ export function renderStatus(): void {
             fill.style.background = phase === 'busy' ? mtPal.accent : mtDot(phase);
         } else bar.style.display = 'none';
     }
-    // empty status = idle → keep the pill up with the page count instead of
-    // hiding it (readers want to know which pages are done)
+    // empty status = idle → keep the pill up with the page count instead of hiding it
     const show = (text || idleStatus()) && !pillDismissed;
     ui.style.display = show ? 'block' : 'none';
 }
 
-// viewport overlap for an activity key: resolve the queued/active/painting
-// job's element (the queue holds the ref); 0 when it can't be found (dropped)
+// viewport overlap for an activity key (0 when the job can't be found)
 function viewportOverlapByKey(key: string): number {
     if (key === activeKeyGet() && activeRefGet()) return viewportOverlap(activeRefGet()!);
     const j = queue.find(j => j.key === key) ?? paintFind(key);
     return j ? viewportOverlap(j.ref) : 0;
 }
 
-// instant pill message (click acks, cancellations): overrides running jobs
-// briefly; empty string clears everything (the dismiss × uses this)
+// instant pill message (click acks, cancellations); empty string clears everything
 export function setStatus(s: string, phase: MtState = 'idle', ms = 2500): void {
     if (!s) { overrideMsg = null; lastMsg = null; }
     else overrideMsg = { text: s, phase, until: Date.now() + ms };
@@ -176,9 +156,8 @@ export function setStatus(s: string, phase: MtState = 'idle', ms = 2500): void {
 
 // ---- toasts + error log ----
 
-// Toasts carry what the status pill can't: transient, stackable, VISIBLE.
-// Errors especially — one long job overwrites the pill instantly, so without
-// a toast a failed page is invisible unless DevTools is open.
+// Toasts carry what the status pill can't: transient, stackable. Errors especially —
+// one long job overwrites the pill instantly, so a failed page would otherwise be invisible.
 export function makeToast(msg: string, kind: 'error' | 'ok', hint?: string): void {
     if (!pipeline.showToasts) return; // user-deafened: pill + popup log still report
     const host = document.getElementById('mt-toasts');
@@ -217,9 +196,8 @@ export async function logError(msg: string, hint?: string, kind?: string): Promi
     await sessSet({ mtErrLog: log.slice(0, 20) });
 }
 
-// Minimal status pill (all controls live in the action popup). Hidden until
-// the first status; keeps id `#mt-ui` + span so the eval harnesses can wait
-// on Done/Error text even while the pill is invisible.
+// Minimal status pill (all controls live in the action popup). Keeps id `#mt-ui` + span so
+// eval harnesses can wait on Done/Error text even while the pill is invisible.
 export function makePill(): HTMLDivElement {
     const div = document.createElement('div');
     div.id = 'mt-ui';

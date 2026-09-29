@@ -30,10 +30,7 @@ export function setDirty(d: boolean): void {
     renderBar();
 }
 
-// single status line in the dirty bar. kind drives the color. Optional
-// target: per-button status (test connection / test cloud) reports under its
-// own button instead of the shared bar — a test error next to "Save Changes"
-// reads as "the save broke".
+// single status line in the dirty bar. Optional target: per-button status reports under its own button.
 export function setStatus(text: string, kind: 'ok' | 'err' | '' = '', ms = 0, target?: HTMLElement): void {
     const el = target ?? ($('status') as HTMLSpanElement);
     el.textContent = text;

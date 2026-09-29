@@ -1,13 +1,13 @@
 // Background service worker: LLM translation (BYOK). Detection runs in the
-// content script's iframe (src/iframe) — this worker owns LLM calls only.
+// content script's iframe — this worker owns LLM calls only.
 
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
 import { buildPrompt, parseResponse, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 
 // content scripts can't touch storage.session by default — open it up.
-// ?. chain: setAccessLevel doesn't exist on older Firefox (sess* falls back to
-// memory there), and a sync throw here would kill the worker before it starts.
+// ?. chain: setAccessLevel doesn't exist on older Firefox, and a sync throw
+// here would kill the worker before it starts.
 chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' })?.catch(() => {});
 
 interface TranslateMsg {
@@ -78,30 +78,21 @@ async function getPipeline(): Promise<PipelineSettings> {
     return loadPipelineSettings(mtPipeline);
 }
 
-// ---- split-pipeline OCR: batched vs one-region-per-call -------------------
-// Some vision models accept exactly ONE image per request (CF llama-3.2-11b:
-// 2+ → 400 code 3030, live-probed) — no provider exposes that capability, so
-// "auto" learns it from one failed batch and remembers per OCR model. The memo
-// is SW-lifetime on purpose: a restart costs one failed batch, never a wrong
-// permanent state (the user's checkbox forces per-region when wanted).
+// ---- split-pipeline OCR: batched vs one-region-per-call.
+// Some vision models accept exactly ONE image per request — no provider exposes
+// that capability, so "auto" learns it from one failed batch and remembers per
+// OCR model. SW-lifetime memo: a restart costs one failed batch, never a wrong
+// permanent state.
 const ocrSingleImage = new Set<string>();
-// models that answered 400 to a pinned temperature (reasoning-family or a
-// strict proxy) — same SW-lifetime memo idea: don't pay a doomed first request
-// per call. callLLM still performs the retry-without; this only stops the next
-// call from repeating it.
+// models that answered 400 to a pinned temperature — same SW-lifetime memo:
+// don't pay a doomed first request per call.
 const ocrNoTemperature = new Set<string>();
-// same idea for a rejected thinking level: without the memo every transcribe
-// call pays the failed attempt first (callLLM retries without it internally,
-// so the failure is invisible except as 2x requests)
+// same idea for a rejected thinking level.
 const ocrNoThinking = new Set<string>();
 function ocrCapKey(s: LLMSettings): string { return `${s.provider}|${s.baseUrl ?? ''}|${s.model}`; }
 
-// provider-visible session ids are hashed + salted per install: the raw
-// chapter key (origin+path+query — query strings can carry tokens) must never
-// ride a provider field, and the salt keeps two installs reading the same
-// chapter from producing the same id. Cached for the SW lifetime (one storage
-// read per wake); storage failure degrades to salt 0 — affinity stays stable,
-// just unsalted.
+// provider-visible session ids are hashed + salted per install: the raw chapter
+// key must never ride a provider field. Cached for the SW lifetime.
 let sessionSalt: Promise<number> | null = null;
 function getSessionSalt(): Promise<number> {
     sessionSalt ??= (async () => {
@@ -119,13 +110,10 @@ function getSessionSalt(): Promise<number> {
 }
 
 interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }
-// the handler owns retry/backoff (rate-limit aware) — helpers just call through
+// the handler owns retry/backoff (rate-limit aware) — helpers just call through.
 type LlmCaller = (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }>;
 // transcribe calls send NO output cap: the cap includes reasoning tokens on
-// reasoning models (a 512/1024 cap came back `incomplete` with an empty output
-// and failed the whole page), and a drifting generation is bounded by the
-// adapter's platform default (4096) and LLM_TIMEOUT_MS anyway — the junk it
-// produces is discarded by joinTranscription either way.
+// reasoning models, and a drifting generation is bounded by the adapter default.
 
 async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller, temperature: number | null): Promise<TranscribeResult> {
     const prompt = buildPrompt(msg.regions, EMPTY_CONTEXT, true, { textOnly: msg.textOnly, transcribeOnly: true, chars: false });
@@ -135,13 +123,9 @@ async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: 
     return { preRaw: t.text, sources, usage: t.usage ?? {}, calls: t.calls, ms: t.ms, tempDropped: t.tempDropped, thinkingDropped: t.thinkingDropped };
 }
 
-// per-region: one crop per request (the annotated full page is dropped), run
-// in batches of parallelLlm. Usage sums; ms is the wall time of the phase.
-// A single region failing leaves its source empty (the page retries it later);
-// ALL regions failing rethrows the first error (never a silent empty page).
-// A refusal (429) or auth error stops the remaining regions: they would fail
-// the same way, and on a rate-limited provider that fanout is what turns one
-// 429 into a request storm.
+// per-region: one crop per request, run in batches of parallelLlm.
+// A single region failing leaves its source empty; ALL regions failing
+// rethrows the first error. A refusal (429/auth) stops the remaining regions.
 async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller, temperature: number | null): Promise<TranscribeResult> {
     const crops = msg.textOnly ? (msg.imagesB64 ?? []) : (msg.imagesB64 ?? []).slice(1);
     const prompt = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false });
@@ -178,13 +162,12 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
         }));
         if (stopped) break; // no further regions — the provider is refusing
     }
-    // every region failed, or we stopped early on a refusal: fail loudly (a
-    // partial page would sail past the caller's "no text" guard)
+    // every region failed, or we stopped early on a refusal: fail loudly.
     if (firstErr && (stopped || failures === msg.regions.length)) throw firstErr;
     return { preRaw: raws.join('\n'), sources, usage, calls, ms: Math.round(performance.now() - t0), tempDropped, thinkingDropped };
 }
 
-// ArrayBuffer → base64 for MV3 message passing (JSON-serializes the channel)
+// ArrayBuffer → base64 for MV3 message passing (JSON-serializes the channel).
 function b64encode(buf: ArrayBuffer): string {
     const bytes = new Uint8Array(buf);
     let bin = '';
@@ -193,24 +176,18 @@ function b64encode(buf: ArrayBuffer): string {
 }
 
 chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
-    // defense-in-depth: today web pages can't reach this listener (no
-    // externally_connectable), but a future manifest change shouldn't silently
-    // expose the fetch/screenshot/storage handlers below
+    // defense-in-depth: a future manifest change shouldn't silently expose the
+    // fetch/screenshot/storage handlers below.
     if (sender.id && sender.id !== chrome.runtime.id) return;
     if (msg?.type === 'mt:worker-token') {
         // worker-iframe handshake: the token lives in storage.session keyed by
         // the worker's public nonce, where only extension contexts can reach it.
-        // postMessage from the page carries the page origin, so page JS could
-        // otherwise drive the worker's RPC (model delete/downloads, inference
-        // abuse) unauthenticated. Nonce-keyed, NOT tab-keyed: extension pages
-        // have no sender.tab, so a tab key collapses to one global slot that a
-        // second tab or a hostile WAR embed could clobber (detection DoS).
+        // Nonce-keyed, NOT tab-keyed: extension pages have no sender.tab.
         if (!/^[0-9a-f]{16}$/.test(msg.nonce ?? '') || !/^[0-9a-f]{32}$/.test(msg.token ?? '')) { sendResponse({ ok: false, error: 'bad handshake' }); return; }
         (async () => {
             const { sessSet, sessGet, sessRemove } = await import('../storage-session');
             // prune stale entries: every iframe load mints a fresh nonce and old
-            // ones are dead forever — without a cap, a page reloading our iframe
-            // (or embedding WAR copies) in a loop grows storage.session until quota
+            // ones are dead forever — cap at 32.
             const all = await sessGet(null);
             const keys = Object.keys(all).filter(k => k.startsWith('mtWorkerToken:'));
             if (keys.length >= 32) {
@@ -234,16 +211,9 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         sendResponse({ ok: true, service: 'arn-manga-background' });
         return;
     }  if (msg?.type === 'mt:test-llm') {
-        // text-only connectivity check: key + model + reachability. Image
-        // support used to be probed here with a hardcoded JPEG, but the string
-        // rotted once (silent truncation → invalid base64) and the test's job is
-        // auth/reachability, not capability — translation-time errors carry the
-        // "switch to Local OCR" hint instead (see toMtError).
+        // text-only connectivity check: key + model + reachability.
         // Thinking probe (optional second call): reports whether the selected
-        // level is accepted or rejected (runtime silently runs without it).
-        // Only 'auto'/empty skip the probe — nothing is sent for those.
-        // 'none' IS probed: most providers transmit it explicitly
-        // (reasoning_effort/thinkingLevel) and can reject it.
+        // level is accepted or rejected. Only 'auto'/empty skip the probe.
         (async () => {
             try {
                 const reply = await callLLM(msg.settings, 'Reply with exactly: pong', undefined, undefined, 'test', msg.temperature);
@@ -252,8 +222,8 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 let thinkingError: string | undefined;
                 if (t && t.toLowerCase() !== 'auto') {
                     try {
-                        // same 'test' session as the connectivity check above —
-                        // some proxies 400 a missing x-opencode-session
+                        // same 'test' session as the connectivity check — some
+                        // proxies 400 a missing session header.
                         await checkThinking(msg.settings, t, 'test');
                         thinking = 'accepted';
                     } catch (e2) {
@@ -268,9 +238,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
     }
     if (msg?.type === 'mt:test-ocr') {
         // VLM-reader self-test: ONE transcribe call on the fixed test crop,
-        // graded against its known text. Covers connectivity + image reading +
-        // format-following in a single call (a rejected thinking level falls
-        // back inside callLLM and simply isn't reported — single-call tradeoff).
+        // graded against its known text.
         (async () => {
             try {
                 if (!msg.imageB64 || !msg.expect) { sendResponse({ ok: false, error: 'test image missing' }); return; }
@@ -288,12 +256,11 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                     sendResponse({ ok: true, verdict: got ? 'mismatch' : 'miss', got, expected: msg.expect });
                     return;
                 }
-                // capability probe (2 images): the verdict is reported in options
-                // and seeds the split-stage memo, so the first real page doesn't
-                // waste a doomed batched call on a single-image model
+                // capability probe (2 images): the verdict seeds the split-stage
+                // memo, so the first real page doesn't waste a doomed batched call.
                 const capKey = ocrCapKey(msg.settings);
                 // the memo already knows this model's image cap — don't spend a
-                // request (or a slow drifting generation) confirming it again
+                // request confirming it again.
                 let multiImage: boolean | undefined = ocrSingleImage.has(capKey) ? false : undefined;
                 if (multiImage === undefined) {
                     try {
@@ -313,8 +280,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
     }
     if (msg?.type === 'mt:test-cloud') {
         // cloud inference check: reachability + auth + model readiness. Doubles
-        // as a prewarm — the first call wakes a sleeping endpoint, so run this
-        // from options before reading, not mid-chapter.
+        // as a prewarm — run this from options before reading, not mid-chapter.
         (async () => {
             try {
                 const base = String(msg.endpoint ?? '').replace(/\/$/, '');
@@ -342,9 +308,8 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:cloud-warm') {
-        // scale-to-zero boot + model load can outlive the per-page 90s cap:
-        // warming gets its own longer one, and the reply carries the boot ms
-        // back for the status pill
+        // scale-to-zero boot can outlive the per-page 90s cap: warming gets its
+        // own longer one, and the reply carries the boot ms back for the pill.
         (async () => {
             const ctrl = new AbortController();
             const to = setTimeout(() => ctrl.abort(), 180000);
@@ -365,10 +330,8 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:cloud-inpaint') {
-        // AI text cleanup on the user's own endpoint: the page rides as base64
-        // JPEG and the prepared erase mask as base64 PNG (JSON through
-        // messaging), boxes as JSON; the server returns per-box PNG patches and
-        // falls back to its own CTD pass when no mask is sent.
+        // AI text cleanup on the user's own endpoint: page as base64 JPEG, erase
+        // mask as base64 PNG, boxes as JSON; the server returns per-box PNG patches.
         (async () => {
             const ctrl = new AbortController();
             const to = setTimeout(() => ctrl.abort(), 90000);
@@ -393,11 +356,8 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:cloud-page') {
-        // content-script fetch is CORS-gated on the page origin (host permissions
-        // don't lift it — same trap as mt:fetch-image), so the /v1/page POST
-        // rides through here. 90s cap: past this, local fallback wins anyway.
-        // inpaint=1 folds the cleanup pass into the same request — its extra
-        // GPU time rides the same cap (150s), it just gets more headroom
+        // content-script fetch is CORS-gated on the page origin, so the /v1/page
+        // POST rides through here. 90s cap (150s with inpaint).
         (async () => {
             const capMs = msg.inpaint ? 150000 : 90000;
             const ctrl = new AbortController();
@@ -430,8 +390,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
     }
     if (msg?.type === 'mt:font-get') {
         // content scripts can't read the extension-origin IndexedDB where fonts
-        // live — hand the bytes over the RPC channel. MV3 message passing
-        // JSON-serializes, so the ArrayBuffer travels as base64.
+        // live — hand the bytes over the RPC channel as base64.
         (async () => {
             const { fontRead, fontName } = await import('../llm/font-store');
             try {
@@ -446,16 +405,10 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
     }
     if (msg?.type === 'mt:screenshot') {
         // last-resort pixel source for CORS-blocked <img> / tainted canvas.
-        // Chrome requires activeTab (granted by the popup/context-menu gesture
-        // that queued this job) or <all_urls> for captureVisibleTab — host
-        // permissions do NOT cover it (live-proven: an un-gestured call on an
-        // https tab the extension fully hosts still throws "Either the
-        // '<all_urls>' or 'activeTab' permission is required"). So auto-translate
-        // can never capture (no gesture), only manual can. Double-gate beyond
-        // that: the sender must be the ACTIVE tab of its own window, and the
-        // capture pins that windowId — captureVisibleTab otherwise photographs
-        // the last-focused window, so a backgrounded window's request would get
-        // pixels of whatever the user is viewing elsewhere.
+        // Chrome requires activeTab (or <all_urls>) for captureVisibleTab — host
+        // permissions do NOT cover it. So auto-translate can never capture (no
+        // gesture), only manual can. Double-gate beyond that: the sender must be
+        // the ACTIVE tab of its own window, and the capture pins that windowId.
         (async () => {
             try {
                 if (!sender.tab?.id || !sender.tab.windowId) throw new Error('no requesting tab');
@@ -470,16 +423,13 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:hotlink-rule') {
-        // hotlink-guarded CDNs (*.2xstorage.com 403s Referer-less SW
-        // fetch): install a session rule stamping the page origin as Referer, so
-        // the mt:fetch-image retry below succeeds. Session-only — gone on restart.
-        // ONE atomic updateSessionRules call (remove+add): concurrent 403s from
-        // parallel preps interleave separate calls and the second add throws
-        // "duplicate ID" — leaving that prep rule-less and holeing its seam run.
+        // hotlink-guarded CDNs 403 Referer-less SW fetch: install a session rule
+        // stamping the page origin as Referer. Session-only — gone on restart.
+        // ONE atomic updateSessionRules call (remove+add): concurrent 403s would
+        // otherwise interleave and the second add throws "duplicate ID".
         (async () => {
             try {
-                // origin must parse and be a bare origin — it becomes a Referer value
-                // (regexFilter stays hardcoded to the two hotlink CDNs regardless)
+                // origin must parse and be a bare origin — it becomes a Referer value.
                 if (typeof msg.origin !== 'string' || new URL(msg.origin).origin !== msg.origin) {
                     sendResponse({ ok: false, error: 'bad origin' }); return;
                 }
@@ -496,25 +446,21 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:fetch-image') {
-        // content-script fetch is CORS-gated on the PAGE origin (host permissions
-        // don't lift it — some image servers send no ACAO) while the worker fetches
-        // free of page CORS — proxy the bytes through here. URL policy first
-        // (fetchImageBlocked): this fetch is CORS-exempt, so it must not become
-        // a read-anything proxy for URLs a page plants in an <img>.
+        // content-script fetch is CORS-gated on the PAGE origin while the worker
+        // fetches free of page CORS — proxy the bytes through here. URL policy
+        // first: this fetch is CORS-exempt, so it must not become a read-anything
+        // proxy for URLs a page plants in an <img>.
         (async () => {
             try {
                 const { fetchImageBlocked } = await import('../content/page-cache');
                 const blocked = fetchImageBlocked(msg.url, sender.url ?? '');
                 if (blocked) { sendResponse({ ok: false, error: `proxy fetch blocked: ${blocked}` }); return; }
                 // hard cap: a CDN that accepts the connection and never answers
-                // would pend this fetch forever — the content side has no
-                // timeout either, so the job's pill would stick at "Reading
-                // page…" while the keepalive port keeps this SW alive past the
-                // "SW death rejects the channel" escape (live-audit finding)
+                // would pend this fetch forever — the content side has no timeout.
                 const resp = await fetch(msg.url, { signal: AbortSignal.timeout(60_000) });
-                // re-check the FINAL url: fetch follows redirects, and a public https
-                // URL 302-ing to http://127.0.0.1/… would otherwise resurrect the
-                // local-network readback the pre-fetch check exists to block
+                // re-check the FINAL url: fetch follows redirects, and a public URL
+                // 302-ing to a loopback host would otherwise resurrect the
+                // local-network readback the pre-fetch check exists to block.
                 const blocked2 = fetchImageBlocked(resp.url, sender.url ?? '');
                 if (blocked2) { sendResponse({ ok: false, error: `proxy fetch blocked (redirect): ${blocked2}` }); return; }
                 if (!resp.ok) { sendResponse({ ok: false, error: `image HTTP ${resp.status}` }); return; }
@@ -534,22 +480,15 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
 });
 
 // Shared translate implementation for the classic sendResponse path and the
-// mt-rpc port path below. Long async handler: on Firefox the event page can
-// be suspended while a sendResponse is still pending (live-proven: reply
-// vanished silently at ~30s) — port replies survive because an open port
-// pins the page. Never rejects; failures come back as {ok:false}.
-// In-flight adoption: identical mt:translate calls share one provider
-// roundtrip instead of each paying it. A page-turn kills the requesting
-// document mid-LLM — the arrival then issues the same payload; attaching it
-// to the still-running call (or the just-finished response) instead of
-// re-spending. Same-doc duplicates (sweep worker vs DOM job on one page)
-// collapse the same way. Misses only cost the optimization (fresh call);
-// SW death wipes the maps and the next call becomes the owner (self-healing).
+// mt-rpc port path below. Never rejects; failures come back as {ok:false}.
+// In-flight adoption: identical mt:translate calls share one provider roundtrip.
+// Misses only cost the optimization (fresh call); SW death wipes the maps and
+// the next call becomes the owner (self-healing).
 const flightWaiters = new Map<string, ((resp: unknown) => void)[]>();
 const flightRecent = new Map<string, { at: number; resp: unknown }>();
 const FLIGHT_RECENT_TTL_MS = 5 * 60 * 1000;
 const FLIGHT_RECENT_MAX = 20;
-// honest counters (numbers only) — E2E asserts dedup through these
+// honest counters (numbers only) — E2E asserts dedup through these.
 const flightStats = { owners: 0, adopted: 0, recentHits: 0 };
 (globalThis as Record<string, unknown>).__mtFlightStats = flightStats;
 function flightRecentGet(id: string): unknown | undefined {
@@ -568,7 +507,7 @@ function flightRecentPut(id: string, resp: unknown): void {
 
 function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (r: unknown) => void) {
     // settles waiters when assigned (post-adoption); pre-adoption failures
-    // (settings reads) answer the caller directly — nothing was claimed.
+    // answer the caller directly — nothing was claimed.
     let settle: ((resp: unknown) => void) | null = null;
     (async () => {
         try {
@@ -578,18 +517,16 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             const { mtCharOverrides, mtDebug } = await chrome.storage.local.get(['mtCharOverrides', 'mtDebug']);
             const dbg = mtDebug === true; // one read per call — always fresh, no SW sleep/wake staleness
             // provider-visible session id: opaque digest of the chapter key, salted
-            // per install (the raw reader URL never leaves the extension)
+            // per install (the raw reader URL never leaves the extension).
             const session = msg.cacheKey ? sessionKey(msg.cacheKey, await getSessionSalt()) : undefined;
-            // guard: a corrupt/absent context must not crash the pipeline
+            // guard: a corrupt/absent context must not crash the pipeline.
             const msgCtx = (msg.context && Array.isArray(msg.context.characters) && Array.isArray(msg.context.pairs))
                 ? msg.context : EMPTY_CONTEXT;
             const ctx = applyOverrides(msgCtx, (mtCharOverrides ?? {}) as Record<string, { gender: 'M' | 'F' | '?'; name?: string }>);
             const vision = !msg.ocr && !!msg.imagesB64?.length;
-            // LLM call with strategic retry: 5xx/network get backoff retries
-            // (a page costing 2 retries still beats failing the whole job);
+            // LLM call with strategic retry: 5xx/network get backoff retries;
             // auth/quota errors fail fast — retrying can't fix them; a 429 is
-            // refused locally by the adapter's breaker until its window passes
-            // (live: retrying 429s turned one refusal into 24 requests in 3min).
+            // refused locally by the adapter's breaker until its window passes.
             const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }> => {
                 let calls = 0;
                 let ms = 0;
@@ -613,8 +550,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             };
             const split = pipeline.useOcrModel && vision && !!msg.imagesB64?.length;
             const ocrSettings = split ? await getOcrSettings() : null;
-            // adoption check (atomic: no await between map lookup and claim —
-            // two identical calls racing each other must not both become owner)
+            // adoption check (atomic: no await between map lookup and claim).
             const reqId = await translateRequestId(translateRequestParts(
                 {
                     cacheKey: session ?? '', imagesB64: msg.imagesB64 ?? [],
@@ -636,8 +572,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             ));
             const recent = flightRecentGet(reqId);
             if (recent && (recent as { ok?: unknown })?.ok) {
-                // the twin call finished moments ago (its document died before
-                // writing cache) — serve without spending
+                // the twin call finished moments ago — serve without spending.
                 flightStats.recentHits++;
                 if (dbg) console.log('[mt:bg] flight recent-hit', reqId.slice(0, 12));
                 send(recent);
@@ -646,7 +581,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             const inflight = flightWaiters.get(reqId);
             if (inflight) {
                 // the twin call is still running — wait for its outcome instead
-                // of paying a duplicate (ok or error, same handling as our own)
+                // of paying a duplicate.
                 flightStats.adopted++;
                 if (dbg) console.log('[mt:bg] flight adopted', reqId.slice(0, 12));
                 send(await new Promise<unknown>(res => inflight.push(res)));
@@ -655,7 +590,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             const mine: ((resp: unknown) => void)[] = [];
             flightWaiters.set(reqId, mine);
             flightStats.owners++;
-            // every exit (ok or error) settles waiters with the same payload
+            // every exit (ok or error) settles waiters with the same payload.
             settle = (resp: unknown) => {
                 flightWaiters.delete(reqId);
                 if ((resp as { ok?: unknown })?.ok) flightRecentPut(reqId, resp);
@@ -676,14 +611,13 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 const ocr = ocrSettings!;
                 const key = ocrCapKey(ocr);
                 // a model that rejected a pinned temperature once keeps its
-                // provider default from then on (SW lifetime)
+                // provider default from then on (SW lifetime).
                 const ocrTemp = ocrNoTemperature.has(key) ? null : pipeline.ocrTemperature;
                 // a model that rejected the thinking level once runs without it
-                // from then on (SW lifetime — same tradeoff as the temperature memo)
+                // from then on (SW lifetime).
                 const ocrPl: PipelineSettings = ocrNoThinking.has(key) ? { ...pipeline, ocrThinking: 'auto' } : pipeline;
-                // per-region when forced, when this model already rejected a
-                // batch once, or when the batch fails with an image-count error
-                // (auto-detect — the failed request is not billed by CF)
+                // per-region when forced, when this model already rejected a batch
+                // once, or when the batch fails with an image-count error.
                 const t = pipeline.ocrPerRegion || ocrSingleImage.has(key)
                     ? await transcribePerRegion(ocr, msg, ocrPl, callWithRetry, ocrTemp)
                     : await transcribeBatched(ocr, msg, ocrPl, callWithRetry, ocrTemp).catch(async (e) => {
@@ -694,13 +628,8 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     });
                 if (t.tempDropped) ocrNoTemperature.add(key);
                 if (t.thinkingDropped) ocrNoThinking.add(key);
-                // zero parsed regions = the OCR model answered nothing usable
-                // (empty response or format drift), NOT "this page has no text"
-                // — an all-keep page still parses one element per region. Without
-                // this the text-only translator gets regions with no source at
-                // all, keeps every one, and the page reports Done with nothing
-                // translated (live: a 53s drifting call, all keep, no visible
-                // change).
+                // zero parsed regions = the OCR model answered nothing usable —
+                // without this the page reports Done with nothing translated.
                 if (!t.sources.size) {
                     throw new MtError('parse', `OCR model returned no text (${msg.regions.length} regions)`,
                         'Retry the page, or check the OCR model in Options');
@@ -712,12 +641,10 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 regions2 = msg.regions.map(r => ({ index: r.index, source: t.sources.get(r.index) ?? '' }));
                 ocrStatus = regions2.map(r => r.source ? 'ok' : 'empty');
                 ocrMs = t.ms;
-                // hand the transcripts over before the translate call: the
-                // content script checkpoints them (partial entry) so a reload or
-                // a retry mid-translate never re-pays the OCR stage. Port
-                // channel only, and only when the caller advertises it — a
-                // sendResponse caller (or an older content script that settles
-                // on the first message) would read this as the final reply.
+                // hand the transcripts over before the translate call: the content
+                // script checkpoints them so a retry mid-translate never re-pays
+                // the OCR stage. Port channel only, and only when the caller
+                // advertises it (interim).
                 if (msg.interim) interim?.({ type: 'mt:ocr-texts', texts: regions2.map(r => r.source) });
             }
             const vision2 = split ? false : vision;
@@ -752,7 +679,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             let outputs = parsed.regions;
             let retryMentions: Mention[] = [];
             let rawAll = split ? '--- transcribe ---\n' + preRaw + '\n--- translate ---\n' + raw : raw; // retained so content can warn on a stale background when missing
-            // retry once with only the missing regions if the model skipped any
+            // retry once with only the missing regions if the model skipped any.
             const missing = regions2.filter(r => !outputs.some(o => o.index === r.index));
             if (missing.length && outputs.length) {
                 console.warn('[mt:bg] missing regions, retrying:', missing.map(r => r.index).join(','));
@@ -766,7 +693,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
                 if (dbg) console.log('[mt:bg] llm prompt (retry missing: ' + missing.map(r => r.index).join(',') + ')', retryPrompt);
-                // crops for the missing regions; page mode prepends the full page ([0])
+                // crops for the missing regions; page mode prepends the full page ([0]).
                 const retryImgs = vision2 && msg.imagesB64
                     ? [...(msg.textOnly ? [] : [msg.imagesB64[0]]), ...missing.map(r => msg.imagesB64![r.index]).filter(Boolean)]
                     : undefined;
@@ -782,10 +709,8 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 retryMentions = retryParsed.mentions;
             }
             if (!outputs.length && regions2.length) {
-                // total parse failure: the model ignored the format entirely —
-                // one full retry before failing loudly. An empty result must
-                // never come back ok:true (content would cache the void and the
-                // page would sit "translated" with nothing on it forever).
+                // total parse failure: one full retry before failing loudly. An empty
+                // result must never come back ok:true (content would cache the void).
                 console.warn('[mt:bg] no regions parsed, retrying full page');
                 const fullPrompt = buildPrompt(regions2, ctx, vision2, {
                     stylePrompt: pipeline.stylePrompt,
@@ -834,14 +759,13 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
 chrome.runtime.onConnect.addListener((port) => {
     if (port.name === 'mt-keepalive') {
         // held open by content runJob while a job runs; its pings are pure
-        // service-worker activity, nothing to answer
+        // service-worker activity, nothing to answer.
         port.onMessage.addListener(() => { /* keepalive ping */ });
         return;
     }
     if (port.name === 'mt-rpc') {
-        // per-message port-RPC: port.postMessage({type:'mt:translate',...}) is
-        // answered with port.postMessage(result) — same runTranslate as the
-        // classic path, so behavior is identical on both channels.
+        // per-message port-RPC — same runTranslate as the classic path, so
+        // behavior is identical on both channels.
         port.onMessage.addListener((msg) => {
             if ((msg as TranslateMsg)?.type !== 'mt:translate') {
                 port.postMessage({ ok: false, error: 'no handler for ' + ((msg as { type?: string })?.type ?? '?') });
@@ -858,16 +782,15 @@ chrome.runtime.onConnect.addListener((port) => {
     }
 });
 
-// `chrome.contextMenus` is undefined on Firefox for Android (menus API
-// unsupported there) — unguarded it throws at top level and kills the whole
-// background event page, so the extension must survive its absence.
+// `chrome.contextMenus` is undefined on Firefox for Android — unguarded it
+// throws at top level and kills the whole background event page.
 chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus?.create({
         id: 'mt-translate-image',
         title: 'Translate this image',
-        // 'page' alongside 'image': overlay readers (overlay readers' per-page
-        // div) eat the right-click target, so the image context never fires —
-        // the content script then resolves the img under the click point
+        // 'page' alongside 'image': overlay readers eat the right-click target,
+        // so the image context never fires — the content script resolves the
+        // img under the click point.
         contexts: ['image', 'page'],
     }); // already-exists errors on SW restart are fine to ignore
 });

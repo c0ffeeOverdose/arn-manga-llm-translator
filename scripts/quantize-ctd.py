@@ -62,8 +62,7 @@ def check(img_path: str) -> None:
     for n, a, b in zip(names, *outs):
         d = float(np.abs(a.astype(np.float64) - b.astype(np.float64)).max())
         print(f'{n}: max-abs-diff int8-vs-fp32 = {d:.4g}')
-    # raw diffs are large by nature (abs-px space) — decoded box COUNT is the
-    # real signal; reuse the spike's own decode
+    # raw diffs are large by nature — decoded box COUNT is the real signal
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from spike_onnx import run_ctd

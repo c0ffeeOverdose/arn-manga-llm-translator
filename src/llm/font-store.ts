@@ -1,8 +1,4 @@
-// Font store: user-selectable render fonts. Presets stream from the google
-// /fonts repo (jsDelivr, raw.githubusercontent fallback) once, then live in
-// IndexedDB offline — same pattern as the OCR language data. Custom fonts
-// come from any URL the user pastes (with a host-permission fallback for
-// CORS-restricted origins). Pure browser logic, no Chrome APIs.
+// Font store: user-selectable render fonts. Presets stream once, then live in IndexedDB offline.
 
 export interface FontPreset {
     id: string;          // stable id, also the IndexedDB key suffix
@@ -12,14 +8,14 @@ export interface FontPreset {
 }
 
 export const FONT_PRESETS: FontPreset[] = [
-    // Thai (research: Sarabun = the standard, round handwritten feel = Mitr/Kanit)
+    // Thai
     { id: 'sarabun', label: 'Sarabun (Thai standard)', repoPath: 'ofl/sarabun/Sarabun-Regular.ttf', langs: 'th+latin' },
     { id: 'mitr', label: 'Mitr (Thai, round)', repoPath: 'ofl/mitr/Mitr-Regular.ttf', langs: 'th+latin' },
     { id: 'prompt', label: 'Prompt (Thai)', repoPath: 'ofl/prompt/Prompt-Regular.ttf', langs: 'th+latin' },
     { id: 'kanit', label: 'Kanit (Thai, bold feel)', repoPath: 'ofl/kanit/Kanit-Regular.ttf', langs: 'th+latin' },
     { id: 'chonburi', label: 'Chonburi (Thai display)', repoPath: 'ofl/chonburi/Chonburi-Regular.ttf', langs: 'th+latin' },
     { id: 'taviraj', label: 'Taviraj (Thai serif)', repoPath: 'ofl/taviraj/Taviraj-Regular.ttf', langs: 'th+latin' },
-    // Latin (nearest hand-lettered feel to CC Wild Words / Anime Ace on GF)
+    // Latin
     { id: 'patrickhand', label: 'Patrick Hand (Latin hand)', repoPath: 'ofl/patrickhand/PatrickHand-Regular.ttf', langs: 'latin' },
     { id: 'comicneue', label: 'Comic Neue (Latin comic)', repoPath: 'ofl/comicneue/ComicNeue-Regular.ttf', langs: 'latin' },
     { id: 'kalam', label: 'Kalam (Latin hand)', repoPath: 'ofl/kalam/Kalam-Regular.ttf', langs: 'latin' },
@@ -91,8 +87,7 @@ async function fetchWithProgress(url: string, onProgress?: (loaded: number, tota
     return new Blob(parts).arrayBuffer();
 }
 
-// download a preset font (google/fonts repo, CDN fallback) — validates that
-// the bytes actually look like a font before caching
+// download a preset font — validates bytes look like a font before caching
 export async function fontDownload(preset: FontPreset, onProgress?: (loaded: number, total: number) => void): Promise<void> {
     const urls = [
         `https://cdn.jsdelivr.net/gh/google/fonts@main/${preset.repoPath}`,
@@ -109,13 +104,11 @@ export async function fontDownload(preset: FontPreset, onProgress?: (loaded: num
     throw new Error(`download failed for ${preset.label}: ${String(lastErr).slice(0, 120)}`);
 }
 
-// custom font from any URL — caller handles the permission fallback for
-// CORS-restricted origins (options page has the user gesture)
+// custom font from any URL — caller handles the permission fallback (options page has the gesture)
 export async function fontAddCustom(id: string, name: string, url: string, onProgress?: (loaded: number, total: number) => void): Promise<void> {
     const buf = await fetchWithProgress(url, onProgress);
     await fontPut(`font:${id}`, buf);
-    // name registry: keep it alongside the bytes so the dropdown + runtime
-    // know the FontFace family name without re-parsing the binary
+    // name registry alongside the bytes so dropdown + runtime know the family without re-parsing
     await fontPut(`fontname:${id}`, new TextEncoder().encode(JSON.stringify({ name })).buffer as ArrayBuffer);
 }
 

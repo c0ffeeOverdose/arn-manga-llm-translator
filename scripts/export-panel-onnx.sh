@@ -1,9 +1,6 @@
 #!/bin/sh
-# One-time: export leoxs22/manga-panel-detector-yolo26n (.pt, Apache-2.0) to
-# ONNX for ORT-Web. Needs: pip install torch ultralytics onnx huggingface_hub
-# Output goes to models/panel-yolo26n.onnx (gitignored, like ctd-int8.onnx).
-# Attribution: model by Leandro Narosky, trained on Manga109-s (condition 5
-# allows commercial use of results with dataset attribution).
+# One-time: export leoxs22/manga-panel-detector-yolo26n (.pt, Apache-2.0) to ONNX for ORT-Web.
+# Output: models/panel-yolo26n.onnx (gitignored). Model by Leandro Narosky, Manga109-s.
 set -e
 cd "$(dirname "$0")/.."
 test -f models/panel-yolo26n.onnx && { echo "models/panel-yolo26n.onnx exists — delete it to re-export"; exit 0; }

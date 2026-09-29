@@ -1,6 +1,4 @@
-// Action popup: the control center (the in-page bar is gone — only a status
-// pill appears on the page while translating).
-// ponytail: state is polled via mt:status while open — no push channel needed
+// Action popup: the control center. State is polled via mt:status while open — no push channel.
 import { loadPipelineSettings, isAutoSite, autoSiteOf, autoSiteList, autoSiteAdd, autoSiteRemove } from '../llm/pipeline-settings';
 import { sessGet } from '../storage-session';
 
@@ -41,8 +39,7 @@ chrome.storage.local.get('mtTheme').then(v => {
     if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
 });
 
-// per-site auto: the checkbox reflects the ACTIVE tab's site only — other
-// sites (ad redirects included) never inherit it
+// per-site auto: checkbox reflects the ACTIVE tab's site only
 (async () => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const origin = autoSiteOf(tab?.url);
@@ -68,16 +65,14 @@ showUsage.onchange = async () => {
 
 const k = (n?: number) => { const v = Number(n); return !Number.isFinite(v) ? '?' : v >= 1000 ? (v / 1000).toFixed(1) + 'k' : String(v); };
 
-// the poll auto-opens usage once data arrives — but never re-opens it after
-// the user collapses it (the old code forced it open every second)
+// poll auto-opens usage once data arrives — never re-opens after the user collapses
 let usagePinned = false;
 usageWrap.ontoggle = () => { if (!usageWrap.open) usagePinned = true; };
 // status auto-opens like usage — but never re-opens after the user collapses it
 let statusPinned = false;
 statusSection.ontoggle = () => { if (!statusSection.open) statusPinned = true; };
 
-// last-known toggle states — click handlers flip the label instantly
-// (optimistic) instead of waiting for the 1s poll; the poll confirms.
+// optimistic labels: handlers flip instantly instead of waiting for the 1s poll; the poll confirms.
 let lastCtx = true, lastChars = false, lastOverlay = true, lastDir: 'rtl' | 'ltr' = 'rtl';
 let sweepRunning = false; // mirrored from mt:status each poll — the button toggles start/cancel
 
@@ -101,9 +96,8 @@ async function refreshStatus(): Promise<void> {
         usageWrap.style.display = hasUsage ? 'block' : 'none';
         if (hasUsage && !usageWrap.open && !usagePinned) usageWrap.open = true;
         if (hasUsage) {
-            // DOM-built, never innerHTML: usage numbers originate from provider
-            // JSON (untrusted — see num() in adapters.ts); textContent kills any
-            // markup that slips through
+            // DOM-built, never innerHTML: usage numbers are untrusted provider JSON (see num());
+            // textContent kills any markup that slips through
             usageBox.replaceChildren();
             const row = (text: string, color?: string) => {
                 const d = document.createElement('div');
@@ -121,16 +115,12 @@ async function refreshStatus(): Promise<void> {
         else if (resp.viewedQueued) btn.textContent = 'Cancel this page';
         else btn.textContent = 'Translate this page';
         redoBtn.disabled = busy || !resp.viewedTranslated;
-        // cancel lives in the status card: visible while work is queued OR any
-        // background engine runs (lookahead chain, chapter sweep) — otherwise
-        // a running pre-translate has no stop control at all
+        // cancel shows while queued OR any background engine runs — otherwise a pre-translate has no stop control
         const q = resp.queued ?? 0;
         const bgRunning = !!resp.lookaheadActive || !!(resp.sweep as { active: boolean } | null)?.active;
         cancelAllBtn.style.display = q > 0 || bgRunning ? '' : 'none';
         cancelAllBtn.textContent = q > 0 ? `Cancel all (${q})` : 'Stop background work';
-        // state label, not action: the switch shows originals until the first
-        // translation lands (fresh doc defaults off), and users read the
-        // button as "what am I looking at", not "what happens on click"
+        // state label, not action: shows originals until first translation lands; reads as "what am I looking at"
         origBtn.textContent = resp.overlayOn ? 'Translated ✓' : 'Original';
         lastOverlay = resp.overlayOn;
         ctxBtn.textContent = `Context: ${resp.shareContext ? 'on' : 'off'}`;
@@ -139,11 +129,7 @@ async function refreshStatus(): Promise<void> {
         dirBtn.textContent = lastDir.toUpperCase();
         charsBtn.textContent = resp.charsOpen ? 'Hide characters' : 'Characters';
         lastChars = resp.charsOpen;
-        // chapter sweep: explicit whole-chapter background run (separate from
-        // auto) — label shows progress while running, page count when idle.
-        // stopping: Stop was pressed but in-flight pages still drain (no mid-LLM
-        // abort) — say so instead of showing a live Stop button that "does
-        // nothing". starting: enumeration in flight — cancel is still possible.
+        // chapter sweep: whole-chapter background run. stopping = in-flight pages still drain (no mid-LLM abort).
         const sw = resp.sweep as { active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean; done: number; total: number; errors: number } | null;
         sweepRunning = !!sw?.active;
         if (sw?.stopping) {
@@ -203,8 +189,7 @@ sweepBtn.onclick = async () => {
     }
     refreshStatus();
 };
-// pages-ahead slider: persisted to mtPipeline, content picks it up live via
-// the storage listener (no message needed — preparePage reloads per job)
+// pages-ahead: persisted to mtPipeline; content picks it up live via the storage listener (no message).
 const ahead = $<HTMLInputElement>('ahead');
 const aheadVal = $<HTMLElement>('aheadVal');
 async function loadAhead(): Promise<void> {
@@ -264,8 +249,7 @@ charsBtn.onclick = async () => {
 };
 
 auto.onchange = async () => {
-    // content script owns the loop; storage.local is the shared state.
-    // per-site: the checkbox edits the ACTIVE tab's origin only.
+    // content owns the loop; storage.local is shared. Per-site: checkbox edits the ACTIVE tab's origin only.
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const origin = autoSiteOf(tab?.url);
     if (!origin) { auto.checked = false; return; }
@@ -300,9 +284,7 @@ sessGet('mtErrLog').then(v => {
 
 $('settings').onclick = () => chrome.runtime.openOptionsPage();
 
-// first-run data-use disclosure — shown until acknowledged, so the user sees
-// where translation data goes before the first translate, not just in the
-// store listing (Chrome Web Store Disclosure Requirements, 2026 update)
+// first-run data-use disclosure — shown until acknowledged (store disclosure requirement).
 chrome.storage.local.get('mtPrivacyAck').then(v => {
     if (!(v as { mtPrivacyAck?: boolean }).mtPrivacyAck) $('privacyNote').style.display = 'block';
 });

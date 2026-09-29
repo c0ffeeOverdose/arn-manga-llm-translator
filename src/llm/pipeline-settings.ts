@@ -1,6 +1,4 @@
-// Central pipeline settings: schema, tuned defaults (validated via E2E),
-// quality presets, and defensive load/merge.
-// Pure logic — unit tested in tests/settings.test.mjs.
+// Central pipeline settings: schema, defaults, presets, defensive load/merge. Pure logic.
 
 export interface PipelineSettings {
     preset: string;            // 'balanced' | 'fast' | 'best' | 'custom'
@@ -80,9 +78,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     ocrEngine: 'baberu',
     ocrLangs: ['jpn', 'eng'],
     targetLang: 'Thai',
-    // OFF by default: the model's extra-region coordinates are ~20-45% off too
-    // often — renders land on wrong ink (floating text over art) or miss the
-    // ink entirely. Turn on to experiment; bubble translation is unaffected.
+    // OFF by default: extra-region coordinates often land on wrong ink. Bubble translation unaffected.
     vlmAssistedDetection: false,
     useContext: true,
     useCharacters: true,
@@ -107,9 +103,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     showToasts: true,
 };
 
-// Searchable target-language list for the options-page combobox.
-// `en` is the value sent to the LLM; `native` is display-only.
-// Free-text outside this list still works (the prompt uses GENERIC_RULE).
+// `en` is sent to the LLM; `native` is display-only. Free-text outside the list uses GENERIC_RULE.
 export interface TargetLang { en: string; native?: string }
 
 export const TARGET_LANGS: TargetLang[] = [
@@ -145,8 +139,7 @@ export const TARGET_LANGS: TargetLang[] = [
     { en: 'Swedish', native: 'Svenska' },
 ];
 
-// ponytail: substring match on both names, English-first ordering —
-// extracted pure so options.ts stays thin and unit-testable
+// substring match on both names, English-first — pure so options.ts stays thin and testable
 export function filterTargetLangs(query: string): TargetLang[] {
     const q = query.trim().toLowerCase();
     if (!q) return TARGET_LANGS;
@@ -182,9 +175,7 @@ export function applyPreset(name: string): PipelineSettings {
     return { ...DEFAULT_PIPELINE_SETTINGS, ...(PRESETS[name] ?? {}), preset: name };
 }
 
-// Merge stored (possibly old/partial) settings over defaults: missing keys are
-// filled, unknown keys dropped, wrong types reset to default. Old-format keys
-// (useVision/visionMode/ocrModel) migrate onto the unified textSource axis.
+// Merge stored settings over defaults; old-format keys migrate onto textSource.
 export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (!stored || typeof stored !== 'object') return { ...DEFAULT_PIPELINE_SETTINGS };
     const s = stored as Record<string, unknown>;
@@ -193,7 +184,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         const v = s[k];
         if (typeof v === typeof def || (k === 'ocrLangs' && Array.isArray(v))) out[k] = v;
     }
-    // ---- migration: thinking presets (minimal was dropped; custom values pass through) ----
+    // ---- migration: thinking presets (custom values pass through) ----
     {
         let t = String(out.thinkingLevel ?? '').trim();
         if (!t) t = 'auto';
@@ -204,7 +195,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         }
         out.thinkingLevel = t;
     }
-    // VLM-reader thinking: same normalization, default 'none' (transcribe needs no reasoning)
+    // VLM-reader thinking: same normalization, default 'none'
     {
         let t = String(out.ocrThinking ?? '').trim();
         if (!t) t = 'none';
@@ -219,8 +210,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (!s.textSource) {
         if (s.ocrModel === 'tesseract') out.textSource = 'ocr';
         else if (s.visionMode === 'text' || s.useVision === false) out.textSource = 'crops';
-        // legacy users who explicitly had vision on keep 'page'; fresh installs
-        // (no legacy keys at all) fall through to the current default
+        // legacy vision-on keeps 'page'; fresh installs fall through to the current default
         else if (s.visionMode != null || s.useVision != null || s.ocrModel != null) out.textSource = 'page';
     }
     if (out.readingDir !== 'rtl' && out.readingDir !== 'ltr') out.readingDir = 'rtl';
@@ -228,12 +218,10 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.detMinSize !== 'number' || !(out.detMinSize >= 1 && out.detMinSize <= 200)) out.detMinSize = 12;
     else out.detMinSize = Math.round(out.detMinSize);
     if (typeof out.panelConf !== 'number' || !(out.panelConf >= 0.05 && out.panelConf <= 1)) out.panelConf = 0.20;
-    // sampling temperature: null = provider default; otherwise pinned 0-1.
-    // Reads raw `s`: the nullable default (null) can't match a stored number
-    // in the type-guarded copy loop above.
+    // sampling temperature: null = provider default; otherwise pinned 0-1. Reads raw `s` (nullable default skips the loop).
     const temp = s.temperature;
     out.temperature = typeof temp === 'number' && Number.isFinite(temp) && temp >= 0 && temp <= 1 ? temp : null;
-    // OCR temperature: default 0 (not provider default), so junk means "back to 0"
+    // OCR temperature default 0, so junk resets to 0
     const otemp = s.ocrTemperature;
     out.ocrTemperature = otemp === null
         ? null
@@ -260,11 +248,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     return out as unknown as PipelineSettings;
 }
 
-// Keys owned by other surfaces (popup's Pages-ahead slider owns prefetchN) —
-// options renders no control for these, so its in-memory copy is stale by
-// design. Saves start from fresh storage and overlay everything EXCEPT
-// these, otherwise Save silently reverts the popup's value (seen live:
-// prefetchN 3 → 10 the moment options saved).
+// Keys owned by other surfaces (popup owns prefetchN) — options saves overlay everything EXCEPT these.
 const PRESERVE_KEYS: readonly string[] = ['prefetchN'];
 
 export function mergePipeline(fresh: unknown, local: PipelineSettings): PipelineSettings {
@@ -291,9 +275,7 @@ export function matchingPreset(s: PipelineSettings): string {
     return 'custom';
 }
 
-// Where AI text cleanup runs for this settings object: 'auto' keeps cloud
-// users on the AI path automatically (no download there) and leaves on-device
-// users on the built-in fill until they opt in and download the model.
+// 'auto' keeps cloud users on the AI path (no download) and on-device users on built-in fill until opt-in.
 export type InpaintMode = 'fill' | 'local' | 'cloud';
 export function inpaintMode(s: PipelineSettings): InpaintMode {
     if (s.inpaint === 'off') return 'fill';
@@ -301,18 +283,13 @@ export function inpaintMode(s: PipelineSettings): InpaintMode {
     return 'cloud';
 }
 
-// ---- per-site auto-translate ----
-// Auto follows the reader per website, not globally: ad redirects and other
-// sites never inherit it. Stored as origins (mtAutoSites); the legacy global
-// flag (mtAutoTranslate) means "everywhere" only when no site list exists
-// (upgrades keep their old behavior until the first toggle writes the list).
+// Auto follows the reader per website, not globally. Legacy global flag means "everywhere" only with no site list.
 export function isAutoSite(origin: string, sites: unknown, legacyAll: boolean): boolean {
     if (Array.isArray(sites)) return (sites as unknown[]).some((s) => typeof s === 'string' && s === origin);
     return legacyAll;
 }
 
-// Origin of a tab URL, or null where the content script can't run (chrome://,
-// about:, extension pages, garbage). Pure so the popup + tests share it.
+// Origin of a tab URL, or null where the content script can't run. Pure so popup + tests share it.
 export function autoSiteOf(url: string | undefined): string | null {
     if (!url) return null;
     try {
@@ -323,8 +300,7 @@ export function autoSiteOf(url: string | undefined): string | null {
     }
 }
 
-// Site-list management (options page owns the list UI, popup owns the toggle —
-// one implementation so the two can't disagree). Stored raw, sanitized here.
+// Site-list management (options owns list UI, popup owns toggle — one implementation). Stored raw, sanitized here.
 export function autoSiteList(stored: unknown): string[] {
     if (!Array.isArray(stored)) return [];
     const out: string[] = [];

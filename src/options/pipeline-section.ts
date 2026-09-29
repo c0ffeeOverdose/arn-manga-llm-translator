@@ -1,5 +1,4 @@
-// Pipeline tab: presets, advanced sliders/toggles, tone, target language,
-// OCR model manager, translation cache row.
+// Pipeline tab: presets, advanced sliders/toggles, tone, target language, OCR manager, cache row.
 
 import { applyPreset, filterTargetLangs, matchingPreset, mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
 import { OCR_LANGUAGES, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuDownload, baberuDelete } from '../llm/ocr-models';
@@ -38,9 +37,7 @@ function syncRange(id: string, key: string): void {
     ($<HTMLInputElement>(id + 'Num')).value = String((pipeline as any)[key]);
 }
 
-// text/outline color controls: Auto checkbox wins, picker holds the manual
-// value. The picker is NEVER disabled — touching it drops out of auto
-// (a disabled color input eats all clicks, which reads as "broken").
+// Auto checkbox wins, picker holds the manual value. Picker is NEVER disabled — touching it drops out of auto.
 function syncColorUI(): void {
     for (const [auto, pick, key, fallback] of [
         ['textColorAuto', 'textColorPick', 'textColor', '#111111'],
@@ -106,9 +103,7 @@ export function syncOcrSeparateUI(): void {
 
 export function syncOcrManager(): void {
     const manager = $('ocrManager');
-    // OCR-text mode always shows this card: local needs an engine + downloads
-    // below, cloud ships its own OCR (nothing to pick — say so instead of
-    // showing a bare card, which reads as a missing selector).
+    // OCR-text mode always shows this card; cloud ships its own OCR — say so instead of a bare card.
     const show = pipeline.textSource === 'ocr';
     manager.style.display = show ? 'block' : 'none';
     if (!show) return;
@@ -231,9 +226,8 @@ async function renderOcrLangs(): Promise<void> {
     setDirty(true);
 };
 
-// one slider + exact number input per row (min/max/step live on the slider).
-// The slider snaps to its steps; the number holds the exact value; garbage
-// reverts to the stored value. Nothing persists until Save Changes.
+// one slider + exact number per row (min/max/step on the slider).
+// Slider snaps to steps; number holds exact; garbage reverts. Nothing persists until Save.
 function wireRange(id: string, key: string, abs?: { min?: number; max?: number }): void {
     const slider = $<HTMLInputElement>(id);
     const num = $<HTMLInputElement>(id + 'Num');
@@ -250,8 +244,7 @@ function wireRange(id: string, key: string, abs?: { min?: number; max?: number }
         if (!Number.isFinite(v)) v = (pipeline as any)[key]; // garbage → revert
         else {
             v = step >= 1 ? Math.round(v) : Math.round(v * 10 ** dec) / 10 ** dec;
-            // the number box may exceed the slider bounds (try 6px fonts) — clamp
-            // to absolute limits instead (slider just pins at its edge visually)
+            // the number box may exceed slider bounds — clamp to absolute limits (slider pins at its edge)
             const lo = abs?.min ?? Number(slider.min), hi = abs?.max ?? Number(slider.max);
             v = Math.min(hi, Math.max(lo, v));
         }
@@ -261,10 +254,8 @@ function wireRange(id: string, key: string, abs?: { min?: number; max?: number }
         markCustom();
     };
 }
-// abs = hard limits for the number box (slider pins at its own edge
-// visually — the browser clamps range inputs on assignment). Values beyond
-// the slider are real: the pipeline uses them verbatim, so caps here are
-// physical/sanity bounds, not the slider's comfort range.
+// abs = hard limits for the number box (slider pins at its edge).
+// Beyond-slider values are real: the pipeline uses them verbatim.
 const RANGE_ABS: Record<string, { min?: number; max?: number }> = {
     detConf: { min: 0, max: 1 },
     detMinSize: { min: 1, max: 200 },
@@ -291,8 +282,7 @@ for (const [auto, pick, key] of [['textColorAuto', 'textColorPick', 'textColor']
         syncColorUI();
         markCustom();
     };
-    // picking the same color fires no input event — a click alone still
-    // means "go manual" so the swatch never feels dead
+    // same-color pick fires no input — click alone still means "go manual"
     ($<HTMLInputElement>(pick)).onclick = () => {
         if ((pipeline as any)[key] === 'auto') {
             (pipeline as any)[key] = ($<HTMLInputElement>(pick)).value;
@@ -459,14 +449,12 @@ document.addEventListener('click', (e) => {
     setDirty(true);
 };
 
-// translation cache lives in the manga tab's content script (per-site IDB) —
-// the options page just forwards. No manga tab open → count stays '…' and
-// Clear explains itself instead of failing silently.
+// cache lives in the manga tab's content script (per-site IDB) — options just forwards.
+// No manga tab → hide the row instead of failing.
 async function mangaTab(): Promise<number | null> {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const t = tabs[0];
-    // url may be hidden without activeTab grant — try the send anyway, the
-    // content script's reply (or lack of it) is the real test.
+    // url may be hidden without grant — try anyway; the reply (or lack of it) is the real test.
     if (!t?.id || (t.url && !/^(https?|blob):/.test(t.url))) return null;
     return t.id;
 }
@@ -475,8 +463,7 @@ async function refreshCacheCount(): Promise<void> {
     const row = $('cacheCountRow') as HTMLElement;
     const id = await mangaTab();
     const resp = id ? await chrome.tabs.sendMessage(id, { type: 'mt:cache-count' }).catch(() => null) : null;
-    // no manga tab (or unreachable) → hide the row instead of showing an
-    // error as if it were a count — the options page is often opened standalone
+    // no manga tab → hide the row (options is often opened standalone)
     if (!resp?.ok) { row.style.display = 'none'; return; }
     row.style.display = '';
     el.textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;

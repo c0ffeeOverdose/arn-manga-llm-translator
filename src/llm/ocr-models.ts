@@ -1,16 +1,11 @@
-// OCR model manager: shared by the options page (download/delete UI) and
-// the iframe worker (runtime loads). Same origin → same IndexedDB store
-// ('mt-models', keys 'tess:{lang}'). Nothing ships in the bundle; users
-// choose what to download. CDNs tried in order.
-// Pure browser logic — no Chrome APIs, usable from any extension page.
+// OCR model manager: options UI + iframe worker share IndexedDB ('mt-models'). Nothing ships in the bundle.
 
 const TESSDATA_URLS = (lang: string) => [
     `https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@main/${lang}.traineddata`,
     `https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/${lang}.traineddata`,
 ];
 
-// lang is interpolated into download URLs — keep it to real tessdata codes
-// (jpn, eng, chi_sim, …) so a crafted value can't steer the fetch elsewhere
+// lang interpolates into download URLs — restrict to tessdata codes so crafted values can't steer the fetch
 export const langOk = (lang: string) => /^[a-z]{2,3}(_[a-z]{2,4})?$/.test(lang);
 
 export const OCR_LANGUAGES: { code: string; label: string }[] = [
@@ -46,7 +41,7 @@ export async function ocrInstalled(): Promise<string[]> {
 
 // keys 'ctd'/'panel' live in the same store (detection models, not OCR)
 
-// detection weights cached for on-device inference (downloaded on first use)
+// detection weights cached for on-device inference
 export async function detModelsInstalled(): Promise<{ ctd: boolean; panel: boolean }> {
     const db = await openDb();
     const has = (k: string) => new Promise<boolean>(res => {
@@ -58,9 +53,7 @@ export async function detModelsInstalled(): Promise<{ ctd: boolean; panel: boole
     return { ctd, panel };
 }
 
-// detection weights (CTD + panel) — same HF runtime mirror the worker uses,
-// same IDB keys ('ctd'/'panel'). Pre-downloaded here so on-device users can
-// fetch on wifi instead of mid-chapter; the worker finds them and skips its own fetch.
+// detection weights (CTD + panel) — pre-downloaded here; the worker finds them and skips its own fetch.
 export const DET_FILES = [
     { key: 'ctd', file: 'ctd-int8.onnx', label: 'CTD model (~40MB)' },
     { key: 'panel', file: 'panel-yolo26n.onnx', label: 'panel model (~10MB)' },
@@ -86,16 +79,10 @@ export async function detDownload(onProgress?: (file: string, loaded: number, to
     }
 }
 
-// stream a URL to an ArrayBuffer with progress (shared by all model downloads).
-// Hardened: short reads (truncated stream) throw instead of returning a corrupt
-// buffer that would poison the IDB cache; a stalled connection (no bytes for
-// STALL_MS) aborts — a total cap would punish slow-but-alive networks.
+// Streamed download with progress. Short reads throw (never cache corrupt buffers);
+// stall aborts; a total cap would punish slow-but-alive networks.
 const STALL_MS = 30000;
-// Transient network failures (truncated stream after a reconnect, RST
-// mid-body — live-proven: a 52MB file died with "Error in input stream"
-// right after a router restart) must not kill a multi-file batch: retry
-// each fetch before surfacing. All callers fetch immutable files, so a
-// retried GET is always safe.
+// Transient failures must not kill a multi-file batch — retry each fetch. Files are immutable, so GET retries are safe.
 const FETCH_RETRIES = 3;
 export async function fetchWithProgress(url: string, onProgress?: (loaded: number, total: number) => void): Promise<ArrayBuffer> {
     let lastErr: unknown = null;
@@ -183,9 +170,8 @@ export async function ocrRead(lang: string): Promise<ArrayBuffer | undefined> {
     });
 }
 
-// ---- Baberu OCR (JA/EN/ZH, 115M) — int4 vision tier, 4 files from Hugging Face ----
-// vision_int4 (weight-only, fp32 activations): runs correctly on webgpu with
-// ORT-Web 1.29+ WITHOUT shader-f16 (fp16 graph needs f16, hard-fails without)
+// ---- Baberu OCR (JA/EN/ZH, 115M) — int4 vision tier, 4 HF files ----
+// vision_int4 runs on webgpu WITHOUT shader-f16 (fp16 graph hard-fails without it)
 
 export const BABERU_FILES = [
     { key: 'baberu:vision4', file: 'onnx/vision_int4.onnx' },
@@ -209,7 +195,7 @@ export async function baberuInstalled(): Promise<boolean> {
 }
 
 export async function baberuDownload(onProgress?: (file: string, loaded: number, total: number) => void): Promise<void> {
-    // stale pre-int4 cache (172MB fp16 vision) — drop it so old installs re-fetch
+    // stale pre-int4 cache — drop so old installs re-fetch
     await new Promise<void>(res => {
         const q = openDb().then(db => db.transaction('m', 'readwrite').objectStore('m').delete('baberu:vision'));
         q.then(() => res(), () => res());
@@ -254,11 +240,7 @@ export async function baberuRead(key: string): Promise<ArrayBuffer | undefined> 
 }
 
 // ---- text-cleanup inpainting (manga-LaMa, fp16 weights, 112MB) ----
-// Same HF runtime mirror + IDB store as the detection weights. WebGPU-only in
-// practice (ORT-web wasm measures ~22s per 512px window) — callers fall back
-// to the built-in fill when the model is missing or no WebGPU session can be
-// created. fp16 weights (weight-only Cast) avoid both the int8
-// DequantizeLinear WebGPU bug and the shader-f16 requirement.
+// WebGPU-only in practice — callers fall back to built-in fill when missing or no WebGPU session.
 
 export const INPAINT_KEY = 'inpaint:manga512';
 export const INPAINT_FILE = 'lama-manga-512-fp16w.onnx';

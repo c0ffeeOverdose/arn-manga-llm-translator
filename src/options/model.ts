@@ -1,5 +1,4 @@
-// Model tab: provider credentials, test connection, thinking level, inference
-// engine (local vs cloud), detection pre-download.
+// Model tab: provider credentials, test connection, thinking level, inference engine, detection pre-download.
 
 import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type LLMSettings } from '../llm/adapters';
 import { inpaintMode, mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
@@ -15,8 +14,7 @@ const MODEL_HINTS: Record<string, string> = {
     cloudflare: 'e.g. @cf/meta/llama-3.2-11b-vision-instruct (pair with OCR text mode; needs a one-time "agree")',
 };
 
-// model input placeholder follows the selected protocol (static HTML keeps
-// the openai default for first paint before this runs)
+// placeholder follows the protocol (static HTML keeps the openai default for first paint)
 const MODEL_PLACEHOLDERS: Record<string, string> = {
     openai: 'e.g. gpt-5.4-mini',
     responses: 'e.g. gpt-5.6-luna',
@@ -129,9 +127,7 @@ export async function saveAll(): Promise<void> {
         setStatus(`Not saved — ${(e as Error).message}`, 'err');
         return;
     }
-    // merge over fresh storage: keys owned by other surfaces (popup's
-    // prefetchN) changed since this page loaded — a blind full-object write
-    // would silently revert them
+    // merge over fresh storage: popup-owned keys changed since load — blind write would revert them
     const { mtPipeline: stored } = await chrome.storage.local.get('mtPipeline');
     Object.assign(pipeline, mergePipeline(stored, pipeline));
     await chrome.storage.local.set({ mtSettings: s, mtOcrSettings: o, mtPipeline: pipeline });
@@ -142,9 +138,7 @@ export async function saveAll(): Promise<void> {
 
 export async function discardAll(fill: (s: LLMSettings) => void, syncAdvancedUI: () => void): Promise<void> {
     const { mtSettings, mtOcrSettings, mtPipeline } = await chrome.storage.local.get(['mtSettings', 'mtOcrSettings', 'mtPipeline']);
-    // reload the pipeline too: syncAdvancedUI (and fillModelFields' thinking/
-    // temperature controls) read the in-memory object, so a Reset without this
-    // left every edited pipeline field on screen
+    // reload pipeline too: thinking/temperature controls read the in-memory object
     loadStoredPipeline(mtPipeline as PipelineSettings | undefined);
     fill({ ...DEFAULT_SETTINGS, ...(mtSettings ?? {}) } as LLMSettings);
     fillOcrFields({ ...DEFAULT_SETTINGS, ...(mtOcrSettings ?? {}) } as LLMSettings);
@@ -164,11 +158,8 @@ export async function testConnection(): Promise<void> {
     setStatus('Testing…', '', 0, el);
     try {
         await ensureHostPermission(s.baseUrl ?? "", s.provider);
-        // text-only connectivity check (key + model + reachability) — image
-        // support is detected at translation time instead, where the error
-        // carries a "switch to Local OCR" hint. Thinking level rides along:
-        // the background probes it with a second call and reports accepted /
-        // rejected (rejected levels silently run without thinking).
+        // text-only check (key + model + reachability); image support is detected at translation time.
+        // Thinking rides along for the probe (accepted/rejected).
         const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s, thinking: pipeline.thinkingLevel, temperature: pipeline.temperature });
         if (resp?.ok) {
             setStatus(`OK — ${resp.reply}${thinkingSuffix(pipeline.thinkingLevel, resp)}`, 'ok', 0, el);
@@ -197,8 +188,7 @@ export async function testOcr(): Promise<void> {
     }
     setStatus('Testing… (reads the test image)', '', 0, el);
     const t0 = Date.now();
-    // a drifting model can take a minute per call (small output caps keep it
-    // bounded, but a cold slow provider still takes seconds) — show the clock
+    // drifting models take a while — show the clock
     const tick = setInterval(() => setStatus(`Testing… ${Math.round((Date.now() - t0) / 1000)}s (reads the test image)`, '', 0, el), 1000);
     try {
         await ensureHostPermission(s.baseUrl ?? '', s.provider);
@@ -225,8 +215,7 @@ export async function testOcr(): Promise<void> {
     }
 }
 
-// fixed self-test crop (src/options/ocr-test.png, copied to dist by build.mjs)
-// + its known transcription, character-for-character
+// fixed self-test crop (copied to dist by build.mjs) + its known transcription
 const OCR_TEST_EXPECT = 'We thirst for the seven wailings. We bear the koan of Jericho.';
 
 async function ocrTestImageB64(): Promise<string> {
@@ -250,8 +239,7 @@ for (const id of ['ocrModel', 'ocrApiKey', 'ocrBaseUrl'] as const) {
     ($<HTMLInputElement>(id)).oninput = markModelDirty;
 }
 ($('ocrProvider') as HTMLSelectElement).onchange = () => { renderOcrThinkingList(); markModelDirty(); };
-// OCR thinking: native datalist (free-text allowed) — deliberately not the
-// main combo machinery; options follow the OCR provider
+// OCR thinking: native datalist (free-text allowed); options follow the OCR provider
 function renderOcrThinkingList(): void {
     const list = $<HTMLDataListElement>('ocrThinkingList');
     list.innerHTML = '';
@@ -295,11 +283,9 @@ $('setupGo').onclick = () => {
     (document.querySelector('.tabs button[data-tab="model"]') as HTMLButtonElement).click();
     ($('apiKey') as HTMLInputElement).focus();
 };
-// note: apiKey/model/baseUrl/provider inputs autosave via markModelDirty (wired at the bottom),
-// which also calls syncSetupBanner — no separate oninput needed here.
+// note: credential inputs autosave via markModelDirty (wired at the bottom) — no separate oninput needed here.
 
-// ---- inference engine: local vs cloud (your Modal endpoint). Behavior
-// knob like prefetchN — dirty-tracked but never marks the preset Custom.
+// ---- inference engine: local vs cloud. Behavior knob — dirty-tracked but never marks Custom.
 export function syncInferUI(): void {
     const cloud = pipeline.inferEngine === 'cloud';
     for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
@@ -316,10 +302,8 @@ export function syncInferUI(): void {
     syncAiCleanupUI();
 }
 
-// AI text cleanup follows the engine above (no separate backend picker): cloud
-// users get it automatically (nothing to download there), on-device users stay
-// on the built-in fill until they tick the box and download the model. The
-// download row only appears when it is actually needed.
+// AI cleanup follows the engine (no separate picker): cloud auto, on-device opt-in + download.
+// The download row shows only when actually needed.
 export function syncAiCleanupUI(): void {
     const cb = $('aiCleanup') as HTMLInputElement;
     const hint = $('aiCleanupHint') as HTMLElement;
@@ -372,8 +356,7 @@ $('aiCleanupBtn').onclick = async () => {
     setDirty(true);
 };
 
-// pre-download so the first on-device page doesn't pay it mid-chapter.
-// Download-only (no Delete — deleting would just break the next translate).
+// pre-download so the first on-device page doesn't pay it mid-chapter. Download-only, no Delete.
 async function renderDetRow(): Promise<void> {
     const det = await detModelsInstalled().catch(() => ({ ctd: false, panel: false }));
     ($('detLabel') as HTMLSpanElement).innerHTML =
@@ -408,8 +391,7 @@ for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')
         setDirty(true);
     };
 }
-// CTD execution provider — behavior knob (Auto = webgpu with wasm fallback,
-// force-wasm = broken GPU drivers). Same dirty-track-not-preset pattern.
+// CTD execution provider — behavior knob (Auto = webgpu with wasm fallback; force-wasm = broken GPU drivers).
 ($('forceWasm') as HTMLInputElement).onchange = () => {
     pipeline.detEp = ($('forceWasm') as HTMLInputElement).checked ? 'wasm' : 'auto';
     syncInferUI();
@@ -440,10 +422,8 @@ export async function testCloud(): Promise<void> {
     }
 }
 
-// ---- temperature: "Provider default" checkbox; slider/number drop out of
-// auto on touch (same rule as the color pickers — never disabled). One
-// implementation for the main model and the VLM reader; only the off-default
-// differs (main 0.3, unless the stored value says otherwise; OCR 0 = literal)
+// ---- temperature: "Provider default" checkbox; touching slider/number drops out of auto.
+// One implementation for main model and VLM reader; only the fallbacks differ (main 0.3, OCR 0).
 function wireTemperature(autoId: string, sliderId: string, numId: string, key: 'temperature' | 'ocrTemperature', fallback: number): () => void {
     const sync = (): void => {
         const auto = pipeline[key] == null;
@@ -480,9 +460,7 @@ function wireTemperature(autoId: string, sliderId: string, numId: string, key: '
 const syncTemperatureUI = wireTemperature('temperatureAuto', 'temperature', 'temperatureNum', 'temperature', 0.3);
 export const syncOcrTemperatureUI = wireTemperature('ocrTemperatureAuto', 'ocrTemperature', 'ocrTemperatureNum', 'ocrTemperature', 0);
 
-// ---- thinking level: searchable combobox, presets depend on provider, free-text allowed ----
-// ponytail: same .combo pattern as targetLang, duplicated —
-// extract a shared helper if a third combo appears
+// ---- thinking level: searchable combobox, presets per provider, free-text allowed ----
 const thinkInput = $<HTMLInputElement>('thinking');
 const thinkList = $<HTMLUListElement>('thinkingList');
 let thinkItems: string[] = [];

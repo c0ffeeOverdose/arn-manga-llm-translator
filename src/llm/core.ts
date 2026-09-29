@@ -9,9 +9,8 @@ export interface CharacterEntry {
     fullName?: string;     // full name ONLY when a page states it — never assembled or guessed
 }
 
-// A person NAMED in the page's dialogue/narration (speaker, addressee, or
-// talked-about) — page-level, unlike spk which is per-region. Text-based, so
-// this channel works in every textSource mode including crops and OCR.
+// A person NAMED in page dialogue/narration — page-level, unlike per-region spk.
+// Text-based, works in every textSource mode including crops and OCR.
 export interface Mention {
     name: string;
     fullName?: string;
@@ -71,14 +70,8 @@ export interface BuildOpts {
     transcribeOne?: boolean;  // per-region VLM-OCR (single-image models): the request has ONE crop and must answer with ONE element (all lines joined)
 }
 
-// Language-specific translation rules. Thai gets the full particle rule;
-// every other language gets the generic gendered-speech rule (the model
-// knows Spanish/French/etc. agreement on its own).
-// Completeness over brevity, always: the renderer shrink-to-fits the font,
-// so the rules push for complete meaning (an old char-budget hint made the
-// model elide subjects/aspect — "WE STARTED LIVING TOGETHER" → "เริ่มอยู่ด้วยกัน" —
-// and numeric hints anchor even next to "translate fully", so no size numbers
-// go into the prompt at all).
+// Thai gets the full particle rule; every other language gets the generic gendered-speech rule.
+// Completeness wins (renderer shrink-fits), so no size numbers go into the prompt.
 const COMPLETENESS = 'Translate the COMPLETE meaning — never drop the subject, tense/aspect, or emphasis to save space; the renderer auto-fits the font size to the region, so completeness always wins over brevity.';
 const LANG_RULES: Record<string, string> = {
     Thai: `Natural Thai. ${COMPLETENESS} Thai may drop pronouns in casual speech, but for a translation keep every meaning unit from the source unless it reads unnatural. Politeness particles ครับ/ค่ะ/คะ must match speaker gender (from character book or image, never honorifics) — but only USE them when the line is polite/formal; casual speech between close characters drops them or uses นะ/สิ/ดิ/วะ per the original tone. Keep -kun/-chan/-san as คุง/จัง/ซัง.`,
@@ -94,15 +87,10 @@ export function buildPrompt(
 ): string {
     const lang = opts.targetLang?.trim() || 'Thai';
     const chars = opts.chars !== false;
-    // VLM-OCR stage: pure transcription, no translation. Same <r> XML shape so
-    // the caller reuses parseResponse (translation field = transcription,
-    // 'keep' = unreadable). SFX is transcribed too — the translate stage owns
-    // the keep decision. No book/pairs/style: a read must not be biased.
+    // VLM-OCR stage: pure transcription, same <r> shape so caller reuses parseResponse.
+    // No book/pairs/style: a read must not be biased.
     if (opts.transcribeOnly) {
-        // per-region variant (single-image OCR models): one crop in, ONE element
-        // out — the model used to split lines into separate numbered elements
-        // (live-probed), which would drop every line after the first when the
-        // caller expects one region per request.
+        // per-region variant: one crop in, ONE element out — never split lines into numbered elements.
         if (opts.transcribeOne) {
             return `<task>Transcribe the text in this single manga region EXACTLY as written. Do NOT translate.</task>
 <images>One image: the crop of the region.</images>
@@ -144,11 +132,7 @@ The second form (self-closing, keep="true", NO text inside) is ONLY for regions 
         for (const r of regions) t += `${r.index} (read from image)\n`;
         return t + '</regions>\n';
     }
-    // XML-structured prompt (prompt-engineering standard): every section is
-    // an explicit tag so the model can't confuse instructions with data —
-    // rules never bleed into region lists, character notes never read as
-    // dialogue. The output format is XML too (keep is a structurally
-    // different element, ending the "=> (ไม่มีข้อความ)" compromise drift).
+    // XML-structured prompt: explicit tags keep instructions apart from data; output is XML too.
     let p = `<task>Translate the numbered manga regions into ${lang}.</task>\n`;
     if (vision && opts.textOnly) {
         p += `<images>Each image is the crop of region 1, 2, … in order — read each region from its own crop. There is no full-page image: you see only the text boxes, not the surrounding artwork.</images>\n`;
@@ -193,9 +177,7 @@ The book is wrong and THIS page proves it: <m name="A" correct="gender|name|desc
     if (opts.stylePrompt?.trim()) {
         p += `- Style (applies to every region): ${opts.stylePrompt.trim()}\n`;
     }
-    // transcribeSrc toggle: the model copies source text into src so vision
-    // modes get full (source => translation) context pairs (OCR mode sends no
-    // images — nothing to transcribe, so the flag is ignored there)
+    // transcribeSrc: model copies source into src for vision-mode pairs (OCR mode sends no images — flag ignored).
     if (opts.transcribeSrc && !opts.ocr) {
         p += `- Transcribe first: copy each region's original text EXACTLY into src, character-for-character — no paraphrase, no cleanup, no guessing unreadable glyphs (leave those regions keep). Then translate.\n`;
     }
@@ -204,9 +186,7 @@ The book is wrong and THIS page proves it: <m name="A" correct="gender|name|desc
         p += `- Missed text (no badge): <extra n="new" x="x1,y1,x2,y2">${lang} translation</extra> (pixels on the ${opts.pageW}x${opts.pageH} first image). Dialogue only, no SFX.\n`;
     }
     p += `</rules>\n`;
-    // a book already polluted with box-type rows must not keep teaching them
-    // back to the model (that is what perpetuates them) — user rows stay, they
-    // are the user's call
+    // a book polluted with box-type rows must not teach them back — user rows stay, they are the user's call
     const book = chars ? ctx.characters.filter(c => c.source === 'user' || !isNonPersonLabel(c.name ?? c.desc)) : [];
     if (book.length) {
         p += '<known_characters>\n';
@@ -228,19 +208,14 @@ The book is wrong and THIS page proves it: <m name="A" correct="gender|name|desc
     }
     p += '<regions>\n';
     for (const r of regions) {
-        // no size numbers here by design (see COMPLETENESS above) — just the
-        // index and the source; the renderer fits whatever comes back
+        // no size numbers by design (see COMPLETENESS) — renderer fits whatever comes back
         p += r.source ? `${r.index} ${r.source}\n` : `${r.index} (read from image)\n`;
     }
     p += '</regions>\n';
     return p;
 }
 
-// Split a buildPrompt output at <regions> — everything before it (task, rules,
-// character book, recent translations) is stable across pages of the same
-// manga; the region list (and any images sent after it) changes every page.
-// Used by the Anthropic adapter to place its cache_control breakpoint on the
-// stable prefix. Null when the boundary is missing (degenerate prompt).
+// Split at <regions>: everything before is stable across pages. Anthropic breakpoint goes here; null when missing.
 export function splitStablePrefix(prompt: string): { stable: string; varying: string } | null {
     const i = prompt.indexOf('\n<regions>');
     if (i < 0) return null;
@@ -271,9 +246,7 @@ function normGender(g: string | undefined): 'M' | 'F' | '?' {
         : g === 'F' || g === 'f' || /female|หญิง|ผู้หญิง/i.test(g ?? '') ? 'F' : '?';
 }
 
-// XML output parser — the primary format. Tolerant of the usual LLM slips:
-// self-closing keeps, paired elements, UNCLOSED elements (content runs to
-// the next tag or end of line), extra whitespace/preambles.
+// XML output parser, tolerant of LLM slips: self-closing keeps, unclosed elements, preambles.
 function parseXml(text: string, expected: number): ParsedResponse | null {
     if (!/<r[\s>]/i.test(text)) return null; // not XML at all → old-format path
     const regions: RegionOutput[] = [];
@@ -326,25 +299,13 @@ function parseXml(text: string, expected: number): ParsedResponse | null {
     return any || extras.length || mentions.length ? { regions, extras, mentions } : null;
 }
 
-// Parse the XML output format. If the model ignored the format entirely,
-// an empty result triggers the caller's retry (status says so — never silent).
+// Parse the XML output format. Empty result triggers the caller's retry — never silent.
 export function parseResponse(text: string, expected: number): ParsedResponse {
     return parseXml(text, expected) ?? { regions: [], extras: [], mentions: [] };
 }
 
-// Per-region transcribe responses: the model may split a multi-line region
-// into several numbered elements (live-probed: a title crop came back as 5) —
-// concatenate every element's text in order. keep/empty contributes nothing.
-// Some models drift and answer with bare text instead of the requested <r>
-// element (live: ~1/3 of CF llama-3.2 calls at the default temperature) — use
-// the bare text rather than silently emptying the region, dropping dangling
-// tags and "no readable text" prose. Temperature 0 in cfBody makes the drift
-// rare; this keeps the slip from eating the line.
-// The bare path also rejects image DESCRIPTIONS: on a text-less crop this model
-// answers "<r n=\"1\">この画像は、ブドウの写真です</r>" instead of keep
-// (live-probed) — a description must not become a translation source. The
-// pattern is deliberately sentence-shaped ("この画像…", "…写真です", "the image
-// is/show") so a real line that merely contains 写真/photo survives.
+// Per-region transcribe: concatenate every element in order (models split multi-line regions).
+// Bare-text drift is used over emptying the region; temperature 0 makes it rare.
 const DESCRIBES_IMAGE = /この画像|画像には|画像です|写真です|イラストです|the image (shows|is|depicts)|this (image|picture) (is|shows)|a (photo|picture) of/i;
 export function joinTranscription(text: string): string {
     const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
@@ -365,23 +326,13 @@ export function joinTranscription(text: string): string {
     return isMetaNoText(bare) || DESCRIBES_IMAGE.test(bare) ? '' : clean(bare);
 }
 
-// OCR self-test comparison: transcription vs expected text. Collapses all
-// whitespace runs (line breaks included) and trims — layout differences are
-// not reading errors. Case-sensitive: flipped case is misreading.
+// OCR self-test: collapse whitespace (layout isn't error). Case-sensitive: flipped case is misreading.
 export function transcriptionMatches(got: string, expected: string): boolean {
     const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
     return norm(expected).length > 0 && norm(got) === norm(expected);
 }
 
-// A model answer that DESCRIBES the crop instead of translating it — almost
-// always "this is not text" said in prose. Checked against the FINAL
-// translation (after spk/arrow extraction) so a trailing "|| spk: girl, F"
-// doesn't break matching.
-// NOTE: there used to be a whole-wrapped-bracket rule here ("[...]" = meta).
-// Removed: it ate faithful bracketed translations (live: a system message
-// "[WELCOME...]" → "[ยินดีต้อนรับ...]" parsed as keep). Bracket-styled leaks
-// ([ตกใจ], "(no readable text)") now render — re-add a narrower guard only
-// if one is seen live again.
+// A model answer that DESCRIBES the crop instead of translating it. Checked against FINAL translation.
 function isMetaNoText(t: string): boolean {
     const whole = t.trim();
     // explicit no-text phrasing anywhere (thai + english), spacing-tolerant
@@ -391,17 +342,11 @@ function isMetaNoText(t: string): boolean {
 // ---- character book ----
 const PRIORITY: Record<CharacterEntry['source'], number> = { user: 3, vlm: 2, speech: 1, mention: 1 };
 
-// Box types the model reports as "the speaker" on regions with no person in
-// them. Learning them burns the 10-slot book and teaches the model to emit
-// spk="narration"/"sign" forever (it picks the vocabulary up from the book and
-// feeds it back — live-proven). Structural-meta class, same as isMetaNoText;
-// only generic labels, never a story-specific name.
+// Box types reported as speaker on person-less regions. Learning them burns the book and teaches spk forever.
 const NON_PERSON_LABEL = /^(?:narration|narrator|caption|subtitle|subtitle text|sfx|sound effect|sound effects|onomatopoeia|sign|signage|shop sign|text|no text|translation note|tn|บรรยาย|บรรยายภาพ|คำบรรยาย|ผู้บรรยาย|ป้าย|ป้ายข้อความ|ข้อความ|เสียง|เสียงประกอบ|ไม่มีข้อความ)$/i;
 const isNonPersonLabel = (s: string | undefined): boolean => !!s && NON_PERSON_LABEL.test(s.trim());
 
-// Address suffixes are not part of a name: "คุจินาชิคุง" is คุจินาชิ,
-// "ฮิมุโระ-ซัง" is ฮิมุโระ. Without this the book grows one row per form of
-// address (live: three rows for one heroine — ฮิมุโระ / ฮิมุโร / ฮิมุโระ-ซัง).
+// Address suffixes are not part of a name — strip them or the book grows one row per form of address.
 const HONORIFIC = /[-・\s]?(?:คุง|คุน|จัง|จัน|ซัง|ซามะ|เซ็นเซย์|senpai|sensei|kun|chan|san|sama)$/i;
 function stripHonorific(s: string): string {
     const t = s.replace(HONORIFIC, '').trim();
@@ -418,9 +363,7 @@ function similar(a: string, b: string): boolean {
     return shared / Math.min(wa.size, wb.size) >= 0.5;
 }
 
-// Two name strings = one person: exact match, or one's tokens are a subset
-// of the other's ("ยามาดะ" ~ "ยามาดะ ทาโร่"). Same-surname collisions across
-// different characters are possible; the user override is the escape hatch.
+// Two names = one person: exact match or token subset. User override is the escape hatch.
 function samePerson(a: string | undefined, b: string | undefined): boolean {
     if (!a || !b) return false;
     const na = stripHonorific(a.toLowerCase().trim()), nb = stripHonorific(b.toLowerCase().trim());
@@ -440,18 +383,13 @@ export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry): Cha
         samePerson(c.fullName, obs.fullName) ||
         samePerson(c.name, obs.fullName) ||
         samePerson(c.fullName, obs.name) ||
-        // sourceless spk observations land with the name in desc ("เอย์จิ" with
-        // name '') — match them against real names or they fragment forever
+        // sourceless spk lands with name in desc — match against real names or they fragment
         samePerson(c.name, obs.desc) ||
         samePerson(obs.name, c.desc));
     if (i === -1) {
         const next = [...book, obs];
         if (next.length > MAX_CHARACTERS) {
-            // Evict the OLDEST lowest-priority row, not the newest: the book is
-            // append-ordered, and dropping the tail let a full book of stale
-            // junk (narration/sign/credits rows) silently refuse every new
-            // character forever — live-proven. User rows never evict (top
-            // priority); ties go to the earlier (older) row.
+            // Evict OLDEST lowest-priority row (book is append-ordered). User rows never evict.
             while (next.length > MAX_CHARACTERS) {
                 let victim = 0;
                 for (let j = 1; j < next.length; j++) {
@@ -466,8 +404,7 @@ export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry): Cha
     const merged: CharacterEntry = {
         desc: cur.desc.length >= obs.desc.length ? cur.desc : obs.desc,
         name: cur.name ?? obs.name,
-        // fill an unknown full name; two stated-but-different full names keep the
-        // first (first-wins naming — the user corrects it in options)
+        // fill unknown full name; two stated-but-different full names keep the first (user corrects in options)
         fullName: cur.fullName ?? obs.fullName,
         gender: cur.gender,
         source: cur.source,
@@ -486,13 +423,8 @@ export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry): Cha
     return next;
 }
 
-// Fold a page's outputs into the context state. 'keep' regions contribute
-// nothing (no pair, no character). mentions are page-level (named people from
-// dialogue/narration) and merge even when every region is keep — the model
-// only emits the block when the page actually names someone.
-// learn=false (useCharacters off): pairs still fold, characters don't.
-// In vision modes outputs carry no source — the translation alone still
-// folds (source '') so later pages keep dialogue continuity.
+// Fold page outputs into context. 'keep' contributes nothing; mentions merge even when all regions are keep.
+// learn=false: pairs still fold, characters don't. Vision outputs carry no source — translation alone still folds.
 export interface ContextUpdate {
     ctx: ContextState;
     bookOps: BookOp[]; // merges/corrections the model ordered and validation approved
@@ -508,10 +440,8 @@ function findEntry(book: CharacterEntry[], ref: string, exclude = -1): number {
         samePerson(c.name, r) || samePerson(c.fullName, r) || similar(c.desc, r)));
 }
 
-// Model-ordered book maintenance (sameAs/correct on <m>). The model proposes,
-// this validates: both sides must be in the sent book, genders must not
-// clash, user rows are untouchable, corrections need a quote. Returns which
-// mention indices were consumed so the caller still learns the rest normally.
+// Model-ordered book maintenance (sameAs/correct). Validates: both sides in sent book,
+// no gender clash, user rows untouchable, corrections need a quote.
 export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
     characters: CharacterEntry[]; ops: BookOp[]; done: number[];
 } {
@@ -521,8 +451,7 @@ export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
     mentions.forEach((m, i) => {
         if (!m.name || isNonPersonLabel(m.name) || (!m.sameAs && !m.correct)) return;
         if (m.sameAs) {
-            // resolve the target first — the main entry often matches BOTH refs
-            // (name + fullName), so the source is searched outside the target
+            // resolve target first — main entry often matches BOTH refs, so source is searched outside target
             const si = findEntry(characters, m.sameAs);
             if (si < 0 || characters[si].source === 'user') return;
             const ti = findEntry(characters, m.name, si);
@@ -533,8 +462,7 @@ export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
             const knownGender = t.gender !== '?' ? t.gender : s.gender;
             const merged: CharacterEntry = {
                 desc: mdesc.length > Math.max(t.desc.length, s.desc.length) ? mdesc : (t.desc.length >= s.desc.length ? t.desc : s.desc),
-                // the <m>'s own gender fills only a blank (priority 1 must not
-                // overrule what vlm already established on either side)
+                // the <m>'s gender fills only a blank (priority 1 must not overrule vlm)
                 gender: knownGender !== '?' ? knownGender : m.gender,
                 source: PRIORITY[t.source] >= PRIORITY[s.source] ? t.source : s.source,
                 name: t.name ?? s.name,
@@ -611,11 +539,7 @@ export function updateContext(
     return { ctx: { pairs: pairs.slice(-maxPairs), characters }, bookOps };
 }
 
-// Apply user overrides (from the options page) on top of the learned book.
-// User entries are law: gender forced, source promoted to 'user'.
-// Entries the user gave the SAME name are one person — collapse them so the
-// model-fragmented book ("spiky-haired guy" + "inspector with spiky hair")
-// presents a single canonical character with the user's name.
+// User overrides are law: gender forced, source promoted. Same-named entries collapse to one.
 export function applyOverrides(
     ctx: ContextState,
     overrides: Record<string, { gender: 'M' | 'F' | '?'; name?: string }>,

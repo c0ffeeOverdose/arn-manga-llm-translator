@@ -39,8 +39,9 @@ failures diagnosable in one message.
 ## Ground rules
 
 - **Strict TypeScript, minimal comments** — a comment only earns its place
-  when it carries information the code can't (a "why", a proven gotcha, a
-  non-obvious constraint). Read neighboring code and mimic its style.
+  when it explains the code (a brief why, a constraint, a contract — ~2 lines
+  max). Incident histories and deep detail belong to the owner's memory system,
+  not the code. Read neighboring code and mimic its style.
 - **No site-specific hacks in the pipeline.** Reader adaptations must be
   generic, named mechanisms, never keyed to a particular site or title.
 - **Never commit models, profiles, or keys** — `models/`, `.test-local/`,

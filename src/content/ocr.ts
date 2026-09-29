@@ -13,14 +13,10 @@ import { erasePlan, computeAiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
 import { inpaintMode } from '../llm/pipeline-settings';
 
-// Warm-path AI cleanup: compute the cleanup patches for a freshly translated
-// page and hand them to the caller's cache entry — arrival then paints with
-// the model's output instead of paying it while the user waits (the headless
-// prefetch/sweep entries otherwise carry no patches). Gated on cache-on +
-// local mode; `noDownload` keeps a background warm from starting the 112MB
-// model download (the worker checks model DB / dev bundle only). Lo-priority
-// ORT — background work must never delay the viewed page. Failures return
-// null — arrival regenerates or falls back to fill.
+// Warm-path AI cleanup: compute cleanup patches for a freshly translated page
+// and hand them to the caller's cache entry. Gated on cache-on + local mode;
+// `noDownload` keeps a background warm from starting the 112MB model download.
+// Lo-priority ORT. Failures return null.
 export async function warmPatches(
     bitmap: ImageBitmap, det: DetectResult, outputs: RegionOutput[],
 ): Promise<{ patches: InpaintPatch[]; patchesGen: number } | null> {
@@ -28,12 +24,9 @@ export async function warmPatches(
     const plan = erasePlan(det, outputs);
     if (!plan.boxesToErase.length) return null;
     if (inpaintMode(pipeline) !== 'local') {
-        // cloud: the patches were already computed server-side inside the
-        // detect roundtrip (det.cloudPatches) — filter to the erase plan under
-        // the same keep-overlap contract the render applies. Full coverage or
-        // nothing: paintRegions skips the built-in fill when any patches
-        // exist, so a partial set would strand unerased boxes. Returning null
-        // makes the paint fall back to the dedicated /v1/inpaint roundtrip.
+        // cloud: the patches were already computed server-side inside the detect
+        // roundtrip — filter to the erase plan. Full coverage or nothing (a
+        // partial set would strand unerased boxes); null falls back to /v1/inpaint.
         const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
             a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
         if (plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) return null;
@@ -54,9 +47,7 @@ export async function warmPatches(
 
 // ---- OCR (Tesseract in the iframe worker; lazy-loaded from CDN) ----
 
-// Full-page pixels for OCR-crop expansion (see expandCropToInk): read once per
-// page, shared by every crop below — per-crop readbacks would re-pay this per
-// region and slice the measurement window blind.
+// Full-page pixels for OCR-crop expansion: read once per page, shared by every crop.
 async function pageImageData(bitmap: ImageBitmap): Promise<ImageData> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
@@ -96,8 +87,8 @@ export async function ocrInWorkerPng(bitmap: ImageBitmap, box: DetBox, pageImg: 
     return ocrInWorker(png, pipeline.ocrLangs);
 }
 
-// Baberu crop: tight padding (~10%) — the model was trained on tight bubble
-// crops and reads vertical text + busy backgrounds natively (no rotate/binarize)
+// Baberu crop: tight padding (~10%) — the model reads vertical text + busy
+// backgrounds natively (no rotate/binarize).
 async function baberuCrop(bitmap: ImageBitmap, box: DetBox, pageImg: ImageData): Promise<ArrayBuffer> {
     const pad = Math.max(4, (box.y2 - box.y1) * 0.10);
     const r = expandCropToInk(pageImg, box, {
@@ -116,11 +107,9 @@ async function baberuCrop(bitmap: ImageBitmap, box: DetBox, pageImg: ImageData):
 }
 
 // Prefetch pipeline: crop of box n+1 + its vision run START while box n is
-// still decoding — depth 2 keeps memory bounded (two decoded KV states max).
-// NOTE: the worker's ORT lock is one global chain, so the overlapped vision
-// still queues behind the in-flight decode step — the win is hiding PNG
-// crop/encode + message latency, not parallel inference (OCR ~40s → ~15s/page
-// measured). Per-box lock waits sum into lockWaitMs for the page-result dump.
+// still decoding — depth 2 keeps memory bounded.
+// NOTE: the worker's ORT lock is one global chain, so the win is hiding PNG
+// crop/encode + message latency, not parallel inference.
 export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], pageImg: ImageData, onProgress?: (done: number, total: number) => void, opts?: { lo?: boolean }): Promise<{ texts: string[]; lockWaitMs: number }> {
     const results: string[] = [];
     let lockWaitMs = 0;
@@ -144,10 +133,8 @@ export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], pageImg
 }
 
 // JPEG base64 helper. Grayscale strips ~2/3 of the payload on B&W pages.
-// FileReader (not arrayBuffer + fromCharCode-spread + btoa): pulling a canvas
-// JPEG blob's bytes through JS TypedArrays throws "Permission denied to access
-// property constructor" on Firefox (live-proven) — the data URL hands back a
-// plain string instead. Same output on Chromium.
+// FileReader (not arrayBuffer + btoa): canvas-blob bytes through JS TypedArrays
+// throw on Firefox — the data URL hands back a plain string instead.
 async function toJpegB64(canvas: OffscreenCanvas, quality: number): Promise<string> {
     const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
     const dataUrl: string = await new Promise((resolve, reject) => {
@@ -174,7 +161,7 @@ export function pageIsGrayscale(bitmap: ImageBitmap): boolean {
 }
 
 // one numbered badge: red disc + white number, the same mark the VLM sees.
-// center clamped into the canvas — edge boxes (x1≈0) lost their badge off-canvas.
+// center clamped into the canvas.
 function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, x: number, y: number, num: number, r: number, W: number, H: number): void {
     x = Math.min(Math.max(x, r), W - r);
     y = Math.min(Math.max(y, r), H - r);
@@ -182,8 +169,7 @@ function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingConte
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = '#ff2222';
     ctx.fill();
-    // thin white rim: separates the red disc from red/busy artwork (cheap,
-    // grows the mark by half a line width only)
+    // thin white rim: separates the red disc from red/busy artwork.
     ctx.lineWidth = Math.max(1.5, r * 0.16);
     ctx.strokeStyle = '#fff';
     ctx.stroke();
@@ -202,17 +188,15 @@ async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: b
     const ctx = c.getContext('2d')!;
     if (grayscale) ctx.filter = 'grayscale(1)';
     ctx.drawImage(bitmap, 0, 0, c.width, c.height);
-    // canvas filters stick to every later draw: without this reset the badges
-    // come out gray whenever the page was grayscale-stripped, while the prompt
-    // tells the model to look for "red number badges" (live-proven mismatch)
+    // canvas filters stick to every later draw: reset, or the badges come out
+    // gray whenever the page was grayscale-stripped.
     ctx.filter = 'none';
     const font = annotFont(scale);
     boxes.forEach((b, i) => drawBadge(ctx, b.x1 * scale, b.y1 * scale, i + 1, font * 0.9, c.width, c.height));
     return toJpegB64(c, pipeline.jpegQuality);
 }
 
-// dark pill with exact conf in threshold units (0.xx) — answers directly
-// "what threshold catches this box?"
+// dark pill with exact conf in threshold units — answers "what threshold catches this box?"
 function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, x: number, y: number, text: string, color: string, font: number, bold = false, right?: number): void {
     ctx.font = `${bold ? 'bold ' : ''}${Math.round(font * 0.7)}px sans-serif`;
     const w = ctx.measureText(text).width;
@@ -226,9 +210,8 @@ function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContex
 }
 
 // full-res debug view: translated image + CTD boxes/badges/conf, YOLO panels
-// (cyan, numbered in reading order), dashed green = the placement area the
-// layout actually got. Below-threshold near-misses draw dimmed gray with conf
-// and NO badge — a badge means "translated in this order".
+// (cyan, numbered in reading order), dashed green = the placement area.
+// Below-threshold near-misses draw dimmed gray with conf and NO badge.
 export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = [], mask?: TextMask): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d')!;
@@ -239,10 +222,10 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
         ctx.strokeStyle = '#00d5ff'; // cyan: reads on both ink and paper, distinct from CTD red
         ctx.strokeRect(p.x1, p.y1, p.x2 - p.x1, p.y2 - p.y1);
         const n = panelNums[i];
-        // top-right: the red CTD badge owns the top-left corner
+    // top-right: the red CTD badge owns the top-left corner.
         confPill(ctx, p.x1, p.y1, n ? `P${n} ${p.conf.toFixed(2)}` : p.conf.toFixed(2), '#00d5ff', font, true, p.x2);
     });
-    // near-misses (under everything live): dimmed, conf only, no badges
+    // near-misses: dimmed, conf only, no badges.
     ctx.save();
     ctx.globalAlpha = 0.65;
     ctx.strokeStyle = '#888888';
@@ -251,15 +234,9 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
         confPill(ctx, d.x1, d.y1, d.conf.toFixed(2), '#888888', font);
     }
     ctx.restore();
-    // placement area the layout actually got (pageArea = bubble fill + canvas
-    // clamp — the same call paintRegions makes), dashed green under the red
-    // boxes. Recomputed from the image being drawn: exact on the original
-    // view, off by an ink-frac hairline on the translated one.
+    // placement area the layout actually got, dashed green under the red boxes.
     const frame = ctx.getImageData(0, 0, c.width, c.height);
-    // the orientation the layout will choose for this region's own text, not
-    // the box aspect: a tall box whose translation fits horizontally is laid
-    // out horizontally, and drawing the vertical area under it misled more
-    // than one diagnosis.
+    // the orientation the layout will choose for this region's own text, not the box aspect.
     const textFor = (i: number) => outputs.find(o => o.index === i + 1)?.translation ?? '';
     ctx.save();
     ctx.setLineDash([font, font * 0.6]);
@@ -269,8 +246,7 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
         if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
     });
     // measured per-line runs (enclosed bubbles): orange outline of the shape
-    // the layout actually follows — short at a round bubble's top, long in the
-    // middle. Not drawn for the no-frame fallback (rect only, as before).
+    // the layout actually follows. Not drawn for the no-frame fallback.
     ctx.setLineDash([font * 0.5, font * 0.4]);
     ctx.strokeStyle = '#ffa02b';
     boxes.forEach((b, i) => {
@@ -310,10 +286,8 @@ export function panelRanks(panels: DetBox[]): number[] {
 }
 
 // debug views for already-translated pages (render builds them inline when on).
-// one per frame so Original/Translate toggle keeps its debug boxes.
-// canvas pages build from memory (stashed descrambled bytes + kept translated
-// bitmap) — st.orig is the still-transposed CDN puzzle, fetching it would put
-// boxes on the wrong layout.
+// canvas pages build from memory — st.orig is the still-transposed CDN puzzle,
+// fetching it would put boxes on the wrong layout.
 export async function ensureDebugViews(): Promise<void> {
     for (const st of uniquePages()) {
         if (!st.det?.boxes.length || (st.debug && st.debugOrig)) continue;
@@ -353,8 +327,7 @@ export async function ensureDebugViews(): Promise<void> {
     }
 }
 
-// canvas paint sources (imported from state-adjacent logic; lives with the
-// debug views that need it) — kept local to avoid a page-io cycle
+// canvas paint sources — kept local to avoid a page-io cycle.
 async function canvasPaintSrc(state: PageState, which: 'orig' | 'translated' | 'debug' | 'debugOrig'): Promise<ImageBitmap | undefined> {
     if (which === 'translated') return state.translatedBmp;
     if (which === 'orig') {
@@ -422,25 +395,16 @@ export async function translateRegions(
     det: DetectResult,
     onStatus: MtOnStatus,
     // fold:false leaves the book alone and returns the raw outcome for the
-    // caller to fold later — parallel workers must not setContext out of
-    // order (each response is folded over its dispatch-time snapshot, so a
-    // late page would clobber earlier commits). Default folds immediately,
-    // exactly like before.
-    // progressKey/continued: cross-document pill continuity — stamp this
-    // page's LLM dispatch and count from the earliest fresh stamp (an arrival
-    // continuing a shared SW call) instead of restarting at 1s. continued
-    // needs caller corroboration (resumed checkpoint, or no cache to resume
-    // from) so a dead call never inflates the counter; force callers drop the
-    // entry first (fresh work counts fresh).
-    // afterOcr: OCR finished and the ORT queue just drained — lets the
-    // caller start infer-lock work (AI cleanup warm) while the LLM is in
-    // flight; on the critical path from here is only the network wait.
+    // caller to fold later — parallel workers must not setContext out of order.
+    // progressKey/continued: cross-document pill continuity — stamp this page's
+    // LLM dispatch and count from the earliest fresh stamp. continued needs
+    // caller corroboration so a dead call never inflates the counter.
+    // afterOcr: OCR finished and the ORT queue just drained — lets the caller
+    // start infer-lock work while the LLM is in flight.
     opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void },
 ): Promise<TranslateOutcome> {
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
-    // ponytail: region cap 150 — dense art pages can drown a single LLM call;
-    // detector output is normally ≤60. Add a "translate top N" flow if real
-    // pages ever hit this.
+    // ponytail: region cap 150 — dense art pages can drown a single LLM call.
     if (det.boxes.length > 150) det.boxes = det.boxes.slice(0, 150);
     await loadContext();
     onStatus('Translating…');
@@ -448,14 +412,9 @@ export async function translateRegions(
         index: i + 1,
         source: '',           // vision mode: the model reads from the annotated image
     }));
-    // post-OCR checkpoint: the OCR text is the paid half of the split pipeline —
-    // persist it onto the same partial entry detect wrote, so a reload or a
-    // retry after a failed LLM resumes at the translation instead of paying the
-    // OCR again (detFromPartial restores the texts as cloudTexts, which the ocr
-    // gate above accepts). Cloud texts are already in that entry; the 150-region
-    // cap keeps boxes and texts aligned by prefix. Written even with the cache
-    // off (in-flight work, not a cached translation): the finished job deletes
-    // it again in that mode (render-page/seam/sweep).
+    // post-OCR checkpoint: persist the OCR text onto the same partial entry
+    // detect wrote, so a reload/retry resumes at translation instead of
+    // re-paying the OCR. Written even with the cache off (in-flight work).
     const checkpointOcr = (texts: string[]) => {
         if (det.cloudTexts || !texts.some(t => t)) return;
         const boxes = det.boxes.length === texts.length ? det.boxes : det.boxes.slice(0, texts.length);
@@ -464,9 +423,8 @@ export async function translateRegions(
     };
     try {
         // unified text-source axis: 'page'/'crops' = VLM reads images, 'ocr' =
-        // Tesseract reads locally and the LLM gets text only. Split pipeline
-        // (useOcrModel) transcribes in the background — except cloud pages,
-        // whose texts already arrived with detection (re-reading them is waste).
+        // local OCR + text-only LLM. Split pipeline transcribes in the background —
+        // except cloud pages, whose texts already arrived with detection.
         const ocr = pipeline.textSource === 'ocr' || (pipeline.useOcrModel && !!det.cloudTexts?.length);
         const vision = !ocr;
         const cropsOnly = vision && pipeline.textSource === 'crops';
@@ -478,14 +436,13 @@ export async function translateRegions(
         // back in THIS space — the model can't know the full-resolution page)
         let annW = bitmap.width, annH = bitmap.height;
         let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
-        // OCR crops grow past edge-cut glyphs (see expandCropToInk) — one shared
-        // readback, not one per region
+        // OCR crops grow past edge-cut glyphs — one shared readback, not one per region.
         const pageImg = await pageImageData(bitmap);
         if (ocr) {
             const tOcr = performance.now();
             onStatus('OCR…', 'ocr');
             if (det.cloudTexts) {
-                // cloud path: texts arrived with detection — no local OCR models needed
+                // cloud path: texts arrived with detection — no local OCR models needed.
                 det.cloudTexts.forEach((t, i) => { if (regions[i]) regions[i].source = t; });
             } else if (pipeline.ocrEngine === 'baberu') {
                 if (!(await baberuInstalled())) {
@@ -513,7 +470,7 @@ export async function translateRegions(
                 }
             }
             ocrStatus = regions.map(r => r.source ? 'ok' : 'empty');
-            // cloud path: local spent ~0ms — the server-side number diagnoses bottlenecks
+            // cloud path: local spent ~0ms — the server-side number diagnoses bottlenecks.
             ocrMs = det.cloudTexts && det.cloudMs
                 ? det.cloudMs.ocr
                 : Math.round(performance.now() - tOcr);
@@ -542,14 +499,13 @@ export async function translateRegions(
             characters: pipeline.useCharacters ? context.characters : [],
         };
         // live status during the LLM call — it can take tens of seconds and the
-        // previous status ("OCR n/n…") would otherwise look stuck
+        // previous status would otherwise look stuck.
         onStatus('LLM translating…', 'llm');
         let llmSeconds = 0;
         const t0local = Date.now();
         if (opts?.progressKey) writeProgressT0(opts.progressKey, t0local);
         // handoff read AFTER our own write is safe by construction: handoffRead
-        // takes the earliest fresh stamp across exact + host-volatile twin keys,
-        // so our just-written entry can never shadow the older twin.
+        // takes the earliest fresh stamp, so our entry can never shadow the older twin.
         const handedT0 = opts?.continued === true && opts?.progressKey ? readProgressT0(opts.progressKey) : null;
         const tickBase = handedT0 != null && handedT0 <= t0local ? handedT0 : t0local;
         const llmTick = setInterval(() => {
@@ -559,8 +515,8 @@ export async function translateRegions(
         opts?.afterOcr?.();
         let resp: any;
         // transcripts seen on the interim message — if the RPC channel dies
-        // mid-translate (service worker killed / reloaded), the fallback below
-        // re-sends them so the new worker translates instead of re-transcribing
+        // mid-translate, the fallback re-sends them so the new worker translates
+        // instead of re-transcribing.
         let interimTexts: string[] | null = null;
         const payload = {
             type: 'mt:translate',
@@ -575,20 +531,17 @@ export async function translateRegions(
             cacheKey: await resolveMangaId() ?? chapterKey(), // stable per manga → prompt-cache affinity
             interim: true, // this version handles the mid-flight transcripts message (see portSend)
         };
-        // suspend-proof channel: an open runtime port pins the background
-        // page alive AND its replies always arrive (Firefox drops a pending
-        // sendResponse when it suspends the event page — live-proven silent
-        // hang mid-LLM). Falls back to plain sendMessage (Chrome SW never
-        // showed the problem, and the port listener is FF-new anyway).
+        // suspend-proof channel: an open runtime port pins the background page
+        // alive AND its replies always arrive (a pending sendResponse can be
+        // dropped when the page suspends). Falls back to plain sendMessage.
         const portSend = () => new Promise<unknown>((resolve, reject) => {
             let port: chrome.runtime.Port;
             try { port = chrome.runtime.connect({ name: 'mt-rpc' }); } catch (e) { reject(e); return; }
             const to = setTimeout(() => { try { port.disconnect(); } catch { /* gone */ } reject(new Error('translate RPC timeout')); }, 260000);
             port.onMessage.addListener((r: unknown) => {
-                // interim: the split pipeline's transcribe finished while the
-                // translate call runs — checkpoint the transcripts now, or a
-                // reload mid-translate re-pays the OCR (the final reply settles
-                // this promise)
+                // interim: the split pipeline's transcribe finished while the translate
+                // call runs — checkpoint the transcripts now (the final reply settles
+                // this promise).
                 const m = r as { type?: string; texts?: string[] };
                 if (m?.type === 'mt:ocr-texts' && Array.isArray(m.texts)) { interimTexts = m.texts; checkpointOcr(m.texts); return; }
                 clearTimeout(to); try { port.disconnect(); } catch { /* gone */ } resolve(r);
@@ -601,15 +554,14 @@ export async function translateRegions(
                 resp = await portSend();
             } catch (e) {
                 if (!/background disconnected|RPC timeout/.test(String((e as Error)?.message ?? ''))) throw e;
-                // wake-race / no listener: retry the classic channel on a
-                // rising backoff before giving up entirely
+                // wake-race / no listener: retry the classic channel on a rising
+                // backoff before giving up entirely.
                 let lastErr: unknown = e;
                 for (const wait of [5000, 20000, 60000]) {
                     await new Promise(r => setTimeout(r, wait));
                     try {
-                        // transcripts already paid for: the re-send is the same
-                        // text-only translate stage the split pipeline would have
-                        // run, not a re-transcription (images dropped too)
+                        // transcripts already paid for: the re-send is the same text-only
+                        // translate stage, not a re-transcription (images dropped too).
                         const retryPayload = interimTexts
                             ? { ...payload, imagesB64: undefined, regions: withSources(payload.regions, interimTexts), vision: false, textOnly: true, ocr: true }
                             : payload;
@@ -631,7 +583,7 @@ export async function translateRegions(
             err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
             throw err;
         }
-        // extras arrive in annotated-image space → rescale to full-page pixels
+        // extras arrive in annotated-image space → rescale to full-page pixels.
         const rawExtras: ExtraRegion[] = resp.extras ?? [];
         const extras: ExtraRegion[] = rawExtras
             .map(e => ({

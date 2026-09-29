@@ -15,9 +15,8 @@ import { pageIsGrayscale } from './ocr';
 
 export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
 
-// cached entry → render-ready det (shared by preparePage and arrival paint —
-// one construction, one gate set: full entry + fp + dims + mask, partials
-// never render as Done). Null when the entry must not paint.
+// cached entry → render-ready det (shared by preparePage and arrival paint).
+// Null unless: full entry + fp + dims + mask (partials never render as Done).
 export function detFromCacheEntry(hit: CachedPage, w: number, h: number): DetectResult | null {
     if (!hit || hit.partial || hit.fp !== settingsFingerprint(pipeline) || hit.w !== w || hit.h !== h || !hit.mask || !cloudSplitFresh(hit, pipeline.inferEngine === 'cloud')) return null;
     return {
@@ -27,20 +26,17 @@ export function detFromCacheEntry(hit: CachedPage, w: number, h: number): Detect
     };
 }
 
-// Headless detect resolve — shared by lookahead prefetch and chapter sweep
-// (DOM jobs use preparePage instead: canvas blanks, ghost twins, stashed
-// bytes). Full hit → {det:null} (caller returns); resumable partial → rebuilt
-// det; else fresh detect + order + checkpoint write. Zero-box pages skip the
-// checkpoint (nothing to resume; the full entry covers them).
+// Headless detect resolve — shared by lookahead prefetch and chapter sweep (DOM jobs use
+// preparePage instead). Full hit → {det:null}; resumable partial → rebuilt det; else fresh
+// detect + order + checkpoint write. Zero-box pages skip the checkpoint (nothing to resume).
 export async function resolveHeadlessDet(
     bitmap: ImageBitmap, hash: string, onStatus: MtOnStatus,
 ): Promise<{ det: DetectResult | null; resumed: boolean }> {
     const key = cacheKey(chapterKey(), hash);
     const fp = settingsFingerprint(pipeline);
     {
-        // full entries are the translation cache (cacheEnabled gates them);
-        // resume checkpoints are in-flight work and always ride (a retry after
-        // a failed LLM must never re-pay detection/OCR, cache or not)
+        // full entries are the translation cache (cacheEnabled gates them); resume checkpoints
+        // are in-flight work and always ride (a retry after a failed LLM never re-pays detect/OCR)
         const hit = await cacheGet(key);
         if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask && cloudSplitFresh(hit, pipeline.inferEngine === 'cloud')) {
             return { det: null, resumed: false };
@@ -58,12 +54,10 @@ export async function resolveHeadlessDet(
     return { det, resumed: false };
 }
 
-// Detection for one bitmap (local or cloud), no ordering — shared by the
-// solo path (preparePage) and the seam path (stitched bitmap, same call).
+// Detection for one bitmap (local or cloud), no ordering — shared by preparePage and the seam path.
 export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts?: { lo?: boolean }): Promise<DetectResult> {
-    // cloud engine: one POST returns boxes+texts. No silent fallback — a cloud
-    // failure is an error (cloud-only users run nothing on-device), and cloud
-    // mode without endpoint/key is a config error, not a cue to go local.
+    // cloud engine: one POST returns boxes+texts. No silent fallback — a cloud failure is an
+    // error, and cloud mode without endpoint/key is a config error, not a cue to go local.
     const { mtSettings } = await chrome.storage.local.get('mtSettings');
     const endpoint = String((mtSettings as LLMSettings | undefined)?.cloudEndpoint ?? '').trim();
     const key = String((mtSettings as LLMSettings | undefined)?.cloudKey ?? '').trim();
@@ -79,9 +73,8 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
             return await cloudDetect(bitmap, endpoint, key, {
                 confThr: pipeline.detConf, minSize: pipeline.detMinSize,
                 quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw && pageIsGrayscale(bitmap),
-                // merge AI cleanup into the same roundtrip — the server already
-                // has the CTD mask; a second /v1/inpaint POST re-uploads the
-                // page and queues behind the inference lock again
+                // merge AI cleanup into the same roundtrip — the server already has the CTD
+                // mask; a second /v1/inpaint POST re-uploads the page
                 inpaint: inpaintMode(pipeline) !== 'fill',
             });
         } catch (e) {
@@ -94,30 +87,27 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
     return detect(bitmap, onStatus, { confThr: pipeline.detConf, minSize: pipeline.detMinSize, forceWasm: pipeline.detEp === 'wasm', lo: opts?.lo === true });
 }
 
-// Box ordering for one detection (panel-guided, strip-banding, or cloud
-// banding) — mutates det in place, same shared call as above.
+// Box ordering for one detection (panel-guided, strip-banding, or cloud banding) —
+// mutates det in place, same shared call as above.
 export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Promise<void> {
-    // cloud texts ride with their boxes: ordering below sorts the same box
-    // OBJECTS, so reattach by identity afterwards
+    // cloud texts ride with their boxes: ordering sorts the same box OBJECTS, so reattach
+    // by identity afterwards
     const cloudTextByBox = det.cloudTexts ? new Map<DetBox, string>(det.boxes.map((b, i) => [b, det.cloudTexts![i] ?? ''])) : null;
-    // same for server-computed cleanup patches — `i` is the PRE-ordering box
-    // index; after the reorder/dedup below it must point at the box's NEW
-    // position or render-page's indexOf-based filter picks the wrong patch
+    // same for server-computed cleanup patches — `i` is the PRE-ordering box index; reindex
+    // to the post-ordering position or the render picks the wrong patch
     const cloudPatchByBox = det.cloudPatches?.length
         ? new Map<DetBox, InpaintPatch>(det.cloudPatches
             .filter(p => (p.i ?? -1) >= 0 && p.i! < det.boxes.length)
             .map(p => [det.boxes[p.i!], p]))
         : null;
-    // panel-guided ordering when the model is present, banding otherwise
-    // (the detector emits confidence order — numbering always sorts)
+    // panel-guided ordering when the model is present, banding otherwise (the detector emits
+    // confidence order — numbering always sorts)
     const page = { w: bitmap.width, h: bitmap.height };
     const defer = pipeline.deferLabels;
-    // extreme-aspect strips (manhwa long-strip, stitched manga pages — same
-    // thing to the model): the 640-resize destroys panel geometry, so don't
-    // even run YOLO. Normal aspects run it but the output still passes the
-    // sanity gate inside orderByPanels.
-    // cloud mode: the server owns boxes and sends no panels by contract —
-    // banding directly keeps cloud-only installs from downloading/running YOLO.
+    // extreme-aspect strips: the 640-resize destroys panel geometry, so don't even run YOLO.
+    // Normal aspects run it but the output still passes the sanity gate inside orderByPanels.
+    // cloud mode: the server owns boxes and sends no panels by contract — banding directly
+    // keeps cloud-only installs from downloading/running YOLO.
     if (det.ep === 'cloud') {
         det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
     } else if (page.h / page.w > 3 || page.w / page.h > 3) {
@@ -137,10 +127,9 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
             det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
         }
     }
-    // containment dedup (every EP incl. cloud — this runs after all ordering
-    // branches): a near-threshold fragment inside a real box survives IoU and
-    // would paint double text downstream. Marginal only (conf < 0.5).
-    // Dropped boxes vanish from cloudTexts with them (identity reattach below).
+    // containment dedup (every EP incl. cloud): a near-threshold fragment inside a real box
+    // survives IoU and would paint double text. Marginal only (conf < 0.5). Dropped boxes
+    // vanish from cloudTexts with them (identity reattach below).
     det.boxes = dropContainedBoxes(det.boxes, 0.9, 0.5);
     if (cloudTextByBox) det.cloudTexts = det.boxes.map(b => cloudTextByBox.get(b) ?? '');
     if (cloudPatchByBox) {
@@ -152,40 +141,28 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
     }
 }
 
-// Detect phase — kicked off at ENQUEUE time so detection of the next page
-// overlaps the LLM call of the current one (CTD parallel, LLM serial).
-// Returns null when the page is already translated (cache hit, no-op job).
-// fromSweep: the caller IS the sweep (already claimed) — skip the sweep-wait
-// or the worker waits on its own claim until timeout.
-// waitSweep=false for user-driven jobs: an explicit Translate press must not
-// sit behind a slow CPU sweep's claim for up to 150s (auto prefetch still
-// waits — its work would duplicate the sweep).
+// Detect phase — kicked off at ENQUEUE time so detection of the next page overlaps the LLM
+// call of the current one. Returns null when already translated (cache hit, no-op job).
+// fromSweep: the caller IS the sweep (already claimed) — skip the sweep-wait.
+// waitSweep=false for user-driven jobs: an explicit Translate press must not sit behind a
+// slow sweep's claim (auto prefetch still waits — it would duplicate the sweep).
 export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false, waitSweep = true): Promise<Prep | null> {
     const existing = stateFor(ref);
     if (existing && !force) return null;
-    // prepMs: read + hash + cache-gate cost (excludes queue wait — the prep
-    // body runs at enqueue time, not when the pump gets to it). Answers
-    // "why is a cache hit slow" without guessing.
+    // prepMs: read + hash + cache-gate cost (excludes queue wait). Answers "why is a cache
+    // hit slow" without guessing.
     const tPrep0 = performance.now();
     const prepMs = () => Math.round(performance.now() - tPrep0);
-    // re-translate: always from the ORIGINAL page — when the translated overlay
-    // is showing, img.src points at our own rendering (canvas: stashed bytes).
+    // re-translate: always from the ORIGINAL page — when the translated overlay is showing,
+    // img.src points at our own rendering (canvas: stashed bytes).
     const srcUrl = existing ? existing.orig : refKey(ref);
     resetContextIfNewChapter();
     await loadPipeline();
     onStatus('Reading page…', 'read');
-    // sliding-window canvas readers: pages outside the render
-    // window are BLANK placeholders that draw real pixels on approach —
-    // translating one poisons the page (state.det set → later real render says
-    // "Already translated", and the sweep repaints the blank over it). Skip:
-    // no state, no cache; the sweep re-queues once the reader actually draws.
-    // The verdict is cached per element+SIZE: these readers resize the canvas
-    // when they draw (1200x1600 → 836x1200), so an unchanged size means still
-    // blank — without the cache, auto re-paid a full toDataURL readback for
-    // every blank canvas every tick and starved the real pages (live-proven:
-    // queue cycled canvas0/1/2 forever, visible canvas15/16 never ran).
-    // A canvas that becomes VISIBLE re-checks regardless (a same-size draw
-    // would otherwise stick); so does a re-read after a stashed-original blank.
+    // sliding-window canvas readers keep BLANK placeholder canvases outside the render window —
+    // translating one poisons the page, so skip (no state, no cache). The verdict is cached per
+    // element+SIZE (readers resize on draw, so an unchanged size means still blank). A canvas
+    // that becomes VISIBLE re-checks regardless.
     let bitmap: ImageBitmap, bytes: ArrayBuffer | undefined;
     if (ref.kind === 'canvas') {
         const el = ref.el;
@@ -208,42 +185,36 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     }
     // persistent cache: same image bytes + same settings → skip detect + LLM.
     // force (re-translate) always misses and overwrites below.
-    // A previous document may have died mid-job on this exact page (full-load
-    // readers kill all in-memory state per page-turn) — leave a trace so the
-    // next load can name the restart instead of silently redoing it.
-    // read BEFORE our own write below — else every first visit matches the
-    // trace it just wrote and cries "interrupted" over nothing.
+    // A previous document may have died mid-job on this exact page (full-load readers kill
+    // in-memory state per page-turn) — leave a trace so the next load can name the restart.
+    // Read BEFORE our own write below, else every visit self-matches.
     const prevWarming = readWarming();
     writeWarming(refKey(ref));
-    // chapter sweep owns this page right now — wait for its commit instead of
-    // paying a duplicate detect + LLM (falls through on cancel/timeout, then
-    // the normal flow finds the fresh cache entry)
+    // chapter sweep owns this page right now — wait for its commit instead of paying a
+    // duplicate detect + LLM (falls through on cancel/timeout)
     if (waitSweep && !force && !fromSweep && pipeline.cacheEnabled) {
         await Promise.race([sweepWait(refKey(ref), onStatus), new Promise(r => setTimeout(r, 150000))]);
     }
     const hash = pageHashFromBitmap(bitmap);
-    // miss-reason instrument: a revisit that SHOULD hit but misses needs a
-    // verdict in one dump (absent | fp | dims | mask | disabled) — no guessing
+    // miss-reason instrument: a revisit that SHOULD hit but misses needs a verdict in one
+    // dump (absent | fp | dims | splitgen | mask | disabled)
     let cacheMiss: string | undefined = pipeline.cacheEnabled ? 'absent' : 'disabled';
     if (!force) {
         const hit = await cacheGet(cacheKey(chapterKey(), hash));
         const fp = settingsFingerprint(pipeline);
-        // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite
-        // partial entries never render as Done (cache) — they resume below
+        // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite.
+        // Partial entries never render as Done — they resume below.
         if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
             cacheMiss = undefined;
             onStatus('Cache hit…');
             const det = detFromCacheEntry(hit, bitmap.width, bitmap.height)!;
             return { srcUrl, bitmap, det, hash, cached: hit, prepMs: prepMs(),
-                // canvas cache hit still needs the original bytes — the canvas will
-                // show our drawing after this (re-translate reads the stash, §readPage)
+                // canvas cache hit still needs the original bytes (re-translate reads the stash)
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
         if (hit && pipeline.cacheEnabled) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : !cloudSplitFresh(hit, pipeline.inferEngine === 'cloud') ? 'splitgen' : 'mask';
-        // detect checkpoint resume: the previous load finished detect (boxes +
-        // panels + mask on disk) but died before translating — continue at
-        // translateRegions, skipping detect entirely. The pill jumps read→llm,
-        // which reads as "continuing" instead of "restarting".
+        // detect checkpoint resume: the previous load finished detect but died before
+        // translating — continue at translateRegions, skipping detect entirely.
         if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
             cacheMiss = undefined;
             onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
@@ -252,33 +223,28 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
         if (!hit) {
-            // total miss with a fresh warming trace for this page = the
-            // previous document died before its detect checkpoint landed
-            // (prevWarming, read before our own write above — never self-match)
+            // total miss with a fresh warming trace for this page = the previous document died
+            // before its detect checkpoint landed (prevWarming never self-matches)
             const w = prevWarming;
             if (w && samePagePath(w.key, refKey(ref)) && warmingFresh(w.ts)) onStatus('Warming was interrupted — restarting…', 'read');
         }
     }
     const det = await detectPage(bitmap, onStatus, { lo: fromSweep });
     await orderDetection(det, bitmap);
-    // detect checkpoint: a page-turn kills this document mid-job — the next
-    // load resumes from this entry (same key the full entry will overwrite).
-    // Zero-box pages skip it (nothing to resume; the full entry covers them).
-    // Written even with the cache off (in-flight work, not a cached
-    // translation): the successful job deletes it again in that mode.
+    // detect checkpoint: a page-turn kills this document mid-job — the next load resumes
+    // from this entry (same key the full entry overwrites). Zero-box pages skip it.
+    // Written even with the cache off (in-flight work, not a cached translation).
     if (!force && det.boxes.length) {
         void cachePut(partialEntry(cacheKey(chapterKey(), hash), settingsFingerprint(pipeline), det, bitmap.width, bitmap.height), pipeline.cacheMax);
     }
-    // canvas pages: stash the original bytes (the canvas will show our drawing
-    // after this — re-translate must read the original, not our overlay)
+    // canvas pages: stash the original bytes (re-translate must read the original, not our overlay)
     const origBytes = ref.kind === 'canvas' ? (bytes ?? existing?.origBytes) : undefined;
     return { srcUrl, bitmap, det, hash, cacheMiss, prepMs: prepMs(), origBytes };
 }
 
-// Paint translated regions onto a canvas (inpaint source text, draw the
-// translation per box) — shared by the solo path and the seam path (which
-// paints the whole stitch, then slices). Returns the per-region layouts.
-// `patches` (AI cleanup output) replace the built-in fill when present.
+// Paint translated regions onto a canvas (inpaint source text, draw the translation per
+// box) — shared by the solo path and the seam path (which paints the whole stitch, then
+// slices). `patches` (AI cleanup output) replace the built-in fill when present.
 export interface PaintPatch { x1: number; y1: number; x2: number; y2: number; bmp: ImageBitmap }
 
 export function paintRegions(
@@ -290,24 +256,18 @@ export function paintRegions(
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
     if (dupIdx.size && isDebug()) console.log('[mt] contained-duplicate boxes kept as-is:', [...dupIdx].join(','));
     if (patches?.length) {
-        // AI cleanup ran on the original page: the patches already carry the
-        // erased background (only erase-box crops change), so paint them
-        // instead of the built-in fill. Drawn into the full rect (not 1:1):
-        // cloud-merged patches are computed on the capped upload and come
-        // back smaller than the full-res window — drawImage scales them up;
-        // local/full-res patches have png dims == rect dims, so this is a
-        // no-op for them.
+        // AI cleanup ran on the original page: paint the patches instead of the built-in fill.
+        // Drawn into the full rect (not 1:1): capped-upload cloud patches come back smaller —
+        // drawImage scales them up; full-res patches make this a no-op.
         for (const p of patches) ctx.drawImage(p.bmp, p.x1, p.y1, p.x2 - p.x1, p.y2 - p.y1);
     } else {
         inpaint(canvas, { ...det, boxes: boxesToErase, keepBoxes });
     }
 
-    // chosen layout per rendered region — diagnoses shrink/clip issues live
+    // chosen layout per rendered region (diagnoses shrink/clip issues)
     const layouts: { i: number; f: number; n: number }[] = [];
-    // divider-clipped layout boxes (see effBoxesForAreas): boxes whose areas
-    // overlap a disjoint neighbor each keep their side of the midline, so
-    // kissing bubbles no longer paint into each other. Erase above already ran
-    // on the ORIGINAL boxes — source ink is erased wherever it is.
+    // divider-clipped layout boxes (see effBoxesForAreas): boxes overlapping a disjoint
+    // neighbor each keep their side of the midline. Erase above ran on ORIGINAL boxes.
     const textFor = (k: number) => {
         const out = outputs.find(o => o.index === k);
         return out?.translation && out.translation !== 'keep' ? out.translation : '';
@@ -323,20 +283,19 @@ export function paintRegions(
             ...(placed.grown ? { g: 1 as const } : {}), // dark-caption area grew past the box cap to hold the text
             ...(isDebug() && placed.color ? { c: placed.color } : null),
             ...(isDebug() && placed.block ? { ly: placed.block.map(Math.round) } : null),
-            // font ceiling from the measured source pitch (debug): f at sc
-            // with no o = the cap is doing its job, f far below sc = the area
+            // debug sc = source-pitch font ceiling (f at sc with no o = the cap holds)
             ...(isDebug() ? { sc: sizeCapFrom(frame, box, boxIsVertical(box)) ?? undefined } : null),
         });
     });
     return layouts;
 }
 
-// VLM-reported extra regions (hand-written signs the detector missed):
-// same shared call as paintRegions — erase with box fill, render there.
+// VLM-reported extra regions (hand-written signs the detector missed): erase with box
+// fill, render there — same shared call as paintRegions.
 export function paintExtras(canvas: OffscreenCanvas, frame: ImageData, det: DetectResult, extras: ExtraRegion[]): void {
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-    // skip any overlapping an existing box (redundant/duplicate reports) and
-    // 'keep'-style noise, then erase with box fill and render the translation
+    // skip boxes overlapping an existing report or 'keep'-style noise, then erase with box
+    // fill and render the translation
     const iou = (a: DetBox, b: { x1: number; y1: number; x2: number; y2: number }) => {
         const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
         const x2 = Math.min(a.x2, b.x2), y2 = Math.min(a.y2, b.y2);
@@ -344,11 +303,9 @@ export function paintExtras(canvas: OffscreenCanvas, frame: ImageData, det: Dete
         const ua = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
         return ua > 0 ? inter / ua : 0;
     };
-    // extras must sit on a LIGHT area (hand-written signs, notes are on light
-    // paper). Dark areas are coordinate errors or bubble art — rendering there
-    // paints dark boxes over art. Busyness (std) is fine: handwritten strokes
-    // are dark-on-light by nature. inpaintBoxRegion's ink-density/dark-bg
-    // guards make the final call on what's really a sign.
+    // extras must sit on a LIGHT area (hand-written signs are dark-on-light by nature).
+    // Dark areas are coordinate errors or bubble art — rendering there paints over art.
+    // inpaintBoxRegion's ink-density/dark-bg guards make the final call.
     const boxIsSignable = (b: { x1: number; y1: number; x2: number; y2: number }): boolean => {
         const { width: W, data } = frame;
         let lum = 0, n = 0;
@@ -372,10 +329,8 @@ export function paintExtras(canvas: OffscreenCanvas, frame: ImageData, det: Dete
         if (usedExtras.some(b => iou(b, ex) > 0.3)) continue; // duplicate/overlapping report
         if (!boxIsSignable(ex)) continue;
         if (extraCount >= 4) break; // ponytail: cap at 4 — extras are best-effort
-        // erase returns WHERE the ink actually was — render the translation
-        // there (VLM coords are approximate; ink pixels are ground truth).
-        // Expand the scan 60% every side: reported boxes routinely miss the
-        // ink by 25-45% (observed on p4 handwritten cards).
+        // erase returns WHERE the ink actually was — render there (VLM coords are approximate;
+        // ink pixels are ground truth). Scan expanded 60%: reported boxes routinely miss the ink.
         const ex0 = Math.max(0, ex.x1 - (ex.x2 - ex.x1) * 0.6);
         const ey0 = Math.max(0, ex.y1 - (ex.y2 - ex.y1) * 0.6);
         const ex1 = ex.x2 + (ex.x2 - ex.x1) * 0.6;

@@ -1,6 +1,4 @@
-// Options page: LLM settings + quality presets + advanced tuning + characters.
-// Section logic lives in model.ts / pipeline-section.ts / panels.ts; this file
-// owns load order and final wiring.
+// Options page: settings + presets + advanced tuning + characters. Sections live in siblings; this owns load order and wiring.
 
 import { DEFAULT_SETTINGS, type LLMSettings } from '../llm/adapters';
 import type { PipelineSettings } from '../llm/pipeline-settings';

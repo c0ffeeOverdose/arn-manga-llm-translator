@@ -4,7 +4,6 @@ import { context, saveContext, loadContext, mtPal } from './state';
 
 let charsPanel: HTMLDivElement | null = null;
 
-// drop one override entry (rename/gender state the user no longer wants)
 async function dropOverride(desc: string): Promise<void> {
     const stored = await chrome.storage.local.get('mtCharOverrides');
     const all = { ...((stored.mtCharOverrides ?? {}) as Record<string, { gender: 'M' | 'F' | '?'; name?: string }>) };
@@ -23,10 +22,7 @@ export async function renderCharsPanel(): Promise<void> {
         box.innerHTML = '<div style="color:#888;padding:6px">No characters yet — translate some pages first.</div>';
     }
     for (const c of context.characters) {
-        // two-line row: the panel is only 320px wide — four controls on one line
-        // squeezed the description to nothing and the name field to 84px. Name
-        // input gets the full line; the learned description sits muted below it
-        // (ellipsis + title, never wrapping).
+        // two-line row: the panel is only 320px wide, so the name input gets its own line.
         const row = document.createElement('div');
         row.style.cssText = `padding:7px 0;border-bottom:1px solid ${mtPal.border}`;
         const top = document.createElement('div');
@@ -49,8 +45,7 @@ export async function renderCharsPanel(): Promise<void> {
             sel.append(o);
         }
         sel.value = overrides[c.desc]?.gender ?? c.gender;
-        // one saver for name + gender: gender-only saves used to clobber a
-        // stored name by writing {gender} bare — never write without merging
+        // one saver for name + gender — never write without merging (clobbers the stored name).
         const saveRow = async () => {
             const stored = await chrome.storage.local.get('mtCharOverrides');
             const all = { ...((stored.mtCharOverrides ?? {}) as Record<string, { gender: 'M' | 'F' | '?'; name?: string }>) };
@@ -83,7 +78,7 @@ export async function renderCharsPanel(): Promise<void> {
         row.append(top, sub);
         box.append(row);
     }
-    // manual character entry (everything above is learned from pages)
+    // manual character entry.
     const addRow = document.createElement('div');
     addRow.style.cssText = 'display:flex;gap:6px;margin-top:8px';
     const inp = document.createElement('input');
@@ -117,9 +112,8 @@ export async function renderCharsPanel(): Promise<void> {
     if (clr) clr.style.display = context.characters.length ? '' : 'none';
 }
 
-// clear all: this book only (the global wipe stays in options). Overrides
-// for the cleared descs go too — applyOverrides would resurrect them in
-// later prompts otherwise.
+// clear all: this book only (the global wipe stays in options). Cleared descs'
+// overrides go too — applyOverrides would resurrect them otherwise.
 async function clearAllChars(): Promise<void> {
     const descs = context.characters.map(x => x.desc);
     context.characters = [];
@@ -160,7 +154,6 @@ export function charsPanelOpen(): boolean {
     return charsPanel ? charsPanel.style.display !== 'none' : false;
 }
 
-// theme application repaints the open panel with the new palette
 export function onThemeChanged(): void {
     if (charsPanel && charsPanel.style.display !== 'none') renderCharsPanel();
 }

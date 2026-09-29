@@ -1,11 +1,7 @@
 // Seam chains: one scene sliced into consecutive same-width images.
-// A cut bubble (gate: seamLinked in page-cache) translates as fragments when
-// each slice runs solo. The owner job stitches the chain into ONE logical
-// page — detect/OCR/LLM once on the stitch, paint whole, slice write-back —
-// so the sentence flows across the cut like the original. Serial-only: pump
-// passes allowSeam=false for parallel batches (no shared book to order, and
-// concurrent owners could interleave slice writes). Any failure → null → the
-// caller falls back to the solo path; members render solo as if seamless.
+// The owner job stitches the chain into ONE logical page — detect/OCR/LLM once
+// on the stitch, paint whole, slice write-back. Serial-only; any failure →
+// null → the caller falls back to the solo path.
 
 import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, seamLinked, seamInkLinked, seamTruncated, boxIoU, bandSpan, seamRowsMatch } from './page-cache';
 import { ensureFont, renderTuning, RENDER_GEN } from './render';
@@ -24,9 +20,8 @@ export const SEAM_MAX = 4; // owner + 3 — bounds the stitch canvas + pulled jo
 
 export interface Job { ref: PageRef; force: boolean; prep: Promise<Prep | null>; key: string; auto: boolean }
 
-// edge-row pixels for the continuity guard: bottom row of the upper bitmap,
-// top row of the lower one. Crop + readback, ms-scale. Null on any failure
-// (caller treats null as reject — fail closed).
+// edge-row pixels for the continuity guard. Null on any failure (caller treats
+// null as reject — fail closed).
 async function seamEdgeRow(bmp: ImageBitmap, edge: 'bottom' | 'top'): Promise<Uint8ClampedArray | null> {
     try {
         const c = new OffscreenCanvas(bmp.width, 1);
@@ -43,10 +38,8 @@ async function seamPixels(u: ImageBitmap, l: ImageBitmap): Promise<boolean> {
 }
 
 // Band verification (suspicion second stage): stack the upper page's bottom
-// quarter over the lower page's top quarter and detect on the band. The band
-// shows CTD the whole local bubble where slices show fragments, so a box
-// spanning the band seam confirms the cut near-deterministically. Small image,
-// ~1s, no LLM — a wrong suspicion costs only that.
+// quarter over the lower page's top quarter and detect on the band. A box
+// spanning the seam confirms the cut. Small image, ~1s, no LLM.
 async function bandConfirms(u: SeamMember, l: SeamMember): Promise<boolean> {
     try {
         const Bu = Math.max(64, Math.floor(u.bitmap.height * 0.25));
@@ -62,14 +55,12 @@ async function bandConfirms(u: SeamMember, l: SeamMember): Promise<boolean> {
 }
 
 export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promise<PageState | null> {
-    // trace helper: every bailout logs its reason (debug-gated — the gate has
-    // three silent stages and blind tuning wastes whole E2E runs)
+    // trace helper: every bailout logs its reason (debug-gated).
     const trace = (why: string, extra?: object) => {
         if (isDebug()) console.log('[mt] seam?', JSON.stringify({ page: prep.bitmap.width + 'x' + prep.bitmap.height, why, ...(extra ?? {}) }));
     };
     // prune helper (declared here so the catch below can also reach it):
-    // pulled members outside the final chain return to the pool (autoTick
-    // picks them up in-window later) instead of soloing immediately.
+    // pulled members outside the final chain return to the pool.
     const pulled: PageRef[] = [];
     const chainKeys = new Set<string>();
     const prune = () => {
@@ -80,16 +71,15 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
     };
     try {
         // contiguous img run around the job with matching width (±2px); canvases
-        // and undecodable imgs break the run (solo fallback this round — autoTick
-        // retries once decoded). Key match, not element: the reader may have
-        // swapped elements since enqueue (same src = same page).
+        // and undecodable imgs break the run. Key match, not element: the reader
+        // may have swapped elements since enqueue.
         const refs = getPages();
         const at = refs.findIndex(r => pageKeyOf(r) === job.key);
         if (at === -1) { trace('ref-gone'); return null; }
         const w0 = job.ref.kind === 'img' ? job.ref.el.naturalWidth : 0;
         if (!w0) { trace('undecoded'); return null; }
-        // balanced expansion (up AND down, 3 each — up-first starved file 6 out
-        // of file 5's run); the chain cap below re-trims around the owner
+        // balanced expansion (up AND down, 3 each); the chain cap below re-trims
+        // around the owner.
         const run: PageRef[] = [refs[at]];
         for (let i = at - 1, n = 0; i >= 0 && n < SEAM_MAX - 1; i--, n++) {
             const r = refs[i];
@@ -103,16 +93,12 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         }
         if (run.length < 2) { trace('lone-width', { run: run.length }); return null; }
         // resolve pixels + solo boxes per member: queued/active preps first (no
-        // re-detect), rendered states next (backward case: the old slice gets
-        // overwritten whole), auto-pulled enqueue last (manual never expands
-        // scope — no surprise LLM spend). Unresolvable members become HOLES that
-        // split the run (a missing neighbor vetoes nothing — the owner's
-        // contiguous block still links); a block of <2 means solo.
+        // re-detect), rendered states next, auto-pulled enqueue last (manual never
+        // expands scope — no surprise LLM spend). Unresolvable members become
+        // HOLES that split the run; a block of <2 means solo.
         const members: (SeamMember | null)[] = [];
-        // concurrent resolution (was sequential awaits — 6 members × ~10s
-        // fetch+detect stalled the owner for a minute): pulls enqueue upfront so
-        // all member preps overlap, then one join. Order kept via placeholders.
-        // (pulled/chainKeys/prune live at trySeam top for catch visibility.)
+        // concurrent resolution: pulls enqueue upfront so all member preps overlap,
+        // then one join. Order kept via placeholders.
         const pend: Promise<{ idx: number; m: SeamMember | null }>[] = [];
         for (const ref of run) {
             const key = pageKeyOf(ref);
@@ -136,16 +122,12 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     }
                 } catch (e) { trace('member-prep-fail', { member: key.slice(-16), err: String((e as Error)?.message ?? e).slice(0, 80) }); mp = null; }
                 const st = pages.get(key);
-                // NOTE: cached member preps are FIRST-class stitch inputs (fresh pixels
-                // in bitmap, valid page-local det for the gate) — excluding them holed
-                // every warm-cache run. Their own jobs twin-skip later (owner registers
-                // states first), so no double render.
+                // NOTE: cached member preps are FIRST-class stitch inputs — excluding
+                // them holed every warm-cache run.
                 if (mp) {
                     return { idx, m: { ref, key, srcUrl: mp.srcUrl, bitmap: mp.bitmap, hash: mp.hash, det: mp.det } };
                 } else if (st) {
-                    // rendered before (solo fragments or cache hit): re-derive pixels and
-                    // re-detect on the stitch — the detector sees the whole bubble, the
-                    // old slice gets overwritten whole
+                    // rendered before: re-derive pixels and re-detect on the stitch.
                     try {
                         const { bitmap } = await fetchBitmap(st.orig);
                         return { idx, m: { ref, key, srcUrl: st.orig, bitmap, hash: pageHashFromBitmap(bitmap), det: st.det ?? prep.det } };
@@ -164,14 +146,12 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         const block = members.slice(blo, bhi + 1) as SeamMember[];
         if (block.length < 2) { trace('lone-block'); prune(); return null; }
         // gate every adjacent pair on solo boxes; shrink to the maximal linked
-        // sub-run containing the job (a mid-run miss = two independent scenes)
+        // sub-run containing the job.
         const linked = [true];
         for (let i = 1; i < block.length; i++) {
             const u = block[i - 1], l = block[i];
-            // box gate first (cheap); ink gate catches cut text with zero boxes
-            // (CTD drops truncated edge fragments — the mask still flags them);
-            // truncation gate catches unboxed glyph bottoms running into the cut
-            // single-sided (the stitch decides truth either way)
+            // box gate first (cheap); ink gate catches cut text with zero boxes;
+            // truncation gate catches unboxed glyph bottoms running into the cut.
             linked.push(
                 seamLinked(u.det.boxes, u.bitmap.height, l.det.boxes, l.bitmap.height) ||
                 seamInkLinked(u.det.mask, l.det.mask) ||
@@ -180,8 +160,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             );
         }
         // shrink + cap around the owner (maximal linked sub-run; ties and excess
-        // trim the end farther from the owner, reading flows down). Never drops
-        // the owner: pop runs only when the bottom end is strictly farther.
+        // trim the end farther from the owner). Never drops the owner.
         const shrink = (): SeamMember[] => {
             let a = block.findIndex(m => m.key === job.key);
             let b = a;
@@ -199,9 +178,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         let chain = shrink();
         if (chain.length < 2) {
             // second stage: single-sided suspicion — a WIDE box near either edge
-            // (the other side may be CTD-blind) + band verification. Wide-only
-            // keeps small edge labels out; a wrong suspicion costs one ~1s band
-            // detect, nothing else. Local-only: cloud skips the extra POST.
+            // + band verification. Wide-only keeps small edge labels out.
+            // Local-only: cloud skips the extra POST.
             if (pipeline.inferEngine !== 'cloud') {
                 for (let i = 1; i < block.length; i++) {
                     if (linked[i]) continue;
@@ -227,8 +205,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             return null;
         }
         // pixel-continuity: every remaining pair must continue row-exact (kills
-        // wrong-pair stitches from lazy-load DOM gaps regardless of filenames —
-        // live: files 8+10 linked across an unloaded 9). ms-scale, no LLM.
+        // wrong-pair stitches from lazy-load DOM gaps). ms-scale, no LLM.
         for (let i = 1; i < chain.length; i++) {
             const u = chain[i - 1], l = chain[i];
             const bi = block.findIndex(m => m.key === l.key);
@@ -251,13 +228,12 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         for (const m of chain) chainKeys.add(m.key);
         prune();
         // rebuild the keep-set from the FINAL chain (pixel-rejected members
-        // return to the pool with everything else unlinked)
+        // return to the pool with everything else unlinked).
         chainKeys.clear();
         for (const m of chain) chainKeys.add(m.key);
         prune();
         trace('linked', { n: chain.length, members: chain.map(m => m.srcUrl.slice(-16)) });
-        // stitch: exact concatenation (slices are cut, not overlapped — proven
-        // pixel-identical rows at the seam, residual = independent webp ringing)
+        // stitch: exact concatenation (slices are cut, not overlapped).
         onStatus(`Stitching ${chain.length} pages…`);
         const W = Math.max(...chain.map(m => m.bitmap.width));
         const H = chain.reduce((n, m) => n + m.bitmap.height, 0);
@@ -269,12 +245,9 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         const stitchBmp = await createImageBitmap(stitch);
         const det = await detectPage(stitchBmp, onStatus);
         // safety net: stitch context can drop a marginal edge line the solo pass
-        // caught (live: "BLOOD...!" scored 0.51 solo, vanished on the stitch).
-        // Re-add solo boxes the stitch missed — EXCEPT fragments of a bubble the
-        // stitch already found whole (IoU≥0.3, or >50% inside a stitch box:
-        // repainting those double-paints Thai-on-Thai in the overlap zone).
-        // Added BEFORE ordering, so panels/banding/cloud-texts treat them
-        // uniformly (cloud appended texts ride as '' — the server never saw them).
+        // caught. Re-add solo boxes the stitch missed — EXCEPT fragments of a
+        // bubble the stitch already found whole (IoU≥0.3, or >50% inside a
+        // stitch box: repainting those double-paints in the overlap zone).
         chain.forEach((m, mi) => {
             for (const b of m.det.boxes) {
                 const sb: DetBox = { ...b, y1: b.y1 + y0[mi], y2: b.y2 + y0[mi] };
@@ -295,15 +268,14 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         await orderDetection(det, stitchBmp);
         if (det.mask.data.byteLength !== W * H) { prune(); return null; } // slice math needs row-major W×H
         // rewind one book for the whole chain (members rendered solo before get
-        // their fragment contribution rewound, like the solo twin path)
+        // their fragment contribution rewound).
         if (shareContext) {
             const olds = chain.map(m => pages.get(m.key)).filter((s): s is PageState => !!s);
             if (olds.length) await rewindContextBefore(...olds);
             for (const o of olds) if (o.hash) bookDrop(o.hash); // rebuilt book excludes them — refold below re-registers
         }
         // pre-chain snapshot for every member state — a later re-translate of
-        // any slice restores this instead of replaying states it may not have
-        // (load first: the context is lazy and translateRegions folds later)
+        // any slice restores this instead of replaying states it may not have.
         await loadContext();
         const bookBefore = context.characters;
         const pairsBefore = context.pairs;
@@ -332,8 +304,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         // entry (revisit = solo cache hits, no stitch needed), own write-back.
         // A box SPANNING the seam belongs to its center member ONLY, clipped to
         // that range — painting the whole translation on both halves duplicates
-        // it on revisit (live-proven). The other half keeps its art (plus any
-        // safety-net line of its own); the owner stitch render stays perfect.
+        // it on revisit.
         let top: PageState | null = null;
         for (let i = 0; i < chain.length; i++) {
             const m = chain[i];
@@ -376,7 +347,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 pairsBefore,
                 hash: m.hash,
             };
-            // blob-origin reader: extension-owned original copy per member (see ownOriginalUrl)
+            // blob-origin reader: extension-owned original copy per member (see ownOriginalUrl).
             if (ownCopyNeeded(m.srcUrl, m.bitmap.width, m.bitmap.height)) {
                 state.origOwn = await ownOriginalUrl(m.bitmap);
                 if (isDebug() && state.origOwn) console.log('[mt] orig copy (seam)', JSON.stringify({ src: m.srcUrl.slice(-14) }));
@@ -423,8 +394,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         }
         return top;
     } catch (e) {
-        // no chain was committed (or it was partial — members re-queue cleanly):
-        // release every pull so nothing solo-translates-and-pulls-further
+        // no chain was committed (or it was partial — members re-queue cleanly).
         chainKeys.clear();
         try { prune(); } catch { /* prune is best-effort */ }
         console.warn('[mt] seam failed, solo fallback:', (e as Error)?.message ?? e);

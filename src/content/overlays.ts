@@ -1,11 +1,5 @@
-// Overlay sweeper: re-apply translated/original src to every loaded page
-// element. Rendering sets src on the element captured at enqueue time, but
-// the paged reader can swap/replace elements while a job sits in the queue —
-// the old code drew into a dead element (console says Done, screen unchanged).
-// A periodic sweep also re-applies overlays if the reader resets src itself.
-// ponytail: polling sweep (1s) — MutationObserver on the reader's DOM would
-// be event-driven but fragile against its lazy-load churn; this is cheap
-// (a handful of imgs) and self-healing.
+// Overlay sweeper: re-apply translated/original src to every loaded page element.
+// The reader can swap elements mid-queue — poll every 1s (cheap, self-healing).
 
 import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
 import { refKey, getPages, readPage, repaintByHash, healImgBinding, writePage } from './page-io';
@@ -18,11 +12,8 @@ import { sweepArrivable, sweepCommitted } from './sweep';
 import { isDebug } from '../debug';
 
 export function applyOverlays(): void {
-    // SPA navigation watch: full loads reboot the script (queue dies with it),
-    // but same-tab SPA moves keep the queue + chapter loop alive — a story
-    // change must not inherit the old run (it would queue story B's pages
-    // into story A's chapter run and fold them into its book). Page-turns
-    // share the normalized key, so 1→2→3 click-through keeps working.
+    // SPA navigation watch: an SPA story change must not inherit the old run's
+    // queue/book — page-turns share the normalized key, so click-through still works.
     if (chapterKey() !== contextChapter) {
         clearQueue();
         resetContextIfNewChapter();
@@ -32,29 +23,21 @@ export function applyOverlays(): void {
         const keyed = pages.get(refKey(ref));
         const st = keyed ?? (ref.kind === 'img' ? elStates.get(ref.el) : undefined);
         if (!st) {
-            // fast repaint lane (back-nav onto known content under a fresh URL) —
-            // first-time pages miss the index and stay on the queue path
             if (ref.kind === 'img') void repaintByHash(ref.el);
             // arrival paint: a committed-but-unpainted page the user is looking
-            // at (sweep commit while it wasn't loaded, fresh doc, auto off) —
-            // IDB hit paints with no queue and no LLM; miss stays quiet.
+            // at — IDB hit paints with no queue and no LLM; miss stays quiet.
             void arrivalPaint(ref);
             continue;
         }
-        // bound element showing an unknown URL (fresh blob the map never saw):
-        // verify by content hash, never paint blind (recycled nodes lie)
+        // bound element showing an unknown URL: verify by content hash, never paint blind.
         if (!keyed && ref.kind === 'img') { void healImgBinding(ref.el, st); continue; }
         writePage(ref, st); // idempotent — heals reader redraws underneath
     }
 }
 
 // arrival paint, bounded: visible + loaded + stateless + jobless refs only,
-// one in flight per element. A miss is dims-qualified (placeholder→full swap
-// re-arms) and expires after a minute (transient read/IDB hiccups must not
-// poison a src forever — the old permanent mark needed one manual press to
-// unstick). renderPage folds iff !bookHas — its own guard, same rule as every
-// other path (a never-folded entry folds here, an already-folded one paints
-// only). Cross-module calls stay in function bodies (queue↔sweep convention).
+// one in flight per element. A miss is dims-qualified and expires after a minute.
+// renderPage folds iff !bookHas — its own guard, same rule as every other path.
 const ARRIVAL_RETRY_MS = 60000;
 const ARRIVAL_GATE_MS = 5000; // gated pages (no auto, uncommitted): recheck cheaply, never hot-loop the fetch
 const arrivalMiss = new WeakMap<Element, { src: string; dims: string; at: number }>();
@@ -67,12 +50,8 @@ function arrivalStuck(el: Element, src: string, dims: string): boolean {
 async function arrivalPaint(ref: PageRef): Promise<void> {
     const el = ref.el;
     // explicit intent only: a reopened page shows originals until the user
-    // presses Translate chapter / enables auto — silent repainting of stale
-    // cache on arrival reads as haunted (user-verdict, 2026-09-13). The one
-    // exception is this session's own sweep commits: the sweep press covers
-    // the chapter, so arrivals paint those with no auto (checked by hash
-    // below — the cheap pre-gate here just avoids fetching when neither auto
-    // nor any session commit exists).
+    // presses Translate chapter / enables auto. This session's own sweep
+    // commits are the exception (checked by hash below).
     if ((!autoOn() && !sweepArrivable()) || arrivalBusy.has(el) || document.hidden) return;
     let dims = '';
     if (ref.kind === 'img') {
@@ -94,18 +73,14 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         const hash = pageHashFromBitmap(bitmap);
         const hit = pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined;
         const det = hit ? detFromCacheEntry(hit, bitmap.width, bitmap.height) : null;
-        // permission: auto covers everything; otherwise only this session's
-        // sweep commits (stale cache from previous sessions stays blank until
-        // press/auto — never miss-mark a gated page, just come back later)
+        // permission: auto covers everything; otherwise only this session's sweep commits.
         if (!det || !hit || stateFor(ref)) { arrivalMiss.set(el, { src, dims, at: Date.now() }); return; }
         if (!autoOn() && !sweepCommitted(hash)) { arrivalGate.set(el, Date.now()); return; }
         if (isDebug()) console.log('[mt] arrival paint (cache):', src.slice(-24));
         await renderPage(ref, { srcUrl, bitmap, det, hash, cached: hit,
             origBytes: ref.kind === 'canvas' ? bytes : undefined }, () => {}, false);
-        // first state in this document comes from arrival, not a job — flip
-        // the overlay or writePage keeps showing the original underneath
-        // (jobs flip it at completion; arrival must do its own). An explicit
-        // "Show original" pin wins: paint into memory, display stays.
+        // first state in this document comes from arrival — flip the overlay here
+        // (jobs flip at completion). An explicit "Show original" pin wins.
         if (overlayChoice === 'auto') setOverlayOn(true);
     } catch { /* transient — no miss mark, the minute-retry above re-arms */ }
     finally { arrivalBusy.delete(el); }
