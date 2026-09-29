@@ -2,7 +2,7 @@
 // content script's iframe — this worker owns LLM calls only.
 
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
-import { buildPrompt, parseResponse, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
+import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 
 // content scripts can't touch storage.session by default — open it up.
@@ -111,6 +111,8 @@ function getSessionSalt(): Promise<number> {
 
 interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }
 // the handler owns retry/backoff (rate-limit aware) — helpers just call through.
+// Deliberately 6 params: OCR must NOT opt into retryEmpty (it has its own
+// per-region fallback and an explicit zero-text gate), so the knob is not exposed here.
 type LlmCaller = (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }>;
 // transcribe calls send NO output cap: the cap includes reasoning tokens on
 // reasoning models, and a drifting generation is bounded by the adapter default.
@@ -527,24 +529,59 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             // LLM call with strategic retry: 5xx/network get backoff retries;
             // auth/quota errors fail fast — retrying can't fix them; a 429 is
             // refused locally by the adapter's breaker until its window passes.
-            const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }> => {
+            // retryEmpty: a provider can return a 200 with no content (empty parse) — a
+            // transient flake, not a real answer. Retried once HERE, where the caller's
+            // alternative is an identical full-page call that re-uploads every crop.
+            const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number, retryEmpty = false): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }> => {
                 let calls = 0;
                 let ms = 0;
                 let tempDropped = false;
                 let thinkingDropped = false;
-                for (let attempt = 0; ; attempt++) {
+                let emptyRetried = false;
+                // TEMP TRACE: identifies which leg (r1/r2/r3) is slow/hanging in the field.
+                const traceTag = `r${retryEmpty ? '1+' : ''}${msg.regions.length}reg${imgs?.length ? `/${imgs.length}img` : ''}`;
+                const tCall = Date.now();
+                console.log(`[mt:trace] callWithRetry START ${traceTag}`);
+                // the discarded empty attempt still billed tokens — sum, never drop.
+                // Stays undefined when the provider reports no usage at all, so the
+                // caller's `usage.inTok != null` gate keeps its old meaning.
+                let usage: LlmUsage | undefined;
+                const addUsage = (u?: LlmUsage): void => {
+                    if (!u || (u.inTok == null && u.outTok == null && u.cachedInTok == null)) return;
+                    usage = {
+                        inTok: (usage?.inTok ?? 0) + (u.inTok ?? 0),
+                        outTok: (usage?.outTok ?? 0) + (u.outTok ?? 0),
+                        cachedInTok: (usage?.cachedInTok ?? 0) + (u.cachedInTok ?? 0),
+                    };
+                };
+                // error-attempt counter is separate from the loop var: an empty retry
+                // must not advance the network backoff ladder (1000ms → 4000ms)
+                let errAttempt = 0;
+                for (;;) {
                     calls++;
+                    const tAttempt = Date.now();
+                    console.log(`[mt:trace] ${traceTag} attempt#${calls} send (${Date.now() - tCall}ms in)`);
                     try {
                         const r = await callLLM(s, p, imgs, thinking ?? pipeline.thinkingLevel, session, temperature, maxTokens);
                         ms += r.ms;
+                        addUsage(r.usage);
                         if (r.tempDropped) tempDropped = true;
                         if (r.thinkingDropped) thinkingDropped = true;
-                        return { text: r.text, usage: r.usage, calls, ms, tempDropped, thinkingDropped };
+                        console.log(`[mt:trace] ${traceTag} attempt#${calls} OK in ${Date.now() - tAttempt}ms, text.len=${r.text.trim().length}`);
+                        if (retryEmpty && !emptyRetried && !r.text.trim()) {
+                            emptyRetried = true;
+                            console.warn(`[mt:trace] ${traceTag} EMPTY response (200, no content) — retrying once`);
+                            continue;
+                        }
+                        console.log(`[mt:trace] callWithRetry DONE ${traceTag} total=${Date.now() - tCall}ms calls=${calls}`);
+                        return { text: r.text, usage, calls, ms, tempDropped, thinkingDropped };
                     } catch (e) {
                         const m = toMtError(e);
                         const retryable = m.kind === 'server' || m.kind === 'network';
-                        if (!retryable || attempt >= 2) throw m;
-                        await new Promise(r => setTimeout(r, attempt === 0 ? 1000 : 4000));
+                        console.warn(`[mt:trace] ${traceTag} attempt#${calls} FAIL in ${Date.now() - tAttempt}ms kind=${m.kind} retryable=${retryable}: ${m.message.slice(0, 120)}`);
+                        if (!retryable || errAttempt >= 2) throw m;
+                        await new Promise(r => setTimeout(r, errAttempt === 0 ? 1000 : 4000));
+                        errAttempt++;
                     }
                 }
             };
@@ -662,7 +699,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             });
             if (dbg) console.log('[mt:bg] llm prompt', prompt);
 
-            const r1 = await callWithRetry(settings, prompt, vision2 ? msg.imagesB64 : undefined, undefined, pipeline.temperature);
+            const r1 = await callWithRetry(settings, prompt, vision2 ? msg.imagesB64 : undefined, undefined, pipeline.temperature, undefined, true);
             const raw = r1.text;
             if (split) {
                 usage.inTok = (usage.inTok ?? 0) + (r1.usage?.inTok ?? 0);
@@ -697,7 +734,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 const retryImgs = vision2 && msg.imagesB64
                     ? [...(msg.textOnly ? [] : [msg.imagesB64[0]]), ...missing.map(r => msg.imagesB64![r.index]).filter(Boolean)]
                     : undefined;
-                const r2 = await callWithRetry(settings, retryPrompt, retryImgs, undefined, pipeline.temperature);
+                const r2 = await callWithRetry(settings, retryPrompt, retryImgs, undefined, pipeline.temperature, undefined, true);
                 rawAll += '\n--- retry (missing regions) ---\n' + r2.text;
                 llmCalls += r2.calls;
                 llmMs += r2.ms;
@@ -721,7 +758,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     maxPairs: pipeline.contextPairs,
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
-                const r3 = await callWithRetry(settings, fullPrompt, vision2 ? msg.imagesB64 : undefined, undefined, pipeline.temperature);
+                const r3 = await callWithRetry(settings, fullPrompt, vision2 ? msg.imagesB64 : undefined, undefined, pipeline.temperature, undefined, true);
                 rawAll += '\n--- retry (no regions parsed) ---\n' + r3.text;
                 llmCalls += r3.calls;
                 llmMs += r3.ms;
@@ -729,11 +766,22 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 usage.outTok = (usage.outTok ?? 0) + (r3.usage?.outTok ?? 0);
                 usage.cachedInTok = (usage.cachedInTok ?? 0) + (r3.usage?.cachedInTok ?? 0);
                 const fullParsed = parseResponse(r3.text, msg.regions.length);
-                outputs = fullParsed.regions;
+                // merge rather than replace: r1/r2 may have returned usable regions the
+                // full retry happened to drop (a model that answers the whole page with
+                // fewer tags than it did in pieces). First occurrence wins per index.
+                outputs = mergeRegions(outputs, fullParsed.regions);
                 retryMentions = [...retryMentions, ...fullParsed.mentions];
                 if (!outputs.length) {
                     throw new MtError('parse', 'No usable text regions parsed (the model ignored the output format)',
                         'Retry the page, or switch to a model with better instruction-following');
+                }
+                // PARTIAL ACCEPT: some regions came back and the rest did not. Failing
+                // the whole page would discard paid, correct translations and leave every
+                // box untranslated (the "regions kept as-is: 4..16" symptom). The regions
+                // with no answer are simply absent from `outputs`; content keeps their
+                // source text as-is (see withSources / missingIdx), so the page renders.
+                if (outputs.length < regions2.length) {
+                    console.warn(`[mt:bg] partial translation accepted: ${outputs.length}/${regions2.length} regions`);
                 }
             }
             const mentions = [...parsed.mentions, ...retryMentions];

@@ -119,8 +119,10 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         bookAdd(hash); // folded above (translateRegions) — arrival must not refold
         if (pipeline.cacheEnabled) {
             // AI cleanup precompute: arrival paints with the model's patches
-            // instead of running it while the user waits (lo-priority ORT).
-            const ai = await warmPatches(bitmap, det, o.outputs);
+            // instead of running it while the user waits (lo-priority ORT). A
+            // missing model must not fail the lookahead page — the sweep path
+            // reports it to the user, background warming stays silent.
+            const ai = await warmPatches(bitmap, det, o.outputs).catch(() => null);
             void cachePut({
                 key,
                 fp,

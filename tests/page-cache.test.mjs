@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -668,13 +668,13 @@ test('parseWarming/warmingFresh: validated trace with a 15-minute life', () => {
   assert.equal(warmingFresh(now + 1000, now), false); // clock skew never counts
 });
 
-test('galleryAllUrls: whole chapter in order + current index (sweep walks from 0)', () => {
+test('galleryAllUrls: whole chapter in order + current index (priority window start)', () => {
   const inner = { media_id: '999001', num_pages: 4, pages: [1, 2, 3, 4].map(n => ({ path: `galleries/999001/${n}.webp` })) };
   const M = JSON.stringify({ body: JSON.stringify(inner) });
   const all = galleryAllUrls(M, 'https://img.gallery.example.org/galleries/999001/2.webp');
   assert.deepEqual(all.urls, [1, 2, 3, 4].map(n => `https://img.gallery.example.org/galleries/999001/${n}.webp`));
   assert.equal(all.index, 1);
-  // unknown anchor still lists everything (index -1 → sweep from page 0)
+  // unknown anchor still lists everything (index -1 → chapter start)
   assert.equal(galleryAllUrls(M, 'https://img.gallery.example.org/galleries/999/1.webp').index, -1);
   // translated blob src must not poison the host (same regression as lookahead)
   assert.deepEqual(galleryAllUrls(M, 'blob:https://x/y').urls, []);
@@ -696,6 +696,38 @@ test('takeOrdered: consecutive run from head only, failures must still buffer', 
   const m3 = new Map([[0, 'a'], [2, 'c']]);
   assert.deepEqual(takeOrdered(m3, 0), { items: ['a'], head: 1 });
   assert.equal(m3.size, 1);
+});
+
+test('priorityIndices: reader page + pages ahead, clamped, unknown anchor falls back to 0', () => {
+  // the reader's page is index 3, 4-page window → 3,4,5,6
+  assert.deepEqual(priorityIndices(10, 3, 4), [3, 4, 5, 6]);
+  // window clamps at the chapter end
+  assert.deepEqual(priorityIndices(5, 4, 3), [4]);
+  assert.deepEqual(priorityIndices(5, 3, 3), [3, 4]);
+  // anchor 0 → current page plus the pages ahead (never behind)
+  assert.deepEqual(priorityIndices(5, 0, 2), [0, 1]);
+  // unknown anchor (-1) → chapter start
+  assert.deepEqual(priorityIndices(5, -1, 2), [0, 1]);
+  // out-of-range anchor → chapter start
+  assert.deepEqual(priorityIndices(5, 9, 2), [0, 1]);
+  // degenerate inputs (empty chapter / zero window) → no priority phase
+  assert.deepEqual(priorityIndices(0, 3, 4), []);
+  assert.deepEqual(priorityIndices(5, 3, 0), []);
+});
+
+test('usableAnchor: parked anchor walks back to the nearest usable page, else -1', () => {
+  // usable pages came from source indices [0, 2, 3, 5]
+  const from = [0, 2, 3, 5];
+  assert.equal(usableAnchor(from, 3), 2); // anchor 3 sits at usable index 2
+  assert.equal(usableAnchor(from, 4), 2); // 4 filtered out → nearest usable before it
+  assert.equal(usableAnchor(from, 2), 1);
+  assert.equal(usableAnchor(from, 0), 0);
+  assert.equal(usableAnchor(from, 9), 3); // out-of-range → last usable at/before
+  // unknown page (-1): no lower index to search → chapter head
+  assert.equal(usableAnchor(from, -1), -1);
+  // nothing usable before the anchor (page 0 parked) → head fallback
+  assert.equal(usableAnchor([2, 3, 5], 1), -1);
+  assert.equal(usableAnchor([], 3), -1);
 });
 
 test('sweepPhase: idle/starting/running/stopping/dead (popup + pill labels)', () => {

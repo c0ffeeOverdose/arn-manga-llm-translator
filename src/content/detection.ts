@@ -654,7 +654,14 @@ function ensureIframe(): Promise<void> {
         waiters.push({ resolve, reject });
         setTimeout(() => {
             const i = waiters.findIndex(w => w.resolve === resolve);
-            if (i >= 0) { waiters.splice(i, 1); reject(new Error('detector iframe timeout')); }
+            if (i < 0) return;
+            waiters.splice(i, 1);
+            // a timed-out iframe is unusable but still in the DOM: leaving it made
+            // every later ensureIframe() short-circuit on the dead element and the
+            // whole session detect-less. Tear it down so the next call rebuilds.
+            if (iframe) { try { iframe.remove(); } catch { /* already gone */ } iframe = null; }
+            ready = false;
+            reject(new Error('detector iframe timeout'));
         }, 30000);
     });
 }

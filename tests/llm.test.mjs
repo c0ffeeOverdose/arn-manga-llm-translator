@@ -19,7 +19,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches, joinTranscription } =
+const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches, joinTranscription } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
@@ -1181,4 +1181,29 @@ test('429: the window is per provider|baseUrl and expires', async (t) => {
     t.mock.timers.reset();
     globalThis.fetch = realFetch;
   }
+});
+
+// ---- mergeRegions: partial-accept across the retry ladder ----
+// Incident: r1 answered 3/14 regions, the missing-region retry and the full-page
+// retry both came back empty/partial, and the old code REPLACED the answer with the
+// last leg's output — discarding paid translations and failing the whole page.
+
+test('mergeRegions: keeps the earlier answer per index, later only fills gaps', () => {
+  const r1 = [{ index: 1, t: 'a' }, { index: 2, t: 'b' }];
+  const r3 = [{ index: 2, t: 'B-replaced?' }, { index: 3, t: 'c' }];
+  assert.deepEqual(mergeRegions(r1, r3), [
+    { index: 1, t: 'a' },
+    { index: 2, t: 'b' }, // first occurrence wins — r1 ran with the full context
+    { index: 3, t: 'c' },
+  ]);
+});
+
+test('mergeRegions: empty later leg preserves the earlier partial answer', () => {
+  const r1 = [{ index: 4 }, { index: 5 }];
+  assert.deepEqual(mergeRegions(r1, []), r1);
+});
+
+test('mergeRegions: output is index-sorted so order/dedup stays stable', () => {
+  const merged = mergeRegions([{ index: 9 }, { index: 2 }], [{ index: 5 }]);
+  assert.deepEqual(merged.map(r => r.index), [2, 5, 9]);
 });

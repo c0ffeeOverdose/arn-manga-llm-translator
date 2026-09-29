@@ -304,6 +304,16 @@ export function parseResponse(text: string, expected: number): ParsedResponse {
     return parseXml(text, expected) ?? { regions: [], extras: [], mentions: [] };
 }
 
+// Merge a retry's regions into an earlier answer, keeping the FIRST occurrence of each
+// index (the earlier leg ran with the full context; the retry answers only what was
+// missing). Sorted by index so downstream order/dedup stays stable. Pure — unit-tested.
+export function mergeRegions<T extends { index: number }>(earlier: T[], later: T[]): T[] {
+    const byIdx = new Map<number, T>();
+    for (const r of earlier) if (!byIdx.has(r.index)) byIdx.set(r.index, r);
+    for (const r of later) if (!byIdx.has(r.index)) byIdx.set(r.index, r);
+    return [...byIdx.values()].sort((a, b) => a.index - b.index);
+}
+
 // Per-region transcribe: concatenate every element in order (models split multi-line regions).
 // Bare-text drift is used over emptying the region; temperature 0 makes it rare.
 const DESCRIBES_IMAGE = /この画像|画像には|画像です|写真です|イラストです|the image (shows|is|depicts)|this (image|picture) (is|shows)|a (photo|picture) of/i;

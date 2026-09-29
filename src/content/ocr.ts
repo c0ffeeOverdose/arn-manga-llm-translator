@@ -9,38 +9,76 @@ import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, INPAINT_PATCH_GEN } from './page-cache';
 import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './render';
-import { erasePlan, computeAiPatches } from './inpaint';
+import { erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
 import { inpaintMode } from '../llm/pipeline-settings';
 
 // Warm-path AI cleanup: compute cleanup patches for a freshly translated page
 // and hand them to the caller's cache entry. Gated on cache-on + local mode;
 // `noDownload` keeps a background warm from starting the 112MB model download.
-// Lo-priority ORT. Failures return null.
+// Lo-priority ORT.
+// `preWarm` is the afterOcr warm (all boxes, no keep) — reused when no keep box
+// overlaps an erase box, so the priority page never waits for a second inpaint.
+// Missing model / no WebGPU throws (callers surface it); anything else returns null.
+export class InpaintUnavailable extends Error {
+    hint: string;
+    constructor(message: string, hint: string) { super(message); this.hint = hint; }
+}
+const INPAINT_HINT = 'Settings → Model → Text cleanup: download the AI model (needs WebGPU), or switch to the built-in fill';
+
+// ---- live translate RPCs (user Stop) ----
+// A translate RPC can sit in the background for the adapter's full 240s timeout.
+// Without an abort handle the sweep's cancel flag could not take effect until that
+// await settled — Stop looked dead for minutes. cancelSweep() calls abortLiveRpcs().
+interface LiveRpc { abort?: () => void }
+const liveRpcs = new Set<LiveRpc>();
+export function abortLiveRpcs(): number {
+    let n = 0;
+    for (const r of [...liveRpcs]) { if (r.abort) { n++; try { r.abort(); } catch { /* already gone */ } } }
+    return n;
+}
+
 export async function warmPatches(
     bitmap: ImageBitmap, det: DetectResult, outputs: RegionOutput[],
+    preWarm?: Promise<AiPatches | null>,
 ): Promise<{ patches: InpaintPatch[]; patchesGen: number } | null> {
     if (!pipeline.cacheEnabled) return null;
     const plan = erasePlan(det, outputs);
     if (!plan.boxesToErase.length) return null;
+    const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
+        a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+    const keepClash = plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)));
+    // warm patches index into det.boxes and cover every box — a keep box inside an
+    // erase window means the warm saw an unclear mask, so it cannot be reused.
+    const reuse = (warm: AiPatches | null): InpaintPatch[] | null => {
+        if (!warm || keepClash) return null;
+        const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
+        const patches = warm.patches.filter(p => idx.has(p.i ?? -1));
+        return patches.length ? patches : null;
+    };
     if (inpaintMode(pipeline) !== 'local') {
         // cloud: the patches were already computed server-side inside the detect
         // roundtrip — filter to the erase plan. Full coverage or nothing (a
         // partial set would strand unerased boxes); null falls back to /v1/inpaint.
-        const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
-            a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
-        if (plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) return null;
-        const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
-        const patches = (det.cloudPatches ?? []).filter(p => idx.has(p.i ?? -1));
-        if (patches.length !== plan.boxesToErase.length) return null;
-        return { patches, patchesGen: INPAINT_PATCH_GEN };
+        if (keepClash) return null;
+        const reuseCloud = reuse({ patches: det.cloudPatches ?? [], windows: 0, ms: 0, maskMs: 0, lockWaitMs: 0, encodeMs: 0 });
+        if (!reuseCloud || reuseCloud.length !== plan.boxesToErase.length) return null;
+        return { patches: reuseCloud, patchesGen: INPAINT_PATCH_GEN };
     }
     try {
+        if (preWarm) {
+            const patches = reuse(await preWarm);
+            if (patches) return { patches, patchesGen: INPAINT_PATCH_GEN };
+        }
         const r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes, { lo: true, noDownload: true });
         if (isDebug()) console.log('[mt] warm patches', JSON.stringify({ erase: plan.boxesToErase.length, patches: r?.patches.length ?? 0 }));
         return r?.patches.length ? { patches: r.patches, patchesGen: INPAINT_PATCH_GEN } : null;
     } catch (e) {
-        if (isDebug()) console.log('[mt] warm patches failed:', String((e as Error)?.message ?? e).slice(0, 140));
+        const msg = String((e as Error)?.message ?? e);
+        // the model is genuinely required and genuinely missing — a silent
+        // fill-down would look like a broken feature, so the caller reports it.
+        if (/not downloaded yet|needs WebGPU|download failed/i.test(msg)) throw new InpaintUnavailable(msg, INPAINT_HINT);
+        if (isDebug()) console.log('[mt] warm patches failed:', msg.slice(0, 140));
         return null;
     }
 }
@@ -534,20 +572,43 @@ export async function translateRegions(
         // suspend-proof channel: an open runtime port pins the background page
         // alive AND its replies always arrive (a pending sendResponse can be
         // dropped when the page suspends). Falls back to plain sendMessage.
+        // The port is registered in `liveRpcs` so a user Stop can disconnect it
+        // immediately — without this a hung LLM call held the page (and the pill)
+        // for its full 240s adapter timeout with no way out.
         const portSend = () => new Promise<unknown>((resolve, reject) => {
             let port: chrome.runtime.Port;
             try { port = chrome.runtime.connect({ name: 'mt-rpc' }); } catch (e) { reject(e); return; }
-            const to = setTimeout(() => { try { port.disconnect(); } catch { /* gone */ } reject(new Error('translate RPC timeout')); }, 260000);
+            const tRpc = Date.now();
+            console.log(`[mt:trace] translateRegions RPC send (regions=${regions.length} vision=${vision} textOnly=${payload.textOnly})`);
+            const stop: LiveRpc = { abort: undefined };
+            let aborted = false;
+            liveRpcs.add(stop);
+            const cleanup = () => { liveRpcs.delete(stop); };
+            const to = setTimeout(() => { cleanup(); try { port.disconnect(); } catch { /* gone */ } console.warn(`[mt:trace] translateRegions RPC TIMEOUT after ${Date.now() - tRpc}ms`); reject(new Error('translate RPC timeout')); }, 260000);
+            stop.abort = () => {
+                aborted = true;
+                clearTimeout(to);
+                cleanup();
+                console.warn(`[mt:trace] translateRegions RPC ABORTED by user after ${Date.now() - tRpc}ms`);
+                try { port.disconnect(); } catch { /* gone */ }
+                reject(new Error('translate aborted by user'));
+            };
             port.onMessage.addListener((r: unknown) => {
                 // interim: the split pipeline's transcribe finished while the translate
                 // call runs — checkpoint the transcripts now (the final reply settles
                 // this promise).
                 const m = r as { type?: string; texts?: string[] };
                 if (m?.type === 'mt:ocr-texts' && Array.isArray(m.texts)) { interimTexts = m.texts; checkpointOcr(m.texts); return; }
-                clearTimeout(to); try { port.disconnect(); } catch { /* gone */ } resolve(r);
+                console.log(`[mt:trace] translateRegions RPC reply in ${Date.now() - tRpc}ms ok=${(r as {ok?:boolean})?.ok}`);
+                clearTimeout(to); cleanup(); try { port.disconnect(); } catch { /* gone */ } resolve(r);
             });
-            port.onDisconnect.addListener(() => { clearTimeout(to); reject(new Error('background disconnected')); });
-            try { port.postMessage(payload); } catch (e) { clearTimeout(to); reject(e); }
+            port.onDisconnect.addListener(() => {
+                clearTimeout(to); cleanup();
+                if (aborted) return; // the abort already rejected with a clearer message
+                console.warn(`[mt:trace] translateRegions RPC DISCONNECTED after ${Date.now() - tRpc}ms`);
+                reject(new Error('background disconnected'));
+            });
+            try { port.postMessage(payload); } catch (e) { clearTimeout(to); cleanup(); reject(e); }
         });
         try {
             try {

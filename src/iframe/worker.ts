@@ -765,25 +765,36 @@ async function runOcr(png: ArrayBuffer, langs: string[]): Promise<string> {
 type InpaintBox = { x1: number; y1: number; x2: number; y2: number };
 const INPAINT_SIZE = 512;
 let inpaintSession: any = null;
+// in-flight create + whether the FIRST requester forbade the download. A warm
+// (background) caller racing a page's own call must not inherit a download it can
+// start itself: the promise is shared, so the strictest flag wins for the whole
+// flight. A later non-warm call re-arms via the next ensure after it settles.
 let inpaintCreating: Promise<void> | null = null;
+let inpaintCreatingNoDownload = false;
 let inpaintNoGpu = false;
 
 async function ensureInpaintSession(noDownload = false): Promise<void> {
     if (inpaintSession) return;
     if (inpaintNoGpu) throw new Error('inpainting needs WebGPU');
-    if (!inpaintCreating) {
-        inpaintCreating = (async () => {
-            const { buf } = await loadModelFile(INPAINT_KEY, `models/${INPAINT_FILE}`, INPAINT_FILE, 'inpaint model (~112MB)', noDownload);
-            try {
-                inpaintSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }));
-            } catch (e) {
-                // EP-level failure is sticky (retrying would only re-pay the upload).
-                // Download errors above are NOT sticky.
-                inpaintNoGpu = true;
-                throw e;
-            }
-        })().finally(() => { inpaintCreating = null; });
+    if (inpaintCreating) {
+        // while a create is in flight, a warm caller must never upgrade it into a
+        // download; if the in-flight one forbade download and the model is absent,
+        // it will reject — surface that rather than silently downloading here.
+        await inpaintCreating;
+        return;
     }
+    inpaintCreatingNoDownload = noDownload;
+    inpaintCreating = (async () => {
+        const { buf } = await loadModelFile(INPAINT_KEY, `models/${INPAINT_FILE}`, INPAINT_FILE, 'inpaint model (~112MB)', inpaintCreatingNoDownload);
+        try {
+            inpaintSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }));
+        } catch (e) {
+            // EP-level failure is sticky (retrying would only re-pay the upload).
+            // Download errors above are NOT sticky.
+            inpaintNoGpu = true;
+            throw e;
+        }
+    })().finally(() => { inpaintCreating = null; inpaintCreatingNoDownload = false; });
     await inpaintCreating;
 }
 

@@ -519,6 +519,53 @@ export function autoBudget(autoQueued: number, ahead: number): number {
     return Math.max(0, ahead - autoQueued);
 }
 
+// Translate-chapter priority window: the page the reader is on plus the next `count-1`
+// pages, clamped to the chapter. anchor < 0 (page unknown) falls back to the chapter start.
+// Pure — unit-tested.
+export function priorityIndices(n: number, anchor: number, count: number): number[] {
+    if (n <= 0 || count <= 0) return [];
+    const start = anchor >= 0 && anchor < n ? anchor : 0;
+    const end = Math.min(n - 1, start + count - 1);
+    const out: number[] = [];
+    for (let i = start; i <= end; i++) out.push(i);
+    return out;
+}
+
+// Index of the reader's page inside the cooldown-filtered sweep array: `usableFrom[u]` is the
+// source index of usable entry u, so a parked anchor walks back to the nearest page that
+// survived. -1 (unknown page, or nothing usable at/before it) → priority window starts at the
+// chapter head. Pure — unit-tested.
+export function usableAnchor(usableFrom: number[], anchor: number): number {
+    for (let k = anchor; k >= 0; k--) {
+        const u = usableFrom.indexOf(k);
+        if (u >= 0) return u;
+    }
+    return -1;
+}
+
+// Host-rotated/among-list anchor match — pure (the sweep passes the item URLs and every
+// candidate src of the visible page). Exact match wins in candidate order, then the
+// cross-host path twin. Unit-tested in tests/sweep-priority.test.mjs.
+export function matchAnchor(itemUrls: string[], candidates: string[]): number {
+    for (const u of candidates) {
+        const exact = itemUrls.indexOf(u);
+        if (exact >= 0) return exact;
+    }
+    for (const u of candidates) {
+        const twin = itemUrls.findIndex(v => samePagePath(v, u)); // CDN host rotation
+        if (twin >= 0) return twin;
+    }
+    return -1;
+}
+
+// Does any live job already own this page path? `key === path` is the exact match;
+// samePagePath is the host-rotated twin (the same file served from a different CDN host).
+// Pure — the queue module hands in its own state, so the whole rule is unit-testable. 
+export function ownedByPath(path: string, active: string | null, queued: string[], painting: string[]): boolean {
+    const hit = (key: string): boolean => key === path || samePagePath(key, path);
+    return (!!active && hit(active)) || queued.some(hit) || painting.some(hit);
+}
+
 // ---- seam chains: one scene sliced into consecutive same-width images with a bubble cut at
 // the shared edge. Per-page jobs see half-boxes and translate fragments — the fix stitches the
 // chain into one logical page (detect/OCR/LLM once, render whole, slice write-back).

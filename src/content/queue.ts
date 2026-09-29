@@ -5,7 +5,7 @@
 // use happens inside function bodies, never at module top level.
 
 import { updateContext, type CharacterEntry } from '../llm/core';
-import { cooldownMark, cooldownClear, paintLaneSize, type FailMark, pageHashFromBitmap } from './page-cache';
+import { cooldownMark, cooldownClear, paintLaneSize, ownedByPath, type FailMark, pageHashFromBitmap } from './page-cache';
 import { isDebug } from '../debug';
 import type { MtStage } from './detection';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, contextChapter, resetContextIfNewChapter, pages, uniquePages, overlayChoice, setOverlayOn, type PageRef, type PageState } from './state';
@@ -60,6 +60,15 @@ export function activeKeyGet(): string | null { return activeKey; }
 export function activePrepGet(): Promise<Prep | null> | null { return activePrep; }
 export function activeRefGet(): PageRef | null { return activeRef; }
 export function queueFind(key: string): Job | undefined { return queue.find(j => j.key === key); }
+
+// Ownership by page PATH, for callers holding a URL but no element (sweep items from
+// manifest/paged/gallery lists): the same page may already be queued/rendering/painting
+// under a host-rotated key, and translating it again is a second paid LLM call. The ref
+// flavors above stay exact-key; this one is the volatile twin.
+export function queueOwnsPath(path: string): boolean {
+    const painting = [...paintQueue.map(j => j.key), ...paintActive.keys()];
+    return ownedByPath(path, activeKey, queue.map(j => j.key), painting);
+}
 
 export function isBusy(): boolean {
     return running || queue.length > 0;
