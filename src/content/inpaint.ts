@@ -121,6 +121,16 @@ export function eraseBoxesAndMask(
     return { boxes, mask, maskMs: Math.round(performance.now() - t0) };
 }
 
+// One in-flight patch computation per distinct erase plan. Two paths routinely race for the
+// same page (the arrival paint and a queued job), and without this both pay the model and
+// then overwrite each other's cache entry — the user sees "cleaning" twice for one page.
+const inflightPatches = new Map<string, Promise<AiPatches | null>>();
+function planKey(bitmap: { width: number; height: number }, erase: { x1: number; y1: number; x2: number; y2: number }[], keep: { x1: number; y1: number; x2: number; y2: number }[]): string {
+    const rect = (r: { x1: number; y1: number; x2: number; y2: number }) =>
+        `${Math.round(r.x1)},${Math.round(r.y1)},${Math.round(r.x2)},${Math.round(r.y2)}`;
+    return `${bitmap.width}x${bitmap.height}|${erase.map(rect).join(';')}|${keep.map(rect).join(';')}`;
+}
+
 // Throws on model/worker failure — callers fall back to the built-in fill
 // (render) or skip (warm). `noDownload`: a background warm must not start
 // a surprise 112MB download.
@@ -132,10 +142,22 @@ export async function computeAiPatches(
     opts?: { lo?: boolean; noDownload?: boolean },
 ): Promise<AiPatches | null> {
     if (!erase.length) return null;
-    const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, erase, keep);
-    const r = await inpaintPage(bitmap, boxes, mask, 0.5, { lo: opts?.lo, noDownload: opts?.noDownload });
-    if (!r.patches.length) return null;
-    return { patches: r.patches, windows: r.windows, ms: r.ms, maskMs, lockWaitMs: r.lockWaitMs, encodeMs: r.encodeMs };
+    const key = planKey(bitmap, erase, keep);
+    const running = inflightPatches.get(key);
+    if (running) return running;
+    const task = (async (): Promise<AiPatches | null> => {
+        const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, erase, keep);
+        const r = await inpaintPage(bitmap, boxes, mask, 0.5, { lo: opts?.lo, noDownload: opts?.noDownload });
+        if (!r.patches.length) return null;
+        return { patches: r.patches, windows: r.windows, ms: r.ms, maskMs, lockWaitMs: r.lockWaitMs, encodeMs: r.encodeMs };
+    })();
+    inflightPatches.set(key, task);
+    try {
+        return await task;
+    } finally {
+        // Drop the entry only after it settles, so a caller arriving mid-flight shares it.
+        inflightPatches.delete(key);
+    }
 }
 
 // Page pixel -> its index inside a cleanup window at page resolution.

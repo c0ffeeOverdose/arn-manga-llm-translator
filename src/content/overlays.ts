@@ -3,7 +3,7 @@
 
 import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
 import { refKey, getPages, readPage, repaintByHash, healImgBinding, writePage } from './page-io';
-import { clearQueue, failMarks, queue, pageKeyOf, paintHas, activeKeyGet, viewportOverlap } from './queue';
+import { clearQueue, failMarks, queue, pageKeyOf, paintHas, claimPaint, releasePaint, activeKeyGet, viewportOverlap } from './queue';
 import { cacheGet, cacheKey, pageHashFromBitmap } from './page-cache';
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
@@ -66,6 +66,10 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
     if (Date.now() - (arrivalGate.get(el) ?? 0) < ARRIVAL_GATE_MS) return;
     const key = pageKeyOf(ref);
     if (queue.some(j => j.key === key) || paintHas(key) || activeKeyGet() === key) return;
+    // Reserve the page for the whole read→render window. The claim happens before any await,
+    // so a queued job or another sweep tick cannot start a second render of the same page —
+    // both would run the cleanup model and overwrite each other's cache entry.
+    if (!claimPaint(key)) return;
     arrivalBusy.add(el);
     try {
         await loadPipeline();
@@ -84,5 +88,5 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         // (jobs flip at completion). An explicit "Show original" pin wins.
         if (overlayChoice === 'auto') setOverlayOn(true);
     } catch { /* transient — no miss mark, the minute-retry above re-arms */ }
-    finally { arrivalBusy.delete(el); }
+    finally { arrivalBusy.delete(el); releasePaint(key); }
 }

@@ -24,11 +24,23 @@ let running = false;
 const paintQueue: Job[] = [];
 const paintActive = new Map<string, Job>();
 let paintRunning = 0;
-// paints are main-thread canvas work (see paintLaneSize)
+// Paints are main-thread canvas work (see paintLaneSize). `painting` is a single reservation
+// set for EVERY path that is about to render a page — the paint lane's own jobs plus
+// out-of-band painters (the arrival sweep). Without it, two paths can render the same page
+// at once: both pay the AI-cleanup model and then overwrite each other's cache entry.
+const painting = new Set<string>();
+export function claimPaint(key: string): boolean {
+    if (painting.has(key)) return false;
+    painting.add(key);
+    return true;
+}
+export function releasePaint(key: string): void { painting.delete(key); }
 export function paintFind(key: string): Job | undefined {
     return paintQueue.find(j => j.key === key) ?? paintActive.get(key);
 }
-export function paintHas(key: string): boolean { return paintQueue.some(j => j.key === key) || paintActive.has(key); }
+export function paintHas(key: string): boolean {
+    return painting.has(key) || paintQueue.some(j => j.key === key) || paintActive.has(key);
+}
 export function paintQueued(): number { return paintQueue.length; }
 export function paintBusy(): boolean { return paintRunning > 0 || paintQueue.length > 0; }
 // failure cooldown per page key: a failed job parks instead of being re-enqueued every autoTick
@@ -187,6 +199,7 @@ function pumpPaint(): void {
         if (!job) return;
         paintRunning++;
         paintActive.set(job.key, job);
+        claimPaint(job.key); // shared with out-of-band painters (the arrival sweep)
         const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
         void (async () => {
             try {
@@ -205,6 +218,7 @@ function pumpPaint(): void {
                 void logError(err.message, err.hint, err.kind);
             } finally {
                 paintActive.delete(job.key);
+                releasePaint(job.key);
                 paintRunning--;
                 applyOverlays();
                 pumpPaint();

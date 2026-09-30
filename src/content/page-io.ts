@@ -192,7 +192,11 @@ export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const bytes = await (await resp.blob()).arrayBuffer();
         return { bitmap: await createImageBitmap(new Blob([bytes])), bytes };
-    } catch { /* CORS/hotlink-blocked/timeout → worker proxy below */ }
+    } catch (e) {
+        // The proxy is the fallback, not a failure: log both so a page that works anyway
+        // does not read as "image loading is broken".
+        if (isDebug()) console.log('[mt] direct fetch failed, using proxy:', srcUrl.slice(-28), String((e as Error)?.message ?? e).slice(0, 60));
+    }
     // content-script fetch is CORS-gated on the page origin even with host permissions — the
     // worker fetches free of page CORS, so proxy through it (readPage falls back to screenshot
     // if this throws too)
