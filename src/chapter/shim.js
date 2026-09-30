@@ -6,8 +6,11 @@
 (function () {
     'use strict';
     if (typeof chrome === 'undefined') return;
-    var existing = chrome.storage;
-    if (existing && existing.local && existing.session) return; // background page: real storage
+    var NOOP_EVENT = {
+        addListener: function () {},
+        removeListener: function () {},
+        hasListener: function () { return false; },
+    };
 
     function send(type, payload) {
         return chrome.runtime.sendMessage(Object.assign({ type: type }, payload));
@@ -32,16 +35,23 @@
             },
             // Storage-change events cannot cross contexts. The runner re-reads on demand and
             // stops on a settings change, so a no-op event keeps every caller working.
-            onChanged: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+            onChanged: NOOP_EVENT,
         };
     }
-    var noopEvent = { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
-    var shim = { local: area('local'), session: area('session'), onChanged: noopEvent };
+    var shim = { local: area('local'), session: area('session'), onChanged: NOOP_EVENT };
+
+    // Patch piecewise, never bail out early: a context can expose `local`/`session` but not
+    // `onChanged` (Chromium offscreen documents do exactly that), and returning early there
+    // left callers with `chrome.storage.onChanged === undefined`.
+    var existing = chrome.storage;
+    if (existing && typeof existing === 'object') {
+        if (!existing.local) { try { existing.local = shim.local; } catch (e) { /* frozen */ } }
+        if (!existing.session) { try { existing.session = shim.session; } catch (e) { /* frozen */ } }
+        if (!existing.onChanged) { try { existing.onChanged = NOOP_EVENT; } catch (e) { /* frozen */ } }
+        if (existing.local && existing.session && existing.onChanged) return;
+    }
     try {
         Object.defineProperty(chrome, 'storage', { value: shim, configurable: true, writable: true });
-    } catch (e) {
-        if (existing && typeof existing === 'object') {
-            try { existing.local = shim.local; existing.session = shim.session; } catch (e2) { /* frozen */ }
-        }
-    }
+    } catch (e) { /* the in-place patch above is the fallback */ }
+
 })();

@@ -327,7 +327,10 @@ async function attach(runnerId: string): Promise<void> {
         inflight: 0, errors: 0, completeManifest: config.completeManifest,
         pages: config.pages.map(p => ({ id: p.id, url: p.url, phase: 'queued' })) };
     for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
-    chrome.storage.onChanged.addListener((changes, area) => {
+    // Storage-change events are optional: an offscreen document is given only the runtime
+    // API, and the shim may not cover every area this build talks to. A missing event must
+    // not take the whole run down.
+    chrome.storage?.onChanged?.addListener((changes, area) => {
         if (area === 'local' && (changes.mtPipeline || changes.mtSettings || changes.mtOcrSettings)) stop('Translation paused — settings changed; start again to use them');
     });
     await publish();
