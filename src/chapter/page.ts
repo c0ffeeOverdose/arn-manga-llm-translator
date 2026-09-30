@@ -6,6 +6,7 @@ import { renderPage } from '../content/render-page';
 import { cacheGet, cachePut, cacheKey, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial } from '../content/page-cache';
 import { RENDER_GEN } from '../content/render';
 import { keepaliveOpen } from '../content/queue';
+import { isDebug } from '../debug';
 import { chapterMessage, providerMessage, type ChapterPage, type ChapterProgress, type Contribution } from './model';
 import { readRecord, writeRecord } from './store';
 import { artifactKey, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
@@ -15,6 +16,10 @@ import { nextDocument, chapterImages, guessNextDocument, sameChapterDocument } f
 import { nextBatch, pagePhase } from './plan';
 
 let id = '';
+// A page lease must cover the slowest real work (cold model load + a full LLM roundtrip) and
+// still be short enough that one stuck page cannot freeze the chapter. Expiry costs that page
+// only — the run carries on with the rest.
+const PAGE_LEASE_MS = 300_000;
 // Bounded breadcrumb for debugging a stalled run.
 const diagnostics: string[] = [];
 (globalThis as unknown as { __mtLog: string[] }).__mtLog = diagnostics;
@@ -260,15 +265,39 @@ async function pump(): Promise<void> {
             // A bounded batch shares an immutable context. Only its ordered reducer writes the book.
             const snapshot = await contextFor(undefined, Math.min(...batch.map(p => p.order)));
             if (generation !== epoch) break;
+            // Stall watch: a batch that returns without any page changing phase means the work
+            // is not progressing. Name each page's stage so a hang reports itself instead of
+            // showing as a spinner forever.
+            const before = new Map(batch.map(p => [p.id, status.pages.find(s => s.id === p.id)!.phase]));
+            const t0 = Date.now();
             await Promise.all(batch.map(p => {
-                const attempt = new Attempt(300_000, () => {
-                    status.pages.find(s => s.id === p.id)!.phase = 'failed';
-                    stop('Translation paused — a page took too long; start again to continue');
+                const slot = status.pages.find(s => s.id === p.id)!;
+                const attempt = new Attempt({
+                    timeoutMs: PAGE_LEASE_MS,
+                    label: () => `p${p.order} ${slot.phase}`,
+                    onExpire: ({ label, elapsedMs }) => {
+                        // One page that never settles must not end the run: mark it failed and
+                        // let the planner take the next one. The lease already revoked its
+                        // results, so a late completion cannot commit anything.
+                        const phase = slot.phase;
+                        slot.phase = 'failed';
+                        const stuck = `p${p.order} stuck in ${phase} for ${Math.round(elapsedMs / 1000)}s`;
+                        note(stuck);
+                        if (isDebug()) console.warn('[mt] chapter', stuck);
+                        void publish().catch(showFatal);
+                    },
                 });
                 attempts.add(attempt);
                 const task = work(p, structuredClone(snapshot), generation, () => attempt.valid());
                 return Promise.race([task, attempt.cancelled]).finally(() => { attempt.finish(); attempts.delete(attempt); });
             }));
+            // Report a batch where nothing moved: a page still in the same stage after a whole
+            // batch round means that stage never settled (a hung fetch, an unanswered RPC).
+            const stalled = batch
+                .map(p => ({ p, was: before.get(p.id), now: status.pages.find(s => s.id === p.id)!.phase }))
+                .filter(x => x.was === x.now && ['reading', 'detecting', 'translating', 'rendering'].includes(x.now))
+                .map(x => `p${x.p.order} held ${x.now}`);
+            if (stalled.length) note(`batch stalled ${Math.round((Date.now() - t0) / 1000)}s: ${stalled.join(', ')}`);
         }
         if (generation !== epoch) {
             for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
