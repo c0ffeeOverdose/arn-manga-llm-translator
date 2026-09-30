@@ -114,11 +114,8 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
     }
     if (urls?.length) {
         const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble }));
-        const anchor = current ? matchAnchor(urls, [original(current), refKey(current)]) : -1;
-        // The page the user is on is the anchor. A miss must not truncate the chapter to
-        // nothing: walk to the nearest page the reader has actually loaded.
-        const resolved = anchor >= 0 ? anchor : nearestAnchor(urls, live);
-        return { pages, anchor: resolved, complete: true };
+        const anchor = anchorInList(urls, live, current);
+        return { pages, anchor, complete: true };
     }
     descramble = false;
     const known = new Set(live.map(original));
@@ -178,6 +175,34 @@ function nearestAnchor(urls: string[], live: PageRef[]): number {
         }
     }
     return best;
+}
+
+// Where the reader is inside the chapter list. Three signals, strongest first:
+//  1. the visible page's URL appears in the list (exact, then host-rotated twin);
+//  2. any loaded page appears in the list — the reader shows a window around itself;
+//  3. the reader's page elements and the list share an ordinal: readers that mint
+//     `blob:` URLs for their pages (so no URL comparison is possible at all) still
+//     append them in reading order, so the visible element's index among the loaded
+//     page images is its chapter index.
+function anchorInList(urls: string[], live: PageRef[], current: PageRef | undefined): number {
+    if (current) {
+        const direct = matchAnchor(urls, [original(current), refKey(current)]);
+        if (direct >= 0) return direct;
+    }
+    const byUrl = nearestAnchor(urls, live);
+    if (byUrl >= 0) return byUrl;
+    return ordinalAnchor(urls.length, live, current);
+}
+
+// Positional fallback for readers whose page URLs are unreadable (blob:) or regenerated:
+// the visible page's index within the DOM's own page-image order is the best estimate of
+// its chapter index. Clamped so an unexpected DOM shape can never run past the chapter.
+function ordinalAnchor(total: number, live: PageRef[], current: PageRef | undefined): number {
+    if (!total || !current) return -1;
+    const inDom = [...document.querySelectorAll('img,canvas')].filter(el => live.some(r => r.el === el));
+    const index = inDom.indexOf(current.el);
+    if (index < 0) return -1;
+    return Math.min(index, total - 1);
 }
 function reportError(e: unknown): void {
     const text = (e as Error).message || String(e);

@@ -14,10 +14,16 @@ export async function initDebug(onFlip?: (v: boolean) => void): Promise<void> {
     } catch {
         on = false;
     }
-    chrome.storage.onChanged.addListener((ch, area) => {
-        if (area === 'local' && ch.mtDebug) {
-            on = ch.mtDebug.newValue === true;
-            onFlip?.(on);
-        }
-    });
+    // A context may have no chrome.storage at all (a Chromium offscreen document has only
+    // chrome.runtime) and no change events even when it does. This must never throw: the
+    // iframe worker calls it with a TOP-LEVEL await, so an exception here aborts the whole
+    // module — including the handshake token registration at its end.
+    try {
+        chrome.storage?.onChanged?.addListener((ch, area) => {
+            if (area === 'local' && ch.mtDebug) {
+                on = ch.mtDebug.newValue === true;
+                onFlip?.(on);
+            }
+        });
+    } catch { /* no storage events in this context — the flag stays as read */ }
 }

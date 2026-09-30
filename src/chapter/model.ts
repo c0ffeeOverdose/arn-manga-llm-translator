@@ -21,6 +21,9 @@ export interface ChapterProgress {
     completeManifest: boolean;
     pages: { id: string; url: string; phase: PagePhase; hash?: string; revision?: number }[];
     message?: string;
+    // Last breadcrumbs from the runner, for a harness debugging a failure. Never shown
+    // to the user: the pill reads `message`, this is diagnosis only.
+    diagnostics?: string;
 }
 export interface ChapterStart {
     chapter: string;

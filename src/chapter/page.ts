@@ -74,6 +74,9 @@ function publish(): Promise<void> {
     status.done = status.pages.filter(p => p.phase === 'ready').length;
     status.errors = status.pages.filter(p => p.phase === 'failed').length;
     status.inflight = status.pages.filter(p => ['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)).length;
+    // The runner has no console a user (or a harness) can open — the last few breadcrumbs
+    // ride along for diagnosis. Never the user-facing `message`: the pill reads that.
+    status.diagnostics = diagnostics.length ? diagnostics.slice(-6).join(' | ').slice(0, 900) : undefined;
     const statusEl = statusElement();
     if (statusEl) statusEl.textContent = chapterMessage(status);
     const snapshot = structuredClone(status);

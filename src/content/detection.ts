@@ -2,6 +2,7 @@
 // to compile wasm under OUR CSP — the host page's CSP blocks it) and talks to
 // it via postMessage.
 import { unpackMask } from './page-cache';
+import { isDebug } from '../debug';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
