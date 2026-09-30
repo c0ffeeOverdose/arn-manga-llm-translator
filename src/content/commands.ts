@@ -273,7 +273,7 @@ export function installMessageListener(): void {
             return;
         }
         if (msg?.type === 'mt:sweep-count') {
-            sweepPages().then(n => sendResponse({ ok: true, count: n }));
+            sweepPages().then(r => sendResponse({ ok: true, ...r }));
             return true;
         }
     });

@@ -1,7 +1,7 @@
 // Page discovery + pixel I/O: getPages/refKey, fetch/read/descramble, write-back,
 // hash-lane repaint + binding healing.
 
-import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, type EpisodeManifest } from './page-cache';
+import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, type EpisodeManifest } from './page-cache';
 import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
 
@@ -116,7 +116,18 @@ export async function galleryManifestJson(): Promise<string | null> {
 // full-data dims against a loaded page image; mismatch walks data-saver.
 export async function fetchPagedUrls(): Promise<string[]> {
     const uuid = pagedChapterUuid(location.pathname, location.hostname);
-    if (!uuid) return [];
+    if (uuid) {
+        const atHome = await fetchAtHomeChapter(uuid);
+        if (atHome.length) return atHome;
+    }
+    // Generic paged tier: the reader itself exposes the chapter's page list through a
+    // same-origin API. Any reader can serve it; no host rules live here.
+    return fetchReaderChapterList();
+}
+
+// The at-home endpoint behind a chapter UUID: the reader's own page list, full-data or
+// data-saver chosen to match what is on screen. Empty on any failure.
+async function fetchAtHomeChapter(uuid: string): Promise<string[]> {
     try {
         const r = await fetch(`https://api.mangadex.org/at-home/server/${encodeURIComponent(uuid)}`, { signal: AbortSignal.timeout(15000) });
         if (!r.ok) return [];
@@ -127,6 +138,34 @@ export async function fetchPagedUrls(): Promise<string[]> {
         const files = tier === 'data-saver' && Array.isArray(saver) && saver.length ? saver : data;
         return buildPagedUrls(baseUrl, hash, files, tier === 'data-saver' && files === saver ? 'data-saver' : 'data');
     } catch { return []; }
+}
+
+// A reader that lists its own chapter: a same-origin JSON endpoint whose payload carries
+// the page filenames. Tried only when the reader declares one; [] keeps the DOM fallback.
+const READER_CHAPTER_ENDPOINTS = ['/api/chapter/', '/api/pages/', '/api/chapter/pages'];
+async function fetchReaderChapterList(): Promise<string[]> {
+    const base = chapterImageBase();
+    if (!base) return [];
+    for (const path of READER_CHAPTER_ENDPOINTS) {
+        try {
+            const r = await fetch(`${path}${encodeURIComponent(location.pathname)}`, { signal: AbortSignal.timeout(8000) });
+            if (!r.ok) continue;
+            const files = readerChapterFiles(await r.json());
+            if (files.length) return files.map(f => `${base}/${f}`);
+        } catch { /* endpoint absent on this reader — try the next shape */ }
+    }
+    return [];
+}
+
+// Base URL every enumerated page starts from: the host + directory of the live page
+// image. No live image means no base, and the DOM branches take over.
+function chapterImageBase(): string | null {
+    const shown = getPages().find(r => r.kind === 'img' && /^https?:/.test(r.el.currentSrc || r.el.src));
+    if (!shown) return null;
+    try {
+        const u = new URL((shown.el as HTMLImageElement).currentSrc || (shown.el as HTMLImageElement).src);
+        return u.origin + u.pathname.replace(/\/[^/]*$/, '');
+    } catch { return null; }
 }
 
 // which at-home tier the reader shows: full-data dims equal a loaded page image, saver

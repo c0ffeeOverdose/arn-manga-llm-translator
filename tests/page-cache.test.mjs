@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -864,6 +864,25 @@ test('buildPagedUrls kinds: data default, data-saver on request, junk kind rejec
     buildPagedUrls('https://svc.example.org', 'h1', ['p1.png', 'p2.png'], 'data-saver'),
     ['https://svc.example.org/data-saver/h1/p1.png', 'https://svc.example.org/data-saver/h1/p2.png']);
   assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', ['p1.png'], 'orig'), []);
+});
+
+test('readerChapterFiles reads the shapes a reader chapter endpoint returns', () => {
+  // bare array
+  assert.deepEqual(readerChapterFiles(['a.png', 'b.png']), ['a.png', 'b.png']);
+  // array under a common key
+  assert.deepEqual(readerChapterFiles({ pages: ['a.png'] }), ['a.png']);
+  assert.deepEqual(readerChapterFiles({ images: ['a.png'] }), ['a.png']);
+  // object list of {name|file|path|src}
+  assert.deepEqual(readerChapterFiles({ pages: [{ name: 'a.png' }, { file: 'b.png' }, { path: 'c.png' }] }),
+    ['a.png', 'b.png', 'c.png']);
+  // one level of envelope
+  assert.deepEqual(readerChapterFiles({ data: { pages: ['a.png'] } }), ['a.png']);
+  // absolute URLs are reduced to the filename; junk keys and traversal are dropped
+  assert.deepEqual(readerChapterFiles({ files: ['https://cdn.example.org/data/h/1.png', '../evil', 7, ''] }),
+    ['data/h/1.png']);
+  // nothing recognizable → [] so the caller keeps its DOM fallback
+  assert.deepEqual(readerChapterFiles({ ok: true }), []);
+  assert.deepEqual(readerChapterFiles(null), []);
 });
 
 test('withSources: fallback re-send carries the paid transcripts per region', () => {

@@ -11,7 +11,7 @@ import { readRecord, writeRecord } from './store';
 import { artifactKey, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
 import type { ContextState } from '../llm/core';
 import { Attempt } from './lifecycle';
-import { nextDocument, documentImages, sameChapterDocument } from './discovery';
+import { nextDocument, chapterImages, guessNextDocument, sameChapterDocument } from './discovery';
 import { nextBatch, pagePhase } from './plan';
 
 let id = '';
@@ -34,7 +34,7 @@ const visitedDocuments = new Set<string>();
 
 async function discover(generation: number): Promise<boolean> {
     const url = config.nextDocument;
-    if (!url || !config.imageSelector) return false;
+    if (!url) return false;
     if (visitedDocuments.has(url)) throw new Error('Reader pagination repeats a page');
     if (!sameChapterDocument(url, config.readerUrl, config.chapter)) return false;
     const response = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(30000) });
@@ -42,7 +42,10 @@ async function discover(generation: number): Promise<boolean> {
     if (!sameChapterDocument(response.url, config.readerUrl, config.chapter)) throw new Error('Reader redirected outside this chapter');
     const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
     if (generation !== epoch) return false;
-    const images = documentImages(doc, response.url, config.imageSelector);
+    // No selector gate: the next document's own page images are what we take. A reader
+    // that virtualizes its DOM exposes no stable class, and requiring one stopped the
+    // run silently on the first page.
+    const images = chapterImages(doc, response.url, config.imageFilter);
     if (!images.length) throw new Error('The next page needs the reader to load its images');
     visitedDocuments.add(url);
     let order = Math.max(...config.pages.map(p => p.order)) + 1;
@@ -52,7 +55,8 @@ async function discover(generation: number): Promise<boolean> {
         config.pages.push(page);
         status.pages.push({ id: page.id, url: page.url, phase: 'queued' });
     }
-    config.nextDocument = nextDocument(doc, response.url, config.chapter);
+    config.nextDocument = nextDocument(doc, response.url, config.chapter)
+        ?? guessNextDocument(response.url, config.chapter);
     config.completeManifest = !config.nextDocument;
     status.completeManifest = config.completeManifest;
     status.total = config.pages.length;

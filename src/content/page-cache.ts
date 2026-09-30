@@ -391,6 +391,40 @@ export function pagedChapterUuid(pathname: string, hostname: string): string | n
     // charset-gated: the id is interpolated into an API URL below
     return m && /^[0-9a-f-]{10,}$/i.test(m[1]) ? m[1] : null;
 }
+
+// Page filenames out of whatever shape a reader's chapter endpoint returns: a bare array,
+// an array under a common key, or an object list of {name|file|path}. Anything else is
+// junk and yields [] so the caller keeps its DOM fallback. Pure — unit-tested.
+const CHAPTER_FILE_KEYS = ['pages', 'images', 'files', 'data', 'items'];
+export function readerChapterFiles(payload: unknown): string[] {
+    let list: unknown = payload;
+    if (list && typeof list === 'object' && !Array.isArray(list)) {
+        const obj = list as Record<string, unknown>;
+        for (const key of CHAPTER_FILE_KEYS) if (Array.isArray(obj[key])) { list = obj[key]; break; }
+        // one level of envelope: { data: { pages: [...] } }
+        if (!Array.isArray(list)) {
+            for (const value of Object.values(obj)) {
+                if (value && typeof value === 'object' && !Array.isArray(value)) {
+                    const nested = readerChapterFiles(value);
+                    if (nested.length) return nested;
+                }
+            }
+        }
+    }
+    if (!Array.isArray(list)) return [];
+    const out: string[] = [];
+    for (const item of list) {
+        const name = typeof item === 'string' ? item
+            : item && typeof item === 'object'
+                ? String((item as Record<string, unknown>).name ?? (item as Record<string, unknown>).file
+                    ?? (item as Record<string, unknown>).path ?? (item as Record<string, unknown>).src ?? '')
+                : '';
+        // A URL already absolute is kept; a bare filename is joined by the caller.
+        const clean = name.replace(/^https?:\/\/[^/]+\//, '').replace(/^\/+/, '');
+        if (clean && !clean.includes('..') && !out.includes(clean)) out.push(clean);
+    }
+    return out;
+}
 export function buildPagedUrls(baseUrl: unknown, hash: unknown, files: unknown, kind: 'data' | 'data-saver' = 'data'): string[] {
     if (typeof baseUrl !== 'string' || typeof hash !== 'string' || !Array.isArray(files)) return [];
     if (kind !== 'data' && kind !== 'data-saver') return [];

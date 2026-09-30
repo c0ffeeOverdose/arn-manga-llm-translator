@@ -8,11 +8,11 @@ import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMa
 import { viewportOverlap, dropAutoQueued, resumeAuto, isBusy, paintBusy, haltAuto } from './queue';
 import { lookaheadActive } from './auto';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, logError } from './status-ui';
-import { remainingPages, chapterMessage, type ChapterPage, type ChapterProgress, type ChapterStart } from '../chapter/model';
+import { remainingPages, sweepCount, type SweepCountReason, chapterMessage, type ChapterPage, type ChapterProgress, type ChapterStart } from '../chapter/model';
 import { blobDataUrl } from '../chapter/store';
 import type { CachedPage } from './page-cache';
 import { RENDER_GEN } from './render';
-import { nextDocument } from '../chapter/discovery';
+import { nextDocument, guessNextDocument } from '../chapter/discovery';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
@@ -101,6 +101,8 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
     const current = visible();
     let urls = episodeManifestSrcs();
     let descramble = !!urls?.length;
+    // A paged reader whose API lists the whole chapter is the most reliable source there
+    // is: it survives virtualization, lazy loading and host rotation. Ask it first.
     if (!urls?.length) urls = await fetchPagedUrls();
     if (!urls?.length) {
         const first = live.find(r => r.kind === 'img' && /^https?:/.test(original(r)));
@@ -108,7 +110,11 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
     }
     if (urls?.length) {
         const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble }));
-        return { pages, anchor: current ? matchAnchor(urls, [original(current), refKey(current)]) : -1, complete: true };
+        const anchor = current ? matchAnchor(urls, [original(current), refKey(current)]) : -1;
+        // The page the user is on is the anchor. A miss must not truncate the chapter to
+        // nothing: walk to the nearest page the reader has actually loaded.
+        const resolved = anchor >= 0 ? anchor : nearestAnchor(urls, live);
+        return { pages, anchor: resolved, complete: true };
     }
     descramble = false;
     const known = new Set(live.map(original));
@@ -132,9 +138,22 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
     const unresolved = live.some(r => r.kind === 'canvas' && !r.el.width);
     return { pages, anchor, complete: !hasNext && !unresolved };
 }
-export async function sweepPages(): Promise<number> {
+export async function sweepPages(): Promise<{ count: number; reason: SweepCountReason }> {
     const result = await enumerate();
-    return remainingPages(result.pages, result.anchor).length;
+    return sweepCount(result.pages.length, result.anchor);
+}
+// The chapter list and the live reader disagree (different CDN host, a swapped element).
+// Anchor on the highest live page the list knows, so "translate to the end" still starts
+// at the reader's position instead of at the chapter head or on nothing at all.
+function nearestAnchor(urls: string[], live: PageRef[]): number {
+    let best = -1;
+    for (const ref of live) {
+        for (const candidate of [original(ref), refKey(ref)]) {
+            const found = urls.findIndex(u => u === candidate || samePagePath(u, candidate));
+            if (found > best) best = found;
+        }
+    }
+    return best;
 }
 function reportError(e: unknown): void {
     const text = (e as Error).message || String(e);
@@ -188,8 +207,9 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-start', data: {
             chapter, readerUrl: location.href, pages, completeManifest: found.complete,
             pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,
-            nextDocument: found.complete ? undefined : nextDocument(document, location.href, chapter),
-            imageSelector: readerImageSelector(),
+            nextDocument: found.complete ? undefined : nextDocument(document, location.href, chapter)
+                ?? guessNextDocument(location.href, chapter),
+            imageFilter: readerImageFilter(),
         } });
         if (!response?.ok) throw new Error(response?.error || 'Could not start chapter translation');
         if (startCancelled) { await control('stop'); return { ok: true, cancelled: true }; }
@@ -203,14 +223,20 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         return { ok: false, error: (e as Error).message };
     } finally { starting = false; if (!sweepActive()) removeActivity('sweep'); }
 }
-function readerImageSelector(): string | undefined {
-    const ref = visible();
-    if (ref?.kind !== 'img') return undefined;
-    if (ref.el.id) return `img#${CSS.escape(ref.el.id)}`;
-    if (ref.el.classList.length) return 'img.' + [...ref.el.classList].map(c => CSS.escape(c)).join('.');
-    const parent = ref.el.parentElement;
-    if (parent?.id) return `#${CSS.escape(parent.id)} img`;
-    return undefined;
+// Shape floor for page art, learned from what the reader already rendered: the smallest
+// loaded img that is not obviously a thumbnail. The host filters fetched documents by it.
+function readerImageFilter(): { minW?: number; minH?: number } | undefined {
+    const sizes = getPages()
+        .filter(r => r.kind === 'img')
+        .map(r => r.el as HTMLImageElement)
+        .filter(el => el.naturalWidth > 0 && el.naturalHeight > 0)
+        .map(el => ({ w: el.naturalWidth, h: el.naturalHeight }))
+        .filter(s => s.h >= 300); // a manga page is at least this tall
+    if (!sizes.length) return undefined;
+    const minW = Math.min(...sizes.map(s => s.w));
+    const minH = Math.min(...sizes.map(s => s.h));
+    // Half the smallest seen page: ads and icons sit far below this, a real page never does.
+    return { minW: Math.round(minW * 0.5), minH: Math.round(minH * 0.5) };
 }
 export function cancelSweep(): { ok: boolean } {
     startCancelled = true;

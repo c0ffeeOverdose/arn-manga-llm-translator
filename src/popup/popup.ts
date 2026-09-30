@@ -1,10 +1,12 @@
 // Action popup: the control center. State is polled via mt:status while open — no push channel.
 import { loadPipelineSettings, isAutoSite, autoSiteOf, autoSiteList, autoSiteAdd, autoSiteRemove } from '../llm/pipeline-settings';
+import { sweepCountMessage, type SweepCountReason } from '../chapter/model';
 import { sessGet } from '../storage-session';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const btn = $<HTMLButtonElement>('translate');
 const sweepBtn = $<HTMLButtonElement>('sweep');
+const sweepWhy = $<HTMLElement>('sweepWhy');
 const cancelAllBtn = $<HTMLButtonElement>('cancelAll');
 const statusEl = $<HTMLElement>('status');
 const auto = $<HTMLInputElement>('auto');
@@ -145,10 +147,25 @@ async function refreshStatus(): Promise<void> {
             sweepBtn.textContent = `Stop translation (${sw.done}/${sw.total} ready)`;
             sweepBtn.disabled = false;
         } else {
-            const sc = await send({ type: 'mt:sweep-count' }) as { ok?: boolean; count?: number } | null;
+            const sc = await send({ type: 'mt:sweep-count' }) as { ok?: boolean; count?: number; reason?: string } | null;
             const n = sc?.count ?? 0;
-            sweepBtn.textContent = n > 0 ? `Translate to end of chapter (${n} pages)` : 'Translate to end of chapter';
-            sweepBtn.disabled = !sc?.ok || n === 0;
+            const why = sc?.ok ? sweepCountMessage(sc.reason as SweepCountReason) : '';
+            if (n > 0) {
+                sweepBtn.textContent = `Translate to end of chapter (${n} pages)`;
+                sweepBtn.disabled = false;
+                sweepWhy.hidden = true;
+            } else if (why) {
+                // The reason beats a disabled button: "unsupported site" and "last page"
+                // looked identical before.
+                sweepBtn.textContent = 'Translate to end of chapter';
+                sweepBtn.disabled = false;
+                sweepWhy.textContent = why;
+                sweepWhy.hidden = false;
+            } else {
+                sweepBtn.textContent = 'Translate to end of chapter';
+                sweepBtn.disabled = false;
+                sweepWhy.hidden = true;
+            }
         }
         // translation cache size (separate message — IDB read, not part of mt:status)
         const cc = await send({ type: 'mt:cache-count' });
