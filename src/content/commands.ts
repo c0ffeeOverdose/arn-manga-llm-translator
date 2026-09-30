@@ -3,7 +3,7 @@
 
 import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, chapterKey, type PageRef } from './state';
 import { getPages, refKey } from './page-io';
-import { cacheClear, cacheCount, cacheCountPrefix } from './page-cache';
+import { cacheClear, cacheCount, cacheCountChapter, cacheCountPrefix } from './page-cache';
 import { isDebug } from '../debug';
 import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued, resumeAuto } from './queue';
 import { setStatus, idleStatus, pageCounts, makeToast, logError } from './status-ui';
@@ -11,7 +11,7 @@ import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
 import { toggleCharsPanel, charsPanelOpen } from './chars-ui';
 import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
-import { startSweep, cancelSweep, sweepStatus, sweepPages, chapterOwnsRequest } from './sweep';
+import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, chapterOwnsRequest } from './sweep';
 
 export function toggleOverlay(): void {
     setOverlayOn(!overlayOn);
@@ -225,7 +225,9 @@ export function installMessageListener(): void {
             return true;
         }
         if (msg?.type === 'mt:cache-count') {
-            (async () => sendResponse({ ok: true, count: await cacheCount(), mine: await cacheCountPrefix(chapterKey() + '#'), max: pipeline.cacheMax }))();
+            // A page is written under both identities (bytes key `chapter#hash` and page key
+            // `chapter@pN`), so counting one shape reported 0 for a chapter full of entries.
+            (async () => sendResponse({ ok: true, count: await cacheCount(), mine: await cacheCountChapter(chapterKey()), max: pipeline.cacheMax }))();
             return true;
         }
         if (msg?.type === 'mt:status') {
@@ -244,6 +246,9 @@ export function installMessageListener(): void {
                 // viewed-page state for the popup's main button (keyed by page —
                 // the reader swaps elements, so element identity lies).
                 viewedTranslated: viewed ? !!stateFor(viewed)?.det : false,
+                // why the last chapter attach refused — distinguishes "not translated" from
+                // "translated but refused to paint", which looked identical from outside
+                attachWhy: sweepAttachWhy(),
                 viewedQueued: viewed ? queue.some(j => j.key === pageKeyOf(viewed)) : false,
                 viewedActive: viewed ? pageKeyOf(viewed) === activeKeyGet() : false,
                 sweep: sweepStatus(),

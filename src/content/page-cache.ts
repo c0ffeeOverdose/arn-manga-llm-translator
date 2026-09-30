@@ -962,6 +962,24 @@ export async function cacheCountPrefix(prefix: string): Promise<number> {
     } catch { return 0; }
 }
 
+// Entries belonging to one chapter, counted by the PAGE identity. Both key shapes exist
+// (`chapter#hash` and `chapter@pN`) and a chapter run writes the page-shaped one, so a
+// counter that only knows `#` reports 0 while the chapter is full of work.
+export async function cacheCountChapter(chapter: string): Promise<number> {
+    try {
+        const d = await db();
+        if (!d) return 0;
+        const keys = await req(d.transaction('pages', 'readonly').objectStore('pages').getAllKeys()) as unknown[];
+        let n = 0;
+        for (const k of keys) {
+            if (typeof k !== 'string' || !k.startsWith(chapter)) continue;
+            const rest = k.slice(chapter.length);
+            if (rest.startsWith('#') || rest.startsWith('@p')) n++;
+        }
+        return n;
+    } catch { return 0; }
+}
+
 // ---- host-volatile CDN identity: some image CDNs serve the same file from different hosts
 // per image, so URL-keyed mechanisms (warming trace, progress handoff, sweep claims) miss
 // across loads while content-hash mechanisms (cache/resume) hit fine. Match by origin + path

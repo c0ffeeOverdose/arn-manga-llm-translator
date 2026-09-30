@@ -13,6 +13,7 @@ import { blobDataUrl } from '../chapter/store';
 import type { CachedPage } from './page-cache';
 import { RENDER_GEN } from './render';
 import { nextDocument, guessNextDocument } from '../chapter/discovery';
+import { isDebug } from '../debug';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
@@ -22,6 +23,7 @@ let refreshBusy = false;
 let discoverAt = 0;
 let notified = '';
 let foldedChapter = '';
+let attachWhy = ''; // why the last attach attempt refused — a page translated but not painted
 const folded = new Set<string>();
 const refs = new Map<string, PageRef>();
 const attaching = new WeakSet<Element>();
@@ -35,6 +37,7 @@ export function bookHas(hash: string): boolean { syncBook(); return folded.has(h
 export function bookAdd(hash: string): void { syncBook(); folded.add(hash); }
 export function bookDrop(hash: string): void { syncBook(); folded.delete(hash); }
 export function sweepArrivable(): boolean { return !!progress && progress.chapter === chapterKey(); }
+export function sweepAttachWhy(): string { return attachWhy; }
 export function sweepCommitted(hash: string): boolean {
     return !!progress?.pages.some(p => p.phase === 'ready' && p.hash === hash);
 }
@@ -74,6 +77,22 @@ function visible(): PageRef | undefined {
 function owned(url: string) {
     if (progress?.chapter !== chapterKey()) return undefined;
     return progress.pages.find(p => p.url === url || samePagePath(p.url, url));
+}
+// Which chapter page is this element? URL identity first (works whenever the reader exposes
+// the real image URL), then the reader's own ordinal: readers that mint `blob:` URLs for
+// their pages can never match a CDN URL, and before this the lookup returned nothing, so a
+// finished page was never attached (translated-but-invisible).
+function ownedRef(ref: PageRef): ChapterProgress['pages'][number] | undefined {
+    const byUrl = owned(original(ref));
+    if (byUrl) return byUrl;
+    if (!progress || progress.chapter !== chapterKey()) return undefined;
+    const domPages = [...document.querySelectorAll('img,canvas')]
+        .filter(el => getPages().some(r => r.el === el));
+    const index = domPages.indexOf(ref.el as Element);
+    if (index < 0) return undefined;
+    // The reader renders a window of pages in reading order; `order` names the slot.
+    const ordered = [...progress.pages].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    return ordered[index];
 }
 export function sweepHas(url: string): boolean {
     return !!owned(url) && sweepActive();
@@ -349,7 +368,17 @@ async function capture(page: Pick<ChapterPage, 'id' | 'url'>): Promise<string | 
     return task;
 }
 async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Promise<void> {
-    if (!progress || attaching.has(ref.el) || document.hidden || viewportOverlap(ref) <= 0) return;
+    // Every early return here decides whether a translated page becomes VISIBLE, and the
+    // runner's own log cannot see any of it. Mark the reason so "translated but invisible"
+    // names its cause instead of being reported as success.
+    const bail = (why: string): void => {
+        attachWhy = `${page.id}:${why}`;
+        if (isDebug()) console.log('[mt] attach skipped', JSON.stringify({ page: page.id, why }));
+    };
+    if (!progress) { bail('no-progress'); return; }
+    if (attaching.has(ref.el)) return; // a normal retry beat the in-flight attempt — not a refusal
+    if (document.hidden) { bail('document-hidden'); return; }
+    if (viewportOverlap(ref) <= 0) { bail('offscreen'); return; }
     const stamp = `${progress.id}:${page.id}:${page.revision ?? 0}`;
     if (applied.get(ref.el) === stamp && stateFor(ref)) return;
     const chapter = chapterKey();
@@ -359,14 +388,18 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
     try {
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter, page: page.id });
         const result = response?.result;
-        if (!result || chapterKey() !== chapter || !ref.el.isConnected || original(ref) !== src) return;
-        if (result.signature !== JSON.stringify(pipeline) + ':' + RENDER_GEN) return;
+        if (!result) { bail(`no-result:${response?.error ?? 'empty'}`); return; }
+        if (chapterKey() !== chapter) { bail('chapter-changed'); return; }
+        if (!ref.el.isConnected) { bail('element-gone'); return; }
+        if (original(ref) !== src) { bail('src-changed'); return; }
+        if (result.signature !== JSON.stringify(pipeline) + ':' + RENDER_GEN) { bail('signature'); return; }
         const old = stateFor(ref);
         const imageBlob = await (await fetch(result.image)).blob();
         const packed = result.mask ? { w: result.mask.w, h: result.mask.h,
             data: Uint8Array.from(atob(result.mask.data.split(',')[1]), c => c.charCodeAt(0)).buffer } : undefined;
         const entry = { ...result.entry, mask: packed } as CachedPage;
-        if (!packed || entry.fp !== settingsFingerprint(pipeline)) return;
+        if (!packed) { bail('no-mask'); return; }
+        if (entry.fp !== settingsFingerprint(pipeline)) { bail('fingerprint'); return; }
         // Bind the result to this element. The runner rendered from bytes it fetched itself,
         // which may differ from what the reader shows (another CDN host, another encoder, the
         // data-saver tier) — a differing content hash is expected and is NOT a reason to
@@ -378,11 +411,16 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
             let probe: ImageBitmap | undefined;
             try {
                 probe = await createImageBitmap(ref.el);
-                if (probe.width !== entry.w || probe.height !== entry.h) { probe.close(); return; }
+                if (probe.width !== entry.w || probe.height !== entry.h) {
+                    const got = `${probe.width}x${probe.height}`;
+                    probe.close();
+                    bail(`dims:${got}≠${entry.w}x${entry.h}`);
+                    return;
+                }
             } catch {
                 // unreadable element: the slot may be showing something else entirely, and a
                 // blob source gives us no second way to check — refuse rather than mispaint
-                if (!/^https?:/.test(src)) return;
+                if (!/^https?:/.test(src)) { bail('unverifiable-blob'); return; }
             } finally { try { probe?.close(); } catch { /* already closed */ } }
         }
         const translated = URL.createObjectURL(imageBlob);
@@ -430,7 +468,7 @@ async function refresh(): Promise<void> {
         if (!progress) return;
         for (const ref of getPages()) {
             if (viewportOverlap(ref) <= 0) continue;
-            const page = owned(original(ref));
+            const page = ownedRef(ref);
             if (!page) continue;
             refs.set(page.id, ref);
             if (page.phase === 'ready') void attach(ref, page);
