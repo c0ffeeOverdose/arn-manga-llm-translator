@@ -56,7 +56,11 @@ function original(ref: PageRef): string {
     return stateFor(ref)?.orig ?? refKey(ref);
 }
 function visible(): PageRef | undefined {
-    return getPages().filter(r => viewportOverlap(r) > 0).sort((a, b) => viewportOverlap(b) - viewportOverlap(a))[0];
+    const ranked = getPages().sort((a, b) => viewportOverlap(b) - viewportOverlap(a));
+    // Any overlap wins. With no overlap at all (scrolled past the images, or hidden in a
+    // container), the top-ranked page is still the reader's best-known position — a null
+    // here used to abort the whole run.
+    return ranked[0];
 }
 function owned(url: string) {
     if (progress?.chapter !== chapterKey()) return undefined;
@@ -132,11 +136,31 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
         if (ref) refs.set(id, ref);
         return { id, url, order, descramble };
     });
-    const anchor = current ? ordered.findIndex(p => p.ref?.el === current.el) : -1;
+    // The anchor is the visible page; when it cannot be resolved, fall back to the
+    // highest page that already has pixels. A reader whose page images are all lazy
+    // still has the current page decoded, and returning nothing is what the user read
+    // as "this site is not supported".
+    let anchor = current ? ordered.findIndex(p => p.ref?.el === current.el) : -1;
+    if (anchor < 0) anchor = highestKnown(ordered, live);
     // A paginated/virtualized reader without a manifest is discovery-incomplete.
     const hasNext = !!document.querySelector('a[rel="next"], link[rel="next"], [data-next-page], [data-infinite-scroll]');
     const unresolved = live.some(r => r.kind === 'canvas' && !r.el.width);
     return { pages, anchor, complete: !hasNext && !unresolved };
+}
+
+// The reader's position when nothing else identifies it: the last list entry the reader
+// has actually loaded, by element identity or by URL. Pages after it are still ahead.
+function highestKnown(ordered: { url: string; ref?: PageRef }[], live: PageRef[]): number {
+    let best = -1;
+    for (const ref of live) {
+        const keys = [original(ref), refKey(ref)];
+        for (const key of keys) {
+            const found = ordered.findIndex(p => p.ref?.el === ref.el || p.url === key
+                || (p.ref && key === original(p.ref)));
+            if (found > best) best = found;
+        }
+    }
+    return best;
 }
 export async function sweepPages(): Promise<{ count: number; reason: SweepCountReason }> {
     const result = await enumerate();
@@ -185,7 +209,13 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         setActivity('sweep', 'Finding the remaining pages in this chapter…', 'sweep', 'read');
         const found = await enumerate();
         const pages = remainingPages(found.pages, found.anchor);
-        if (!pages.length) throw new Error('Could not identify the current page. Open a page image and try again.');
+        if (!pages.length) {
+            // Distinguish "no pages at all" from "found them, but not where you are".
+            // The popup already explains the reason; the pill must agree with it.
+            throw new Error(found.pages.length
+                ? 'Could not match the page you are on — scroll to a page image and try again'
+                : 'No page images found on this reader — scroll to a page and try again');
+        }
         const seeds: NonNullable<ChapterStart['seeds']> = [];
         for (const page of pages) {
             const ref = getPages().find(r => original(r) === page.url);

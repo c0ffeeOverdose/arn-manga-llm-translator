@@ -63,6 +63,19 @@ test('no selector gate remains in the runner discovery path', () => {
     assert.match(src, /guessNextDocument\(/, 'a reader without rel=next must still be walkable');
 });
 
+test('the sweep anchors on the nearest known page instead of giving up', () => {
+    const src = readFileSync(new URL('../src/content/sweep.ts', import.meta.url), 'utf8');
+    // The manifest branch must fall back to the nearest live page.
+    assert.match(src, /const resolved = anchor >= 0 \? anchor : nearestAnchor\(/,
+        'a list/live mismatch must anchor, not truncate');
+    // The DOM branch must fall back to the highest loaded page.
+    assert.match(src, /if \(anchor < 0\) anchor = highestKnown\(/, 'the DOM branch must anchor too');
+    // `visible()` must not return null merely because nothing overlaps the viewport.
+    const vis = src.slice(src.indexOf('function visible'), src.indexOf('function owned'));
+    assert.ok(!/viewportOverlap\(r\) > 0\s*\)\s*\.\s*sort|filter\(r => viewportOverlap\(r\) > 0\)\.sort/.test(vis),
+        'a zero-overlap viewport must not null the anchor');
+});
+
 test('sweepCount names why there is nothing ahead', async () => {
     const { sweepCount, sweepCountMessage } = await import('/tmp/opencode/chapter-model.mjs');
     assert.deepEqual(sweepCount(8, 2), { count: 6, reason: 'known' });
