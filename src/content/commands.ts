@@ -11,7 +11,7 @@ import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
 import { toggleCharsPanel, charsPanelOpen } from './chars-ui';
 import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
-import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, chapterOwnsRequest } from './sweep';
+import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, elementMap, chapterOwnsRequest } from './sweep';
 
 export function toggleOverlay(): void {
     setOverlayOn(!overlayOn);
@@ -229,6 +229,13 @@ export function installMessageListener(): void {
             // `chapter@pN`), so counting one shape reported 0 for a chapter full of entries.
             (async () => sendResponse({ ok: true, count: await cacheCount(), mine: await cacheCountChapter(chapterKey()), max: pipeline.cacheMax }))();
             return true;
+        }
+        if (msg?.type === 'mt:element-map') {
+            // Which chapter page does the extension think each on-screen element is? A
+            // windowed reader makes this an inference, so it has to be observable to be
+            // checkable — a wrong mapping shows as non-contiguous or unmoving orders.
+            sendResponse(elementMap());
+            return;
         }
         if (msg?.type === 'mt:status') {
             const viewed = imgInViewport();

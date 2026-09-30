@@ -19,7 +19,7 @@ export interface ChapterProgress {
     inflight: number;
     errors: number;
     completeManifest: boolean;
-    pages: { id: string; url: string; phase: PagePhase; hash?: string; revision?: number; order?: number }[];
+    pages: { id: string; url: string; phase: PagePhase; hash?: string; revision?: number; order?: number; matchedBy?: 'url' | 'position' }[];
     message?: string;
     // Last breadcrumbs from the runner, for a harness debugging a failure. Never shown
     // to the user: the pill reads `message`, this is diagnosis only.

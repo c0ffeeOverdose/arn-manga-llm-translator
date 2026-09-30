@@ -38,6 +38,18 @@ export function bookAdd(hash: string): void { syncBook(); folded.add(hash); }
 export function bookDrop(hash: string): void { syncBook(); folded.delete(hash); }
 export function sweepArrivable(): boolean { return !!progress && progress.chapter === chapterKey(); }
 export function sweepAttachWhy(): string { return attachWhy; }
+// Debug/verification view of the window mapping: each on-screen page element in DOM order,
+// with the chapter order it resolves to and how that was decided.
+export function elementMap(): { map: { index: number; order: number | null; matchedBy: string; url: string }[] } {
+    const live = getPages();
+    const dom = [...document.querySelectorAll('img,canvas')].filter(el => live.some(r => r.el === el));
+    return { map: dom.map((el, index) => {
+        const ref = live.find(r => r.el === el);
+        if (!ref) return { index, order: null, matchedBy: 'none', url: '' };
+        const page = ownedRef(ref);
+        return { index, order: page?.order ?? null, matchedBy: page?.matchedBy ?? 'unmatched', url: refKey(ref).slice(-24) };
+    }) };
+}
 export function sweepCommitted(hash: string): boolean {
     return !!progress?.pages.some(p => p.phase === 'ready' && p.hash === hash);
 }
@@ -78,21 +90,87 @@ function owned(url: string) {
     if (progress?.chapter !== chapterKey()) return undefined;
     return progress.pages.find(p => p.url === url || samePagePath(p.url, url));
 }
-// Which chapter page is this element? URL identity first (works whenever the reader exposes
-// the real image URL), then the reader's own ordinal: readers that mint `blob:` URLs for
-// their pages can never match a CDN URL, and before this the lookup returned nothing, so a
-// finished page was never attached (translated-but-invisible).
+// Which chapter page is this element? URL identity is the only trustworthy answer, and a
+// reader that mints `blob:` URLs never provides one — so the element is resolved by its slot
+// in the reader's CURRENT window, anchored to a known page.
+//
+// A windowed reader keeps only the pages near the viewport in the DOM, so an element's
+// ordinal among them drifts as the user moves: once the window slides from pages 3-7 to
+// 9-13, ordinal 0 is page 9, not page 0. Treating the ordinal as the chapter index painted
+// page 9 with page 3's translation. The anchor is therefore measured ONCE (anchorInList,
+// when the reader is at a page whose URL is still knowable) and subsequent positions are
+// derived from the window's offset relative to that anchor.
+// Which chapter page is this element? Three signals, strongest first:
+//  1. URL identity — a reader that keeps the page in the URL (…/chapter/<id>/4) states it
+//     outright, and the visible page is the one that fills the viewport;
+//  2. a page slug in the chapter list whose URL matches the element (exact, then host twin);
+//  3. window position, anchored once to a URL-matched page and then tracked by delta.
+// A windowed reader keeps only the pages near the viewport in the DOM, so an element's raw
+// ordinal is NOT its chapter index: mapping ordinal→index painted page 9 with page 3's text
+// as soon as the window slid.
+const PAGE_IN_URL = /\/(?:chapter|read)\/[^/]+\/(\d+)(?:\/|$)/;
+function urlPageNumber(): number | null {
+    const m = location.pathname.match(PAGE_IN_URL);
+    if (!m) return null;
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+let anchorOrder: number | null = null;
+let anchorElementIndex: number | null = null;
+function domPageElements(): Element[] {
+    const live = getPages();
+    return [...document.querySelectorAll('img,canvas')].filter(el => live.some(r => r.el === el));
+}
+// The page the reader is actually showing: the one covering the most viewport. A single-page
+// viewer keeps neighbours preloaded in the DOM, so "first image" is not the answer.
+function displayRef(): PageRef | undefined {
+    return getPages()
+        .map(r => ({ r, ov: viewportOverlap(r) }))
+        .filter(x => x.ov > 0)
+        .sort((a, b) => b.ov - a.ov)[0]?.r;
+}
+// Measure the anchor ONCE, from a page whose slot is knowable. Afterwards position comes from
+// the window's delta: the reader keeps the pages around the viewport, so the distance between
+// two elements does not change as the window slides.
+function rememberAnchor(): void {
+    if (anchorOrder !== null) return;
+    const p = progress;
+    if (!p || p.chapter !== chapterKey()) return;
+    // The URL is the strongest statement of position, but it names the page the READER is
+    // on; the anchor must name the same page's slot in the chapter list.
+    const domPages = domPageElements();
+    for (let i = 0; i < domPages.length; i++) {
+        const ref = getPages().find(r => r.el === domPages[i]);
+        if (!ref) continue;
+        const src = original(ref);
+        const hit = p.pages.find(q => q.url === src || samePagePath(q.url, src));
+        if (hit) { anchorOrder = hit.order ?? 0; anchorElementIndex = i; return; }
+    }
+    // No URL-matched element: fall back to the URL's own page number, applied to the visible
+    // page. Its index among the loaded pages is the delta origin from then on.
+    const display = displayRef();
+    const n = urlPageNumber();
+    if (display && n != null) {
+        const index = domPages.indexOf(display.el as Element);
+        if (index >= 0) { anchorOrder = n - 1; anchorElementIndex = index; }
+    }
+}
+// Forget the anchor when the chapter changes: it describes one window.
+function forgetAnchor(): void { anchorOrder = null; anchorElementIndex = null; }
+
 function ownedRef(ref: PageRef): ChapterProgress['pages'][number] | undefined {
     const byUrl = owned(original(ref));
-    if (byUrl) return byUrl;
+    if (byUrl) return { ...byUrl, matchedBy: 'url' as const };
     if (!progress || progress.chapter !== chapterKey()) return undefined;
-    const domPages = [...document.querySelectorAll('img,canvas')]
-        .filter(el => getPages().some(r => r.el === el));
-    const index = domPages.indexOf(ref.el as Element);
+    rememberAnchor();
+    if (anchorOrder === null || anchorElementIndex === null) return undefined;
+    const index = domPageElements().indexOf(ref.el as Element);
     if (index < 0) return undefined;
-    // The reader renders a window of pages in reading order; `order` names the slot.
-    const ordered = [...progress.pages].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-    return ordered[index];
+    const order = anchorOrder + (index - anchorElementIndex);
+    const hit = progress.pages.find(p => (p.order ?? -1) === order);
+    // Positional matches are an inference, and attach() must verify them before painting.
+    return hit ? { ...hit, matchedBy: 'position' as const } : undefined;
 }
 export function sweepHas(url: string): boolean {
     return !!owned(url) && sweepActive();
@@ -400,14 +478,14 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         const entry = { ...result.entry, mask: packed } as CachedPage;
         if (!packed) { bail('no-mask'); return; }
         if (entry.fp !== settingsFingerprint(pipeline)) { bail('fingerprint'); return; }
-        // Bind the result to this element. The runner rendered from bytes it fetched itself,
+        // Bind the result to this element. The runner renders from bytes it fetched itself,
         // which may differ from what the reader shows (another CDN host, another encoder, the
-        // data-saver tier) — a differing content hash is expected and is NOT a reason to
-        // refuse; refusing here is what left pages translated-but-invisible. The result is
-        // addressed to this page slot by id. The one case page identity cannot catch is a
-        // different page occupying this slot, so when we can read the element's own pixels we
-        // check its dimensions against the render (page dims are stable across encoders).
-        if (old && old.hash !== page.hash) {
+        // data-saver tier), so a differing content hash is expected and is NOT a reason to
+        // refuse. But when the element was matched by WINDOW POSITION rather than by URL, the
+        // mapping is an inference and must be checked before painting: a wrong guess would
+        // put another page's translation on this one. Page dims are stable across encoders,
+        // so they are a reliable tell when the pixels are readable.
+        if (page.matchedBy !== 'url') {
             let probe: ImageBitmap | undefined;
             try {
                 probe = await createImageBitmap(ref.el);
@@ -418,9 +496,10 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
                     return;
                 }
             } catch {
-                // unreadable element: the slot may be showing something else entirely, and a
-                // blob source gives us no second way to check — refuse rather than mispaint
-                if (!/^https?:/.test(src)) { bail('unverifiable-blob'); return; }
+                // unreadable pixels: an inferred mapping cannot be verified, so refuse
+                // rather than risk painting the wrong page
+                bail('unverifiable-position');
+                return;
             } finally { try { probe?.close(); } catch { /* already closed */ } }
         }
         const translated = URL.createObjectURL(imageBlob);
@@ -461,7 +540,7 @@ async function refresh(): Promise<void> {
     refreshBusy = true;
     const chapter = chapterKey();
     try {
-        if (observedChapter !== chapter) { observedChapter = chapter; progress = null; refs.clear(); removeActivity('sweep'); }
+        if (observedChapter !== chapter) { observedChapter = chapter; progress = null; refs.clear(); removeActivity('sweep'); forgetAnchor(); }
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-status', chapter });
         if (chapterKey() !== chapter) return;
         if (response?.status) { progress = response.status; showProgress(); }
