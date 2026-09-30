@@ -32,6 +32,7 @@ __pycache__/
 opencode.json
 skills-lock.json
 AGENTS.md
+LESSONS.md
 
 # secrets
 *.env
