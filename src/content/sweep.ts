@@ -38,6 +38,15 @@ export function sweepArrivable(): boolean { return !!progress && progress.chapte
 export function sweepCommitted(hash: string): boolean {
     return !!progress?.pages.some(p => p.phase === 'ready' && p.hash === hash);
 }
+// The page's slot in the chapter, found by the URL the reader is showing. This is the
+// identity the runner writes under: it survives a different encoder/host/tier, where the
+// content hash does not. Returns undefined when the reader is off-manifest.
+export function sweepPageOrder(url: string): number | undefined {
+    const page = progress?.chapter === chapterKey()
+        ? progress.pages.find(p => p.url === url || samePagePath(p.url, url))
+        : undefined;
+    return page?.order;
+}
 export function sweepActive(): boolean {
     return starting || !!progress && progress.chapter === chapterKey() && ['running', 'waiting', 'stopping'].includes(progress.phase);
 }
@@ -353,25 +362,29 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         if (!result || chapterKey() !== chapter || !ref.el.isConnected || original(ref) !== src) return;
         if (result.signature !== JSON.stringify(pipeline) + ':' + RENDER_GEN) return;
         const old = stateFor(ref);
-        // Unknown/recycled bindings are verified from the original pixels before painting.
-        if (old?.hash !== page.hash) {
-            if (old) return;
-            try {
-                bitmap = await createImageBitmap(ref.el);
-                if (pageHashFromBitmap(bitmap) !== page.hash) return;
-            } catch {
-                bitmap?.close();
-                bitmap = undefined;
-                if (!/^https?:/.test(src)) return;
-                bitmap = (await fetchBitmap(src)).bitmap;
-                if (pageHashFromBitmap(bitmap) !== page.hash) return;
-            }
-        }
         const imageBlob = await (await fetch(result.image)).blob();
         const packed = result.mask ? { w: result.mask.w, h: result.mask.h,
             data: Uint8Array.from(atob(result.mask.data.split(',')[1]), c => c.charCodeAt(0)).buffer } : undefined;
         const entry = { ...result.entry, mask: packed } as CachedPage;
         if (!packed || entry.fp !== settingsFingerprint(pipeline)) return;
+        // Bind the result to this element. The runner rendered from bytes it fetched itself,
+        // which may differ from what the reader shows (another CDN host, another encoder, the
+        // data-saver tier) — a differing content hash is expected and is NOT a reason to
+        // refuse; refusing here is what left pages translated-but-invisible. The result is
+        // addressed to this page slot by id. The one case page identity cannot catch is a
+        // different page occupying this slot, so when we can read the element's own pixels we
+        // check its dimensions against the render (page dims are stable across encoders).
+        if (old && old.hash !== page.hash) {
+            let probe: ImageBitmap | undefined;
+            try {
+                probe = await createImageBitmap(ref.el);
+                if (probe.width !== entry.w || probe.height !== entry.h) { probe.close(); return; }
+            } catch {
+                // unreadable element: the slot may be showing something else entirely, and a
+                // blob source gives us no second way to check — refuse rather than mispaint
+                if (!/^https?:/.test(src)) return;
+            } finally { try { probe?.close(); } catch { /* already closed */ } }
+        }
         const translated = URL.createObjectURL(imageBlob);
         let origBytes = old?.origBytes;
         let origOwn: string | undefined;
@@ -423,7 +436,7 @@ async function refresh(): Promise<void> {
             if (page.phase === 'ready') void attach(ref, page);
             else if (page.phase === 'waiting') {
                 const source = await capture(page);
-                if (source) await control('append', { pages: [{ id: page.id, url: page.url, order: 0, descramble: false, source }] });
+                if (source) await control('append', { pages: [{ id: page.id, url: page.url, order: page.order ?? 0, descramble: false, source }] });
             }
             else if (sweepActive()) void control('prioritize', { page: page.id }).catch(() => {});
         }

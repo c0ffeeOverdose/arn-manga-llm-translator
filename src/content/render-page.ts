@@ -4,12 +4,13 @@
 import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea, effBoxesForAreas, growDarkArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
-import { cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN } from './page-cache';
+import { cacheKey, pageKey, PAGE_KEY_GEN, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN } from './page-cache';
 import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus, type DetectResult } from './detection';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep, type PaintPatch } from './pipeline';
 import { eraseBoxesAndMask, erasePlan, computeAiPatches, type AiPatches } from './inpaint';
+import { sweepPageOrder } from './sweep';
 import { inpaintMode } from '../llm/pipeline-settings';
 import { ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
@@ -311,39 +312,50 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // Fire-and-forget — a slow IDB write never blocks the sweep.
     // Never cache a void result (boxes but zero outputs): it would sit
     // "translated" with nothing on it until force.
+    // The entry is written under BOTH identities: bytes (its crops belong to these pixels)
+    // and page slot (so a chapter run, which addresses pages by slot, can reuse it).
+    const cacheKeys = (): string[] => {
+        const keys = [cacheKey(chapterKey(), prep.hash)];
+        const order = sweepPageOrder(prep.srcUrl);
+        if (order != null) keys.push(pageKey(chapterKey(), order));
+        return keys;
+    };
+    const entryBase = {
+        fp: settingsFingerprint(pipeline),
+        w: bitmap.width, h: bitmap.height,
+        boxes: det.boxes, panels: det.panels ?? [],
+        outputs, extras, mentions,
+        mask: packMask(det.mask),
+        splitGen: det.splitGen ?? 0,
+        ep: det.ep,
+    };
     if (!prep.cached && pipeline.cacheEnabled && (det.boxes.length === 0 || outputs.length > 0)) {
         if (aiPatches?.length) savedPatches = true;
-        void cachePut({
-            key: cacheKey(chapterKey(), prep.hash),
-            fp: settingsFingerprint(pipeline),
-            w: bitmap.width, h: bitmap.height,
-            boxes: det.boxes, panels: det.panels ?? [],
-            outputs, extras, mentions,
-            mask: packMask(det.mask),
-            splitGen: det.splitGen ?? 0,
-            ep: det.ep,
-            ...(aiPatches?.length ? { patches: aiPatches, patchesGen: INPAINT_PATCH_GEN } : null),
-        }, pipeline.cacheMax);
+        const order = sweepPageOrder(prep.srcUrl);
+        for (const key of cacheKeys()) {
+            void cachePut({
+                ...entryBase, key,
+                ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
+                ...(aiPatches?.length ? { patches: aiPatches, patchesGen: INPAINT_PATCH_GEN } : null),
+            }, pipeline.cacheMax);
+        }
     } else if (!prep.cached) {
         // cache off: drop the resume checkpoint this finished job may have used.
-        void cacheDelete(cacheKey(chapterKey(), prep.hash));
+        for (const key of cacheKeys()) void cacheDelete(key);
     } else if ((aiGenerated || aiWarmUsed) && aiPatches?.length && pipeline.cacheEnabled) {
         // cache hit that produced crops this visit — persist so the next visit skips the
         // model. Both sources must persist: a fresh compute (aiGenerated) and the warm
         // run that rode the LLM wait (aiWarmUsed). Saving only the former meant every
         // later visit re-ran the model for the same page.
         savedPatches = true;
-        void cachePut({
-            key: cacheKey(chapterKey(), prep.hash),
-            fp: settingsFingerprint(pipeline),
-            w: bitmap.width, h: bitmap.height,
-            boxes: det.boxes, panels: det.panels ?? [],
-            outputs, extras, mentions,
-            mask: packMask(det.mask),
-            splitGen: det.splitGen ?? 0,
-            ep: det.ep,
-            patches: aiPatches, patchesGen: INPAINT_PATCH_GEN,
-        }, pipeline.cacheMax);
+        const order = sweepPageOrder(prep.srcUrl);
+        for (const key of cacheKeys()) {
+            void cachePut({
+                ...entryBase, key,
+                ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
+                patches: aiPatches, patchesGen: INPAINT_PATCH_GEN,
+            }, pipeline.cacheMax);
+        }
     }
     if (force && shareContext) {
         replayPagesAfter(state);

@@ -4,11 +4,11 @@
 import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
 import { refKey, getPages, readPage, repaintByHash, healImgBinding, writePage } from './page-io';
 import { clearQueue, failMarks, queue, pageKeyOf, paintHas, claimPaint, releasePaint, activeKeyGet, viewportOverlap } from './queue';
-import { cacheGet, cacheKey, pageHashFromBitmap } from './page-cache';
+import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap } from './page-cache';
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
 import { autoOn } from './auto';
-import { sweepArrivable, sweepCommitted, chapterOwnsRequest } from './sweep';
+import { sweepArrivable, sweepCommitted, sweepPageOrder, chapterOwnsRequest } from './sweep';
 import { isDebug } from '../debug';
 
 export function applyOverlays(): void {
@@ -76,7 +76,15 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         const srcUrl = refKey(ref);
         const { bitmap, bytes } = await readPage(ref, srcUrl);
         const hash = pageHashFromBitmap(bitmap);
-        const hit = pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined;
+        // Prefer the page-identity entry: the chapter wrote it under the page's slot, so it
+        // matches whatever tier/host the reader is showing. The bytes entry is the fallback
+        // for work done outside a chapter run.
+        const order = sweepPageOrder(refKey(ref));
+        const identityHit = pipeline.cacheEnabled && order != null ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
+        const decision = pageEntryDecision(identityHit, hash, settingsFingerprint(pipeline), bitmap.width, bitmap.height);
+        const hit = decision.usable
+            ? { ...identityHit!, ...(decision.dropPatches ? { patches: undefined, patchesGen: undefined } : null) }
+            : (pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined);
         const det = hit ? detFromCacheEntry(hit, bitmap.width, bitmap.height) : null;
         // permission: auto covers everything; otherwise only this session's sweep commits.
         if (!det || !hit || stateFor(ref)) { arrivalMiss.set(el, { src, dims, at: Date.now() }); return; }

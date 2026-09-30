@@ -3,7 +3,7 @@ import { fetchBitmap, unscrambleTiles } from '../content/page-io';
 import { resolveHeadlessDet, detFromCacheEntry } from '../content/pipeline';
 import { translateRegions, abortLiveRpcs } from '../content/ocr';
 import { renderPage } from '../content/render-page';
-import { cacheGet, cachePut, cacheKey, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial } from '../content/page-cache';
+import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial } from '../content/page-cache';
 import { RENDER_GEN } from '../content/render';
 import { keepaliveOpen } from '../content/queue';
 import { isDebug } from '../debug';
@@ -58,7 +58,7 @@ async function discover(generation: number): Promise<boolean> {
         if (config.pages.some(p => p.url === image)) continue;
         const page = { id: `url:${image}`, url: image, order: order++, descramble: false };
         config.pages.push(page);
-        status.pages.push({ id: page.id, url: page.url, phase: 'queued' });
+        status.pages.push({ id: page.id, url: page.url, order: page.order, phase: 'queued' });
     }
     config.nextDocument = nextDocument(doc, response.url, config.chapter)
         ?? guessNextDocument(response.url, config.chapter);
@@ -157,20 +157,26 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
         const hash = pageHashFromBitmap(bitmap);
         item.hash = hash;
         if (bitmap.width < 400 || bitmap.height < 300) throw new Error('Image is too small to be a manga page');
-        const key = cacheKey(config.chapter, hash);
+        // Two keys, two questions. `bytesKey` is the pixels we hold (resume checkpoints and
+        // crops must belong to them); `identityKey` is the page in the chapter (the
+        // translation, detection and rendered image do not change with the encoder).
+        const bytesKey = cacheKey(config.chapter, hash);
+        const identityKey = pageKey(config.chapter, page.order);
         stage('detecting');
         if (force) {
             // Retranslation is "the same page again": fresh detection and a fresh answer, but
             // overlapping pages keep their contributions so the book stays in reading order.
             const { cacheDelete } = await import('../content/page-cache');
-            await cacheDelete(key);
+            await cacheDelete(bytesKey);
+            await cacheDelete(identityKey);
         }
         let resolved;
         try {
             // Resume first: when detection already ran and the OCR checkpoint landed, coming
             // back through /v1/page would re-pay detect and re-OCR, and the fresh call would
             // send empty sources. A resumed detect carries the paid texts in cloudTexts.
-            const hit = await cacheGet(key);
+            // The checkpoint is bytes-scoped: it describes a detection of THESE pixels.
+            const hit = await cacheGet(bytesKey);
             if (!force && isResumable(hit, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud')) {
                 resolved = { det: detFromPartial(hit!, bitmap.width, bitmap.height), resumed: true };
             } else {
@@ -181,7 +187,13 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
             throw e;
         }
         if (!valid()) return null;
-        const cached = !resolved.det ? await cacheGet(key) : undefined;
+        // A finished page is reusable across encoders: prefer the page-identity entry, and
+        // fall back to the bytes entry (a page whose source URL never varies writes both).
+        const byIdentity = await cacheGet(identityKey);
+        const decision = pageEntryDecision(byIdentity, hash, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height);
+        const cached = !resolved.det
+            ? (decision.usable ? byIdentity : await cacheGet(bytesKey))
+            : undefined;
         const boxes = resolved.det?.boxes.length ?? cached?.boxes.length ?? 0;
         // A page with no detected text has nothing to translate or paint; do not cache or fold it.
         if (!boxes) {
@@ -203,20 +215,36 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
         if ('error' in out && out.error) throw Object.assign(new Error(out.error), { kind: out.errorKind });
         if (!valid()) return null;
         stage('rendering');
+        // AI-cleanup crops are erased pixels, so they are reusable only when the bytes match.
+        // The translation above is keyed by page identity and may have come from a different
+        // encoder — carrying its crops onto these pixels would paint erased regions in the
+        // wrong places, so they are dropped and re-derived from these bytes.
+        const reusablePatches = cached === byIdentity && !decision.dropPatches ? byIdentity?.patches : undefined;
         const rendered = await renderPage({ kind: 'img', el: document.createElement('img') },
-            { srcUrl: page.url, bitmap, det, hash, cached: { outputs: out.outputs, extras: out.extras, mentions: out.mentions } },
+            { srcUrl: page.url, bitmap, det, hash,
+                cached: { ...out, patches: reusablePatches,
+                    ...(reusablePatches?.length ? { patchesGen: byIdentity?.patchesGen } : null) } },
             () => {}, false, { paintOnly: true, detached: true });
         let blob: Blob;
         try { blob = await (await fetch(rendered.translated)).blob(); }
         finally { URL.revokeObjectURL(rendered.translated); }
         if (!valid()) return null;
-        const entry: ChapterArtifact['entry'] = { key, fp: settingsFingerprint(config.pipeline),
+        const fp = settingsFingerprint(config.pipeline);
+        // Identity entry: what the page says, reusable whatever the encoder. Written under
+        // page identity so the reader finds it no matter which bytes it is showing.
+        const entry: ChapterArtifact['entry'] = { key: identityKey, fp,
             w: bitmap.width, h: bitmap.height, boxes: det.boxes, panels: det.panels ?? [],
             outputs: out.outputs, extras: out.extras, mentions: out.mentions,
-            mask: packMask(det.mask), splitGen: det.splitGen ?? 0, ep: det.ep };
+            mask: packMask(det.mask), splitGen: det.splitGen ?? 0, ep: det.ep,
+            order: page.order, keyGen: PAGE_KEY_GEN };
+        // Bytes entry: the resume checkpoint's full form, home of the crops.
+        const bytesEntry: ChapterArtifact['entry'] = { ...entry, key: bytesKey };
         await writeRecord(artifactKey(id, page.id), { blob, entry, at: Date.now(), signature: signature() } satisfies ChapterArtifact);
         if (!valid()) return null;
-        if (config.pipeline.cacheEnabled) await cachePut(entry, config.pipeline.cacheMax);
+        if (config.pipeline.cacheEnabled) {
+            await cachePut(entry, config.pipeline.cacheMax);
+            await cachePut(bytesEntry, config.pipeline.cacheMax);
+        }
         const contribution = { id: page.id, order: page.order, hash, outputs: out.outputs, mentions: out.mentions ?? [] };
         await contextFor([contribution]);
         if (!valid()) return null;
@@ -335,7 +363,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         for (const p of msg.pages as ChapterPage[]) {
             if (!config.pages.some(old => old.id === p.id)) {
                 config.pages.push(p);
-                status.pages.push({ id: p.id, url: p.url, phase: 'queued' });
+                status.pages.push({ id: p.id, url: p.url, order: p.order, phase: 'queued' });
             } else {
                 const old = config.pages.find(old => old.id === p.id)!;
                 if (p.source) old.source = p.source;
@@ -365,7 +393,7 @@ async function attach(runnerId: string): Promise<void> {
     if (checkpoint) config = { ...config, ...checkpoint.config };
     status = checkpoint?.progress ?? { id, chapter: config.chapter, phase: 'running', done: 0, total: config.pages.length,
         inflight: 0, errors: 0, completeManifest: config.completeManifest,
-        pages: config.pages.map(p => ({ id: p.id, url: p.url, phase: 'queued' })) };
+        pages: config.pages.map(p => ({ id: p.id, url: p.url, order: p.order, phase: 'queued' })) };
     for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
     // Storage-change events are optional: an offscreen document is given only the runtime
     // API, and the shim may not cover every area this build talks to. A missing event must

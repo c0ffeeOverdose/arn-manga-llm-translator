@@ -116,7 +116,7 @@ export function regionChunks<T>(regions: T[], size = LLM_REGIONS_PER_REQUEST): T
 }
 
 export interface CachedPage {
-    key: string;      // chapter#contentHash
+    key: string;      // chapter#contentHash — bytes identity: which pixels this was made from
     fp: string;       // settings fingerprint at translate time
     w: number; h: number; // full-page dims — must still match (cheap second gate)
     atime: number;    // last hit, for LRU
@@ -147,6 +147,11 @@ export interface CachedPage {
     // `boxes`) — restored by detFromPartial so a resumed job skips the /v1/inpaint roundtrip.
     // Full entries never carry this.
     cpatches?: InpaintPatch[];
+    // page identity: the chapter order this entry belongs to, and the scheme generation.
+    // An entry without these was written under bytes identity (legacy) and must not be
+    // matched by page-identity lookups.
+    order?: number;
+    keyGen?: number;
 }
 
 // Bump when the AI-cleanup crop pipeline changes (window geometry, model, mask recipe,
@@ -212,6 +217,35 @@ export function isResumable(hit: CachedPage | undefined, fp: string, w: number, 
     return !!hit && hit.partial === true && hit.fp === fp
         && hit.w === w && hit.h === h && hit.boxes.length > 0 && !!hit.mask
         && cloudSplitFresh(hit, isCloud);
+}
+
+// Can a page-identity entry be used for the bytes we are holding? The translation, the
+// detection and the rendered image do not depend on which encoder/host/tier produced the
+// pixels, so a differing content hash is NOT a reason to discard them. Only the AI-cleanup
+// crops are made of erased pixels and must come from the same bytes.
+//
+// `hash` is the current bytes' content hash ('' when unknown — a runner that could not read
+// them). A mismatch is tolerated; the caller drops `patches` and re-derives them.
+export interface PageKeyDecision {
+    usable: boolean;
+    // the crops must be recomputed: they were made from different pixels
+    dropPatches: boolean;
+    reason: 'ok' | 'no-entry' | 'legacy' | 'fingerprint' | 'dims' | 'partial';
+}
+export function pageEntryDecision(
+    hit: CachedPage | undefined, hash: string, fp: string, w: number, h: number,
+): PageKeyDecision {
+    if (!hit) return { usable: false, dropPatches: false, reason: 'no-entry' };
+    // Written before page identity existed: keyed by bytes, so a hash change means the work
+    // may belong to different pixels. Refuse rather than guess.
+    if (hit.keyGen !== PAGE_KEY_GEN) return { usable: false, dropPatches: false, reason: 'legacy' };
+    if (hit.fp !== fp) return { usable: false, dropPatches: false, reason: 'fingerprint' };
+    // Page dims are stable across encoders of the same page; a real change means a different
+    // page landed in this slot, which page identity alone cannot detect.
+    if (hit.w !== w || hit.h !== h) return { usable: false, dropPatches: false, reason: 'dims' };
+    if (hit.partial === true) return { usable: false, dropPatches: false, reason: 'partial' };
+    const sameBytes = !!hash && hit.key.slice(hit.key.lastIndexOf('#') + 1) === hash;
+    return { usable: true, dropPatches: !sameBytes, reason: 'ok' };
 }
 
 // rebuild a live DetectResult from a resumable partial — ordered boxes, panels, mask and
@@ -285,6 +319,26 @@ export function pageHashFromBitmap(bitmap: ImageBitmap): string {
 export function cacheKey(chapter: string, hash: string): string {
     return `${chapter}#${hash}`;
 }
+
+// ---- page identity vs bytes identity (they are different questions).
+//
+//   cacheKey(chapter, hash)  "which pixels is this work made from"  — bytes identity
+//   pageKey(chapter, order)  "which page in the chapter is this"    — page identity
+//
+// A reader may serve the same page from another CDN host, another encoder, or the
+// data-saver tier: the bytes change while the page does not. Keying the expensive, bytes-
+// independent work (translation, detection, the rendered image) on bytes identity made
+// those change a MISS, so the same page was re-translated — and the reader, reading under
+// its own hash, never saw the chapter's result at all. Translation does not depend on which
+// JPEG the CDN chose, so it is keyed by page identity; only the AI-cleanup crops, which are
+// literally erased pixels, stay on bytes identity.
+export function pageKey(chapter: string, order: number): string {
+    return `${chapter}@p${order}`;
+}
+
+// Marks an entry written under page identity (as opposed to a legacy bytes-keyed entry).
+// Bumped when the identity scheme changes so stale entries never mix schemes.
+export const PAGE_KEY_GEN = 1;
 
 // Story identity for multi-site use: origin + path + query + hash, minus obvious page-turn
 // suffixes. Page-turns share a key (queue + context survive flipping pages); anything else

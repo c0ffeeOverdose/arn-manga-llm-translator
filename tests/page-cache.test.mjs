@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -866,8 +866,36 @@ test('buildPagedUrls kinds: data default, data-saver on request, junk kind rejec
   assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', ['p1.png'], 'orig'), []);
 });
 
-test('regionChunks splits a page so no request starves its own answer', () => {
-  // A single request with the page plus a crop per region came back 200 with no content
+test('pageEntryDecision: page identity survives an encoder change, crops do not', () => {
+  const fp = 'fp1', W = 836, H = 1200;
+  const entry = (over = {}) => ({ key: `ch#aaa`, fp, w: W, h: H, keyGen: PAGE_KEY_GEN, ...over });
+  // Same bytes: everything reusable.
+  assert.deepEqual(pageEntryDecision(entry(), 'aaa', fp, W, H), { usable: true, dropPatches: false, reason: 'ok' });
+  // Different bytes (another host / encoder / data-saver tier): the translation still holds,
+  // only the erased-pixel crops are dropped. This is the whole point of page identity.
+  assert.deepEqual(pageEntryDecision(entry(), 'bbb', fp, W, H), { usable: true, dropPatches: true, reason: 'ok' });
+  // An entry written before page identity existed cannot be trusted on a hash mismatch.
+  assert.equal(pageEntryDecision(entry({ keyGen: undefined }), 'bbb', fp, W, H).reason, 'legacy');
+  assert.equal(pageEntryDecision(entry({ keyGen: 0 }), 'aaa', fp, W, H).reason, 'legacy');
+  // Settings changed → the translation is not the one the user asked for.
+  assert.equal(pageEntryDecision(entry(), 'aaa', 'fp2', W, H).reason, 'fingerprint');
+  // Different page dims: this slot holds a different page, which identity alone cannot see.
+  assert.equal(pageEntryDecision(entry(), 'aaa', fp, W, H + 1).reason, 'dims');
+  // A checkpoint is not a finished page.
+  assert.equal(pageEntryDecision(entry({ partial: true }), 'aaa', fp, W, H).reason, 'partial');
+  assert.equal(pageEntryDecision(undefined, 'aaa', fp, W, H).reason, 'no-entry');
+  // Unknown current hash (runner could not read the bytes) still uses the entry.
+  assert.deepEqual(pageEntryDecision(entry(), '', fp, W, H), { usable: true, dropPatches: true, reason: 'ok' });
+});
+
+test('pageKey is a page identity, distinct from the bytes key', () => {
+  // Same page, two encoders: one identity, two bytes keys.
+  assert.equal(pageKey('ch1', 4), pageKey('ch1', 4));
+  assert.notEqual(pageKey('ch1', 4), pageKey('ch1', 5));
+  assert.notEqual(pageKey('ch1', 4), cacheKey('ch1', 'deadbeef'));
+});
+
+test('regionChunks splits a page so no request starves its own answer', () => {  // A single request with the page plus a crop per region came back 200 with no content
   // once a page had ~10+ regions, while 3-6 region requests answered fine.
   assert.deepEqual(regionChunks([1, 2, 3, 4, 5, 6, 7]), [[1, 2, 3, 4, 5, 6], [7]]);
   assert.deepEqual(regionChunks([1, 2, 3]), [[1, 2, 3]]);

@@ -8,7 +8,8 @@ import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
 import { inpaintMode } from '../llm/pipeline-settings';
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, type CachedPage } from './page-cache';
+import { pageHashFromBitmap, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, type CachedPage } from './page-cache';
+import { sweepPageOrder } from './sweep';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
@@ -200,8 +201,8 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     // dump (absent | fp | dims | splitgen | mask | disabled)
     let cacheMiss: string | undefined = pipeline.cacheEnabled ? 'absent' : 'disabled';
     if (!force) {
-        const hit = await cacheGet(cacheKey(chapterKey(), hash));
         const fp = settingsFingerprint(pipeline);
+        const hit = await cacheGet(cacheKey(chapterKey(), hash));
         // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite.
         // Partial entries never render as Done — they resume below.
         if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
@@ -213,6 +214,26 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
         if (hit && pipeline.cacheEnabled) cacheMiss = hit.fp !== fp ? 'fp' : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : !cloudSplitFresh(hit, pipeline.inferEngine === 'cloud') ? 'splitgen' : 'mask';
+        // A chapter run writes its work under page identity, so a page the user opens after
+        // "Translate to end of chapter" is a HIT here even though the bytes the reader is
+        // showing differ from what the runner fetched. Without this the same page was
+        // translated again (and billed again) on "Translate this page".
+        if (pipeline.cacheEnabled) {
+            const order = sweepPageOrder(srcUrl);
+            const byPage = order != null ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
+            const decision = pageEntryDecision(byPage, hash, fp, bitmap.width, bitmap.height);
+            if (decision.usable && byPage?.mask) {
+                cacheMiss = undefined;
+                onStatus('Cache hit…');
+                const det = detFromCacheEntry(byPage, bitmap.width, bitmap.height)!;
+                // crops are erased pixels: keep them only when the bytes match this page
+                const cached = decision.dropPatches
+                    ? { ...byPage, patches: undefined, patchesGen: undefined }
+                    : byPage;
+                return { srcUrl, bitmap, det, hash, cached, prepMs: prepMs(),
+                    origBytes: ref.kind === 'canvas' ? bytes : undefined };
+            }
+        }
         // detect checkpoint resume: the previous load finished detect but died before
         // translating — continue at translateRegions, skipping detect entirely.
         if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
