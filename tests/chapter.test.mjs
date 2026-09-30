@@ -91,8 +91,14 @@ test('the page the reader is on is planned first, and the batch stays bounded', 
     const phases = pages(6).map(() => 'queued');
     assert.deepEqual(nextBatch(phases, pages(6), { perBatch: 3, priority: 'p3' }).map(b => b.order), [3, 0, 1]);
 });
-test('a waiting page stops the planner instead of looping forever', () => {
-    assert.deepEqual(nextBatch(['waiting', 'queued'], pages(2), { perBatch: 3, priority: '' }), []);
+test('a waiting page is skipped, never allowed to stall the queue', () => {
+    // Holding every page behind a pixel-waiting one left a chapter stuck part-way
+    // (observed as "18 of 27 ready" with a page still "waiting"). The waiting page
+    // keeps its phase; the rest of the chapter proceeds.
+    assert.deepEqual(nextBatch(['waiting', 'queued'], pages(2), { perBatch: 3, priority: '' }).map(b => b.order), [1]);
+    assert.deepEqual(nextBatch(['waiting', 'queued', 'queued'], pages(3), { perBatch: 3, priority: '' }).map(b => b.order), [1, 2]);
+    // Only waiting pages left → nothing to plan, and the caller stops cleanly.
+    assert.deepEqual(nextBatch(['waiting', 'waiting'], pages(2), { perBatch: 3, priority: '' }), []);
     assert.equal(pagePhase('waiting'), 'waiting');
     assert.equal(pagePhase('rendering'), 'rendering');
     assert.equal(pagePhase('ready'), 'ready');

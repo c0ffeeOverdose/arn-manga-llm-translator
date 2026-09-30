@@ -103,6 +103,18 @@ export function paintLaneSize(gpu: boolean): number {
     return gpu ? 3 : 1;
 }
 
+// Vision translation sends the full page plus one crop per region, and a provider burns its
+// output budget long before it runs out of regions: a request with ~10+ crops routinely came
+// back 200 with no content while a 3-6 region request answered fine. Split the region list so
+// no single request is large enough to starve its own answer. Pure — unit-tested.
+export const LLM_REGIONS_PER_REQUEST = 6;
+export function regionChunks<T>(regions: T[], size = LLM_REGIONS_PER_REQUEST): T[][] {
+    if (!regions.length || size < 1) return [];
+    const out: T[][] = [];
+    for (let i = 0; i < regions.length; i += size) out.push(regions.slice(i, i + size));
+    return out;
+}
+
 export interface CachedPage {
     key: string;      // chapter#contentHash
     fp: string;       // settings fingerprint at translate time

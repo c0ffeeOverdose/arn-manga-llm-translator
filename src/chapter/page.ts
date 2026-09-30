@@ -251,7 +251,9 @@ async function pump(): Promise<void> {
             const batch = nextBatch(status.pages.map(p => pagePhase(p.phase)), config.pages,
                 { perBatch: config.pipeline.parallelLlm || 3, priority });
             if (!batch.length) {
-                // A page still waiting for its pixels ends the run; discovery may append more.
+                // No queued page is due: either more pages exist to discover, or only
+                // pixel-waiting pages remain (not a completion — the reader may still
+                // materialize them). Discovery may append work; otherwise stop cleanly.
                 if (await discover(generation)) continue;
                 break;
             }
@@ -272,7 +274,9 @@ async function pump(): Promise<void> {
             for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
             if (status.phase === 'stopping') status.phase = 'stopped';
         } else if (status.phase === 'running') {
-            status.phase = config.completeManifest && !status.pages.some(p => p.phase === 'waiting') ? 'complete' : 'waiting';
+            // Pixel-waiting pages are the reader's problem, not a failure of the run: the
+            // chapter is complete when the manifest is complete and nothing is left to do.
+            status.phase = config.completeManifest ? 'complete' : 'waiting';
         }
         await publish();
     } catch (e) { stop('Translation paused — could not save chapter progress'); showFatal(e); }

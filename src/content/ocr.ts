@@ -7,7 +7,7 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
-import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, INPAINT_PATCH_GEN } from './page-cache';
+import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, INPAINT_PATCH_GEN } from './page-cache';
 import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './render';
 import { erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
@@ -552,6 +552,28 @@ export async function translateRegions(
             onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
         }, 1000);
         opts?.afterOcr?.();
+        // A single request carrying the full page plus a crop per region starves the model's
+        // output budget: ~10+ regions routinely answered 200 with no content while a 3-6 region
+        // request answered fine. Split into chunks and merge. The annotated full page (index 0)
+        // rides only the chunk's own regions, so the prompt stays consistent per request.
+        const chunks = regionChunks(regions);
+        // Renumber each chunk to 1..n and pair it with its own crops. The prompt numbers
+        // regions by `index` while the crops travel positionally, and the background reads
+        // `imagesB64[index]` — so a chunk carrying page-global indices (7..12) asked for
+        // "region 7" with its first crop and read crop slot 7, which either missed or
+        // mismatched. Chunk-local indices keep prompt, crops and reply aligned.
+        const chunkPayload = (subset: RegionInput[]): Record<string, unknown> => {
+            const local = subset.map((r, i) => ({ ...r, index: i + 1 }));
+            let chunkImages = imagesB64;
+            if (vision && imagesB64?.length) {
+                const cropOf = new Map(regions.map((r, i) => [r.index, imagesB64![cropsOnly ? i : i + 1]]));
+                chunkImages = [
+                    ...(cropsOnly ? [] : [imagesB64[0]]), // the annotated page, if this mode sends one
+                    ...subset.map(r => cropOf.get(r.index)).filter((b): b is string => !!b),
+                ];
+            }
+            return { ...payload, imagesB64: chunkImages, regions: local };
+        };
         let resp: any;
         // transcripts seen on the interim message — if the RPC channel dies
         // mid-translate, the fallback re-sends them so the new worker translates
@@ -576,7 +598,7 @@ export async function translateRegions(
         // The port is registered in `liveRpcs` so a user Stop can disconnect it
         // immediately — without this a hung LLM call held the page (and the pill)
         // for its full 240s adapter timeout with no way out.
-        const portSend = () => new Promise<unknown>((resolve, reject) => {
+        const portSend = (sendPayload: Record<string, unknown>) => new Promise<unknown>((resolve, reject) => {
             let port: chrome.runtime.Port;
             try { port = chrome.runtime.connect({ name: 'mt-rpc' }); } catch (e) { reject(e); return; }
             const tRpc = Date.now();
@@ -609,42 +631,71 @@ export async function translateRegions(
                 console.warn(`[mt:trace] translateRegions RPC DISCONNECTED after ${Date.now() - tRpc}ms`);
                 reject(new Error('background disconnected'));
             });
-            try { port.postMessage(payload); } catch (e) { clearTimeout(to); cleanup(); reject(e); }
+            try { port.postMessage(sendPayload); } catch (e) { clearTimeout(to); cleanup(); reject(e); }
         });
+        // Send each chunk and merge. The reply shape is the background's own
+        // (`outputs`/`extras`/`mentions`/`usage`/`llmCalls`/`llmMs`), so the merged reply
+        // must be rebuilt in that shape — reading `resp.regions` here silently produced an
+        // empty result and every page failed with "no usable text regions parsed".
+        const merged: { outputs: RegionOutput[]; extras: ExtraRegion[]; mentions: Mention[]; raw: string;
+            usage: Record<string, number>; calls: number; ms: number; context?: ContextState; bookOps: BookOp[] } =
+            { outputs: [], extras: [], mentions: [], raw: '', usage: {}, calls: 0, ms: 0, bookOps: [] };
         try {
-            try {
-                resp = await portSend();
-            } catch (e) {
-                if (!/background disconnected|RPC timeout/.test(String((e as Error)?.message ?? ''))) throw e;
-                // wake-race / no listener: retry the classic channel on a rising
-                // backoff before giving up entirely.
-                let lastErr: unknown = e;
-                for (const wait of [5000, 20000, 60000]) {
-                    await new Promise(r => setTimeout(r, wait));
-                    try {
-                        // transcripts already paid for: the re-send is the same text-only
-                        // translate stage, not a re-transcription (images dropped too).
-                        const retryPayload = interimTexts
-                            ? { ...payload, imagesB64: undefined, regions: withSources(payload.regions, interimTexts), vision: false, textOnly: true, ocr: true }
-                            : payload;
-                        resp = await chrome.runtime.sendMessage(retryPayload);
-                        lastErr = null;
-                        break;
-                    } catch (e2) {
-                        lastErr = e2;
-                        if (!/Receiving end/.test(String((e2 as Error)?.message ?? ''))) throw e2;
+            for (const chunk of chunks.length ? chunks : [regions]) {
+                const one = chunkPayload(chunk);
+                try {
+                    resp = await portSend(one);
+                } catch (e) {
+                    if (!/background disconnected|RPC timeout/.test(String((e as Error)?.message ?? ''))) throw e;
+                    // wake-race / no listener: retry the classic channel on a rising
+                    // backoff before giving up entirely.
+                    let lastErr: unknown = e;
+                    for (const wait of [5000, 20000, 60000]) {
+                        await new Promise(r => setTimeout(r, wait));
+                        try {
+                            // transcripts already paid for: the re-send is the same text-only
+                            // translate stage, not a re-transcription (images dropped too).
+                            const retryPayload = interimTexts
+                                ? { ...one, imagesB64: undefined, regions: withSources(one.regions as RegionInput[], interimTexts), vision: false, textOnly: true, ocr: true }
+                                : one;
+                            resp = await chrome.runtime.sendMessage(retryPayload);
+                            lastErr = null;
+                            break;
+                        } catch (e2) {
+                            lastErr = e2;
+                            if (!/Receiving end/.test(String((e2 as Error)?.message ?? ''))) throw e2;
+                        }
                     }
+                    if (lastErr) throw lastErr;
                 }
-                if (lastErr) throw lastErr;
+                if (!resp?.ok) {
+                    const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string; retryAfterMs?: number };
+                    err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
+                    throw err;
+                }
+                // Replies carry chunk-local indices; map them back to the page's own
+                // numbering, or the renderer paints crop 1's text on region 7.
+                const globalOf = new Map(chunk.map((r, i) => [i + 1, r.index]));
+                const lift = <T extends { index: number }>(list: T[]): T[] =>
+                    list.map(o => ({ ...o, index: globalOf.get(o.index) ?? o.index }));
+                merged.outputs.push(...lift(resp.outputs as RegionOutput[] ?? []));
+                merged.extras.push(...(resp.extras ?? []));
+                merged.mentions.push(...(resp.mentions ?? []));
+                merged.bookOps.push(...(resp.bookOps ?? []));
+                merged.raw += (merged.raw ? '\n' : '') + (resp.raw ?? '');
+                for (const [k, v] of Object.entries(resp.usage ?? {})) merged.usage[k] = (merged.usage[k] ?? 0) + Number(v ?? 0);
+                merged.calls += resp.llmCalls ?? 0;
+                merged.ms += resp.llmMs ?? 0;
+                // The book context is the last chunk's own view; every chunk ran against the
+                // same snapshot, so the final one is as correct as any single-request run.
+                if (resp.context) merged.context = resp.context as ContextState;
             }
         } finally {
             clearInterval(llmTick);
         }
-        if (!resp?.ok) {
-            const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string; retryAfterMs?: number };
-            err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
-            throw err;
-        }
+        resp = { ok: true, outputs: merged.outputs, extras: merged.extras, mentions: merged.mentions,
+            bookOps: merged.bookOps, raw: merged.raw, usage: merged.usage, llmCalls: merged.calls,
+            llmMs: merged.ms, context: merged.context };
         // extras arrive in annotated-image space → rescale to full-page pixels.
         const rawExtras: ExtraRegion[] = resp.extras ?? [];
         const extras: ExtraRegion[] = rawExtras
