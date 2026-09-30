@@ -128,6 +128,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
     let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiPre = false, aiError: string | undefined;
     let aiMaskMs = 0, aiLockWaitMs = 0, aiEncodeMs = 0;
+    let savedPatches = false; // crops written to the cache this visit (diagnostic)
     if (aiMode !== 'fill') {
         const cached = prep.cached?.patches?.length && prep.cached.patchesGen === INPAINT_PATCH_GEN
             ? prep.cached.patches : null;
@@ -230,11 +231,12 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         ...(aiMode !== 'fill' ? {
             inpaint: {
                 mode: aiMode, ms: aiMs, windows: aiWindows, patches: aiPatches?.length ?? 0,
-                cached: !!aiPatches && !aiGenerated,
+                cached: !!aiPatches && !aiGenerated && !aiWarmUsed,
                 // breakdown: mask build (main thread) / PNG encode + transfer /
                 // worker ORT queue wait; warm = patches rode the LLM wait
-                ...(aiGenerated ? { maskMs: aiMaskMs, encodeMs: aiEncodeMs, lockWaitMs: aiLockWaitMs } : null),
+                ...((aiGenerated || aiWarmUsed) ? { maskMs: aiMaskMs, encodeMs: aiEncodeMs, lockWaitMs: aiLockWaitMs } : null),
                 ...(aiWarmUsed ? { warm: true } : null),
+                ...(savedPatches ? { saved: true } : null), // crops persisted for the next visit
                 ...(aiPre ? { pre: true } : null), // patches rode the cloud detect call, not a second roundtrip
                 ...(aiError ? { error: aiError } : null),
             },
@@ -310,6 +312,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // Never cache a void result (boxes but zero outputs): it would sit
     // "translated" with nothing on it until force.
     if (!prep.cached && pipeline.cacheEnabled && (det.boxes.length === 0 || outputs.length > 0)) {
+        if (aiPatches?.length) savedPatches = true;
         void cachePut({
             key: cacheKey(chapterKey(), prep.hash),
             fp: settingsFingerprint(pipeline),
@@ -324,8 +327,12 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     } else if (!prep.cached) {
         // cache off: drop the resume checkpoint this finished job may have used.
         void cacheDelete(cacheKey(chapterKey(), prep.hash));
-    } else if (aiGenerated && aiPatches?.length && pipeline.cacheEnabled) {
-        // cache hit that regenerated crops — persist so the next visit skips the model.
+    } else if ((aiGenerated || aiWarmUsed) && aiPatches?.length && pipeline.cacheEnabled) {
+        // cache hit that produced crops this visit — persist so the next visit skips the
+        // model. Both sources must persist: a fresh compute (aiGenerated) and the warm
+        // run that rode the LLM wait (aiWarmUsed). Saving only the former meant every
+        // later visit re-ran the model for the same page.
+        savedPatches = true;
         void cachePut({
             key: cacheKey(chapterKey(), prep.hash),
             fp: settingsFingerprint(pipeline),
