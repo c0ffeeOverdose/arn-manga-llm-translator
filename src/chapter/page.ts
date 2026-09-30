@@ -61,11 +61,16 @@ async function discover(generation: number): Promise<boolean> {
 }
 
 function signature(): string { return JSON.stringify(config.pipeline) + ':' + RENDER_GEN; }
+// The runner module is also bundled into Chromium's service worker (the broker imports the
+// boot helper), where there is no document at all. Every DOM touch must go through here.
+function statusElement(): HTMLElement | null {
+    return typeof document === 'undefined' ? null : document.querySelector('#status');
+}
 function publish(): Promise<void> {
     status.done = status.pages.filter(p => p.phase === 'ready').length;
     status.errors = status.pages.filter(p => p.phase === 'failed').length;
     status.inflight = status.pages.filter(p => ['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)).length;
-    const statusEl = document.querySelector('#status');
+    const statusEl = statusElement();
     if (statusEl) statusEl.textContent = chapterMessage(status);
     const snapshot = structuredClone(status);
     const checkpoint: HostCheckpoint = { config: structuredClone(config), progress: snapshot };
@@ -87,7 +92,7 @@ function stop(message?: string): void {
 }
 function showFatal(e: unknown): void {
     const msg = `Translation paused — ${(e as Error).message || String(e)}`;
-    const el = document.querySelector('#status');
+    const el = statusElement();
     if (el) el.textContent = msg;
     console.error('[mt] chapter runner', e);
     // Persist the reason: an offscreen document has no console a user can open, so a crash
@@ -329,14 +334,13 @@ async function attach(runnerId: string): Promise<void> {
     pumpCheck();
 }
 
-// The broker decides when a runner exists and which session it belongs to. A runner that
-// reloads (event page wake, devtools reload) re-asks for the live session and resumes from
-// the stored checkpoint, so a restart costs at most the page in flight.
-export async function bootChapterRunner(): Promise<void> {
+// Entry point for a context that hosts this runner. Chromium's offscreen document calls it
+// on load; Firefox's background page calls it through chapter/boot.ts. Safe to call twice.
+export async function attachChapterRunner(): Promise<void> {
     if (status) return;
-    const boot = await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-boot' }) as
+    const reply = await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-boot' }) as
         { ok?: boolean; id?: string } | undefined;
-    if (boot?.id) await attach(boot.id);
+    if (reply?.id) await attach(reply.id);
 }
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (sender.id !== chrome.runtime.id) return;
@@ -349,5 +353,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (msg?.type === 'mt:chapter-runner-stop') { stop(); respond({ ok: true }); return; }
 });
 
-void bootChapterRunner().catch(showFatal);
+// A page loaded directly (offscreen document, or a developer opening page.html) attaches
+// itself. Firefox reaches the same code through boot.ts, where the module also evaluates —
+// attaching twice is a no-op because `status` is already set.
+void attachChapterRunner().catch(showFatal);
 

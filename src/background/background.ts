@@ -5,7 +5,7 @@ import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError
 import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl } from './chapter-broker';
-import { bootChapterRunner } from '../chapter/page';
+import { bootChapterRunner } from '../chapter/boot';
 
 // content scripts can't touch storage.session by default — open it up.
 // ?. chain: setAccessLevel doesn't exist on older Firefox, and a sync throw
