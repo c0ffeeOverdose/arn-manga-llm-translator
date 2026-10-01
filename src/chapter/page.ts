@@ -4,16 +4,17 @@ import { resolveHeadlessDet, detFromCacheEntry } from '../content/pipeline';
 import { translateRegions, abortLiveRpcs } from '../content/ocr';
 import { renderPage } from '../content/render-page';
 import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial } from '../content/page-cache';
-import { RENDER_GEN } from '../content/render';
 import { keepaliveOpen } from '../content/queue';
-import { isDebug } from '../debug';
+import { initDebug, isDebug } from '../debug';
 import { chapterMessage, providerMessage, type ChapterPage, type ChapterProgress, type Contribution } from './model';
 import { readRecord, writeRecord } from './store';
-import { artifactKey, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
+import { artifactKey, chapterSignature, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
+import { identifyBitmap, signatureOf } from '../image-identity';
 import type { ContextState } from '../llm/core';
 import { Attempt } from './lifecycle';
 import { nextDocument, chapterImages, guessNextDocument, sameChapterDocument } from './discovery';
 import { nextBatch, pagePhase } from './plan';
+import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 
 let id = '';
 // A page lease must cover the slowest real work (cold model load + a full LLM roundtrip) and
@@ -69,7 +70,7 @@ async function discover(generation: number): Promise<boolean> {
     return true;
 }
 
-function signature(): string { return JSON.stringify(config.pipeline) + ':' + RENDER_GEN; }
+function signature(): string { return chapterSignature(config.pipeline); }
 // The runner module is also bundled into Chromium's service worker (the broker imports the
 // boot helper), where there is no document at all. Every DOM touch must go through here.
 function statusElement(): HTMLElement | null {
@@ -134,7 +135,8 @@ async function source(page: ChapterPage): Promise<ImageBitmap> {
 }
 async function work(page: ChapterPage, snapshot: ContextState, generation: number, live: () => boolean): Promise<Contribution | null> {
     const item = status.pages.find(p => p.id === page.id)!;
-    const valid = () => generation === epoch && live();
+    const cacheEpoch = config.cacheEpoch ?? await cacheReady();
+    const valid = () => generation === epoch && live() && cacheCurrent(cacheEpoch);
     const stage = (phase: typeof item.phase) => { if (valid()) { item.phase = phase; void publish().catch(showFatal); } };
     let bitmap: ImageBitmap | undefined;
     try {
@@ -142,9 +144,10 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
         const previous = await readRecord<ChapterArtifact>(artifactKey(id, page.id));
         const force = config.force?.has(page.id) === true;
         if (!valid()) return null;
-        if (!force && previous && previous.signature === signature()) {
-            const hash = previous.entry.key.slice(previous.entry.key.lastIndexOf('#') + 1);
+        if (!force && previous?.identity && previous.hash && previous.signature === signature()) {
+            const hash = previous.hash;
             item.hash = hash;
+            item.image = signatureOf(previous.identity);
             const contribution = { id: page.id, order: page.order, hash, outputs: previous.entry.outputs, mentions: previous.entry.mentions ?? [] };
             if (!page.inBaseContext) await contextFor([contribution]);
             if (!valid()) return null;
@@ -156,6 +159,7 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
         if (!valid()) return null;
         const hash = pageHashFromBitmap(bitmap);
         item.hash = hash;
+        item.image = signatureOf(identifyBitmap(bitmap));
         if (bitmap.width < 400 || bitmap.height < 300) throw new Error('Image is too small to be a manga page');
         // Two keys, two questions. `bytesKey` is the pixels we hold (resume checkpoints and
         // crops must belong to them); `identityKey` is the page in the chapter (the
@@ -167,8 +171,8 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
             // Retranslation is "the same page again": fresh detection and a fresh answer, but
             // overlapping pages keep their contributions so the book stays in reading order.
             const { cacheDelete } = await import('../content/page-cache');
-            await cacheDelete(bytesKey);
-            await cacheDelete(identityKey);
+            await cacheDelete(bytesKey, cacheEpoch);
+            await cacheDelete(identityKey, cacheEpoch);
         }
         let resolved;
         try {
@@ -180,7 +184,7 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
             if (!force && isResumable(hit, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud')) {
                 resolved = { det: detFromPartial(hit!, bitmap.width, bitmap.height), resumed: true };
             } else {
-                resolved = await resolveHeadlessDet(bitmap, hash, () => {});
+                resolved = await resolveHeadlessDet(bitmap, hash, () => {}, cacheEpoch);
             }
         } catch (e) {
             note(`detect p${page.order} ${(e as Error).message}`.slice(0, 160));
@@ -204,10 +208,11 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
         }
         const det = resolved.det ?? (cached && detFromCacheEntry(cached, bitmap.width, bitmap.height));
         if (!det) throw new Error('Saved page data is incomplete');
+        const identity = identifyBitmap(bitmap, det.boxes);
         stage('translating');
         let out;
         try {
-            out = cached ?? await translateRegions(bitmap, det, () => {}, { fold: false, lo: true, context: snapshot });
+            out = cached ?? await translateRegions(bitmap, det, () => {}, { fold: false, lo: true, context: snapshot, fresh: force, cacheEpoch });
         } catch (e) {
             note(`llm p${page.order} ${(e as Error).message}`.slice(0, 200));
             throw e;
@@ -221,7 +226,7 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
         // wrong places, so they are dropped and re-derived from these bytes.
         const reusablePatches = cached === byIdentity && !decision.dropPatches ? byIdentity?.patches : undefined;
         const rendered = await renderPage({ kind: 'img', el: document.createElement('img') },
-            { srcUrl: page.url, bitmap, det, hash,
+            { srcUrl: page.url, bitmap, det, hash, cacheEpoch,
                 cached: { ...out, patches: reusablePatches,
                     ...(reusablePatches?.length ? { patchesGen: byIdentity?.patchesGen } : null) } },
             () => {}, false, { paintOnly: true, detached: true });
@@ -239,15 +244,17 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
             order: page.order, keyGen: PAGE_KEY_GEN };
         // Bytes entry: the resume checkpoint's full form, home of the crops.
         const bytesEntry: ChapterArtifact['entry'] = { ...entry, key: bytesKey };
-        await writeRecord(artifactKey(id, page.id), { blob, entry, at: Date.now(), signature: signature() } satisfies ChapterArtifact);
+        await writeRecord(artifactKey(id, page.id), { blob, entry, identity, hash, at: Date.now(), signature: signature() } satisfies ChapterArtifact);
         if (!valid()) return null;
         if (config.pipeline.cacheEnabled) {
-            await cachePut(entry, config.pipeline.cacheMax);
-            await cachePut(bytesEntry, config.pipeline.cacheMax);
+            await cachePut(entry, config.pipeline.cacheMax, cacheEpoch);
+            await cachePut(bytesEntry, config.pipeline.cacheMax, cacheEpoch);
         }
         const contribution = { id: page.id, order: page.order, hash, outputs: out.outputs, mentions: out.mentions ?? [] };
+        if (!valid()) return null;
         await contextFor([contribution]);
         if (!valid()) return null;
+        config.force?.delete(page.id);
         item.revision = (item.revision ?? 0) + 1;
         item.phase = 'ready';
         await publish();
@@ -350,10 +357,15 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             if (page) {
                 config.force ??= new Set();
                 config.force.add(page.id);
-                // A page already in flight is superseded, not duplicated.
-                for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
-                if (['reading', 'detecting', 'translating', 'rendering'].includes(page.phase)) epoch++;
-                else page.phase = 'queued';
+                // Revoke the active generation before resetting its phases, so a late
+                // answer cannot replace the user's newer retranslation intent.
+                if (['reading', 'detecting', 'translating', 'rendering'].includes(page.phase)) {
+                    epoch++;
+                    for (const attempt of attempts) attempt.cancel();
+                    abortLiveRpcs();
+                    for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
+                }
+                page.phase = 'queued';
                 status.phase = 'running';
                 status.message = undefined;
             }
@@ -382,9 +394,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 
 async function attach(runnerId: string): Promise<void> {
     id = runnerId;
+    await cacheReady();
+    await initDebug();
     const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-host-init', id });
     if (!response?.ok) throw new Error(response?.error || 'Chapter session expired');
     config = response.config;
+    assertCacheCurrent(config.cacheEpoch ?? '');
     // Load custom fonts before pinning the execution session's settings.
     await loadPipeline();
     configureChapterHost(config.chapter, config.bookKey, config.pipeline, config.context);
@@ -408,7 +423,7 @@ async function attach(runnerId: string): Promise<void> {
 // Entry point for a context that hosts this runner. Chromium's offscreen document calls it
 // on load; Firefox's background page calls it through chapter/boot.ts. Safe to call twice.
 export async function attachChapterRunner(): Promise<void> {
-    if (status) return;
+    if (id) return;
     const reply = await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-boot' }) as
         { ok?: boolean; id?: string } | undefined;
     if (reply?.id) await attach(reply.id);
@@ -417,15 +432,23 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (sender.id !== chrome.runtime.id) return;
     // Firefox starts a run by telling the background page (which IS the runner) to attach.
     if (msg?.type === 'mt:chapter-runner-attach') {
-        if (status) { respond({ ok: true, already: true }); return; }
+        if (id) { respond({ ok: true, already: true }); return; }
         attach(String(msg.id)).then(() => respond({ ok: true }), e => { showFatal(e); respond({ ok: false }); });
         return true;
     }
-    if (msg?.type === 'mt:chapter-runner-stop') { stop(); respond({ ok: true }); return; }
+    if (msg?.type === 'mt:chapter-runner-stop') {
+        (async () => {
+            if (status) stop();
+            while (pumping) await new Promise(r => setTimeout(r, 20));
+            await publishChain;
+            id = '';
+            respond({ ok: true });
+        })();
+        return true;
+    }
 });
 
 // A page loaded directly (offscreen document, or a developer opening page.html) attaches
 // itself. Firefox reaches the same code through boot.ts, where the module also evaluates —
 // attaching twice is a no-op because `status` is already set.
 void attachChapterRunner().catch(showFatal);
-

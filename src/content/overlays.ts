@@ -8,8 +8,9 @@ import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pa
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
 import { autoOn } from './auto';
-import { sweepArrivable, sweepCommitted, sweepPageOrder, chapterOwnsRequest } from './sweep';
+import { sweepArrivable, sweepCommitted, sweepPageOrder, chapterOwnsRequest, resolveChapterRef } from './sweep';
 import { isDebug } from '../debug';
+import { cacheReady, assertCacheCurrent } from '../cache-generation';
 
 export function applyOverlays(): void {
     // SPA navigation watch: an SPA story change must not inherit the old run's
@@ -48,7 +49,6 @@ function arrivalStuck(el: Element, src: string, dims: string): boolean {
     return !!m && m.src === src && m.dims === dims && Date.now() - m.at < ARRIVAL_RETRY_MS;
 }
 async function arrivalPaint(ref: PageRef): Promise<void> {
-    if (chapterOwnsRequest(ref, false)) return;
     const el = ref.el;
     // explicit intent only: a reopened page shows originals until the user
     // presses Translate chapter / enables auto. This session's own sweep
@@ -72,6 +72,9 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
     if (!claimPaint(key)) return;
     arrivalBusy.add(el);
     try {
+        const cacheEpoch = await cacheReady();
+        await resolveChapterRef(ref);
+        if (chapterOwnsRequest(ref, false)) return;
         await loadPipeline();
         const srcUrl = refKey(ref);
         const { bitmap, bytes } = await readPage(ref, srcUrl);
@@ -90,7 +93,8 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         if (!det || !hit || stateFor(ref)) { arrivalMiss.set(el, { src, dims, at: Date.now() }); return; }
         if (!autoOn() && !sweepCommitted(hash)) { arrivalGate.set(el, Date.now()); return; }
         if (isDebug()) console.log('[mt] arrival paint (cache):', src.slice(-24));
-        await renderPage(ref, { srcUrl, bitmap, det, hash, cached: hit,
+        assertCacheCurrent(cacheEpoch);
+        await renderPage(ref, { srcUrl, bitmap, det, hash, cacheEpoch, cached: hit,
             origBytes: ref.kind === 'canvas' ? bytes : undefined }, () => {}, false);
         // first state in this document comes from arrival — flip the overlay here
         // (jobs flip at completion). An explicit "Show original" pin wins.

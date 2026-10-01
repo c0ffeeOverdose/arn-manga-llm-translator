@@ -1,5 +1,6 @@
 import type { ContextState, RegionOutput, Mention } from '../llm/core';
 import type { PipelineSettings } from '../llm/pipeline-settings';
+import type { ImageIdentity, ImageSignature } from '../image-identity';
 
 export interface ChapterPage {
     id: string;
@@ -19,13 +20,15 @@ export interface ChapterProgress {
     inflight: number;
     errors: number;
     completeManifest: boolean;
-    pages: { id: string; url: string; phase: PagePhase; hash?: string; revision?: number; order?: number; matchedBy?: 'url' | 'position' }[];
+    pages: { id: string; url: string; phase: PagePhase; hash?: string; revision?: number; order?: number;
+        image?: ImageSignature; matchedBy?: 'url' | 'image' }[];
     message?: string;
     // Last breadcrumbs from the runner, for a harness debugging a failure. Never shown
     // to the user: the pill reads `message`, this is diagnosis only.
     diagnostics?: string;
 }
 export interface ChapterStart {
+    cacheEpoch?: string;
     chapter: string;
     readerUrl: string;
     pages: ChapterPage[];
@@ -38,7 +41,7 @@ export interface ChapterStart {
     // Page-image shape floor, learned from the images already loaded in the reader. The
     // runner needs it to tell page art from ads/spacers in a document it only parsed.
     imageFilter?: { minW?: number; minH?: number };
-    seeds?: { page: string; image: string; entry: import('../content/page-cache').CachedPage; maskData: string }[];
+    seeds?: { page: string; image: string; entry: import('../content/page-cache').CachedPage; maskData: string; identity?: ImageIdentity }[];
 }
 export interface Contribution {
     id: string;

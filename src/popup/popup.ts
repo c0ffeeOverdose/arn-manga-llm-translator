@@ -246,10 +246,13 @@ ctxBtn.onclick = async () => {
     refreshStatus();
 };
 cacheClearBtn.onclick = async () => {
+    cacheClearBtn.disabled = true;
     cacheClearBtn.textContent = 'Clearing…';
     const resp = await send({ type: 'mt:cache-clear' });
     if (resp?.ok) cacheLabel.textContent = `Cached pages (${resp.mine ?? resp.count} here · ${resp.count} total)`;
+    else statusEl.textContent = resp?.error ?? 'Could not clear translations';
     cacheClearBtn.textContent = 'Clear';
+    cacheClearBtn.disabled = false;
 };
 dirBtn.onclick = async () => {
     lastDir = lastDir === 'rtl' ? 'ltr' : 'rtl';

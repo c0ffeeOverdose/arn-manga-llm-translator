@@ -7,6 +7,7 @@ import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelet
 import { ensureFont, renderTuning, RENDER_GEN } from './render';
 import { updateContext, type Mention, type RegionOutput } from '../llm/core';
 import { isDebug } from '../debug';
+import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { type DetectResult, type DetBox, type MtOnStatus } from './detection';
 import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, loadContext, type PageRef, type PageState } from './state';
 import { getPages, fetchBitmap, writePage, ownCopyNeeded, ownOriginalUrl } from './page-io';
@@ -55,6 +56,8 @@ async function bandConfirms(u: SeamMember, l: SeamMember): Promise<boolean> {
 }
 
 export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promise<PageState | null> {
+    const cacheEpoch = prep.cacheEpoch ?? await cacheReady();
+    assertCacheCurrent(cacheEpoch);
     // trace helper: every bailout logs its reason (debug-gated).
     const trace = (why: string, extra?: object) => {
         if (isDebug()) console.log('[mt] seam?', JSON.stringify({ page: prep.bitmap.width + 'x' + prep.bitmap.height, why, ...(extra ?? {}) }));
@@ -279,7 +282,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         await loadContext();
         const bookBefore = context.characters;
         const pairsBefore = context.pairs;
-        const outcome = await translateRegions(stitchBmp, det, onStatus);
+        const outcome = await translateRegions(stitchBmp, det, onStatus, { cacheEpoch });
         if (outcome.error) { prune(); return null; } // members fall back to solo (parked normally)
         for (const m of chain) bookAdd(m.hash); // folded above (whole-stitch context) — arrivals skip refold
         const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = outcome;
@@ -338,6 +341,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 mask: { width: W, height: mh, data: maskRows },
             };
             const state: PageState = {
+                cacheEpoch,
                 orig: m.srcUrl,
                 translated: URL.createObjectURL(blob),
                 det: localDet,
@@ -357,6 +361,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 state.debug = await renderDebugView(await createImageBitmap(sc), boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask);
             }
             const existing = pages.get(m.key);
+            assertCacheCurrent(cacheEpoch);
             if (existing) {
                 unregPage(existing);
                 URL.revokeObjectURL(existing.translated);
@@ -374,9 +379,9 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     mask: packMask(localDet.mask),
                     splitGen: localDet.splitGen ?? 0,
                     ep: localDet.ep,
-                }, pipeline.cacheMax);
+                }, pipeline.cacheMax, cacheEpoch);
             } else {
-                void cacheDelete(cacheKey(chapterKey(), m.hash)); // cache off: drop the member's resume checkpoint
+                void cacheDelete(cacheKey(chapterKey(), m.hash), cacheEpoch); // cache off: drop the member's resume checkpoint
             }
             writePage(m.ref, state);
             if (!top) top = state;
@@ -394,6 +399,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         }
         return top;
     } catch (e) {
+        assertCacheCurrent(cacheEpoch);
         // no chain was committed (or it was partial — members re-queue cleanly).
         chainKeys.clear();
         try { prune(); } catch { /* prune is best-effort */ }

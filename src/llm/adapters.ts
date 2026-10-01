@@ -525,6 +525,7 @@ export interface TranslateRequestFingerprint {
     regions: RegionInput[];
     context: ContextState;
     vision: boolean; textOnly: boolean; ocr: boolean; split: boolean;
+    requestNonce?: string;
 }
 export interface TranslateFingerprintSettings {
     provider: string; model: string; baseUrl: string; ocrModel: string;
@@ -547,6 +548,7 @@ export function translateRequestParts(
         st.useCharacters, st.contextPairs, st.transcribeSrc, st.vlmAssisted,
         req.vision, req.textOnly, req.ocr, req.split,
         JSON.stringify(req.regions), JSON.stringify(req.context),
+        ...(req.requestNonce && /^[0-9a-f-]{36}$/.test(req.requestNonce) ? ['intent', req.requestNonce] : []),
         ...req.imagesB64,
     ];
 }

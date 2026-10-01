@@ -1,0 +1,86 @@
+import { pages, elStates, retiredBlobs, stateFor, type PageRef, type PageState } from './state';
+import { fetchBitmap, refKey, unscrambleTiles } from './page-io';
+import { identifyBitmap, verifyBitmap, type ImageIdentity } from '../image-identity';
+
+export interface PageSnapshot {
+    source: string;
+    token: string;
+    bitmap: ImageBitmap;
+    image: ImageIdentity;
+    fromNetwork: boolean;
+}
+export function viewToken(ref: PageRef): string {
+    return ref.kind === 'img'
+        ? JSON.stringify([ref.el.src, ref.el.currentSrc, ref.el.naturalWidth, ref.el.naturalHeight])
+        : JSON.stringify([ref.pageSrc, ref.key, ref.el.width, ref.el.height]);
+}
+export function viewSource(ref: PageRef): string {
+    if (ref.kind === 'canvas') return refKey(ref);
+    const live = ref.el.currentSrc || ref.el.src;
+    return pages.get(live)?.orig ?? retiredBlobs.get(live) ?? live;
+}
+function ownsDisplayedImage(ref: PageRef, state: PageState): boolean {
+    if (ref.kind === 'canvas') return false;
+    const live = ref.el.currentSrc || ref.el.src;
+    return [state.origOwn, state.translated, state.debug, state.debugOrig].includes(live) || retiredBlobs.get(live) === state.orig;
+}
+export async function savedOriginal(state: PageState): Promise<ImageBitmap> {
+    if (state.origBytes) return createImageBitmap(new Blob([state.origBytes]));
+    if (state.origOwn) return createImageBitmap(await (await fetch(state.origOwn)).blob());
+    if (/^https?:/.test(state.orig)) return (await fetchBitmap(state.orig)).bitmap;
+    throw new Error('Original image is no longer available');
+}
+
+// Capture only the current source; an owned render is read through its saved original.
+// No screenshot fallback here: a verification probe must not scroll or photograph our paint.
+export async function readView(ref: PageRef): Promise<PageSnapshot> {
+    if (!ref.el.isConnected || (ref.kind === 'img' && !ref.el.complete)) throw new Error('Image is not ready');
+    const token = viewToken(ref), source = viewSource(ref);
+    const state = stateFor(ref);
+    let bitmap: ImageBitmap | undefined;
+    let fromNetwork = false;
+    try {
+        if (state && ownsDisplayedImage(ref, state)) {
+            fromNetwork = !state.origBytes && !state.origOwn && /^https?:/.test(state.orig);
+            bitmap = await savedOriginal(state);
+        }
+        else {
+            try {
+                bitmap = await createImageBitmap(ref.el);
+                const image = identifyBitmap(bitmap);
+                if (ref.kind === 'canvas' && state?.paintedImage && verifyBitmap(bitmap, state.paintedImage) && state.origBytes) {
+                    bitmap.close();
+                    bitmap = await savedOriginal(state);
+                } else if (ref.kind === 'canvas' && state?.paintedImage && state.image && !verifyBitmap(bitmap, state.image)) {
+                    if (pages.get(source) === state) pages.delete(source);
+                    elStates.delete(ref.el);
+                }
+            } catch (e) {
+                bitmap?.close(); bitmap = undefined;
+                if (!/^https?:/.test(source)) throw e;
+                bitmap = (await fetchBitmap(source)).bitmap;
+                fromNetwork = true;
+                if (ref.kind === 'canvas' && ref.pageSrc) {
+                    const fixed = await unscrambleTiles(bitmap);
+                    if (fixed) { bitmap.close(); bitmap = fixed.bitmap; }
+                }
+            }
+        }
+        const image = identifyBitmap(bitmap);
+        if (!ref.el.isConnected || viewToken(ref) !== token) throw new Error('Image changed while reading');
+        return { token, source, bitmap, image, fromNetwork };
+    } catch (e) { bitmap?.close(); throw e; }
+}
+export async function verifyView(ref: PageRef, snapshot: PageSnapshot, identity: ImageIdentity): Promise<boolean> {
+    if (!ref.el.isConnected || viewToken(ref) !== snapshot.token) return false;
+    let current: PageSnapshot | undefined;
+    try {
+        current = await readView(ref);
+        const stable = current.image.exact === snapshot.image.exact
+            || /^https?:/.test(snapshot.source) && (current.fromNetwork || snapshot.fromNetwork)
+                && (ref.kind === 'img' || ref.pageSrc === snapshot.source);
+        return current.token === snapshot.token && stable
+            && verifyBitmap(current.bitmap, identity);
+    } catch { return false; }
+    finally { current?.bitmap.close(); }
+}

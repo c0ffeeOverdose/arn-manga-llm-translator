@@ -3,15 +3,17 @@
 
 import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, chapterKey, type PageRef } from './state';
 import { getPages, refKey } from './page-io';
-import { cacheClear, cacheCount, cacheCountChapter, cacheCountPrefix } from './page-cache';
-import { isDebug } from '../debug';
-import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued, resumeAuto } from './queue';
+import { cacheCount, cacheCountChapter } from './page-cache';
+import { isDebug, setDebug } from '../debug';
+import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued, resumeAuto, viewportOverlap } from './queue';
 import { setStatus, idleStatus, pageCounts, makeToast, logError } from './status-ui';
 import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
 import { toggleCharsPanel, charsPanelOpen } from './chars-ui';
 import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
-import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, elementMap, chapterOwnsRequest } from './sweep';
+import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, elementMap, chapterOwnsRequest, resolveChapterRef } from './sweep';
+import { initTranslationReset } from './translation-reset';
+import { acceptCacheGeneration } from '../cache-generation';
 
 export function toggleOverlay(): void {
     setOverlayOn(!overlayOn);
@@ -26,11 +28,9 @@ export async function toggleShareContextToggle(): Promise<void> {
 }
 
 function imgInViewport(): PageRef | null {
-    const vh = window.innerHeight;
     let best: PageRef | null = null, bestOverlap = 0;
     for (const ref of getPages()) {
-        const r = ref.el.getBoundingClientRect();
-        const overlap = Math.min(r.bottom, vh) - Math.max(r.top, 0);
+        const overlap = viewportOverlap(ref);
         if (overlap > bestOverlap) { bestOverlap = overlap; best = ref; }
     }
     return best;
@@ -65,7 +65,7 @@ function imgAtPoint(x: number, y: number): PageRef | null {
 // popup-button press (no click behind it): translate the whole visible
 // spread, most-visible first. Visibility is by area; slivers under 20% of the
 // viewport are skipped, with nothing passing the dominant page alone keeps going.
-function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => void): void {
+async function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => void): Promise<void> {
     const vh = window.innerHeight || 1;
     const vw = window.innerWidth || 1;
     const area = (r: PageRef): number => {
@@ -95,6 +95,7 @@ function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => void): 
     resumeAuto(); // user intent — a provider halt (rate limit/auth) waits for exactly this
     let queued = 0, cancelled = 0, active = false;
     for (const c of fresh) {
+        await resolveChapterRef(c.r);
         const r = enqueue(c.r);
         if (r === 'queued') queued++;
         else if (r === 'active') active = true;
@@ -122,7 +123,12 @@ function missPage(sendResponse: (r: unknown) => void): void {
 }
 
 export function installMessageListener(): void {
+    initTranslationReset();
     chrome.runtime.onMessage.addListener((msg: { type: string; srcUrl?: string }, _sender, sendResponse) => {
+        if (msg?.type === 'mt:reader-identity') {
+            sendResponse({ url: location.href, chapter: chapterKey() });
+            return;
+        }
         if (msg?.type === 'mt:translate-image') {
             const refs = getPages();
             // click-directed (menu pick / srcUrl) vs spread (bare popup press means
@@ -137,7 +143,10 @@ export function installMessageListener(): void {
             lastRightClicked = null;
             lastRightClickXY = null;
             lastRightClickT = 0;
-            if (!directed) return translateVisible(refs, sendResponse);
+            if (!directed) {
+                void translateVisible(refs, sendResponse).catch(e => sendResponse({ ok: false, error: String(e) }));
+                return true;
+            }
             const ref = elHit || urlHit || ptHit || imgInViewport();
             if (isDebug()) console.log('[mt] translate-image pick', JSON.stringify({
                 via: elHit ? 'element' : urlHit ? 'srcUrl' : ptHit ? 'point' : ref ? 'viewport' : 'none',
@@ -153,17 +162,14 @@ export function installMessageListener(): void {
             }
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
             resumeAuto(); // user intent — clears a provider halt (rate limit/auth)
-            const r = enqueue(ref);
-            if (r === 'dup') {
-                // second click on a queued page = cancel it
-                if (dequeue(ref)) { setStatus(`Removed from queue — ${idleStatus()}`, 'idle'); sendResponse({ ok: true, cancelled: true }); }
-                else sendResponse({ ok: true, cancelled: false });
-            } else if (r === 'active') {
-                sendResponse({ ok: true, active: true });
-            } else {
-                sendResponse({ ok: true });
-            }
-            return;
+            resolveChapterRef(ref).then(() => {
+                const r = enqueue(ref);
+                if (r === 'dup') {
+                    if (dequeue(ref)) { setStatus(`Removed from queue — ${idleStatus()}`, 'idle'); sendResponse({ ok: true, cancelled: true }); }
+                    else sendResponse({ ok: true, cancelled: false });
+                } else sendResponse(r === 'active' ? { ok: true, active: true } : { ok: true });
+            }, e => sendResponse({ ok: false, error: String(e) }));
+            return true;
         }
         if (msg?.type === 'mt:cancel-all') {
             // drop everything queued — the in-flight page runs out (mid-LLM abort
@@ -185,11 +191,13 @@ export function installMessageListener(): void {
             if (pageKeyOf(ref) === activeKeyGet()) { sendResponse({ ok: false, error: 'page is rendering right now' }); return; }
             // The chapter owner holds this page's pixels and book position: a queue job would
             // duplicate the render and fold the page twice. Let the owner redo it instead.
-            if (chapterOwnsRequest(ref, true)) { sendResponse({ ok: true, viaChapter: true }); return; }
-            dequeue(ref); // re-click replaces the queued twin (keyed by page, no-op if absent)
-            const r = enqueue(ref, true);
-            sendResponse(r === 'queued' ? { ok: true } : r === 'active' ? { ok: true, active: true } : { ok: false, error: 'could not queue re-translate' });
-            return;
+            resolveChapterRef(ref).then(() => {
+                if (chapterOwnsRequest(ref, true)) { sendResponse({ ok: true, viaChapter: true }); return; }
+                dequeue(ref);
+                const r = enqueue(ref, true);
+                sendResponse(r === 'queued' ? { ok: true } : r === 'active' ? { ok: true, active: true } : { ok: false, error: 'could not queue re-translate' });
+            }, e => sendResponse({ ok: false, error: String(e) }));
+            return true;
         }
         if (msg?.type === 'mt:toggle-original') {
             toggleOverlay();
@@ -215,13 +223,23 @@ export function installMessageListener(): void {
         if (msg?.type === 'mt:toggle-debug') {
             setDebugOn(!debugOn);
             const on = debugOn;
+            setDebug(on);
             chrome.storage.local.set({ mtDebug: on })
                 .then(() => (on ? ensureDebugViews() : Promise.resolve()))
                 .then(() => { applyOverlays(); sendResponse({ ok: true, debugOn }); });
             return true;
         }
         if (msg?.type === 'mt:cache-clear') {
-            cacheClear().then(async () => sendResponse({ ok: true, count: await cacheCount(), mine: 0, max: pipeline.cacheMax }));
+            chrome.runtime.sendMessage({ type: 'mt:translation-cache-clear' }).then(async response => {
+                if (!response?.ok) { sendResponse({ ok: false, error: response?.error ?? 'Could not clear translations' }); return; }
+                await acceptCacheGeneration(response.generation);
+                sendResponse({ ok: true, count: await cacheCount(), mine: 0, max: pipeline.cacheMax });
+            }).catch(e => sendResponse({ ok: false, error: String(e) }));
+            return true;
+        }
+        if (msg?.type === 'mt:cache-reset') {
+            const generation = (msg as { type: string; generation?: string }).generation;
+            acceptCacheGeneration(generation).then(() => sendResponse({ ok: true }), e => sendResponse({ ok: false, error: String(e) }));
             return true;
         }
         if (msg?.type === 'mt:cache-count') {
@@ -234,8 +252,8 @@ export function installMessageListener(): void {
             // Which chapter page does the extension think each on-screen element is? A
             // windowed reader makes this an inference, so it has to be observable to be
             // checkable — a wrong mapping shows as non-contiguous or unmoving orders.
-            sendResponse(elementMap());
-            return;
+            elementMap().then(sendResponse, e => sendResponse({ error: String(e) }));
+            return true;
         }
         if (msg?.type === 'mt:status') {
             const viewed = imgInViewport();

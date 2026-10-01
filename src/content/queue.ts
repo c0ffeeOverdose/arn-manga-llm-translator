@@ -210,6 +210,7 @@ function pumpPaint(): void {
                 removeActivity(job.key);
                 renderStatus();
             } catch (e) {
+                if ((e as Error)?.name === 'AbortError') return;
                 const err = e as Error & { kind?: string; hint?: string };
                 cooldownMark(failMarks, job.key, Date.now());
                 removeActivity(job.key);
@@ -332,6 +333,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         applyOverlays();
         cooldownClear(failMarks, job.key);
     } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return;
         const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         cooldownMark(failMarks, job.key, Date.now());
         // a refusal stops the chapter's background work: retrying pages cannot succeed

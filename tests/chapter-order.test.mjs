@@ -1,60 +1,109 @@
-// A windowed reader keeps only the pages near the viewport in the DOM, so an element's
-// ordinal among them is NOT its chapter index. Mapping ordinal→index painted page 9 with
-// page 3's translation. Position must be derived from the window's offset from a measured
-// anchor, and any positional match must be verified before it paints.
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
+import { build } from 'esbuild';
 import { readFileSync } from 'node:fs';
+import { test, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { bitmap, grayPage, imageRef, installCanvas } from './helpers/image-fixture.mjs';
 
-const src = readFileSync(new URL('../src/content/sweep.ts', import.meta.url), 'utf8');
+const stubs = {
+    state: `export const pipeline = {}; export const context = {}; export const shareContext = false;
+        export const pages = new Map(); export const elStates = new WeakMap(); export const retiredBlobs = new Map(); export const overlayChoice = 'auto';
+        export const chapterKey = () => 'chapter:test'; export const stateFor = () => undefined;
+        export const bookKey = () => 'book'; export const loadContext = async () => {}; export const loadPipeline = async () => {};
+        export const regPage = state => globalThis.fixture.paints.push(state);
+        export const unregPage = () => {}; export const setOverlayChoice = () => {}; export const setOverlayOn = () => {};
+        export const acceptChapterContext = () => {};`,
+    'page-io': `export const getPages = () => globalThis.fixture.live;
+        export const refKey = ref => ref.el.currentSrc || ref.el.src || ref.key;
+        export const fetchBitmap = async () => { throw new Error('No network'); };
+        export const unscrambleTiles = async () => null; export const ownOriginalUrl = async () => undefined;
+        export const episodeManifestSrcs = () => null; export const fetchPagedUrls = async () => [];
+        export const galleryManifestJson = async () => null; export const collectUnloadedUrls = () => [];
+        export const bitmapBlank = async () => false; export const writePage = () => {};`,
+    queue: `export const viewportOverlap = () => 1; export const dropAutoQueued = () => {};
+        export const resumeAuto = () => {}; export const isBusy = () => false; export const paintBusy = () => false;
+        export const haltAuto = () => {};`,
+    auto: `export const lookaheadActive = () => false;`,
+    'status-ui': `export const setActivity = () => {}; export const removeActivity = () => {};
+        export const lastMsgSet = () => {}; export const renderStatus = () => {}; export const pillUnDismiss = () => {};
+        export const logError = async () => {};`,
+    protocol: `export const chapterSignature = () => 'test:signature';`,
+    store: `export const blobDataUrl = async () => '';`,
+    discovery: `export const nextDocument = () => undefined; export const guessNextDocument = () => undefined;`,
+    debug: `export const isDebug = () => false;`,
+    ocr: `export const ensurePageDebugViews = async () => {};`,
+};
+await build({ entryPoints: ['src/content/sweep.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-order.mjs',
+    plugins: [{ name: 'reader-fixture', setup(build) {
+        build.onResolve({ filter: /./ }, args => {
+            const name = args.path.split('/').at(-1);
+            if (name in stubs) return { path: name, namespace: 'fixture' };
+        });
+        build.onLoad({ filter: /./, namespace: 'fixture' }, args => ({ contents: stubs[args.path], loader: 'js' }));
+        build.onLoad({ filter: /src\/content\/sweep\.ts$/ }, args => ({ loader: 'ts', contents:
+            readFileSync(args.path, 'utf8') + '\nexport const testProgress = p => { progress = p; evidence.clear(); imageAliases.clear(); };\nexport { attach as testAttach };' }));
+    } }] });
+await build({ entryPoints: ['src/image-identity.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-order-image.mjs' });
+const { identifyBitmap, signatureOf } = await import('../.test-build/chapter-order-image.mjs');
+const { testProgress, resolveChapterRef, elementMap, testAttach } = await import('../.test-build/chapter-order.mjs');
 
-test('a positional page match is derived from the anchor, not from the raw ordinal', () => {
-    const fn = src.slice(src.indexOf('function ownedRef'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    // The mapping must be anchor-relative. Using the element's own index as the chapter
-    // order is exactly the bug: a slid window makes ordinal 0 map to page 9.
-    assert.match(body, /anchorOrder \+ \(index - anchorElementIndex\)/,
-        'position must be the window delta from the measured anchor');
-    assert.ok(!/ordered\[index\]/.test(body),
-        'the raw ordinal must never be used as the chapter index');
+beforeEach(() => {
+    installCanvas();
+    globalThis.fixture = { live: [], artifacts: new Map(), paints: [], onResult: undefined };
+    globalThis.document = { hidden: false, querySelectorAll: () => fixture.live.map(r => r.el) };
+    globalThis.chrome = { runtime: { sendMessage: async msg => {
+        if (fixture.onResult) await fixture.onResult(msg);
+        return { result: fixture.artifacts.get(msg.page) };
+    } } };
+    const pages = [1, 2, 3, 4, 5, 6].map(order => {
+        const identity = identifyBitmap(bitmap(grayPage(order)), [{ x1: 10, y1: 10, x2: 200, y2: 200 }]);
+        fixture.artifacts.set(`p${order}`, { identity, signature: 'test:signature' });
+        return { id: `p${order}`, url: `https://cdn.test/${order}.png`, order, phase: 'ready', revision: 1, image: signatureOf(identity) };
+    });
+    testProgress({ id: crypto.randomUUID(), chapter: 'chapter:test', phase: 'complete', pages });
 });
 
-test('a reader that states the page in its URL is believed directly', () => {
-    // /chapter/<uuid>/4 means page 4 — no inference needed, and it is the anchor of last
-    // resort when no element URL matches the chapter list.
-    const fn = src.slice(src.indexOf('function urlPageNumber'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    assert.match(body, /location\.pathname\.match\(PAGE_IN_URL\)/, 'the page number comes from the path');
-    // The visible page is not "the first image": a single-page viewer preloads neighbours.
-    const disp = src.slice(src.indexOf('function displayRef'));
-    assert.match(disp.slice(0, disp.indexOf('\n}')), /viewportOverlap/,
-        'the displayed page is the one covering the viewport');
+test('opaque images resolve without a native page-number URL', async () => {
+    const ref = imageRef('blob:opaque', bitmap(grayPage(4)));
+    assert.equal((await resolveChapterRef(ref))?.order, 4);
 });
-
-test('the anchor is measured once, from a page whose slot is knowable', () => {
-    const fn = src.slice(src.indexOf('function rememberAnchor'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    assert.match(body, /if \(anchorOrder !== null\) return/, 'the anchor is measured once');
-    // Signal 1: a URL the chapter list recognises.
-    assert.match(body, /samePagePath\(q\.url, src\)/, 'a URL-matched element anchors directly');
-    // Signal 2: the URL's own page number, applied to the visible page.
-    assert.match(body, /urlPageNumber\(\)/, 'the URL page number is the fallback anchor');
-    // With neither, there is no anchor and no positional matching — refusing beats guessing.
-    assert.match(fn.slice(0, fn.indexOf('\n}')), /anchorOrder = null|anchorOrder = n - 1/);
+test('sliding a window changes the mapping even when all pages have the same dimensions', async () => {
+    fixture.live = [1, 2, 3].map(n => imageRef(`blob:${n}`, bitmap(grayPage(n))));
+    assert.deepEqual((await elementMap()).map.map(p => p.order), [1, 2, 3]);
+    fixture.live = [4, 5, 6].map(n => imageRef(`blob:${n}`, bitmap(grayPage(n))));
+    assert.deepEqual((await elementMap()).map.map(p => p.order), [4, 5, 6]);
 });
-
-test('a positionally matched page is verified before it paints', () => {
-    const fn = src.slice(src.indexOf('async function attach'));
-    const body = fn.slice(0, fn.indexOf('\n} catch (e) { console.debug'));
-    // An inferred mapping that cannot be checked must refuse: painting page 9 with page 3's
-    // text is far worse than leaving it untranslated.
-    assert.match(body, /page\.matchedBy !== 'url'/, 'url matches are trusted, others are checked');
-    assert.match(body, /probe\.width !== entry\.w/, 'the check compares rendered dims');
-    assert.match(body, /unverifiable-position/, 'an unreadable element with an inferred match refuses');
+test('a recycled node is resolved from its new source rather than its old binding', async () => {
+    const ref = imageRef('blob:first', bitmap(grayPage(2)));
+    assert.equal((await resolveChapterRef(ref))?.order, 2);
+    ref.el.src = ref.el.currentSrc = 'blob:next';
+    ref.el.pixels = bitmap(grayPage(5));
+    assert.equal((await resolveChapterRef(ref))?.order, 5);
 });
-
-test('the anchor is forgotten when the chapter changes', () => {
-    assert.match(src, /forgetAnchor\(\)/, 'a stale anchor describes the old chapter window');
-    const fn = src.slice(src.indexOf('function forgetAnchor'));
-    assert.match(fn.slice(0, fn.indexOf('\n}')), /anchorOrder = null/);
+test('duplicate images in different chapter slots are ambiguous, not last-write-wins', async () => {
+    const identity = identifyBitmap(bitmap(grayPage(2)));
+    fixture.artifacts.set('duplicate', { identity, signature: 'test:signature' });
+    const pages = ['one', 'duplicate'].map((id, order) => ({ id, order, url: `https://cdn/${id}`, phase: 'ready', image: signatureOf(identity) }));
+    fixture.artifacts.set('one', { identity, signature: 'test:signature' });
+    testProgress({ id: 'duplicates', chapter: 'chapter:test', pages });
+    assert.equal(await resolveChapterRef(imageRef('blob:duplicate', bitmap(grayPage(2)))), undefined);
+});
+test('a source change while evidence is in flight cannot bind the late result', async () => {
+    const ref = imageRef('blob:first', bitmap(grayPage(2)));
+    fixture.onResult = async () => {
+        ref.el.src = ref.el.currentSrc = 'blob:next';
+        ref.el.pixels = bitmap(grayPage(5));
+    };
+    assert.equal(await resolveChapterRef(ref), undefined);
+});
+test('a late attachment cannot overwrite a recycled image', async () => {
+    const ref = imageRef('blob:first', bitmap(grayPage(2)));
+    const page = await resolveChapterRef(ref);
+    fixture.onResult = async () => { ref.el.src = ref.el.currentSrc = 'blob:next'; ref.el.pixels = bitmap(grayPage(5)); };
+    await testAttach(ref, page);
+    assert.deepEqual(fixture.paints, []);
+    assert.equal(ref.el.src, 'blob:next');
+});
+test('a different aspect ratio never matches one page of a composite', async () => {
+    const ref = imageRef('blob:spread', bitmap(grayPage(2), { width: 1200, height: 800 }));
+    assert.equal(await resolveChapterRef(ref), undefined);
 });

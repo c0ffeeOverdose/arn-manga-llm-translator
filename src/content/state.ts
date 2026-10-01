@@ -7,10 +7,13 @@ import { fontStackFor, setRenderTuning } from './render';
 import { sessGet } from '../storage-session';
 import { normalizeChapterKey, type EpisodeManifest } from './page-cache';
 import type { DetectResult } from './detection';
+import type { ImageIdentity } from '../image-identity';
+import { cacheGeneration, cacheCurrent } from '../cache-generation';
 
 declare const __BUILD_ID__: string; // injected by build.mjs — which build is this?
 
 export interface PageState {
+    cacheEpoch?: string;
     orig: string;
     translated: string;
     // extension-owned PNG copy of the original pixels for blob-URL readers (their URLs
@@ -26,6 +29,8 @@ export interface PageState {
     bookBefore?: CharacterEntry[];
     pairsBefore?: [string, string][];
     hash?: string; // content hash of the ORIGINAL pixels — element-identity fallback
+    image?: ImageIdentity;
+    paintedImage?: ImageIdentity;
     // canvas pages only: no URL to re-read, so the first read is stashed (original bytes
     // for re-translate, translated bitmap for write-back)
     origBytes?: ArrayBuffer;
@@ -44,18 +49,23 @@ export const pages = new Map<string, PageState>();
 // URL-keyed identity. The element itself is the stable identity: every successful write
 // binds element→state, and an unknown src is verified by content hash (match → alias +
 // paint; mismatch = recycled node showing another page → drop the binding). WeakMap.
-export const elStates = new WeakMap<Element, PageState>();
+export let elStates = new WeakMap<Element, PageState>();
 // in-flight / failed hash verifications per element+src (the 1s sweep must not re-hash them)
-export const verifying = new WeakMap<Element, string>();
-export const verifyFailed = new WeakMap<Element, string>();
+export let verifying = new WeakMap<Element, string>();
+export let verifyFailed = new WeakMap<Element, string>();
 // content index: original-pixel hash → translated state, for the fast repaint lane
 // (known content under an unknown URL repaints with no queue/prep/fold). Same lifecycle
 // as the pages map; memory-only, dies with the tab.
 export const hashStates = new Map<string, { state: PageState; w: number; h: number }>();
 // hash repaints already attempted per element+src with no index hit — genuinely-new pages
 // stay on the queue path instead of re-hashing every sweep. Re-arms on src change.
-export const hashMiss = new WeakMap<Element, string>();
-export const hashPending = new WeakMap<Element, string>();
+export let hashMiss = new WeakMap<Element, string>();
+export let hashPending = new WeakMap<Element, string>();
+export function clearPageBindings(): void {
+    pages.clear(); hashStates.clear();
+    elStates = new WeakMap(); verifying = new WeakMap(); verifyFailed = new WeakMap();
+    hashMiss = new WeakMap(); hashPending = new WeakMap();
+}
 
 // fastest truth first: a KNOWN url (orig, translated blob, retired alias) always wins over
 // a possibly-stale element binding. refKey logic duplicated (one-liner) — no page-io import (cycle).
@@ -63,10 +73,15 @@ export function stateFor(ref: PageRef): PageState | undefined {
     let key: string;
     if (ref.kind === 'canvas') key = ref.pageSrc ?? ref.key;
     else {
-        const ex = pages.get(ref.el.src);
-        key = ex ? ex.orig : (retiredBlobs.get(ref.el.src) ?? ref.el.src);
+        const live = ref.el.currentSrc || ref.el.src;
+        const ex = pages.get(live);
+        key = ex ? ex.orig : (retiredBlobs.get(live) ?? live);
     }
-    return pages.get(key) ?? (ref.kind === 'img' ? elStates.get(ref.el) : undefined);
+    const keyed = pages.get(key);
+    if (keyed || ref.kind === 'canvas') return keyed;
+    const bound = elStates.get(ref.el);
+    const live = ref.el.currentSrc || ref.el.src;
+    return bound && [bound.orig, bound.origOwn, bound.translated, bound.debug, bound.debugOrig].includes(live) ? bound : undefined;
 }
 
 // retired blob URLs: unregPage deletes live keys, but elements still showing an old blob
@@ -81,6 +96,7 @@ export function retireBlob(blob: string | undefined, orig: string): void {
 }
 
 export function regPage(state: PageState): void {
+    if (!cacheCurrent(state.cacheEpoch ?? cacheGeneration())) return;
     pages.set(state.orig, state);
     pages.set(state.translated, state);
     if (state.origOwn) pages.set(state.origOwn, state);

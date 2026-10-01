@@ -11,10 +11,12 @@ import { resolveHeadlessDet } from './pipeline';
 import { sweepHas, sweepActive, bookAdd } from './sweep';
 import { translateRegions, warmPatches, type TranslateOutcome } from './ocr';
 import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto, keepaliveOpen } from './queue';
+import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { cooldownMark, cooldownParked } from './page-cache';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, registerAutoTranslateFlag } from './status-ui';
 
 let autoTranslate = false;          // user toggle (persisted in storage.local)
+export function resetWarmedPages(): void { warmedUrls.clear(); }
 let autoTimer: number | undefined;  // single poll loop, no matter how often toggled
 
 // rolling pre-translate window: every tick refills the queue up to
@@ -74,6 +76,7 @@ export function cancelLookahead(): boolean {
 }
 let lastMtAutoFlag: string | undefined; // E2E auto hook above — transition-only writes
 async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnStatus = () => {}): Promise<void> {
+    const cacheEpoch = await cacheReady();
     resetContextIfNewChapter();
     await loadPipeline();
     // trace before work: a page-turn kills this chain silently, and the next
@@ -99,7 +102,7 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         const fp = settingsFingerprint(pipeline);
         // shared headless resolve (full hit → return, partial → resume,
         // else detect + order + checkpoint).
-        const r = await resolveHeadlessDet(bitmap, hash, onStatus);
+        const r = await resolveHeadlessDet(bitmap, hash, onStatus, cacheEpoch);
         if (!r.det) return;
         if (!r.resumed && prev && samePagePath(prev.key, url) && warmingFresh(prev.ts)) {
             onStatus('Warming was interrupted — restarting…', 'read');
@@ -110,11 +113,12 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         let o: TranslateOutcome;
         try {
             o = await translateRegions(bitmap, det, onStatus,
-                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled, lo: true });
+                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled, lo: true, cacheEpoch });
         } finally {
             endKeepalive();
         }
         if (o.error) throw Object.assign(new Error(`LLM failed: ${o.error}`), { kind: o.errorKind, hint: o.errorHint, retryAfterMs: o.errorRetryAfterMs });
+        assertCacheCurrent(cacheEpoch);
         onStatus('Saving…', 'render'); // headless has no paint — the cache write is the last leg
         bookAdd(hash); // folded above (translateRegions) — arrival must not refold
         if (pipeline.cacheEnabled) {
@@ -123,6 +127,7 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
             // missing model must not fail the lookahead page — the sweep path
             // reports it to the user, background warming stays silent.
             const ai = await warmPatches(bitmap, det, o.outputs).catch(() => null);
+            assertCacheCurrent(cacheEpoch);
             void cachePut({
                 key,
                 fp,
@@ -133,9 +138,9 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
                 splitGen: det.splitGen ?? 0,
                 ep: det.ep,
                 ...(ai ? { patches: ai.patches, patchesGen: ai.patchesGen } : null),
-            }, pipeline.cacheMax);
+            }, pipeline.cacheMax, cacheEpoch);
         } else {
-            void cacheDelete(key); // cache off: drop the resume checkpoint this headless job finished
+            void cacheDelete(key, cacheEpoch); // cache off: drop the resume checkpoint this headless job finished
         }
         if (o.usage) {
             sessionUsage.pages++;
@@ -204,6 +209,7 @@ async function prefetchAhead(): Promise<void> {
                 warmedUrls.add(url);
                 warmed++;
             } catch (e) {
+                if ((e as Error)?.name === 'AbortError') break;
                 const msg = (e as Error)?.message ?? String(e);
                 if (!firstErr) firstErr = msg;
                 cooldownMark(failMarks, url, Date.now());

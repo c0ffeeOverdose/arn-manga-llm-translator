@@ -4,13 +4,18 @@ import { build } from 'esbuild';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync } from 'fs';
+import { bitmap, grayPage, installCanvas } from './helpers/image-fixture.mjs';
 
 mkdirSync('.test-build', { recursive: true });
 await build({
   stdin: {
     contents: [
-      `export { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage } from './src/content/page-io.ts';`
-      + `\nexport { setOverlayOn, setDebugOn } from './src/content/state.ts';`,
+      `export { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage } from './src/content/page-io.ts';`
+      + `\nexport { setOverlayOn, setDebugOn } from './src/content/state.ts';`
+      + `\nexport { identifyBitmap } from './src/image-identity.ts';`,
+      `export { regPage, pages, retireBlob } from './src/content/state.ts';`,
+      `export { cacheGeneration, acceptCacheGeneration } from './src/cache-generation.ts';`,
+      `export { readView } from './src/content/page-identity.ts';`,
     ].join('\n'),
     resolveDir: process.cwd(),
     loader: 'ts',
@@ -21,7 +26,8 @@ await build({
 // state.ts computes contextChapter at import time (needs location)
 globalThis.location = { origin: 'https://test.local', pathname: '/chapter/1', search: '', hash: '' };
 
-const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, setOverlayOn, setDebugOn } =
+const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage, identifyBitmap, setOverlayOn, setDebugOn,
+  regPage, pages, retireBlob, readView, cacheGeneration, acceptCacheGeneration } =
   await import(new URL('../.test-build/page-io.mjs', import.meta.url).href);
 
 function fakeState(extra = {}) {
@@ -102,4 +108,98 @@ test('readPage: dead stashed blob fails loud instead of screenshotting our own r
     /no longer available/,
   );
   assert.ok(!msgs.includes('mt:screenshot'), 'a screenshot here would photograph our translation');
+});
+
+test('canvas paint refuses a same-size redraw while its decode is pending', async () => {
+    installCanvas(); setOverlayOn(true); setDebugOn(false);
+    const original = bitmap(grayPage(1)), translated = bitmap(grayPage(2));
+    let draws = 0;
+    const el = { width: 600, height: 800, gray: original.gray, region: original.region,
+        getContext: () => ({ drawImage() { draws++; } }) };
+    const state = { orig: 'canvas:one', translatedBmp: translated,
+        image: identifyBitmap(original), paintedImage: identifyBitmap(translated) };
+    writePage({ kind: 'canvas', el, key: 'canvas:one' }, state);
+    el.gray = grayPage(4);
+    await new Promise(setImmediate);
+    assert.equal(draws, 0, 'the queued callback must not overwrite new pixels');
+});
+test('canvas paint accepts verified original and translated pixels', async () => {
+    installCanvas(); setOverlayOn(true); setDebugOn(false);
+    const original = bitmap(grayPage(1)), translated = bitmap(grayPage(2));
+    let draws = 0;
+    const el = { width: 600, height: 800, gray: original.gray, region: original.region,
+        getContext: () => ({ drawImage(bmp) { draws++; el.gray = bmp.gray; el.region = bmp.region; } }) };
+    const state = { orig: 'canvas:one', translatedBmp: translated, origBmp: original,
+        image: identifyBitmap(original), paintedImage: identifyBitmap(translated) };
+    writePage({ kind: 'canvas', el, key: 'canvas:one' }, state);
+    await new Promise(setImmediate);
+    assert.equal(draws, 1);
+    setOverlayOn(false);
+    writePage({ kind: 'canvas', el, key: 'canvas:one' }, state);
+    await new Promise(setImmediate);
+    assert.equal(draws, 2);
+    assert.deepEqual(el.gray, original.gray);
+});
+
+test('a source-only state after Clear remains readable without the revoked reader blob', async () => {
+    const state = { orig: 'blob:revoked-source', origOwn: 'blob:owned-source', translated: 'blob:owned-source' };
+    regPage(state);
+    const seen = [];
+    globalThis.fetch = async url => { seen.push(url); return { blob: async () => new Blob([new Uint8Array([7])]) }; };
+    globalThis.createImageBitmap = async () => ({ width: 23, height: 31, close() {} });
+    const result = await readPage({ kind: 'img', el: imgEl(state.origOwn) }, state.orig);
+    assert.equal(result.bitmap.width, 23);
+    assert.deepEqual(seen, [state.origOwn]);
+    pages.clear();
+});
+test('a redrawn canvas cannot reuse original bytes from its old source-only state', async () => {
+    installCanvas();
+    const original = bitmap(grayPage(1));
+    const state = { orig: 'canvas:recycled', translated: 'canvas:recycled',
+        image: identifyBitmap(original), paintedImage: identifyBitmap(original) };
+    regPage(state);
+    const el = { width: 600, height: 800, gray: grayPage(4), region: original.region,
+        toDataURL: () => 'data:image/png;base64,Bw==' };
+    const seen = [];
+    globalThis.createImageBitmap = async blob => { seen.push([...new Uint8Array(await blob.arrayBuffer())]); return bitmap(grayPage(4)); };
+    await readPage({ kind: 'canvas', el, key: state.orig }, state.orig, new Uint8Array([9]).buffer);
+    assert.deepEqual(seen, [[7]], 'read the new canvas, not the old stash');
+    pages.clear();
+});
+test('turning off canvas debug recognizes our debug frame and restores the translation', async () => {
+    installCanvas(); setOverlayOn(true); setDebugOn(true);
+    const original = bitmap(grayPage(1)), translated = bitmap(grayPage(2)), debug = bitmap(grayPage(3));
+    const el = { width: 600, height: 800, gray: original.gray, region: original.region,
+        getContext: () => ({ drawImage(bmp) { el.gray = bmp.gray; el.region = bmp.region; } }) };
+    const state = { orig: 'canvas:debug', translatedBmp: translated, debug: 'blob:debug', debugBmp: debug,
+        image: identifyBitmap(original), paintedImage: identifyBitmap(translated) };
+    await writePage({ kind: 'canvas', el, key: state.orig }, state);
+    assert.deepEqual(el.gray, debug.gray);
+    setDebugOn(false);
+    await writePage({ kind: 'canvas', el, key: state.orig }, state);
+    assert.deepEqual(el.gray, translated.gray);
+});
+test('a cache reset invalidates a canvas callback already waiting for its paint source', async () => {
+    installCanvas(); setOverlayOn(true); setDebugOn(false);
+    const token = cacheGeneration(), original = bitmap(grayPage(1)), translated = bitmap(grayPage(2));
+    let draws = 0;
+    const el = { width: 600, height: 800, gray: original.gray, region: original.region,
+        getContext: () => ({ drawImage() { draws++; } }) };
+    const state = { cacheEpoch: token, orig: 'canvas:late', translatedBmp: translated,
+        image: identifyBitmap(original), paintedImage: identifyBitmap(translated) };
+    const paint = writePage({ kind: 'canvas', el, key: state.orig }, state);
+    await acceptCacheGeneration('reset');
+    await paint;
+    assert.equal(draws, 0);
+    await acceptCacheGeneration(token);
+});
+test('a retired translated view cannot be decoded as an original after Clear', async () => {
+    installCanvas();
+    const state = { orig: 'blob:missing-original', translated: 'blob:missing-original' };
+    regPage(state); retireBlob('blob:retired-render', state.orig);
+    const pixels = bitmap(grayPage(2));
+    const el = { src: 'blob:retired-render', currentSrc: 'blob:retired-render', complete: true, isConnected: true,
+        naturalWidth: pixels.width, naturalHeight: pixels.height, pixels };
+    await assert.rejects(() => readView({ kind: 'img', el }), /Original image is no longer available/);
+    pages.clear();
 });

@@ -6,6 +6,7 @@
 
 import type { DetBox, DetectResult, InpaintPatch, MtOnStatus } from './detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
+import { cacheReady, cacheGeneration, cacheCurrent } from '../cache-generation';
 
 // ORT inference-queue picker (worker-side, pure): first hi-priority task (0), else the
 // oldest — background lookahead/sweep inference yields to the page the user is waiting on.
@@ -116,6 +117,7 @@ export function regionChunks<T>(regions: T[], size = LLM_REGIONS_PER_REQUEST): T
 }
 
 export interface CachedPage {
+    cacheEpoch?: string;
     key: string;      // chapter#contentHash — bytes identity: which pixels this was made from
     fp: string;       // settings fingerprint at translate time
     w: number; h: number; // full-page dims — must still match (cheap second gate)
@@ -894,12 +896,40 @@ function req<T>(q: IDBRequest<T>): Promise<T> {
     return new Promise((res, rej) => { q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
 }
 
+let purgedGeneration: string | undefined;
+let purgeWork: Promise<void> = Promise.resolve();
+async function freshDb(): Promise<IDBDatabase | null> {
+    await cacheReady();
+    const d = await db();
+    if (!d) return null;
+    const token = cacheGeneration();
+    purgeWork = purgeWork.catch(() => {}).then(async () => {
+        if (purgedGeneration === token) return;
+        await new Promise<void>((resolve, reject) => {
+            const tx = d.transaction('pages', 'readwrite');
+            const cursor = tx.objectStore('pages').openCursor();
+            cursor.onsuccess = () => {
+                const row = cursor.result;
+                if (!row) return;
+                if ((row.value.cacheEpoch ?? '') !== token) row.delete();
+                row.continue();
+            };
+            tx.oncomplete = () => resolve();
+            tx.onerror = tx.onabort = () => reject(tx.error ?? new Error('Could not invalidate translation cache'));
+        });
+        purgedGeneration = token;
+    });
+    await purgeWork;
+    return cacheCurrent(token) ? d : freshDb();
+}
+
 export async function cacheGet(key: string): Promise<CachedPage | undefined> {
     try {
-        const d = await db();
+        const d = await freshDb();
         if (!d) return undefined;
+        const token = cacheGeneration();
         const got = await req(d.transaction('pages', 'readonly').objectStore('pages').get(key)) as CachedPage | undefined;
-        if (!got) return undefined;
+        if (!got || !cacheCurrent(token) || (got.cacheEpoch ?? '') !== token) return undefined;
         // LRU touch — fire and forget, a miss here never matters
         try {
             got.atime = Date.now();
@@ -909,12 +939,12 @@ export async function cacheGet(key: string): Promise<CachedPage | undefined> {
     } catch { return undefined; }
 }
 
-export async function cachePut(entry: Omit<CachedPage, 'atime'>, max = CACHE_MAX): Promise<void> {
+export async function cachePut(entry: Omit<CachedPage, 'atime'>, max = CACHE_MAX, token = cacheGeneration()): Promise<void> {
     try {
-        const d = await db();
-        if (!d) return;
+        const d = await freshDb();
+        if (!d || !cacheCurrent(token)) return;
         const store = d.transaction('pages', 'readwrite').objectStore('pages');
-        await req(store.put({ ...entry, atime: Date.now() }));
+        await req(store.put({ ...entry, cacheEpoch: token, atime: Date.now() }));
         const n = await req(store.count());
         if (n > max) {
             const idx = store.index('byAtime');
@@ -927,23 +957,29 @@ export async function cachePut(entry: Omit<CachedPage, 'atime'>, max = CACHE_MAX
 
 // drop one entry (resume checkpoints are written even with the cache off — a finished job
 // must leave nothing behind in that mode)
-export async function cacheDelete(key: string): Promise<void> {
+export async function cacheDelete(key: string, token = cacheGeneration()): Promise<void> {
     try {
-        const d = await db();
-        if (d) await req(d.transaction('pages', 'readwrite').objectStore('pages').delete(key));
+        const d = await freshDb();
+        if (d && cacheCurrent(token)) await req(d.transaction('pages', 'readwrite').objectStore('pages').delete(key));
     } catch { /* best-effort */ }
 }
 
 export async function cacheClear(): Promise<void> {
-    try {
-        const d = await db();
-        if (d) await req(d.transaction('pages', 'readwrite').objectStore('pages').clear());
-    } catch { /* ignore */ }
+    await cacheReady();
+    const d = await db();
+    if (!d) throw new Error('Translation cache is unavailable');
+    await new Promise<void>((resolve, reject) => {
+        const tx = d.transaction('pages', 'readwrite');
+        tx.objectStore('pages').clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = tx.onabort = () => reject(tx.error ?? new Error('Could not clear translation cache'));
+    });
+    purgedGeneration = cacheGeneration();
 }
 
 export async function cacheCount(): Promise<number> {
     try {
-        const d = await db();
+        const d = await freshDb();
         if (!d) return 0;
         return await req(d.transaction('pages', 'readonly').objectStore('pages').count());
     } catch { return 0; }
@@ -953,7 +989,7 @@ export async function cacheCount(): Promise<number> {
 // ever visited, which reads as "unstable" on a 30-page chapter
 export async function cacheCountPrefix(prefix: string): Promise<number> {
     try {
-        const d = await db();
+        const d = await freshDb();
         if (!d) return 0;
         const keys = await req(d.transaction('pages', 'readonly').objectStore('pages').getAllKeys()) as unknown[];
         let n = 0;
@@ -967,7 +1003,7 @@ export async function cacheCountPrefix(prefix: string): Promise<number> {
 // counter that only knows `#` reports 0 while the chapter is full of work.
 export async function cacheCountChapter(chapter: string): Promise<number> {
     try {
-        const d = await db();
+        const d = await freshDb();
         if (!d) return 0;
         const keys = await req(d.transaction('pages', 'readonly').objectStore('pages').getAllKeys()) as unknown[];
         let n = 0;

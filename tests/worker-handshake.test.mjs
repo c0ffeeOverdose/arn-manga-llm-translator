@@ -7,22 +7,43 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { build } from 'esbuild';
 
-const debug = readFileSync(new URL('../src/debug.ts', import.meta.url), 'utf8');
+await build({ entryPoints: ['src/debug.ts'], bundle: true, format: 'esm', outfile: '.test-build/worker-debug.mjs' });
+const loadDebug = name => import(new URL(`../.test-build/worker-debug.mjs?${name}`, import.meta.url).href);
 
-test('initDebug never throws when the context has no chrome.storage', () => {
-    const fn = debug.slice(debug.indexOf('export async function initDebug'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    // Both storage touches must be guarded: the read AND the change listener.
-    const read = body.indexOf('chrome.storage.local.get');
-    const listener = body.indexOf('onChanged');
-    assert.ok(read >= 0 && listener > read, 'initDebug reads the flag then subscribes');
-    // The subscription must be optional-chained AND inside a try — a context without
-    // chrome.storage throws on property access, not on the call.
-    assert.match(body.slice(listener - 30, listener + 20), /chrome\.storage\?\.onChanged\?\./,
-        'the change listener must tolerate a missing storage area');
-    const guarden = body.slice(body.indexOf('onChanged') - 200, body.indexOf('onChanged'));
-    assert.match(guarden, /try\s*\{/, 'the listener registration must sit inside a try');
+test('initDebug never throws when the context has no chrome.storage or runtime', async () => {
+    globalThis.chrome = {};
+    const debug = await loadDebug('no-storage');
+    await debug.initDebug();
+    assert.equal(debug.isDebug(), false);
+});
+test('a debug change during the initial read cannot be overwritten by a stale stored flag', async () => {
+    let changed, resolveRead;
+    globalThis.chrome = { storage: { local: { get: () => new Promise(r => { resolveRead = r; }) },
+        onChanged: { addListener: fn => { changed = fn; } } } };
+    const debug = await loadDebug('read-race');
+    const flips = [];
+    const ready = debug.initDebug(v => flips.push(v));
+    changed({ mtDebug: { newValue: true } }, 'local');
+    resolveRead({ mtDebug: false });
+    await ready;
+    assert.equal(debug.isDebug(), true);
+    assert.deepEqual(flips, [true]);
+});
+test('offscreen debug follows authenticated runtime updates without storage events', async () => {
+    let message;
+    globalThis.chrome = { runtime: { id: 'test-extension', onMessage: { addListener: fn => { message = fn; } } } };
+    const debug = await loadDebug('runtime');
+    const flips = [];
+    await debug.initDebug(v => flips.push(v));
+    message({ type: 'mt:debug-state', on: true }, { id: 'foreign-extension' });
+    assert.equal(debug.isDebug(), false);
+    message({ type: 'mt:debug-state', on: true }, { id: 'test-extension' });
+    assert.equal(debug.isDebug(), true);
+    message({ type: 'mt:debug-state', on: false }, { id: 'test-extension' });
+    assert.equal(debug.isDebug(), false);
+    assert.deepEqual(flips, [true, false]);
 });
 
 test('the worker registers its token after every top-level await', () => {

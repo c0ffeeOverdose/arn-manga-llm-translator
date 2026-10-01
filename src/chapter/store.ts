@@ -35,6 +35,15 @@ export async function deleteRecord(key: string): Promise<void> {
         tx.onerror = tx.onabort = () => reject(tx.error);
     });
 }
+export async function clearRecords(): Promise<void> {
+    const d = await db();
+    return new Promise((resolve, reject) => {
+        const tx = d.transaction('records', 'readwrite');
+        tx.objectStore('records').clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = tx.onabort = () => reject(tx.error ?? new Error('Could not clear chapter results'));
+    });
+}
 export function blobDataUrl(blob: Blob): Promise<string> {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();

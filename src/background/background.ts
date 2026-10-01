@@ -6,11 +6,14 @@ import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcript
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl } from './chapter-broker';
 import { bootChapterRunner } from '../chapter/boot';
+import { cacheReady, cacheCurrent, onCacheReset } from '../cache-generation';
+import { initDebug, isDebug } from '../debug';
 
 // content scripts can't touch storage.session by default — open it up.
 // ?. chain: setAccessLevel doesn't exist on older Firefox, and a sync throw
 // here would kill the worker before it starts.
 chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' })?.catch(() => {});
+const debugReady = initDebug(on => { void chrome.runtime.sendMessage({ type: 'mt:debug-state', on }).catch(() => {}); });
 
 interface TranslateMsg {
     type: 'mt:translate';
@@ -24,6 +27,8 @@ interface TranslateMsg {
     pageH: number;
     cacheKey?: string;        // stable per manga — routes provider-side prompt caching
     interim?: boolean;        // caller understands {type:'mt:ocr-texts'} mid-flight messages (new content only — an old listener would read the interim as the final reply and fail the job)
+    requestNonce?: string;    // fresh user intent; transport retries reuse the same nonce
+    cacheEpoch?: string;
 }
 interface TestLlmMsg {
     type: 'mt:test-llm';
@@ -518,6 +523,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
 // the next call becomes the owner (self-healing).
 const flightWaiters = new Map<string, ((resp: unknown) => void)[]>();
 const flightRecent = new Map<string, { at: number; resp: unknown }>();
+onCacheReset(() => { flightRecent.clear(); flightWaiters.clear(); });
 const FLIGHT_RECENT_TTL_MS = 5 * 60 * 1000;
 const FLIGHT_RECENT_MAX = 20;
 // honest counters (numbers only) — E2E asserts dedup through these.
@@ -543,11 +549,13 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
     let settle: ((resp: unknown) => void) | null = null;
     (async () => {
         try {
+            const cacheEpoch = await cacheReady();
+            await debugReady;
+            if (msg.cacheEpoch !== undefined && msg.cacheEpoch !== cacheEpoch) throw new DOMException('Translation cache was cleared', 'AbortError');
             const settings = await getSettings();
             const pipeline = await getPipeline();
             // user gender overrides from the options page are law
-            const { mtCharOverrides, mtDebug } = await chrome.storage.local.get(['mtCharOverrides', 'mtDebug']);
-            const dbg = mtDebug === true; // one read per call — always fresh, no SW sleep/wake staleness
+            const { mtCharOverrides } = await chrome.storage.local.get('mtCharOverrides');
             // provider-visible session id: opaque digest of the chapter key, salted
             // per install (the raw reader URL never leaves the extension).
             const session = msg.cacheKey ? sessionKey(msg.cacheKey, await getSessionSalt()) : undefined;
@@ -571,7 +579,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 // TEMP TRACE: identifies which leg (r1/r2/r3) is slow/hanging in the field.
                 const traceTag = `r${retryEmpty ? '1+' : ''}${msg.regions.length}reg${imgs?.length ? `/${imgs.length}img` : ''}`;
                 const tCall = Date.now();
-                console.log(`[mt:trace] callWithRetry START ${traceTag}`);
+                if (isDebug()) console.log(`[mt:trace] callWithRetry START ${traceTag}`);
                 // the discarded empty attempt still billed tokens — sum, never drop.
                 // Stays undefined when the provider reports no usage at all, so the
                 // caller's `usage.inTok != null` gate keeps its old meaning.
@@ -590,20 +598,20 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 for (;;) {
                     calls++;
                     const tAttempt = Date.now();
-                    console.log(`[mt:trace] ${traceTag} attempt#${calls} send (${Date.now() - tCall}ms in)`);
+                    if (isDebug()) console.log(`[mt:trace] ${traceTag} attempt#${calls} send (${Date.now() - tCall}ms in)`);
                     try {
                         const r = await callLLM(s, p, imgs, thinking ?? pipeline.thinkingLevel, session, temperature, maxTokens);
                         ms += r.ms;
                         addUsage(r.usage);
                         if (r.tempDropped) tempDropped = true;
                         if (r.thinkingDropped) thinkingDropped = true;
-                        console.log(`[mt:trace] ${traceTag} attempt#${calls} OK in ${Date.now() - tAttempt}ms, text.len=${r.text.trim().length}`);
+                        if (isDebug()) console.log(`[mt:trace] ${traceTag} attempt#${calls} OK in ${Date.now() - tAttempt}ms, text.len=${r.text.trim().length}`);
                         if (retryEmpty && !emptyRetried && !r.text.trim()) {
                             emptyRetried = true;
                             console.warn(`[mt:trace] ${traceTag} EMPTY response (200, no content) — retrying once`);
                             continue;
                         }
-                        console.log(`[mt:trace] callWithRetry DONE ${traceTag} total=${Date.now() - tCall}ms calls=${calls}`);
+                        if (isDebug()) console.log(`[mt:trace] callWithRetry DONE ${traceTag} total=${Date.now() - tCall}ms calls=${calls}`);
                         return { text: r.text, usage, calls, ms, tempDropped, thinkingDropped };
                     } catch (e) {
                         const m = toMtError(e);
@@ -618,11 +626,12 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             const split = pipeline.useOcrModel && vision && !!msg.imagesB64?.length;
             const ocrSettings = split ? await getOcrSettings() : null;
             // adoption check (atomic: no await between map lookup and claim).
-            const reqId = await translateRequestId(translateRequestParts(
+            const reqId = (await translateRequestId(translateRequestParts(
                 {
                     cacheKey: session ?? '', imagesB64: msg.imagesB64 ?? [],
                     regions: msg.regions, context: msgCtx,
                     vision, textOnly: !!msg.textOnly, ocr: !!msg.ocr, split,
+                    requestNonce: msg.requestNonce,
                 },
                 {
                     provider: settings.provider, model: settings.model, baseUrl: settings.baseUrl ?? '',
@@ -635,12 +644,13 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     contextPairs: pipeline.contextPairs, transcribeSrc: pipeline.transcribeSrc,
                     vlmAssisted: pipeline.vlmAssistedDetection,
                 },
-            ));
+            ))) + ':' + cacheEpoch;
+            if (!cacheCurrent(cacheEpoch)) throw new DOMException('Translation cache was cleared', 'AbortError');
             const recent = flightRecentGet(reqId);
             if (recent && (recent as { ok?: unknown })?.ok) {
                 // the twin call finished moments ago — serve without spending.
                 flightStats.recentHits++;
-                if (dbg) console.log('[mt:bg] flight recent-hit', reqId.slice(0, 12));
+                if (isDebug()) console.log('[mt:bg] flight recent-hit', reqId.slice(0, 12));
                 send(recent);
                 return;
             }
@@ -649,7 +659,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 // the twin call is still running — wait for its outcome instead
                 // of paying a duplicate.
                 flightStats.adopted++;
-                if (dbg) console.log('[mt:bg] flight adopted', reqId.slice(0, 12));
+                if (isDebug()) console.log('[mt:bg] flight adopted', reqId.slice(0, 12));
                 send(await new Promise<unknown>(res => inflight.push(res)));
                 return;
             }
@@ -659,6 +669,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             // every exit (ok or error) settles waiters with the same payload.
             settle = (resp: unknown) => {
                 flightWaiters.delete(reqId);
+                if (!cacheCurrent(cacheEpoch)) resp = { ok: false, error: 'Translation cache was cleared', kind: 'cancelled' };
                 if ((resp as { ok?: unknown })?.ok) flightRecentPut(reqId, resp);
                 send(resp);
                 for (const w of mine.splice(0)) { try { w(resp); } catch { /* waiter gone */ } }
@@ -688,7 +699,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     ? await transcribePerRegion(ocr, msg, ocrPl, callWithRetry, ocrTemp)
                     : await transcribeBatched(ocr, msg, ocrPl, callWithRetry, ocrTemp).catch(async (e) => {
                         if (!isImageCapError(e)) throw e;
-                        if (dbg) console.log('[mt:bg] ocr image cap → per-region fallback');
+                        if (isDebug()) console.log('[mt:bg] ocr image cap → per-region fallback');
                         ocrSingleImage.add(key);
                         return await transcribePerRegion(ocr, msg, ocrPl, callWithRetry, ocrTemp);
                     });
@@ -726,7 +737,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 maxPairs: pipeline.contextPairs,
                 transcribeSrc: split ? false : pipeline.transcribeSrc,
             });
-            if (dbg) console.log('[mt:bg] llm prompt', prompt);
+            if (isDebug()) console.log('[mt:bg] llm prompt', prompt);
 
             const r1 = await callWithRetry(settings, prompt, vision2 ? msg.imagesB64 : undefined, undefined, pipeline.temperature, undefined, true);
             const raw = r1.text;
@@ -758,7 +769,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     maxPairs: pipeline.contextPairs,
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
-                if (dbg) console.log('[mt:bg] llm prompt (retry missing: ' + missing.map(r => r.index).join(',') + ')', retryPrompt);
+                if (isDebug()) console.log('[mt:bg] llm prompt (retry missing: ' + missing.map(r => r.index).join(',') + ')', retryPrompt);
                 // crops for the missing regions; page mode prepends the full page ([0]).
                 const retryImgs = vision2 && msg.imagesB64
                     ? [...(msg.textOnly ? [] : [msg.imagesB64[0]]), ...missing.map(r => msg.imagesB64![r.index]).filter(Boolean)]
@@ -815,8 +826,8 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             }
             const mentions = [...parsed.mentions, ...retryMentions];
             const { ctx: newCtx, bookOps } = updateContext(msgCtx, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs);
-            if (dbg) console.log('[mt:bg] llm raw', rawAll);
-            if (dbg && bookOps.length) console.log('[mt:bg] book ops', JSON.stringify(bookOps));
+            if (isDebug()) console.log('[mt:bg] llm raw', rawAll);
+            if (isDebug() && bookOps.length) console.log('[mt:bg] book ops', JSON.stringify(bookOps));
             settle({
                 ok: true, outputs, extras: parsed.extras, mentions, context: newCtx, model: settings.model, raw: rawAll,
                 bookOps: bookOps.length ? bookOps : undefined,

@@ -4,17 +4,20 @@
 import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, type EpisodeManifest } from './page-cache';
 import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
+import { identifyBitmap, verifyBitmap } from '../image-identity';
+import { cacheGeneration, cacheCurrent } from '../cache-generation';
 
 // page identity: img = its original src (translated blobs alias via pages.get), canvas =
 // the manifest image URL when the reader embeds one (stable across canvas recreation),
 // else the assigned data-mt-key fallback
 export function refKey(ref: PageRef): string {
     if (ref.kind === 'canvas') return ref.pageSrc ?? ref.key;
-    const ex = pages.get(ref.el.src);
+    const live = ref.el.currentSrc || ref.el.src;
+    const ex = pages.get(live);
     if (ex) return ex.orig;
     // zombie element showing a revoked blob: resolve via the retired map so it
     // re-fetches the (alive) original instead of the dead blob
-    return retiredBlobs.get(ref.el.src) ?? ref.el.src;
+    return retiredBlobs.get(live) ?? live;
 }
 
 export function getPages(): PageRef[] {
@@ -111,9 +114,7 @@ export async function galleryManifestJson(): Promise<string | null> {
 
 // Full-chapter enumeration for paged readers that virtualize the DOM (sweeping DOM refs
 // undercounts). [] on any failure so callers fall through to the DOM branches silently.
-// Tier match: the reader may show the data-saver variant (different bytes) — sweeping
-// full-data then paints nowhere and forks a second cache universe. Probe the first page's
-// full-data dims against a loaded page image; mismatch walks data-saver.
+// Source URLs identify a tier; dimensions of unrelated chapter pages never do.
 export async function fetchPagedUrls(): Promise<string[]> {
     const uuid = pagedChapterUuid(location.pathname, location.hostname);
     if (uuid) {
@@ -134,7 +135,7 @@ async function fetchAtHomeChapter(uuid: string): Promise<string[]> {
         const j = await r.json();
         const baseUrl = j?.baseUrl, hash = j?.chapter?.hash;
         const data = j?.chapter?.data, saver = j?.chapter?.dataSaver;
-        const tier = await pagedTier(baseUrl, hash, data);
+        const tier = pagedTier(baseUrl, hash, data, saver);
         const files = tier === 'data-saver' && Array.isArray(saver) && saver.length ? saver : data;
         return buildPagedUrls(baseUrl, hash, files, tier === 'data-saver' && files === saver ? 'data-saver' : 'data');
     } catch { return []; }
@@ -168,23 +169,19 @@ function chapterImageBase(): string | null {
     } catch { return null; }
 }
 
-// which at-home tier the reader shows: full-data dims equal a loaded page image, saver
-// dims don't. No loaded page / unreadable probe / junk payload keeps the full-data default.
-async function pagedTier(baseUrl: unknown, hash: unknown, data: unknown): Promise<'data' | 'data-saver'> {
-    try {
-        if (typeof baseUrl !== 'string' || typeof hash !== 'string' || !Array.isArray(data) || !data.length) return 'data';
-        const shown = getPages().find(r => r.kind === 'img' && (r.el as HTMLImageElement).naturalWidth >= 400)?.el as HTMLImageElement | undefined;
-        if (!shown) return 'data';
-        const first = buildPagedUrls(baseUrl, hash, [data[0]], 'data');
-        if (!first.length) return 'data';
-        const f = await fetchBitmap(first[0]);
-        let dw = 0, dh = 0;
-        try { dw = f.bitmap.width; dh = f.bitmap.height; }
-        finally { try { f.bitmap.close(); } catch { /* already closed */ } }
-        const tier = (dw === shown.naturalWidth && dh === shown.naturalHeight) ? 'data' : 'data-saver';
-        if (isDebug()) console.log('[mt] paged tier:', JSON.stringify({ tier, shown: `${shown.naturalWidth}x${shown.naturalHeight}`, data: `${dw}x${dh}` }));
-        return tier;
-    } catch { return 'data'; }
+function pagedTier(baseUrl: unknown, hash: unknown, data: unknown, saver: unknown): 'data' | 'data-saver' {
+    const tiers = [
+        { kind: 'data-saver' as const, urls: buildPagedUrls(baseUrl, hash, saver, 'data-saver') },
+        { kind: 'data' as const, urls: buildPagedUrls(baseUrl, hash, data, 'data') },
+    ];
+    for (const ref of getPages()) {
+        try {
+            const path = new URL(refKey(ref)).pathname;
+            const tier = tiers.find(t => t.urls.some(url => new URL(url).pathname === path));
+            if (tier) return tier.kind;
+        } catch { /* opaque source: image matching handles the canonical data tier */ }
+    }
+    return 'data';
 }
 
 // DOM walk for lazy <img> with an addressable src but no pixels yet (the sweep fetches these
@@ -313,10 +310,22 @@ export async function unscrambleTiles(bmp: ImageBitmap): Promise<{ bitmap: Image
 }
 
 export async function readPage(ref: PageRef, srcUrl: string, stashed?: ArrayBuffer): Promise<{ bitmap: ImageBitmap; bytes?: ArrayBuffer }> {
+    const saved = pages.get(srcUrl);
+    if (ref.kind === 'img' && saved?.origOwn) {
+        const live = ref.el.currentSrc || ref.el.src;
+        if ([saved.origOwn, saved.translated, saved.debug, saved.debugOrig].includes(live) || retiredBlobs.get(live) === saved.orig) {
+            return { bitmap: await createImageBitmap(await (await fetch(saved.origOwn)).blob()) };
+        }
+    }
     // canvas re-translate: the canvas already shows OUR drawing — re-read from the stashed
     // original bytes instead
     if (ref.kind === 'canvas' && stashed) {
-        return { bitmap: await createImageBitmap(new Blob([stashed])) };
+        let owned = true;
+        if (saved?.image && saved.paintedImage) {
+            try { owned = verifyBitmap(ref.el, saved.paintedImage) || verifyBitmap(ref.el, saved.image); }
+            catch { owned = ref.pageSrc === saved.orig; }
+        }
+        if (owned) return { bitmap: await createImageBitmap(new Blob([stashed])) };
     }
     try {
         if (ref.kind === 'img') {
@@ -450,7 +459,9 @@ export function shownSrc(st: PageState): string {
 // pixels out: img swaps src to the translated blob, canvas gets the translated bitmap drawn
 // back over itself (same in-place philosophy, no overlay layer). Re-applied by the sweep —
 // a reader redraw underneath is painted over again within 2s.
-export function writePage(ref: PageRef, state: PageState): void {
+export function writePage(ref: PageRef, state: PageState): void | Promise<void> {
+    const token = state.cacheEpoch ?? cacheGeneration();
+    if (!cacheCurrent(token)) return;
     if (ref.kind === 'img') {
         // single writer for img src. The src guard avoids reload flicker, but <source>
         // clearing runs EVERY sweep while translated: readers re-render <picture> on page
@@ -479,15 +490,23 @@ export function writePage(ref: PageRef, state: PageState): void {
     const which = !wantOverlay
         ? (wantDebug && state.debugOrig ? 'debugOrig' as const : 'orig' as const)
         : (wantDebug && state.debug ? 'debug' as const : 'translated' as const);
-    void canvasPaintSrc(state, which).then(bmp => {
+    return canvasPaintSrc(state, which).then(bmp => {
         if (!bmp) { if (isDebug()) console.warn('[mt] canvas paint source unavailable:', which); return; }
+        if (!cacheCurrent(token)) return;
         if (overlayOn !== wantOverlay || debugOn !== wantDebug) return;
+        if (state.image && state.paintedImage) {
+            try {
+                if (!verifyBitmap(ref.el, state.paintedImage) && !verifyBitmap(ref.el, state.image)) return;
+            } catch {
+                if (ref.pageSrc !== state.orig) return;
+            }
+        }
         const ctx = ref.el.getContext('2d');
         if (!ctx) { console.warn('[mt] canvas page is not 2d — leaving original'); return; }
         ctx.drawImage(bmp, 0, 0, ref.el.width, ref.el.height);
+        state.paintedImage = identifyBitmap(bmp, state.det?.boxes);
         elStates.set(ref.el, state);
-    });
-    return;
+    }).catch(e => console.debug('[mt] canvas paint deferred', e));
 }
 
 // canvas paint sources: translated lives decoded already; original and debug frames decode
@@ -517,7 +536,8 @@ async function canvasPaintSrc(state: PageState, which: 'orig' | 'translated' | '
 // with no queue / prep / book fold. First-time pages miss the index and stay on the queue.
 // Decode + 48×48 hash is ms-scale, no network; tainted/undecoded elements bail silently.
 export async function repaintByHash(el: HTMLImageElement): Promise<void> {
-    const src = el.src;
+    const token = cacheGeneration();
+    const src = el.currentSrc || el.src;
     if (!src || pages.has(src) || elStates.get(el) || hashPending.get(el) === src || hashMiss.get(el) === src) return;
     hashPending.set(el, src);
     try {
@@ -526,19 +546,19 @@ export async function repaintByHash(el: HTMLImageElement): Promise<void> {
             bmp = await createImageBitmap(el);
         } catch { return; }
         const W = bmp.width, H = bmp.height;
-        let h: string;
+        let match: { state: PageState; w: number; h: number } | undefined;
         try {
-            h = pageHashFromBitmap(bmp);
+            const e = hashStates.get(pageHashFromBitmap(bmp));
+            if (e && e.w === W && e.h === H && (!e.state.image || verifyBitmap(bmp, e.state.image))) match = e;
         } catch { return; } // tainted bitmap — queue path handles it (screenshot)
         finally {
             try { bmp.close(); } catch { /* already closed */ }
         }
-        if (el.src !== src) return; // rotated mid-hash — next sweep re-fires
-        const e = hashStates.get(h);
-        if (e && e.w === W && e.h === H) {
-            pages.set(src, e.state);
-            elStates.set(el, e.state);
-            writePage({ kind: 'img', el }, e.state);
+        if (!cacheCurrent(token) || (el.currentSrc || el.src) !== src) return;
+        if (match) {
+            pages.set(src, match.state);
+            elStates.set(el, match.state);
+            writePage({ kind: 'img', el }, match.state);
             if (isDebug()) console.log('[mt] seam?', JSON.stringify({ why: 'hash-repaint', src: src.slice(-14) }));
         } else {
             hashMiss.set(el, src); // genuinely new — stop re-hashing until src changes
@@ -554,21 +574,28 @@ export async function repaintByHash(el: HTMLImageElement): Promise<void> {
 // hash: match → alias the new URL + paint; mismatch → drop the binding. Taint/decode failures
 // are unverifiable — keep the binding and never retry this src; the next src change re-arms.
 export async function healImgBinding(el: HTMLImageElement, state: PageState): Promise<void> {
-    const src = el.src;
+    const token = state.cacheEpoch ?? cacheGeneration();
+    if (!cacheCurrent(token)) return;
+    const src = el.currentSrc || el.src;
     if (!src || pages.has(src) || verifying.get(el) === src || verifyFailed.get(el) === src || state.hash == null) return;
     verifying.set(el, src);
     try {
-        if (pages.has(el.src)) return; // healed concurrently while decoding
+        if (pages.has(el.currentSrc || el.src)) return;
         let bmp: ImageBitmap;
         try {
             bmp = await createImageBitmap(el);
         } catch { verifyFailed.set(el, src); return; }
         // src rotated mid-decode — this result is about NOBODY now; the sweep re-fires for
         // the current src on its next pass
-        const cur = el.src;
+        const cur = el.currentSrc || el.src;
+        if (!cacheCurrent(token)) return;
         if (cur !== src) return;
         try {
-            if (pageHashFromBitmap(bmp) === state.hash) {
+            const matches = state.image
+                ? bmp.width === state.image.w && bmp.height === state.image.h
+                    && identifyBitmap(bmp).exact === state.image.exact && verifyBitmap(bmp, state.image)
+                : pageHashFromBitmap(bmp) === state.hash;
+            if (matches) {
                 pages.set(cur, state);
                 elStates.set(el, state);
                 writePage({ kind: 'img', el }, state);

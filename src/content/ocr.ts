@@ -12,6 +12,8 @@ import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './r
 import { erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
 import { inpaintMode } from '../llm/pipeline-settings';
+import { savedOriginal } from './page-identity';
+import { cacheReady, cacheGeneration, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 
 // Warm-path AI cleanup: compute cleanup patches for a freshly translated page
 // and hand them to the caller's cache entry. Gated on cache-on + local mode;
@@ -328,62 +330,37 @@ export function panelRanks(panels: DetBox[]): number[] {
 // fetching it would put boxes on the wrong layout.
 export async function ensureDebugViews(): Promise<void> {
     for (const st of uniquePages()) {
-        if (!st.det?.boxes.length || (st.debug && st.debugOrig)) continue;
-        if (st.origBytes || st.translatedBmp) {
-            try {
-                const ranks = panelRanks(st.det.panels ?? []);
-                if (!st.debugOrig) {
-                    const orig = await canvasPaintSrc(st, 'orig');
-                    if (orig) {
-                        st.debugOrig = await renderDebugView(orig, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
-                        pages.set(st.debugOrig, st);
-                    }
-                }
-                if (!st.debug && st.translatedBmp) {
-                    st.debug = await renderDebugView(st.translatedBmp, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
-                    pages.set(st.debug, st);
-                }
-            } catch (e) {
-                if (isDebug()) console.warn('[mt] debug view failed:', e);
-            }
-            continue;
-        }
-        if (!/^(blob:|https?:)/.test(st.orig)) continue;
-        try {
-            const ranks = panelRanks(st.det.panels ?? []);
-            if (!st.debugOrig) {
-                st.debugOrig = await renderDebugView((await fetchBitmap(st.orig)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
-                pages.set(st.debugOrig, st);
-            }
-            if (!st.debug) {
-                st.debug = await renderDebugView((await fetchBitmap(st.translated)).bitmap, st.det.boxes, st.det.panels, ranks, st.det.dropped, st.det.panelDropped, st.outputs, st.det.mask);
-                pages.set(st.debug, st);
-            }
-        } catch (e) {
-            console.warn('[mt] debug view failed:', e);
-        }
+        await ensurePageDebugViews(st);
     }
 }
-
-// canvas paint sources — kept local to avoid a page-io cycle.
-async function canvasPaintSrc(state: PageState, which: 'orig' | 'translated' | 'debug' | 'debugOrig'): Promise<ImageBitmap | undefined> {
-    if (which === 'translated') return state.translatedBmp;
-    if (which === 'orig') {
-        if (!state.origBmp && state.origBytes) {
+const debugWork = new WeakMap<PageState, Promise<void>>();
+export async function ensurePageDebugViews(state: PageState, original?: ImageBitmap, translated?: ImageBitmap): Promise<void> {
+    if (!state.det?.boxes.length || state.debug && state.debugOrig) return;
+    const pending = debugWork.get(state);
+    if (pending) return pending;
+    const token = state.cacheEpoch ?? cacheGeneration();
+    const det = state.det, ranks = panelRanks(det.panels ?? []);
+    const task = (async () => {
+        for (const side of ['debugOrig', 'debug'] as const) {
+            if (state[side] || !cacheCurrent(token)) continue;
+            let bitmap: ImageBitmap | undefined, owned = false;
             try {
-                state.origBmp = await createImageBitmap(new Blob([state.origBytes]));
-            } catch { return undefined; }
+                bitmap = side === 'debugOrig' ? original : translated ?? state.translatedBmp;
+                if (!bitmap) {
+                    bitmap = side === 'debugOrig' ? await savedOriginal(state) : (await fetchBitmap(state.translated)).bitmap;
+                    owned = true;
+                }
+                const url = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, state.outputs, det.mask);
+                if (!cacheCurrent(token)) { URL.revokeObjectURL(url); continue; }
+                state[side] = url;
+                if (pages.get(state.orig) === state) pages.set(url, state);
+            } catch (e) {
+                if (isDebug()) console.warn('[mt] debug view failed:', e);
+            } finally { if (owned) bitmap?.close(); }
         }
-        return state.origBmp;
-    }
-    const key = which === 'debug' ? 'debugBmp' : 'debugOrigBmp';
-    const url = which === 'debug' ? state.debug : state.debugOrig;
-    if (!state[key] && url) {
-        try {
-            state[key] = await createImageBitmap(await (await fetch(url)).blob());
-        } catch { return undefined; }
-    }
-    return state[key];
+    })().finally(() => { debugWork.delete(state); });
+    debugWork.set(state, task);
+    return task;
 }
 
 // Zoomed crop per region (upscaled so small narration text is readable).
@@ -439,8 +416,10 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string },
 ): Promise<TranslateOutcome> {
+    const cacheEpoch = opts?.cacheEpoch ?? await cacheReady();
+    assertCacheCurrent(cacheEpoch);
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
     // ponytail: region cap 150 — dense art pages can drown a single LLM call.
     if (det.boxes.length > 150) det.boxes = det.boxes.slice(0, 150);
@@ -457,7 +436,7 @@ export async function translateRegions(
         if (det.cloudTexts || !texts.some(t => t)) return;
         const boxes = det.boxes.length === texts.length ? det.boxes : det.boxes.slice(0, texts.length);
         void cachePut(partialEntry(cacheKey(chapterKey(), pageHashFromBitmap(bitmap)), settingsFingerprint(pipeline),
-            { ...det, boxes, cloudTexts: texts }, bitmap.width, bitmap.height), pipeline.cacheMax);
+            { ...det, boxes, cloudTexts: texts }, bitmap.width, bitmap.height), pipeline.cacheMax, cacheEpoch);
     };
     try {
         // unified text-source axis: 'page'/'crops' = VLM reads images, 'ocr' =
@@ -591,6 +570,8 @@ export async function translateRegions(
             pageH: annH,
             cacheKey: await resolveMangaId() ?? chapterKey(), // stable per manga → prompt-cache affinity
             interim: true, // this version handles the mid-flight transcripts message (see portSend)
+            requestNonce: opts?.fresh ? crypto.randomUUID() : undefined,
+            cacheEpoch,
         };
         // suspend-proof channel: an open runtime port pins the background page
         // alive AND its replies always arrive (a pending sendResponse can be
@@ -602,7 +583,7 @@ export async function translateRegions(
             let port: chrome.runtime.Port;
             try { port = chrome.runtime.connect({ name: 'mt-rpc' }); } catch (e) { reject(e); return; }
             const tRpc = Date.now();
-            console.log(`[mt:trace] translateRegions RPC send (regions=${regions.length} vision=${vision} textOnly=${payload.textOnly})`);
+            if (isDebug()) console.log(`[mt:trace] translateRegions RPC send (regions=${regions.length} vision=${vision} textOnly=${payload.textOnly})`);
             const stop: LiveRpc = { abort: undefined };
             let aborted = false;
             liveRpcs.add(stop);
@@ -622,7 +603,7 @@ export async function translateRegions(
                 // this promise).
                 const m = r as { type?: string; texts?: string[] };
                 if (m?.type === 'mt:ocr-texts' && Array.isArray(m.texts)) { interimTexts = m.texts; checkpointOcr(m.texts); return; }
-                console.log(`[mt:trace] translateRegions RPC reply in ${Date.now() - tRpc}ms ok=${(r as {ok?:boolean})?.ok}`);
+                if (isDebug()) console.log(`[mt:trace] translateRegions RPC reply in ${Date.now() - tRpc}ms ok=${(r as {ok?:boolean})?.ok}`);
                 clearTimeout(to); cleanup(); try { port.disconnect(); } catch { /* gone */ } resolve(r);
             });
             port.onDisconnect.addListener(() => {
@@ -642,6 +623,7 @@ export async function translateRegions(
             { outputs: [], extras: [], mentions: [], raw: '', usage: {}, calls: 0, ms: 0, bookOps: [] };
         try {
             for (const chunk of chunks.length ? chunks : [regions]) {
+                assertCacheCurrent(cacheEpoch);
                 const one = chunkPayload(chunk);
                 try {
                     resp = await portSend(one);
@@ -652,6 +634,7 @@ export async function translateRegions(
                     let lastErr: unknown = e;
                     for (const wait of [5000, 20000, 60000]) {
                         await new Promise(r => setTimeout(r, wait));
+                        assertCacheCurrent(cacheEpoch);
                         try {
                             // transcripts already paid for: the re-send is the same text-only
                             // translate stage, not a re-transcription (images dropped too).
@@ -668,6 +651,7 @@ export async function translateRegions(
                     }
                     if (lastErr) throw lastErr;
                 }
+                assertCacheCurrent(cacheEpoch);
                 if (!resp?.ok) {
                     const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string; retryAfterMs?: number };
                     err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
@@ -709,6 +693,7 @@ export async function translateRegions(
                 e.x2 <= bitmap.width * 1.05 && e.y2 <= bitmap.height * 1.05 &&
                 (e.x2 - e.x1) > 12 && (e.y2 - e.y1) > 12);
         if (opts?.fold !== false && shareContext) {
+            assertCacheCurrent(cacheEpoch);
             const c = resp.context as ContextState | undefined;
             setContext((c && Array.isArray(c.characters) && Array.isArray(c.pairs)) ? c : context);
             await saveContext();
@@ -725,6 +710,7 @@ export async function translateRegions(
             ocrLockWaitMs,
         };
     } catch (e) {
+        assertCacheCurrent(cacheEpoch);
         const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         const error = String(err.message ?? e).slice(0, 160);
         console.warn('[mt] LLM translation failed:', e);

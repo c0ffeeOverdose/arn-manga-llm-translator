@@ -1,19 +1,19 @@
 import { sessGet, sessSet, sessRemove } from '../storage-session';
-import { readRecord, writeRecord, blobDataUrl } from '../chapter/store';
-import { artifactKey, runnerHtml, type HostConfig, type ChapterArtifact } from '../chapter/protocol';
+import { readRecord, writeRecord, clearRecords, blobDataUrl } from '../chapter/store';
+import { artifactKey, runnerHtml, chapterSignature, type HostConfig, type ChapterArtifact } from '../chapter/protocol';
 import type { ChapterProgress, ChapterStart } from '../chapter/model';
 import { chapterContext } from './chapter-context';
-import { RENDER_GEN } from '../content/render';
 import { createRunner, runnerKind, runnerUrl, type ChapterRunner } from '../chapter/runner';
+import { readerStartAllowed } from '../chapter/reader';
+import { cacheClear } from '../content/page-cache';
+import { CACHE_GENERATION_KEY, cacheReady, cacheGeneration, acceptCacheGeneration, assertCacheCurrent } from '../cache-generation';
 
 interface Binding { id: string; kind: 'offscreen' | 'background'; chapter: string }
 const bindingKey = (tab: number) => `mtChapterTab:${tab}`;
 const starts = new Map<number, Promise<unknown>>();
-// The reader's frame request must be the ONLY init attempt, or a duplicate overrides the
-// real session id in storage.session and orphans the runner.
-const frameAttempts = new Map<number, string>();
 let runner: ChapterRunner = createRunner();
 let liveId = '';
+let clearing: Promise<unknown> | undefined;
 async function binding(tab: number): Promise<Binding | undefined> {
     return (await sessGet(bindingKey(tab)))[bindingKey(tab)] as Binding | undefined;
 }
@@ -49,6 +49,8 @@ export async function chapterReaderUrl(sender: chrome.runtime.MessageSender): Pr
     return sender.url ?? '';
 }
 async function start(tab: number, data: ChapterStart): Promise<unknown> {
+    const token = await cacheReady();
+    if (data.cacheEpoch !== undefined) assertCacheCurrent(data.cacheEpoch);
     const old = await binding(tab);
     if (old) {
         const status = await readRecord<ChapterProgress>(`status:${old.id}`);
@@ -57,15 +59,18 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
         }
         await runner.stop(old.id);
     }
+    assertCacheCurrent(token);
     const id = crypto.randomUUID();
-    const config: HostConfig = { ...data, id, readerTab: tab, kind: runnerKind() };
+    const config: HostConfig = { ...data, cacheEpoch: token, id, readerTab: tab, kind: runnerKind() };
     for (const seed of data.seeds ?? []) {
         const entry = { ...seed.entry, mask: seed.entry.mask ? { ...seed.entry.mask,
             data: Uint8Array.from(atob(seed.maskData), c => c.charCodeAt(0)).buffer } : undefined };
-        await writeRecord(artifactKey(id, seed.page), { entry, blob: await (await fetch(seed.image)).blob(),
-            at: Date.now(), signature: JSON.stringify(data.pipeline) + ':' + RENDER_GEN } satisfies ChapterArtifact);
+        await writeRecord(artifactKey(id, seed.page), { entry, identity: seed.identity,
+            hash: entry.key.slice(entry.key.lastIndexOf('#') + 1), blob: await (await fetch(seed.image)).blob(),
+            at: Date.now(), signature: chapterSignature(data.pipeline) } satisfies ChapterArtifact);
     }
     delete config.seeds;
+    assertCacheCurrent(token);
     await writeRecord(`host:${id}`, config);
     liveId = id;
     await sessSet({ [bindingKey(tab)]: { id, kind: config.kind, chapter: data.chapter } });
@@ -73,8 +78,34 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
     return { ok: true, id, total: data.pages.length };
 }
 
+async function clearTranslations(): Promise<unknown> {
+    await cacheReady();
+    const generation = crypto.randomUUID();
+    await chrome.storage.local.set({ [CACHE_GENERATION_KEY]: generation });
+    await acceptCacheGeneration(generation);
+    await Promise.allSettled([...starts.values()]);
+    await runner.stop(liveId);
+    liveId = '';
+    const keys = Object.keys(await sessGet(null)).filter(key => key.startsWith('mtChapterTab:'));
+    await sessRemove(keys);
+    await clearRecords();
+    await cacheClear();
+    const tabs = await chrome.tabs.query({});
+    const readers = await Promise.all(tabs.filter(t => t.id !== undefined).map(t =>
+        chrome.tabs.sendMessage(t.id!, { type: 'mt:cache-reset', generation }, { frameId: 0 }).catch(() => null)));
+    const failed = readers.find(r => r?.ok === false);
+    if (failed) throw new Error(failed.error ?? 'Could not restore original images in a reader');
+    return { ok: true, generation, count: 0, mine: 0 };
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-    if (sender.id !== chrome.runtime.id || typeof msg?.type !== 'string' || !msg.type.startsWith('mt:chapter-')) return;
+    if (sender.id !== chrome.runtime.id || typeof msg?.type !== 'string') return;
+    if (msg.type === 'mt:translation-cache-clear') {
+        clearing ??= clearTranslations().finally(() => { clearing = undefined; });
+        clearing.then(respond, e => respond({ ok: false, error: (e as Error).message }));
+        return true;
+    }
+    if (!msg.type.startsWith('mt:chapter-')) return;
     // The runner asks which session it owns; the answer is also what starts it pumping.
     if (msg.type === 'mt:chapter-runner-boot') {
         if (!isRunnerSender(sender)) return;
@@ -107,15 +138,17 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             return b ? { ok: true, status: null, result: null } : { ok: false, error: 'No chapter session for this reader' };
         }
         if (msg.type === 'mt:chapter-start') {
+            if (clearing) await clearing;
             const data = msg.data as ChapterStart;
-            if (!data?.pages?.length || data.readerUrl !== sender.url) return { ok: false, error: 'Reader changed; try again' };
-            const previous = frameAttempts.get(tab);
-            if (previous === sender.url) return { ok: false, error: 'Chapter translation is already running in this reader' };
-            if (previous) {
-                const stale = await binding(tab);
-                if (stale) await runner.stop(stale.id);
+            const current = await chrome.tabs.get(tab);
+            const origin = sender.origin ?? (sender.url ? new URL(sender.url).origin : '');
+            if (!data?.pages?.length || !current.url || !readerStartAllowed(data.readerUrl, data.chapter, current.url, origin)) {
+                return { ok: false, error: 'Reader changed; try again' };
             }
-            frameAttempts.set(tab, sender.url);
+            if (sender.documentLifecycle && sender.documentLifecycle !== 'active') return { ok: false, error: 'Reader changed; try again' };
+            const identity = await chrome.tabs.sendMessage(tab, { type: 'mt:reader-identity' },
+                sender.documentId ? { documentId: sender.documentId } : { frameId: 0 }).catch(() => null);
+            if (!identity || !readerStartAllowed(data.readerUrl, data.chapter, identity.url, origin)) return { ok: false, error: 'Reader changed; try again' };
             const pending = starts.get(tab);
             if (pending) return pending;
             const p = start(tab, data).finally(() => starts.delete(tab));
@@ -137,8 +170,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         if (msg.type === 'mt:chapter-result') {
             const artifact = await readRecord<ChapterArtifact>(artifactKey(b.id, msg.page));
             if (!artifact) return { ok: true, result: null };
+            if (msg.evidenceOnly) return { ok: true, result: { identity: artifact.identity, hash: artifact.hash, signature: artifact.signature } };
             const { mask, patches: _patches, ...entry } = artifact.entry;
-            return { ok: true, result: { image: await blobDataUrl(artifact.blob), entry, signature: artifact.signature,
+            return { ok: true, result: { image: await blobDataUrl(artifact.blob),
+                entry, identity: artifact.identity, hash: artifact.hash, signature: artifact.signature,
                 mask: mask ? { w: mask.w, h: mask.h, data: await blobDataUrl(new Blob([mask.data])) } : undefined } };
         }
         if (msg.type === 'mt:chapter-control') {

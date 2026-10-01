@@ -9,6 +9,7 @@ import { installMessageListener } from './commands';
 import { initAuto } from './auto';
 import { initSweep } from './sweep';
 import { onThemeChanged } from './chars-ui';
+import { cacheReady } from '../cache-generation';
 
 declare const __BUILD_ID__: string; // injected by build.mjs — which build is this?
 
@@ -29,6 +30,7 @@ initSweep(); // registers the chapter-sweep waiter (preparePage attach lane)
 
 async function main() {
     console.log('[mt] build', __BUILD_ID__);
+    await cacheReady();
     await loadTheme();
     await loadDebug();
     await loadPipeline();

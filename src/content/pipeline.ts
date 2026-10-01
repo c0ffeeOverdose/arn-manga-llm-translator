@@ -13,8 +13,9 @@ import { sweepPageOrder } from './sweep';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
+import { cacheReady, assertCacheCurrent } from '../cache-generation';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cacheEpoch?: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
 
 // cached entry → render-ready det (shared by preparePage and arrival paint).
 // Null unless: full entry + fp + dims + mask (partials never render as Done).
@@ -32,7 +33,10 @@ export function detFromCacheEntry(hit: CachedPage, w: number, h: number): Detect
 // detect + order + checkpoint write. Zero-box pages skip the checkpoint (nothing to resume).
 export async function resolveHeadlessDet(
     bitmap: ImageBitmap, hash: string, onStatus: MtOnStatus,
+    token?: string,
 ): Promise<{ det: DetectResult | null; resumed: boolean }> {
+    token ??= await cacheReady();
+    assertCacheCurrent(token);
     const key = cacheKey(chapterKey(), hash);
     const fp = settingsFingerprint(pipeline);
     {
@@ -49,8 +53,9 @@ export async function resolveHeadlessDet(
     }
     const det = await detectPage(bitmap, onStatus, { lo: true }); // lookahead/sweep headless — background
     await orderDetection(det, bitmap);
+    assertCacheCurrent(token);
     if (det.boxes.length) {
-        void cachePut(partialEntry(key, fp, det, bitmap.width, bitmap.height), pipeline.cacheMax);
+        void cachePut(partialEntry(key, fp, det, bitmap.width, bitmap.height), pipeline.cacheMax, token);
     }
     return { det, resumed: false };
 }
@@ -148,8 +153,9 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
 // waitSweep=false for user-driven jobs: an explicit Translate press must not sit behind a
 // slow sweep's claim (auto prefetch still waits — it would duplicate the sweep).
 export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false, waitSweep = true): Promise<Prep | null> {
+    const cacheEpoch = await cacheReady();
     const existing = stateFor(ref);
-    if (existing && !force) return null;
+    if (existing?.det && !force) return null;
     // prepMs: read + hash + cache-gate cost (excludes queue wait). Answers "why is a cache
     // hit slow" without guessing.
     const tPrep0 = performance.now();
@@ -197,6 +203,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         await Promise.race([sweepWait(refKey(ref), onStatus), new Promise(r => setTimeout(r, 150000))]);
     }
     const hash = pageHashFromBitmap(bitmap);
+    assertCacheCurrent(cacheEpoch);
     // miss-reason instrument: a revisit that SHOULD hit but misses needs a verdict in one
     // dump (absent | fp | dims | splitgen | mask | disabled)
     let cacheMiss: string | undefined = pipeline.cacheEnabled ? 'absent' : 'disabled';
@@ -209,7 +216,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
             cacheMiss = undefined;
             onStatus('Cache hit…');
             const det = detFromCacheEntry(hit, bitmap.width, bitmap.height)!;
-            return { srcUrl, bitmap, det, hash, cached: hit, prepMs: prepMs(),
+            return { srcUrl, bitmap, det, hash, cacheEpoch, cached: hit, prepMs: prepMs(),
                 // canvas cache hit still needs the original bytes (re-translate reads the stash)
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
@@ -230,7 +237,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                 const cached = decision.dropPatches
                     ? { ...byPage, patches: undefined, patchesGen: undefined }
                     : byPage;
-                return { srcUrl, bitmap, det, hash, cached, prepMs: prepMs(),
+                return { srcUrl, bitmap, det, hash, cacheEpoch, cached, prepMs: prepMs(),
                     origBytes: ref.kind === 'canvas' ? bytes : undefined };
             }
         }
@@ -239,7 +246,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
             cacheMiss = undefined;
             onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
-            return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, resumed: true as const,
+            return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, cacheEpoch, resumed: true as const,
                 ...(hit.texts?.length ? { ocrResumed: true as const } : null), prepMs: prepMs(),
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
@@ -252,15 +259,16 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     }
     const det = await detectPage(bitmap, onStatus, { lo: fromSweep });
     await orderDetection(det, bitmap);
+    assertCacheCurrent(cacheEpoch);
     // detect checkpoint: a page-turn kills this document mid-job — the next load resumes
     // from this entry (same key the full entry overwrites). Zero-box pages skip it.
     // Written even with the cache off (in-flight work, not a cached translation).
     if (!force && det.boxes.length) {
-        void cachePut(partialEntry(cacheKey(chapterKey(), hash), settingsFingerprint(pipeline), det, bitmap.width, bitmap.height), pipeline.cacheMax);
+        void cachePut(partialEntry(cacheKey(chapterKey(), hash), settingsFingerprint(pipeline), det, bitmap.width, bitmap.height), pipeline.cacheMax, cacheEpoch);
     }
     // canvas pages: stash the original bytes (re-translate must read the original, not our overlay)
     const origBytes = ref.kind === 'canvas' ? (bytes ?? existing?.origBytes) : undefined;
-    return { srcUrl, bitmap, det, hash, cacheMiss, prepMs: prepMs(), origBytes };
+    return { srcUrl, bitmap, det, hash, cacheEpoch, cacheMiss, prepMs: prepMs(), origBytes };
 }
 
 // Paint translated regions onto a canvas (inpaint source text, draw the translation per

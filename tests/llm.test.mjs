@@ -1106,6 +1106,17 @@ test('translateRequestId: stable 64-hex, sensitive to every output-shaping input
   }
 });
 
+test('fresh translation intents separate completed answers but transport retries still adopt', async () => {
+  const normal = await translateRequestId(translateRequestParts(ADOPT_REQ, ADOPT_ST));
+  const first = { ...ADOPT_REQ, requestNonce: '11111111-1111-4111-8111-111111111111' };
+  const second = { ...ADOPT_REQ, requestNonce: '22222222-2222-4222-8222-222222222222' };
+  const fresh = await translateRequestId(translateRequestParts(first, ADOPT_ST));
+  assert.notEqual(fresh, normal);
+  assert.notEqual(await translateRequestId(translateRequestParts(second, ADOPT_ST)), fresh);
+  assert.equal(await translateRequestId(translateRequestParts(structuredClone(first), ADOPT_ST)), fresh);
+  assert.equal(await translateRequestId(translateRequestParts({ ...ADOPT_REQ, requestNonce: 'invalid' }, ADOPT_ST)), normal);
+});
+
 // ---- provider rate-limit breaker: a 429 is a refusal, not a hiccup ----
 // Live case (OpenRouter free VLM): per-call retries x page cooldown x
 // sweep/lookahead workers turned one 429 into 24 identical requests in 3min.

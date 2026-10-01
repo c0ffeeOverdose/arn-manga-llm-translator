@@ -66,12 +66,11 @@ test('no selector gate remains in the runner discovery path', () => {
 test('the sweep anchors on the nearest known page instead of giving up', () => {
     const src = readFileSync(new URL('../src/content/sweep.ts', import.meta.url), 'utf8');
     // The manifest branch must delegate to the multi-signal anchor, not truncate.
-    assert.match(src, /const anchor = anchorInList\(/, 'a list/live mismatch must anchor, not truncate');
-    // All three signals exist, in strength order, ending in the positional fallback for
-    // readers whose page URLs are unreadable (blob:).
+    assert.match(src, /const anchor = await anchorInList\(/, 'a list/live mismatch must anchor, not truncate');
     assert.match(src, /const direct = matchAnchor\(/, 'the visible page URL is tried first');
     assert.match(src, /const byUrl = nearestAnchor\(/, 'then any loaded page the list knows');
-    assert.match(src, /return ordinalAnchor\(/, 'then the DOM ordinal for blob:/regenerated URLs');
+    assert.match(src, /verifyBitmap\(snapshot\.bitmap, identity\)/, 'opaque sources need pixel verification');
+    assert.doesNotMatch(src, /ordinalAnchor|anchorElementIndex/, 'a moving DOM ordinal must not identify a page');
     // The DOM branch must fall back to the highest loaded page.
     assert.match(src, /if \(anchor < 0\) anchor = highestKnown\(/, 'the DOM branch must anchor too');
     // `visible()` must not return null merely because nothing overlaps the viewport.

@@ -2,7 +2,7 @@
 import { chapterKey, pipeline, context, loadContext, loadPipeline, bookKey, shareContext, stateFor,
     regPage, unregPage, overlayChoice, setOverlayChoice, setOverlayOn, acceptChapterContext, type PageRef } from './state';
 import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, galleryManifestJson,
-    collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap } from './page-io';
+    collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap, ownOriginalUrl } from './page-io';
 import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMask,
     registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cacheKey } from './page-cache';
 import { viewportOverlap, dropAutoQueued, resumeAuto, isBusy, paintBusy, haltAuto } from './queue';
@@ -11,9 +11,13 @@ import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, l
 import { remainingPages, sweepCount, type SweepCountReason, chapterMessage, type ChapterPage, type ChapterProgress, type ChapterStart } from '../chapter/model';
 import { blobDataUrl } from '../chapter/store';
 import type { CachedPage } from './page-cache';
-import { RENDER_GEN } from './render';
+import { chapterSignature } from '../chapter/protocol';
+import { identifyBitmap, imageCandidates, verifyBitmap, signatureOf, type ImageIdentity } from '../image-identity';
+import { readView, verifyView, viewSource, viewToken, type PageSnapshot } from './page-identity';
 import { nextDocument, guessNextDocument } from '../chapter/discovery';
 import { isDebug } from '../debug';
+import { ensurePageDebugViews } from './ocr';
+import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
@@ -29,6 +33,12 @@ const refs = new Map<string, PageRef>();
 const attaching = new WeakSet<Element>();
 const applied = new WeakMap<Element, string>();
 const sourceRequests = new Map<string, Promise<string | undefined>>();
+type ProgressPage = ChapterProgress['pages'][number];
+const imageBindings = new WeakMap<Element, { run: string; token: string; page: string; source: string;
+    exact: string; revision?: number; complete: boolean }>();
+const imageAliases = new Map<string, string>();
+const evidence = new Map<string, Promise<ImageIdentity | undefined>>();
+const sourceImages = new Map<string, Promise<ImageIdentity>>();
 
 function syncBook(): void {
     if (foldedChapter !== chapterKey()) { foldedChapter = chapterKey(); folded.clear(); }
@@ -36,19 +46,25 @@ function syncBook(): void {
 export function bookHas(hash: string): boolean { syncBook(); return folded.has(hash); }
 export function bookAdd(hash: string): void { syncBook(); folded.add(hash); }
 export function bookDrop(hash: string): void { syncBook(); folded.delete(hash); }
+export function forgetSweep(): void {
+    startCancelled = true;
+    progress = null; refs.clear(); evidence.clear(); imageAliases.clear(); sourceImages.clear(); sourceRequests.clear();
+    folded.clear(); notified = ''; attachWhy = '';
+    removeActivity('sweep');
+}
 export function sweepArrivable(): boolean { return !!progress && progress.chapter === chapterKey(); }
 export function sweepAttachWhy(): string { return attachWhy; }
 // Debug/verification view of the window mapping: each on-screen page element in DOM order,
 // with the chapter order it resolves to and how that was decided.
-export function elementMap(): { map: { index: number; order: number | null; matchedBy: string; url: string }[] } {
+export async function elementMap(): Promise<{ map: { index: number; order: number | null; matchedBy: string; url: string }[] }> {
     const live = getPages();
     const dom = [...document.querySelectorAll('img,canvas')].filter(el => live.some(r => r.el === el));
-    return { map: dom.map((el, index) => {
+    return { map: await Promise.all(dom.map(async (el, index) => {
         const ref = live.find(r => r.el === el);
         if (!ref) return { index, order: null, matchedBy: 'none', url: '' };
-        const page = ownedRef(ref);
+        const page = await resolveChapterRef(ref);
         return { index, order: page?.order ?? null, matchedBy: page?.matchedBy ?? 'unmatched', url: refKey(ref).slice(-24) };
-    }) };
+    })) };
 }
 export function sweepCommitted(hash: string): boolean {
     return !!progress?.pages.some(p => p.phase === 'ready' && p.hash === hash);
@@ -57,10 +73,7 @@ export function sweepCommitted(hash: string): boolean {
 // identity the runner writes under: it survives a different encoder/host/tier, where the
 // content hash does not. Returns undefined when the reader is off-manifest.
 export function sweepPageOrder(url: string): number | undefined {
-    const page = progress?.chapter === chapterKey()
-        ? progress.pages.find(p => p.url === url || samePagePath(p.url, url))
-        : undefined;
-    return page?.order;
+    return owned(url)?.order;
 }
 export function sweepActive(): boolean {
     return starting || !!progress && progress.chapter === chapterKey() && ['running', 'waiting', 'stopping'].includes(progress.phase);
@@ -77,7 +90,7 @@ export function sweepStatus(): SweepStatus | null {
         errors: progress.errors, skipped: 0, inflight: progress.inflight };
 }
 function original(ref: PageRef): string {
-    return stateFor(ref)?.orig ?? refKey(ref);
+    return viewSource(ref);
 }
 function visible(): PageRef | undefined {
     const ranked = getPages().sort((a, b) => viewportOverlap(b) - viewportOverlap(a));
@@ -88,26 +101,9 @@ function visible(): PageRef | undefined {
 }
 function owned(url: string) {
     if (progress?.chapter !== chapterKey()) return undefined;
-    return progress.pages.find(p => p.url === url || samePagePath(p.url, url));
+    return progress.pages.find(p => p.url === url || samePagePath(p.url, url))
+        ?? progress.pages.find(p => p.id === imageAliases.get(url));
 }
-// Which chapter page is this element? URL identity is the only trustworthy answer, and a
-// reader that mints `blob:` URLs never provides one — so the element is resolved by its slot
-// in the reader's CURRENT window, anchored to a known page.
-//
-// A windowed reader keeps only the pages near the viewport in the DOM, so an element's
-// ordinal among them drifts as the user moves: once the window slides from pages 3-7 to
-// 9-13, ordinal 0 is page 9, not page 0. Treating the ordinal as the chapter index painted
-// page 9 with page 3's translation. The anchor is therefore measured ONCE (anchorInList,
-// when the reader is at a page whose URL is still knowable) and subsequent positions are
-// derived from the window's offset relative to that anchor.
-// Which chapter page is this element? Three signals, strongest first:
-//  1. URL identity — a reader that keeps the page in the URL (…/chapter/<id>/4) states it
-//     outright, and the visible page is the one that fills the viewport;
-//  2. a page slug in the chapter list whose URL matches the element (exact, then host twin);
-//  3. window position, anchored once to a URL-matched page and then tracked by delta.
-// A windowed reader keeps only the pages near the viewport in the DOM, so an element's raw
-// ordinal is NOT its chapter index: mapping ordinal→index painted page 9 with page 3's text
-// as soon as the window slid.
 const PAGE_IN_URL = /\/(?:chapter|read)\/[^/]+\/(\d+)(?:\/|$)/;
 function urlPageNumber(): number | null {
     const m = location.pathname.match(PAGE_IN_URL);
@@ -116,61 +112,63 @@ function urlPageNumber(): number | null {
     return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-let anchorOrder: number | null = null;
-let anchorElementIndex: number | null = null;
-function domPageElements(): Element[] {
-    const live = getPages();
-    return [...document.querySelectorAll('img,canvas')].filter(el => live.some(r => r.el === el));
+function ownedRef(ref: PageRef): ProgressPage | undefined {
+    if (!progress || progress.chapter !== chapterKey()) return;
+    const source = original(ref);
+    const direct = progress.pages.find(p => p.url === source || samePagePath(p.url, source));
+    if (direct) return { ...direct, matchedBy: 'url' };
+    const binding = imageBindings.get(ref.el);
+    if (binding?.run !== progress.id || binding.token !== viewToken(ref)) return;
+    const page = progress.pages.find(p => p.id === binding.page);
+    return page ? { ...page, matchedBy: 'image' } : undefined;
 }
-// The page the reader is actually showing: the one covering the most viewport. A single-page
-// viewer keeps neighbours preloaded in the DOM, so "first image" is not the answer.
-function displayRef(): PageRef | undefined {
-    return getPages()
-        .map(r => ({ r, ov: viewportOverlap(r) }))
-        .filter(x => x.ov > 0)
-        .sort((a, b) => b.ov - a.ov)[0]?.r;
-}
-// Measure the anchor ONCE, from a page whose slot is knowable. Afterwards position comes from
-// the window's delta: the reader keeps the pages around the viewport, so the distance between
-// two elements does not change as the window slides.
-function rememberAnchor(): void {
-    if (anchorOrder !== null) return;
-    const p = progress;
-    if (!p || p.chapter !== chapterKey()) return;
-    // The URL is the strongest statement of position, but it names the page the READER is
-    // on; the anchor must name the same page's slot in the chapter list.
-    const domPages = domPageElements();
-    for (let i = 0; i < domPages.length; i++) {
-        const ref = getPages().find(r => r.el === domPages[i]);
-        if (!ref) continue;
-        const src = original(ref);
-        const hit = p.pages.find(q => q.url === src || samePagePath(q.url, src));
-        if (hit) { anchorOrder = hit.order ?? 0; anchorElementIndex = i; return; }
+async function pageEvidence(page: ProgressPage): Promise<ImageIdentity | undefined> {
+    const run = progress?.id;
+    const key = `${run}:${page.id}:${page.revision ?? 0}`;
+    let task = evidence.get(key);
+    if (!task) {
+        task = chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter: chapterKey(), page: page.id, evidenceOnly: true })
+            .then(r => r?.result?.signature === chapterSignature(pipeline) ? r.result.identity : undefined)
+            .catch(() => undefined);
+        evidence.set(key, task!);
     }
-    // No URL-matched element: fall back to the URL's own page number, applied to the visible
-    // page. Its index among the loaded pages is the delta origin from then on.
-    const display = displayRef();
-    const n = urlPageNumber();
-    if (display && n != null) {
-        const index = domPages.indexOf(display.el as Element);
-        if (index >= 0) { anchorOrder = n - 1; anchorElementIndex = index; }
-    }
+    return task;
 }
-// Forget the anchor when the chapter changes: it describes one window.
-function forgetAnchor(): void { anchorOrder = null; anchorElementIndex = null; }
-
-function ownedRef(ref: PageRef): ChapterProgress['pages'][number] | undefined {
-    const byUrl = owned(original(ref));
-    if (byUrl) return { ...byUrl, matchedBy: 'url' as const };
-    if (!progress || progress.chapter !== chapterKey()) return undefined;
-    rememberAnchor();
-    if (anchorOrder === null || anchorElementIndex === null) return undefined;
-    const index = domPageElements().indexOf(ref.el as Element);
-    if (index < 0) return undefined;
-    const order = anchorOrder + (index - anchorElementIndex);
-    const hit = progress.pages.find(p => (p.order ?? -1) === order);
-    // Positional matches are an inference, and attach() must verify them before painting.
-    return hit ? { ...hit, matchedBy: 'position' as const } : undefined;
+// URL identity may prioritize work; only unique, pixel-verified evidence binds opaque images.
+export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): Promise<ProgressPage | undefined> {
+    const token = await cacheReady();
+    if (!progress || progress.chapter !== chapterKey()) return;
+    const run = progress.id, chapter = chapterKey();
+    const direct = progress.pages.find(p => p.url === original(ref) || samePagePath(p.url, original(ref)));
+    if (direct) return { ...direct, matchedBy: 'url' };
+    const binding = imageBindings.get(ref.el), state = stateFor(ref);
+    const live = ref.kind === 'img' ? ref.el.currentSrc || ref.el.src : '';
+    const bound = progress.pages.find(p => p.id === binding?.page);
+    if (ref.kind === 'img' && progress.phase === 'complete' && binding?.complete && binding.run === run
+        && state?.orig === binding.source && state.image?.exact === binding.exact && bound && bound.revision === binding.revision
+        && [state.translated, state.origOwn].includes(live)) {
+        imageBindings.set(ref.el, { ...binding, token: viewToken(ref) });
+        return { ...bound, matchedBy: 'image' };
+    }
+    let snapshot = supplied;
+    try {
+        snapshot ??= await readView(ref);
+        const matches: ProgressPage[] = [];
+        for (const page of imageCandidates(snapshot.image, progress.pages)) {
+            const identity = await pageEvidence(page);
+            if (!cacheCurrent(token) || progress?.id !== run || chapterKey() !== chapter || viewToken(ref) !== snapshot.token) return;
+            if (!identity && page.phase !== 'ready' && page.phase !== 'failed') return;
+            if (identity && verifyBitmap(snapshot.bitmap, identity)) matches.push(page);
+            if (matches.length > 1) return;
+        }
+        if (matches.length !== 1) return;
+        const page = matches[0];
+        imageBindings.set(ref.el, { run, token: snapshot.token, page: page.id, source: snapshot.source,
+            exact: snapshot.image.exact, revision: page.revision, complete: progress.phase === 'complete' });
+        if (ref.kind === 'img') imageAliases.set(snapshot.source, page.id);
+        return { ...page, matchedBy: 'image' };
+    } catch { return; }
+    finally { if (!supplied) snapshot?.bitmap.close(); }
 }
 export function sweepHas(url: string): boolean {
     return !!owned(url) && sweepActive();
@@ -181,16 +179,14 @@ async function control(command: string, extra: Record<string, unknown> = {}): Pr
 
 // Manual/auto requests join the chapter owner, including explicit retranslation.
 export function chapterOwnsRequest(ref: PageRef, force: boolean): boolean {
-    const page = owned(original(ref));
+    const page = ownedRef(ref);
     if (!page) return false;
     if (!sweepActive() && !force && page.phase !== 'ready') return false;
     refs.set(page.id, ref);
     if (force) {
-        // Retranslate through the owner already holding the pixels: a fresh detection and a
-        // fresh answer, folded back in reading order. Re-entering the queue would re-render
-        // the page alone and make the book's pairs depend on which path ran.
+        // Keep the old state until replacement: it owns the original pixels behind a
+        // revoked reader blob. The new revision replaces its paint and context together.
         applied.delete(ref.el);
-        detach(ref);
         void control('retry', { page: page.id }).catch(reportError);
     } else {
         void control('prioritize', { page: page.id }).catch(reportError);
@@ -198,18 +194,11 @@ export function chapterOwnsRequest(ref: PageRef, force: boolean): boolean {
     }
     return true;
 }
-// Drop our rendered state for one element so the owner's redraw is the only one left.
-function detach(ref: PageRef): void {
-    const state = stateFor(ref);
-    if (!state) return;
-    unregPage(state);
-    URL.revokeObjectURL(state.translated);
-}
-
 async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; complete: boolean }> {
     const live = getPages();
     const current = visible();
     let urls = episodeManifestSrcs();
+    let unresolvedManifest = false;
     let descramble = !!urls?.length;
     // A paged reader whose API lists the whole chapter is the most reliable source there
     // is: it survives virtualization, lazy loading and host rotation. Ask it first.
@@ -220,8 +209,9 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
     }
     if (urls?.length) {
         const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble }));
-        const anchor = anchorInList(urls, live, current);
-        return { pages, anchor, complete: true };
+        const anchor = await anchorInList(urls, live, current);
+        if (anchor >= 0) return { pages, anchor, complete: true };
+        unresolvedManifest = true;
     }
     descramble = false;
     const known = new Set(live.map(original));
@@ -248,7 +238,7 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
     // A paginated/virtualized reader without a manifest is discovery-incomplete.
     const hasNext = !!document.querySelector('a[rel="next"], link[rel="next"], [data-next-page], [data-infinite-scroll]');
     const unresolved = live.some(r => r.kind === 'canvas' && !r.el.width);
-    return { pages, anchor, complete: !hasNext && !unresolved };
+    return { pages, anchor, complete: !unresolvedManifest && !hasNext && !unresolved };
 }
 
 // The reader's position when nothing else identifies it: the last list entry the reader
@@ -283,34 +273,51 @@ function nearestAnchor(urls: string[], live: PageRef[]): number {
     return best;
 }
 
-// Where the reader is inside the chapter list. Three signals, strongest first:
-//  1. the visible page's URL appears in the list (exact, then host-rotated twin);
-//  2. any loaded page appears in the list — the reader shows a window around itself;
-//  3. the reader's page elements and the list share an ordinal: readers that mint
-//     `blob:` URLs for their pages (so no URL comparison is possible at all) still
-//     append them in reading order, so the visible element's index among the loaded
-//     page images is its chapter index.
-function anchorInList(urls: string[], live: PageRef[], current: PageRef | undefined): number {
+// Chapter position comes from a source URL or verified pixels; a URL page number is
+// only a search hint. An unreadable manifest falls back to captured DOM pages.
+async function anchorInList(urls: string[], live: PageRef[], current: PageRef | undefined): Promise<number> {
     if (current) {
         const direct = matchAnchor(urls, [original(current), refKey(current)]);
         if (direct >= 0) return direct;
     }
     const byUrl = nearestAnchor(urls, live);
-    if (byUrl >= 0) return byUrl;
-    return ordinalAnchor(urls.length, live, current);
-}
-
-// Positional fallback for readers whose page URLs are unreadable (blob:) or regenerated:
-// the visible page's index within the DOM's own page-image order is the best estimate of
-// its chapter index. Clamped so an unexpected DOM shape can never run past the chapter.
-function ordinalAnchor(total: number, live: PageRef[], current: PageRef | undefined): number {
-    if (!total || !current) return -1;
-    const inDom = [...document.querySelectorAll('img,canvas')].filter(el => live.some(r => r.el === el));
-    const index = inDom.indexOf(current.el);
-    if (index < 0) return -1;
-    return Math.min(index, total - 1);
+    if (!current) return byUrl;
+    let snapshot: PageSnapshot | undefined;
+    const href = location.href;
+    try {
+        snapshot = await readView(current);
+        const hint = urlPageNumber();
+        const indices = urls.map((_, i) => i);
+        if (hint && hint <= urls.length) {
+            indices.splice(indices.indexOf(hint - 1), 1);
+            indices.unshift(hint - 1);
+        }
+        const matches: number[] = [];
+        for (const index of indices) {
+            let identity: ImageIdentity;
+            try {
+                let task = sourceImages.get(urls[index]);
+                if (!task) {
+                    task = fetchBitmap(urls[index]).then(({ bitmap }) => {
+                        try { return identifyBitmap(bitmap); } finally { bitmap.close(); }
+                    });
+                    sourceImages.set(urls[index], task);
+                }
+                identity = await task;
+            } catch { continue; }
+            if (location.href !== href || viewToken(current) !== snapshot.token) return -1;
+            if (verifyBitmap(snapshot.bitmap, identity)) {
+                if (hint === index + 1) return index;
+                matches.push(index);
+                if (matches.length > 1) return -1;
+            }
+        }
+        return matches.length === 1 ? matches[0] : -1;
+    } catch { return byUrl; }
+    finally { snapshot?.bitmap.close(); }
 }
 function reportError(e: unknown): void {
+    if ((e as Error)?.name === 'AbortError') return;
     const text = (e as Error).message || String(e);
     lastMsgSet({ text: `Chapter translation paused — ${text}`, phase: 'error', until: Date.now() + 10000 });
     renderStatus();
@@ -323,6 +330,7 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
     startCancelled = false;
     const chapter = chapterKey();
     try {
+        const cacheEpoch = await cacheReady();
         pillUnDismiss();
         setOverlayChoice('auto');
         abortLookahead();
@@ -359,19 +367,21 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
                     key: cacheKey(chapter, state.hash), fp: settingsFingerprint(pipeline), atime: Date.now(),
                     w: state.det.mask.width, h: state.det.mask.height, boxes: state.det.boxes, panels: state.det.panels ?? [],
                     outputs: state.outputs, extras: [], mentions: state.mentions, mask,
-                } });
+                }, identity: state.image });
             page.inBaseContext = bookHas(state.hash);
         }
         // Capture readable opaque pixels before the reader can destroy their document.
         for (const page of pages) if (!/^https?:/.test(page.url)) page.source = await capture(page);
         if (startCancelled || chapter !== chapterKey()) return { ok: true, cancelled: true };
+        assertCacheCurrent(cacheEpoch);
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-start', data: {
-            chapter, readerUrl: location.href, pages, completeManifest: found.complete,
+            chapter, cacheEpoch, readerUrl: location.href, pages, completeManifest: found.complete,
             pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,
             nextDocument: found.complete ? undefined : nextDocument(document, location.href, chapter)
                 ?? guessNextDocument(location.href, chapter),
             imageFilter: readerImageFilter(),
         } });
+        assertCacheCurrent(cacheEpoch);
         if (!response?.ok) throw new Error(response?.error || 'Could not start chapter translation');
         if (startCancelled) { await control('stop'); return { ok: true, cancelled: true }; }
         progress = response.status ?? { id: response.id, chapter, phase: 'running', done: 0, total: pages.length,
@@ -427,28 +437,24 @@ async function capture(page: Pick<ChapterPage, 'id' | 'url'>): Promise<string | 
     const pending = sourceRequests.get(page.id);
     if (pending) return pending;
     const task = (async () => {
+        const token = await cacheReady();
         const ref = refs.get(page.id) ?? getPages().find(r => original(r) === page.url);
         if (!ref?.el.isConnected) return undefined;
-        const old = stateFor(ref);
-        let bitmap: ImageBitmap;
-        if (old?.origBytes) bitmap = await createImageBitmap(new Blob([old.origBytes]));
-        else if (old?.origOwn) bitmap = await createImageBitmap(await (await fetch(old.origOwn)).blob());
-        else if (old) return undefined;
-        else bitmap = await createImageBitmap(ref.el);
+        if (original(ref) !== page.url && ownedRef(ref)?.id !== page.id) return undefined;
+        const snapshot = await readView(ref);
+        const bitmap = snapshot.bitmap;
         try {
             if (await bitmapBlank(bitmap)) return undefined;
             const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
             canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
-            return blobDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
+            const source = await blobDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
+            return cacheCurrent(token) && ref.el.isConnected && viewToken(ref) === snapshot.token ? source : undefined;
         } finally { bitmap.close(); }
     })().catch(() => undefined).finally(() => sourceRequests.delete(page.id));
     sourceRequests.set(page.id, task);
     return task;
 }
 async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Promise<void> {
-    // Every early return here decides whether a translated page becomes VISIBLE, and the
-    // runner's own log cannot see any of it. Mark the reason so "translated but invisible"
-    // names its cause instead of being reported as success.
     const bail = (why: string): void => {
         attachWhy = `${page.id}:${why}`;
         if (isDebug()) console.log('[mt] attach skipped', JSON.stringify({ page: page.id, why }));
@@ -459,95 +465,102 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
     if (viewportOverlap(ref) <= 0) { bail('offscreen'); return; }
     const stamp = `${progress.id}:${page.id}:${page.revision ?? 0}`;
     if (applied.get(ref.el) === stamp && stateFor(ref)) return;
-    const chapter = chapterKey();
-    const src = original(ref);
+    const chapter = chapterKey(), run = progress.id;
     attaching.add(ref.el);
-    let bitmap: ImageBitmap | undefined;
+    let snapshot: PageSnapshot | undefined;
+    let translated = '', origOwn: string | undefined, translatedBmp: ImageBitmap | undefined;
+    let committed = false;
     try {
+        const cacheEpoch = await cacheReady();
+        snapshot = await readView(ref);
+        const src = snapshot.source;
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter, page: page.id });
         const result = response?.result;
         if (!result) { bail(`no-result:${response?.error ?? 'empty'}`); return; }
-        if (chapterKey() !== chapter) { bail('chapter-changed'); return; }
-        if (!ref.el.isConnected) { bail('element-gone'); return; }
-        if (original(ref) !== src) { bail('src-changed'); return; }
-        if (result.signature !== JSON.stringify(pipeline) + ':' + RENDER_GEN) { bail('signature'); return; }
+        const current = (): boolean => cacheCurrent(cacheEpoch) && chapterKey() === chapter && progress?.id === run && ref.el.isConnected
+            && viewToken(ref) === snapshot!.token
+            && progress.pages.some(p => p.id === page.id && p.phase === 'ready' && p.revision === page.revision)
+            && result.signature === chapterSignature(pipeline);
+        if (!current()) { bail('view-changed'); return; }
+        if (!result.identity || !verifyBitmap(snapshot.bitmap, result.identity)) { bail('image-mismatch'); return; }
         const old = stateFor(ref);
-        const imageBlob = await (await fetch(result.image)).blob();
+        let imageBlob = await (await fetch(result.image)).blob();
         const packed = result.mask ? { w: result.mask.w, h: result.mask.h,
             data: Uint8Array.from(atob(result.mask.data.split(',')[1]), c => c.charCodeAt(0)).buffer } : undefined;
         const entry = { ...result.entry, mask: packed } as CachedPage;
         if (!packed) { bail('no-mask'); return; }
         if (entry.fp !== settingsFingerprint(pipeline)) { bail('fingerprint'); return; }
-        // Bind the result to this element. The runner renders from bytes it fetched itself,
-        // which may differ from what the reader shows (another CDN host, another encoder, the
-        // data-saver tier), so a differing content hash is expected and is NOT a reason to
-        // refuse. But when the element was matched by WINDOW POSITION rather than by URL, the
-        // mapping is an inference and must be checked before painting: a wrong guess would
-        // put another page's translation on this one. Page dims are stable across encoders,
-        // so they are a reliable tell when the pixels are readable.
-        if (page.matchedBy !== 'url') {
-            let probe: ImageBitmap | undefined;
-            try {
-                probe = await createImageBitmap(ref.el);
-                if (probe.width !== entry.w || probe.height !== entry.h) {
-                    const got = `${probe.width}x${probe.height}`;
-                    probe.close();
-                    bail(`dims:${got}≠${entry.w}x${entry.h}`);
-                    return;
-                }
-            } catch {
-                // unreadable pixels: an inferred mapping cannot be verified, so refuse
-                // rather than risk painting the wrong page
-                bail('unverifiable-position');
-                return;
-            } finally { try { probe?.close(); } catch { /* already closed */ } }
+        const w = snapshot.bitmap.width, h = snapshot.bitmap.height;
+        translatedBmp = await createImageBitmap(imageBlob);
+        if (translatedBmp.width !== entry.w || translatedBmp.height !== entry.h) { bail('artifact-dims'); return; }
+        if (w !== entry.w || h !== entry.h) {
+            const resized = new OffscreenCanvas(w, h);
+            resized.getContext('2d')!.drawImage(translatedBmp, 0, 0, w, h);
+            imageBlob = await resized.convertToBlob({ type: 'image/png' });
+            translatedBmp.close();
+            translatedBmp = await createImageBitmap(imageBlob);
         }
-        const translated = URL.createObjectURL(imageBlob);
-        let origBytes = old?.origBytes;
-        let origOwn: string | undefined;
-        if (old?.origOwn) origOwn = URL.createObjectURL(await (await fetch(old.origOwn)).blob());
-        else if (ref.kind === 'img' && src.startsWith('blob:') && bitmap) {
-            const originalCanvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-            originalCanvas.getContext('2d')!.drawImage(bitmap, 0, 0);
-            origOwn = URL.createObjectURL(await originalCanvas.convertToBlob({ type: 'image/png' }));
-        }
-        if (ref.kind === 'canvas' && !origBytes && bitmap) {
-            const originalCanvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-            originalCanvas.getContext('2d')!.drawImage(bitmap, 0, 0);
+        const sx = w / entry.w, sy = h / entry.h;
+        const scale = <T extends { x1: number; y1: number; x2: number; y2: number }>(b: T): T => ({
+            ...b, x1: b.x1 * sx, y1: b.y1 * sy, x2: b.x2 * sx, y2: b.y2 * sy,
+        });
+        const boxes = entry.boxes.map(b => ({ ...scale(b), ...(b.clip ? { clip: scale(b.clip) } : {}) }));
+        const image = identifyBitmap(snapshot.bitmap, boxes);
+        const hash = pageHashFromBitmap(snapshot.bitmap);
+        translated = URL.createObjectURL(imageBlob);
+        let origBytes: ArrayBuffer | undefined;
+        if (ref.kind === 'img' && src.startsWith('blob:')) origOwn = await ownOriginalUrl(snapshot.bitmap);
+        if (ref.kind === 'canvas') {
+            const originalCanvas = new OffscreenCanvas(w, h);
+            originalCanvas.getContext('2d')!.drawImage(snapshot.bitmap, 0, 0);
             const data = await blobDataUrl(await originalCanvas.convertToBlob({ type: 'image/png' }));
             origBytes = Uint8Array.from(atob(data.split(',')[1]), c => c.charCodeAt(0)).buffer;
         }
-        const translatedBmp = ref.kind === 'canvas' ? await createImageBitmap(imageBlob) : undefined;
-        if (chapterKey() !== chapter || !ref.el.isConnected || original(ref) !== src) {
-            URL.revokeObjectURL(translated); if (origOwn) URL.revokeObjectURL(origOwn); translatedBmp?.close(); return;
-        }
-        const state = { orig: src, origOwn, translated, translatedBmp, origBytes, outputs: entry.outputs,
-            mentions: entry.mentions, hash: page.hash,
-            det: { boxes: entry.boxes, panels: entry.panels, inferMs: 0, ep: 'cache',
-                mask: { width: entry.w, height: entry.h, data: unpackMask(packed, entry.w, entry.h) } } };
+        const paintedImage = ref.kind === 'canvas' ? identifyBitmap(translatedBmp, boxes) : undefined;
+        const state = { cacheEpoch, orig: src, origOwn, translated, translatedBmp: ref.kind === 'canvas' ? translatedBmp : undefined,
+            origBytes, outputs: entry.outputs, mentions: entry.mentions, hash, image, paintedImage,
+            det: { boxes, panels: entry.panels.map(scale), inferMs: 0, ep: 'cache',
+                mask: { width: w, height: h, data: unpackMask(packed, w, h) } } };
+        if (isDebug()) await ensurePageDebugViews(state, snapshot.bitmap, translatedBmp);
+        if (!await verifyView(ref, snapshot, result.identity) || !current()) { bail('view-changed'); return; }
         if (old) { unregPage(old); URL.revokeObjectURL(old.translated); }
         regPage(state);
-        if (pipeline.cacheEnabled) await cachePut({ ...entry, key: cacheKey(chapter, page.hash!) }, pipeline.cacheMax);
-        bookAdd(page.hash!);
+        committed = true;
+        if (pipeline.cacheEnabled && result.hash) void cachePut({ ...entry, key: cacheKey(chapter, result.hash) }, pipeline.cacheMax, cacheEpoch);
+        if (page.hash) bookAdd(page.hash);
         applied.set(ref.el, stamp);
         if (overlayChoice === 'auto') setOverlayOn(true);
         writePage(ref, state);
+        if (isDebug()) console.log('[mt] page result', JSON.stringify({ via: 'chapter', page: `${w}x${h}`, hash,
+            boxes: state.det.boxes, outputs: state.outputs, ep: state.det.ep }));
     } catch (e) { console.debug('[mt] chapter image attach deferred', e); }
-    finally { bitmap?.close(); attaching.delete(ref.el); }
+    finally {
+        snapshot?.bitmap.close();
+        if (!committed) { if (translated) URL.revokeObjectURL(translated); if (origOwn) URL.revokeObjectURL(origOwn); }
+        if (!committed || ref.kind === 'img') translatedBmp?.close();
+        attaching.delete(ref.el);
+    }
 }
 async function refresh(): Promise<void> {
     if (refreshBusy) return;
     refreshBusy = true;
     const chapter = chapterKey();
     try {
-        if (observedChapter !== chapter) { observedChapter = chapter; progress = null; refs.clear(); removeActivity('sweep'); forgetAnchor(); }
+        const token = await cacheReady();
+        if (observedChapter !== chapter) {
+            observedChapter = chapter; progress = null; refs.clear(); imageAliases.clear(); evidence.clear(); sourceImages.clear();
+            removeActivity('sweep');
+        }
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-status', chapter });
-        if (chapterKey() !== chapter) return;
-        if (response?.status) { progress = response.status; showProgress(); }
+        if (!cacheCurrent(token) || chapterKey() !== chapter) return;
+        if (response?.status) {
+            if (progress?.id !== response.status.id) { imageAliases.clear(); evidence.clear(); }
+            progress = response.status; showProgress();
+        }
         if (!progress) return;
         for (const ref of getPages()) {
             if (viewportOverlap(ref) <= 0) continue;
-            const page = ownedRef(ref);
+            const page = await resolveChapterRef(ref);
             if (!page) continue;
             refs.set(page.id, ref);
             if (page.phase === 'ready') void attach(ref, page);
@@ -576,6 +589,7 @@ export function initSweep(): void {
     chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         if (sender.id !== chrome.runtime.id) return;
         if (msg?.type === 'mt:chapter-update' && msg.status.chapter === chapterKey()) {
+            if (progress?.id !== msg.status.id) { imageAliases.clear(); evidence.clear(); }
             progress = msg.status;
             showProgress();
             void refresh();

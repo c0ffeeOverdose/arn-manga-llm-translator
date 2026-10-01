@@ -13,10 +13,12 @@ import { eraseBoxesAndMask, erasePlan, computeAiPatches, type AiPatches } from '
 import { sweepPageOrder } from './sweep';
 import { inpaintMode } from '../llm/pipeline-settings';
 import { ownCopyNeeded, ownOriginalUrl } from './page-io';
-import { translateRegions, renderDebugView, panelRanks } from './ocr';
+import { translateRegions, ensurePageDebugViews } from './ocr';
 import { rewindContextBefore, replayPagesAfter } from './queue';
 import { bookHas, bookAdd, bookDrop } from './sweep';
 import { saveContext } from './state';
+import { identifyBitmap } from '../image-identity';
+import { cacheReady, assertCacheCurrent } from '../cache-generation';
 
 // Dump-only twin of the paint's area resolution (see the `areas` entry below).
 function dumpAreas(
@@ -58,13 +60,15 @@ function dumpAreas(
 // harmless). The book snapshot is skipped too (context is mid-chapter at paint time).
 export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean,
     opts: { paintOnly?: boolean; detached?: boolean } = {}): Promise<PageState> {
+    const cacheEpoch = prep.cacheEpoch ?? await cacheReady();
+    assertCacheCurrent(cacheEpoch);
     const paintOnly = opts.paintOnly === true;
 
     const { srcUrl, bitmap, det } = prep;
     const existing = stateFor(ref) ?? pages.get(srcUrl);
     // twin prep made before the first job finished — reuse it, don't pay twice.
-    if (existing && !force) return existing;
-    if (existing && shareContext && !paintOnly) await rewindContextBefore(existing);
+    if (existing?.det && !force) return existing;
+    if (existing?.det && shareContext && !paintOnly) await rewindContextBefore(existing);
     // the rebuilt book excludes this page — its hash must refold (fresh fold
     // below re-registers; an error leaves it dropped so arrival refolds).
     // Same for the progress stamp: a force retranslate counts fresh.
@@ -102,6 +106,8 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, errorRetryAfterMs, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
             {
                 progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled,
+                fresh: force,
+                cacheEpoch,
                 // AI cleanup warm: starts the moment OCR ends (the infer lock
                 // is about to go idle) and runs through the LLM's network
                 // wait — a cold inpaint session uploads 112MB here too
@@ -268,8 +274,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         ...(bookOps?.length ? { bookOps } : null),
     }));
     if (rawLLM == null) console.warn('[mt] llm raw unavailable — stale service worker? reload the extension');
+    assertCacheCurrent(cacheEpoch);
     const blob = await withEncodeLock(() => canvas.convertToBlob({ type: 'image/png' }));
+    assertCacheCurrent(cacheEpoch);
     const state: PageState = {
+        cacheEpoch,
         orig: srcUrl,
         translated: URL.createObjectURL(blob),
         det,
@@ -278,6 +287,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         bookBefore,
         pairsBefore,
         hash: prep.hash,
+        image: identifyBitmap(bitmap, det.boxes),
         // canvas pages have no URL to re-read — carry the original bytes forward
         // (and a decoded translated bitmap for write-back) with the state
         origBytes: prep.origBytes ?? existing?.origBytes,
@@ -294,13 +304,13 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // debug views ride along only when debug is on — zero cost otherwise.
     // one on each frame so Original/Translate toggle keeps its debug boxes.
     if (debugOn && det.boxes.length) {
-        const ranks = panelRanks(det.panels ?? []);
-        state.debugOrig = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs, det.mask);
         // canvas pages reuse the kept translated bitmap (transfer is one-shot);
         // img pages transfer here as before — the canvas is dead after this
         const bmp = state.translatedBmp ?? canvas.transferToImageBitmap();
-        state.debug = await renderDebugView(bmp, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, outputs, det.mask);
+        await ensurePageDebugViews(state, bitmap, bmp);
+        if (!state.translatedBmp) bmp.close();
     }
+    assertCacheCurrent(cacheEpoch);
     if (existing) {
         unregPage(existing);
         URL.revokeObjectURL(existing.translated);
@@ -337,11 +347,11 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 ...entryBase, key,
                 ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
                 ...(aiPatches?.length ? { patches: aiPatches, patchesGen: INPAINT_PATCH_GEN } : null),
-            }, pipeline.cacheMax);
+            }, pipeline.cacheMax, cacheEpoch);
         }
     } else if (!prep.cached) {
         // cache off: drop the resume checkpoint this finished job may have used.
-        for (const key of cacheKeys()) void cacheDelete(key);
+        for (const key of cacheKeys()) void cacheDelete(key, cacheEpoch);
     } else if ((aiGenerated || aiWarmUsed) && aiPatches?.length && pipeline.cacheEnabled) {
         // cache hit that produced crops this visit — persist so the next visit skips the
         // model. Both sources must persist: a fresh compute (aiGenerated) and the warm
@@ -354,7 +364,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 ...entryBase, key,
                 ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
                 patches: aiPatches, patchesGen: INPAINT_PATCH_GEN,
-            }, pipeline.cacheMax);
+            }, pipeline.cacheMax, cacheEpoch);
         }
     }
     if (force && shareContext) {

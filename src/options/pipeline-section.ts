@@ -449,8 +449,8 @@ document.addEventListener('click', (e) => {
     setDirty(true);
 };
 
-// cache lives in the manga tab's content script (per-site IDB) — options just forwards.
-// No manga tab → hide the row instead of failing.
+// Counts come from the current reader origin; clearing is coordinated by the extension
+// so its background results and other reader origins cannot restore old translations.
 async function mangaTab(): Promise<number | null> {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const t = tabs[0];
@@ -469,12 +469,17 @@ async function refreshCacheCount(): Promise<void> {
     el.textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;
 }
 ($('cacheClear') as HTMLButtonElement).onclick = async () => {
-    const id = await mangaTab();
-    if (!id) { alert('Open a manga page first — the cache lives with the site.'); return; }
     const btn = $('cacheClear') as HTMLButtonElement;
+    btn.disabled = true;
     btn.textContent = 'Clearing…';
-    const resp = await chrome.tabs.sendMessage(id, { type: 'mt:cache-clear' }).catch(() => null);
-    btn.textContent = 'Clear translation cache';
-    if (resp?.ok) ($('cacheCount') as HTMLElement).textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'mt:translation-cache-clear' });
+        if (!resp?.ok) throw new Error(resp?.error ?? 'Could not clear translations');
+        ($('cacheCount') as HTMLElement).textContent = '0 here · 0 total';
+        btn.textContent = 'Translations cleared';
+    } catch (e) {
+        btn.textContent = 'Clear translation cache';
+        alert((e as Error).message);
+    } finally { btn.disabled = false; }
 };
 refreshCacheCount();
