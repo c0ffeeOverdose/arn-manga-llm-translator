@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -383,9 +383,21 @@ test('hotlinkRule: session rule stamping the page origin as Referer on guard CDN
   assert.match('https://img-r2.2xstorage.com/slug/1/0.webp', re);
   assert.match('https://img-r1.2xstorage.com/slug/1/0.webp', re);
   assert.match('https://storage.waitst.com/x/1.webp', re);
+  // MangaDex's network answers a referer-less fetch with 404, so it needs the same rule
+  assert.match('https://cmdxd98sb0x3yprd.mangadex.network/data/hash/1-x.jpg', re);
+  assert.match('https://uploads.mangadex.org/covers/x/1.jpg', re);
+  assert.doesNotMatch('https://mangadex.org/chapter/abc', re);
   assert.doesNotMatch('https://strip.example/images/logo.webp', re);
   assert.doesNotMatch('https://imgsrv5.com/x/1.jpg', re);
-  assert.deepEqual(rule.condition.resourceTypes, ['xmlhttprequest']); // SW fetch only, <img> needs no help
+  assert.deepEqual(rule.condition.resourceTypes, ['xmlhttprequest']); // SW/offscreen fetch only, <img> needs no help
+});
+
+test('hotlinkRetryable: 403 and 404 trigger the referer retry, anything else does not', () => {
+  assert.equal(hotlinkRetryable('image HTTP 403'), true);
+  assert.equal(hotlinkRetryable('image HTTP 404'), true);
+  assert.equal(hotlinkRetryable('image HTTP 500'), false);
+  assert.equal(hotlinkRetryable('proxy fetch timed out (75s)'), false);
+  assert.equal(hotlinkRetryable(undefined), false);
 });
 
 test('failure cooldown: park during cooldown, cap attempts, clear on force', () => {  const marks = new Map();

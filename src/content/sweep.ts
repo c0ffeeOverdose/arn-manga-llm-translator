@@ -413,6 +413,10 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         for (const page of pages) if (!/^https?:/.test(page.url)) page.source = await capture(page);
         if (startCancelled || chapter !== chapterKey()) return { ok: true, cancelled: true };
         assertCacheCurrent(cacheEpoch);
+        // Some image CDNs (MangaDex's network) refuse a referer-less fetch with 403/404; the
+        // session rule carries the reader origin as Referer for the runner's fetches. Install
+        // it before the run starts — the offscreen runner cannot know the reader origin.
+        await chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin: location.origin }).catch(() => {});
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-start', data: {
             chapter, cacheEpoch, readerUrl: location.href, pages, completeManifest: found.complete,
             pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,

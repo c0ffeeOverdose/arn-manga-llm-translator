@@ -1,7 +1,7 @@
 // Page discovery + pixel I/O: getPages/refKey, fetch/read/descramble, write-back,
 // hash-lane repaint + binding healing.
 
-import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, type EpisodeManifest } from './page-cache';
+import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, hotlinkRetryable, type EpisodeManifest } from './page-cache';
 import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
 import { identifyBitmap, verifyBitmap } from '../image-identity';
@@ -256,11 +256,15 @@ export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap
         new Promise<FetchResp>(res => setTimeout(() => res({ ok: false, error: 'proxy fetch timed out (75s)' }), 75_000)),
     ]);
     let r = await via(srcUrl);
-    // hotlink-guarded CDN (403s the Referer-less worker fetch): stamp our origin as Referer
-    // via a DNR session rule, then retry ONCE — a second 403 is a real block.
-    if ((!r?.ok || !r.b64) && (r?.error ?? '').startsWith('image HTTP 403')) {
+    // hotlink-guarded CDN (refuses the Referer-less worker fetch — 403, or 404 on MangaDex's
+    // network): stamp the reader's origin as Referer via a DNR session rule, then retry ONCE —
+    // a second failure is a real block or an evicted file.
+    if ((!r?.ok || !r.b64) && hotlinkRetryable(r?.error)) {
+        // A content script knows the reader origin; the offscreen runner does not (its own
+        // origin is chrome-extension://), so it lets the background resolve it from the session.
+        const origin = /^https?:$/.test(location.protocol) ? location.origin : undefined;
         const rule = await Promise.race([
-            chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin: location.origin }) as
+            chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin }) as
                 Promise<{ ok: boolean; error?: string }>,
             new Promise<{ ok: boolean; error?: string }>(res => setTimeout(() => res({ ok: false, error: 'hotlink rule timed out' }), 15_000)),
         ]);

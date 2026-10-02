@@ -395,11 +395,11 @@ export function readerPageNumber(origin: string, pathname: string, search: strin
     return n > 0 ? n : null;
 }
 
-// ---- hotlink Referer rule: some image CDNs 403 any request without a page Referer — and an
+// ---- hotlink Referer rule: some image CDNs refuse a request without a page Referer — and an
 // MV3 service worker cannot send one (Chrome strips referrer from SW fetch silently), so the
-// SW proxy 403s where a plain <img> loads fine. Fix at the network layer: a
-// declarativeNetRequest session rule sets the header for SW fetches to these hosts.
-// Pure builder — the background installs it via updateSessionRules; unit-tested below.
+// SW proxy fails where a plain <img> loads fine. Some answer 403, MangaDex's network answers
+// 404. Fix at the network layer: a declarativeNetRequest session rule sets the header for
+// fetches to these hosts. Pure builder — the background installs it; unit-tested below.
 export const HOTLINK_RULE_ID = 1001;
 export function hotlinkRule(origin: string): object {
     return {
@@ -410,11 +410,18 @@ export function hotlinkRule(origin: string): object {
             requestHeaders: [{ header: 'Referer', operation: 'set', value: origin + '/' }],
         },
         condition: {
-            // SW fetch() surfaces as xmlhttprequest; <img> loads need no help
-            regexFilter: '^https://[^/]*\\.(2xstorage\\.com|waitst\\.com)/',
+            // SW/offscreen fetch() surface as xmlhttprequest; <img> loads need no help. The
+            // optional subdomain group covers host rotation (img-r2.2xstorage.com, cmdx….mangadex.network).
+            regexFilter: '^https://([^/]+\\.)?(2xstorage\\.com|waitst\\.com|uploads\\.mangadex\\.org|mangadex\\.network)/',
             resourceTypes: ['xmlhttprequest'],
         },
     };
+}
+
+// A referer-less fetch is refused as 403 by some CDNs and as 404 by others (MangaDex's
+// network) — both warrant the session-rule retry. Pure — unit-tested.
+export function hotlinkRetryable(error: string | undefined): boolean {
+    return /^image HTTP (403|404)$/.test(error ?? '');
 }
 
 // ---- mt:fetch-image policy: the SW fetch is CORS-exempt under host_permissions, so without

@@ -432,20 +432,22 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:hotlink-rule') {
-        // hotlink-guarded CDNs 403 Referer-less SW fetch: install a session rule
-        // stamping the page origin as Referer. Session-only — gone on restart.
-        // ONE atomic updateSessionRules call (remove+add): concurrent 403s would
-        // otherwise interleave and the second add throws "duplicate ID".
+        // hotlink-guarded CDNs refuse a Referer-less fetch: install a session rule stamping
+        // the READER's origin as Referer. Session-only — gone on restart. ONE atomic
+        // updateSessionRules call (remove+add): concurrent failures would otherwise
+        // interleave and the second add throws "duplicate ID".
         (async () => {
             try {
-                // origin must parse and be a bare origin — it becomes a Referer value.
-                if (typeof msg.origin !== 'string' || new URL(msg.origin).origin !== msg.origin) {
-                    sendResponse({ ok: false, error: 'bad origin' }); return;
-                }
+                // A content script sends its own origin; the offscreen runner sends none (its
+                // origin is chrome-extension://), so the chapter session resolves the reader.
+                const raw = typeof msg.origin === 'string' && /^https?:/.test(msg.origin) ? msg.origin
+                    : await chapterReaderUrl(sender);
+                const origin = raw ? new URL(raw).origin : '';
+                if (!origin || origin === 'null') { sendResponse({ ok: false, error: 'bad origin' }); return; }
                 const { hotlinkRule, HOTLINK_RULE_ID } = await import('../content/page-cache');
                 await chrome.declarativeNetRequest.updateSessionRules({
                     removeRuleIds: [HOTLINK_RULE_ID],
-                    addRules: [hotlinkRule(msg.origin) as chrome.declarativeNetRequest.Rule],
+                    addRules: [hotlinkRule(origin) as chrome.declarativeNetRequest.Rule],
                 });
                 sendResponse({ ok: true });
             } catch (e) {
