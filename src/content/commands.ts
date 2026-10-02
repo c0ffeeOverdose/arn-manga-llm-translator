@@ -162,7 +162,12 @@ export function installMessageListener(): void {
             }
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
             resumeAuto(); // user intent — clears a provider halt (rate limit/auth)
-            resolveChapterRef(ref).then(() => {
+            // The chapter owner may already hold this page's finished translation (the element
+            // is just unbound after a reader redraw/rendition swap). Hand it to the owner so it
+            // re-attaches instead of paying the LLM again — `chapterOwnsRequest` paints a ready
+            // page and returns true; only a genuine stranger falls through to the queue.
+            resolveChapterRef(ref).then(async () => {
+                if (chapterOwnsRequest(ref, false)) { sendResponse({ ok: true, active: true }); return; }
                 const r = enqueue(ref);
                 if (r === 'dup') {
                     if (dequeue(ref)) { setStatus(`Removed from queue — ${idleStatus()}`, 'idle'); sendResponse({ ok: true, cancelled: true }); }

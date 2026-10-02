@@ -7,8 +7,7 @@ import { clearQueue, failMarks, queue, pageKeyOf, paintHas, claimPaint, releaseP
 import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap } from './page-cache';
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
-import { autoOn } from './auto';
-import { sweepArrivable, sweepCommitted, sweepPageOrder, chapterOwnsRequest, resolveChapterRef } from './sweep';
+import { sweepPageOrder, idlePageOrder, chapterOwnsRequest, resolveChapterRef } from './sweep';
 import { isDebug } from '../debug';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 
@@ -50,10 +49,11 @@ function arrivalStuck(el: Element, src: string, dims: string): boolean {
 }
 async function arrivalPaint(ref: PageRef): Promise<void> {
     const el = ref.el;
-    // explicit intent only: a reopened page shows originals until the user
-    // presses Translate chapter / enables auto. This session's own sweep
-    // commits are the exception (checked by hash below).
-    if ((!autoOn() && !sweepArrivable()) || arrivalBusy.has(el) || document.hidden) return;
+    // Explicit intent is NOT required when the page is already in the translation cache: that
+    // entry is durable proof the user already translated this page, so re-showing it spends
+    // nothing. Auto/sweep intent still governs pages with no cache entry (below), so a plain
+    // reopen never starts new work on its own — it only surfaces work already paid for.
+    if (arrivalBusy.has(el) || document.hidden) return;
     let dims = '';
     if (ref.kind === 'img') {
         const img = el as HTMLImageElement;
@@ -73,7 +73,7 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
     arrivalBusy.add(el);
     try {
         const cacheEpoch = await cacheReady();
-        await resolveChapterRef(ref);
+        const chapterRef = await resolveChapterRef(ref);
         if (chapterOwnsRequest(ref, false)) return;
         await loadPipeline();
         const srcUrl = refKey(ref);
@@ -81,17 +81,21 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         const hash = pageHashFromBitmap(bitmap);
         // Prefer the page-identity entry: the chapter wrote it under the page's slot, so it
         // matches whatever tier/host the reader is showing. The bytes entry is the fallback
-        // for work done outside a chapter run.
-        const order = sweepPageOrder(refKey(ref));
+        // for work done outside a chapter run. On a plain reopen there is no live run, so the
+        // slot comes from the resolved chapter page — the durable page identity, not the window.
+        // A live run names the page authoritatively; with no run the reader's own page number
+        // is the durable slot the chapter cache was written under.
+        const order = sweepPageOrder(refKey(ref)) ?? chapterRef?.order ?? idlePageOrder();
         const identityHit = pipeline.cacheEnabled && order != null ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
         const decision = pageEntryDecision(identityHit, hash, settingsFingerprint(pipeline), bitmap.width, bitmap.height);
         const hit = decision.usable
             ? { ...identityHit!, ...(decision.dropPatches ? { patches: undefined, patchesGen: undefined } : null) }
             : (pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined);
         const det = hit ? detFromCacheEntry(hit, bitmap.width, bitmap.height) : null;
-        // permission: auto covers everything; otherwise only this session's sweep commits.
+        // Reaching here with a usable `hit` IS the authorization: the entry is durable proof the
+        // page was already translated, so painting it spends nothing. Pages with no entry keep
+        // the explicit-intent gate below (they would cost a fresh detect + LLM call).
         if (!det || !hit || stateFor(ref)) { arrivalMiss.set(el, { src, dims, at: Date.now() }); return; }
-        if (!autoOn() && !sweepCommitted(hash)) { arrivalGate.set(el, Date.now()); return; }
         if (isDebug()) console.log('[mt] arrival paint (cache):', src.slice(-24));
         assertCacheCurrent(cacheEpoch);
         await renderPage(ref, { srcUrl, bitmap, det, hash, cacheEpoch, cached: hit,

@@ -127,17 +127,27 @@ export async function fetchPagedUrls(): Promise<string[]> {
 }
 
 // The at-home endpoint behind a chapter UUID: the reader's own page list, full-data or
-// data-saver chosen to match what is on screen. Empty on any failure.
+// data-saver chosen to match what is on screen. Empty on any failure. One URL per page —
+// enumeration must stay 1:1 with the chapter. A CDN can evict one tier's encoding while the
+// sibling is intact; `tierAlternates` below supplies that sibling per page for the fetch retry.
+let atHomeAlternates: string[][] = [];
+export function pagedTierAlternates(): (string[] | undefined)[] { return atHomeAlternates; }
 async function fetchAtHomeChapter(uuid: string): Promise<string[]> {
+    atHomeAlternates = [];
     try {
         const r = await fetch(`https://api.mangadex.org/at-home/server/${encodeURIComponent(uuid)}`, { signal: AbortSignal.timeout(15000) });
         if (!r.ok) return [];
         const j = await r.json();
         const baseUrl = j?.baseUrl, hash = j?.chapter?.hash;
-        const data = j?.chapter?.data, saver = j?.chapter?.dataSaver;
+        const data: unknown = j?.chapter?.data, saver: unknown = j?.chapter?.dataSaver;
         const tier = pagedTier(baseUrl, hash, data, saver);
-        const files = tier === 'data-saver' && Array.isArray(saver) && saver.length ? saver : data;
-        return buildPagedUrls(baseUrl, hash, files, tier === 'data-saver' && files === saver ? 'data-saver' : 'data');
+        const preferred = tier === 'data-saver' ? saver : data;
+        const fallback = tier === 'data-saver' ? data : saver;
+        const primary = buildPagedUrls(baseUrl, hash, preferred, tier === 'data-saver' ? 'data-saver' : 'data');
+        const secondary = buildPagedUrls(baseUrl, hash, fallback, tier === 'data-saver' ? 'data' : 'data-saver');
+        // positional alignment: index i is the same page ordinal in both tiers
+        atHomeAlternates = primary.map((_, i) => secondary[i] ? [secondary[i]] : []);
+        return primary;
     } catch { return []; }
 }
 
@@ -221,8 +231,10 @@ async function screenshotPage(el: Element): Promise<ImageBitmap> {
 }
 
 export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap; bytes: ArrayBuffer }> {
-    // fast path: direct fetch (CORS-open CDNs). Timeout: a long-tail hang here would wedge
-    // a sweep worker forever.
+    // A CDN can evict one encoding of a paged reader's files while the sibling tier is intact.
+    // The two tiers are DIFFERENT FILES (their filename hashes differ), so an extension swap
+    // cannot reconstruct the other one — the caller that knows the tier lists (the runner and
+    // the sweep) enqueues the sibling URL as its own page. Here a 404 simply falls through.
     try {
         const resp = await fetch(srcUrl, { signal: AbortSignal.timeout(120_000) });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -591,9 +603,12 @@ export async function healImgBinding(el: HTMLImageElement, state: PageState): Pr
         if (!cacheCurrent(token)) return;
         if (cur !== src) return;
         try {
+            // verifyBitmap is already the tolerant test: it checks aspect (5%) and pixel
+            // agreement, so it accepts the same page through another encoder/rendition size.
+            // Requiring exact dims AND an exact hash on top rejected blob-rotating readers,
+            // which left a finished page unbound and made the user pay for it again.
             const matches = state.image
-                ? bmp.width === state.image.w && bmp.height === state.image.h
-                    && identifyBitmap(bmp).exact === state.image.exact && verifyBitmap(bmp, state.image)
+                ? verifyBitmap(bmp, state.image)
                 : pageHashFromBitmap(bmp) === state.hash;
             if (matches) {
                 pages.set(cur, state);

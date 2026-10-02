@@ -866,6 +866,7 @@ test('buildPagedUrls kinds: data default, data-saver on request, junk kind rejec
   assert.deepEqual(buildPagedUrls('https://svc.example.org', 'h1', ['p1.png'], 'orig'), []);
 });
 
+
 test('pageEntryDecision: page identity survives an encoder change, crops do not', () => {
   const fp = 'fp1', W = 836, H = 1200;
   const entry = (over = {}) => ({ key: `ch#aaa`, fp, w: W, h: H, keyGen: PAGE_KEY_GEN, ...over });

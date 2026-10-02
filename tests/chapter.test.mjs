@@ -7,7 +7,7 @@ await build({ entryPoints: ['src/chapter/model.ts'], bundle: true, format: 'esm'
 await build({ entryPoints: ['src/chapter/discovery.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-discovery.mjs' });
 await build({ entryPoints: ['src/chapter/plan.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-plan.mjs' });
 const { replayLedger, replaceContribution, recordEdits } = await import('../.test-build/chapter-context.mjs');
-const { remainingPages, chapterMessage } = await import('../.test-build/chapter-model.mjs');
+const { remainingPages, chapterMessage, fetchSourceWithAlternate } = await import('../.test-build/chapter-model.mjs');
 const { sameChapterDocument } = await import('../.test-build/chapter-discovery.mjs');
 const { nextBatch, pagePhase } = await import('../.test-build/chapter-plan.mjs');
 const empty = () => ({ base: { pairs: [], characters: [] }, entries: [], edits: [] });
@@ -64,6 +64,29 @@ test('status distinguishes ready pages, failures and incomplete discovery', () =
     assert.equal(chapterMessage(s), '2 of 4 pages ready to read · Working on 1 page');
     assert.match(chapterMessage({ ...s, phase: 'waiting' }), /Waiting for more page images/);
     assert.doesNotMatch(chapterMessage({ ...s, phase: 'complete' }), /complete/);
+});
+test('a 404 on the preferred encoding retries the sibling of the SAME page', async () => {
+    const tried = [];
+    const load = url => {
+        tried.push(url);
+        return url === 'saver-6' ? Promise.resolve('pixels') : Promise.reject(new Error('HTTP 404'));
+    };
+    const retries = [];
+    assert.equal(await fetchSourceWithAlternate('data-6', 'saver-6', load, m => retries.push(m)), 'pixels');
+    assert.deepEqual(tried, ['data-6', 'saver-6']);
+    assert.deepEqual(retries, ['HTTP 404']);
+});
+test('a 404 with no sibling still fails the page (never a silent blank)', async () => {
+    const tried = [];
+    const load = url => { tried.push(url); return Promise.reject(new Error('HTTP 404')); };
+    await assert.rejects(() => fetchSourceWithAlternate('data-6', undefined, load), /HTTP 404/);
+    assert.deepEqual(tried, ['data-6'], 'no alternate means exactly one attempt');
+});
+test('a healthy preferred encoding never touches the sibling', async () => {
+    const tried = [];
+    const load = url => { tried.push(url); return Promise.resolve('pixels'); };
+    assert.equal(await fetchSourceWithAlternate('data-6', 'saver-6', load), 'pixels');
+    assert.deepEqual(tried, ['data-6']);
 });
 test('document pagination cannot leave the current chapter or origin', () => {
     const reader = 'https://reader.test/chapter/one/2';

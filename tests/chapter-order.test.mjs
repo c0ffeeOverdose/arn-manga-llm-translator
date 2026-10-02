@@ -17,6 +17,7 @@ const stubs = {
         export const fetchBitmap = async () => { throw new Error('No network'); };
         export const unscrambleTiles = async () => null; export const ownOriginalUrl = async () => undefined;
         export const episodeManifestSrcs = () => null; export const fetchPagedUrls = async () => [];
+        export const pagedTierAlternates = () => [];
         export const galleryManifestJson = async () => null; export const collectUnloadedUrls = () => [];
         export const bitmapBlank = async () => false; export const writePage = () => {};`,
     queue: `export const viewportOverlap = () => 1; export const dropAutoQueued = () => {};
@@ -44,7 +45,7 @@ await build({ entryPoints: ['src/content/sweep.ts'], bundle: true, format: 'esm'
     } }] });
 await build({ entryPoints: ['src/image-identity.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-order-image.mjs' });
 const { identifyBitmap, signatureOf } = await import('../.test-build/chapter-order-image.mjs');
-const { testProgress, resolveChapterRef, elementMap, testAttach } = await import('../.test-build/chapter-order.mjs');
+const { testProgress, resolveChapterRef, elementMap, testAttach, idlePageOrder } = await import('../.test-build/chapter-order.mjs');
 
 beforeEach(() => {
     installCanvas();
@@ -60,6 +61,31 @@ beforeEach(() => {
         return { id: `p${order}`, url: `https://cdn.test/${order}.png`, order, phase: 'ready', revision: 1, image: signatureOf(identity) };
     });
     testProgress({ id: crypto.randomUUID(), chapter: 'chapter:test', phase: 'complete', pages });
+});
+
+test('idlePageOrder names the page from the reader URL so a reopen can find its cache', () => {
+    // No run, no binding — the reader's own /N is the only durable page identity.
+    globalThis.location = { origin: 'https://reader.test', pathname: '/chapter/uuid/6', search: '', hash: '', href: 'https://reader.test/chapter/uuid/6' };
+    assert.equal(idlePageOrder(), 5);
+    globalThis.location = { origin: 'https://reader.test', pathname: '/read/uuid/1', search: '', hash: '', href: 'https://reader.test/read/uuid/1' };
+    assert.equal(idlePageOrder(), 0);
+    globalThis.location = { origin: 'https://reader.test', pathname: '/', search: '', hash: '', href: 'https://reader.test/' };
+    assert.equal(idlePageOrder(), undefined, 'no page number → never guess a slot');
+});
+
+test('a not-yet-finished neighbour does not abort resolving the shown page', async () => {
+    // The shown page (order 4) is ready; a pending neighbour has no artifact yet. The pending
+    // candidate must be skipped, not abort the resolve — otherwise the finished page never
+    // binds, never attaches, and its paid translation is stranded.
+    const shown = identifyBitmap(bitmap(grayPage(4)), [{ x1: 10, y1: 10, x2: 200, y2: 200 }]);
+    const pages = [
+        { id: 'p4', url: 'https://cdn.test/4.png', order: 4, phase: 'ready', revision: 1, image: signatureOf(shown) },
+        { id: 'p5', url: 'https://cdn.test/5.png', order: 5, phase: 'translating', revision: 0, image: undefined },
+    ];
+    fixture.artifacts.set('p4', { identity: shown, signature: 'test:signature' });
+    fixture.artifacts.delete('p5');
+    testProgress({ id: 'run', chapter: 'chapter:test', phase: 'running', pages });
+    assert.equal((await resolveChapterRef(imageRef('blob:shown-4', bitmap(grayPage(4)))))?.order, 4);
 });
 
 test('opaque images resolve without a native page-number URL', async () => {

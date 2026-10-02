@@ -83,7 +83,10 @@ async function refreshStatus(): Promise<void> {
     if (resp?.ok) {
         const counts = resp.translated && resp.loaded ? ` · ${resp.translated}/${resp.loaded} pages` : '';
         const raw = resp.status || (resp.translated ? `${resp.translated} page(s) translated` : '');
-        statusEl.textContent = raw + counts || (resp.loaded === 0 ? 'No manga images found on this page.' : '');
+        // A finished page can fail to reach the reader; without this the button just looked
+        // like "not translated" and pressing it re-paid the model. Name the refusal.
+        const why = typeof resp.attachWhy === 'string' && resp.attachWhy ? ` · page not shown: ${resp.attachWhy}` : '';
+        statusEl.textContent = (raw + counts + why) || (resp.loaded === 0 ? 'No manga images found on this page.' : '');
         // empty idle state shows no card at all — not an empty box with a dot
         statusSection.style.display = statusEl.textContent ? '' : 'none';
         if (statusEl.textContent && !statusSection.open && !statusPinned) statusSection.open = true;

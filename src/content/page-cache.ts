@@ -504,6 +504,7 @@ export function buildPagedUrls(baseUrl: unknown, hash: unknown, files: unknown, 
     }
     return out;
 }
+
 // unloaded-but-addressable pages: lazy <img> with an http(s) src and no pixels yet. Loaded
 // ones are covered by getPages refs; known dedupes against those + each other. data:/empty/
 // blob: srcs are unusable headless — skip.

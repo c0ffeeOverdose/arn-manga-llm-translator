@@ -9,6 +9,10 @@ export interface ChapterPage {
     descramble: boolean;
     source?: string;
     inBaseContext?: boolean;
+    // Sibling encoding of the same page (paged readers that ship two tiers): a CDN may evict
+    // one tier's file while the other is intact, so a 404 on `url` retries this once. Same
+    // page ordinal, never a different page.
+    alt?: string;
 }
 export type PagePhase = 'queued' | 'reading' | 'detecting' | 'translating' | 'rendering' | 'ready' | 'failed' | 'waiting';
 export interface ChapterProgress {
@@ -49,6 +53,23 @@ export interface Contribution {
     hash: string;
     outputs: RegionOutput[];
     mentions: Mention[];
+}
+
+// Fetch a paged page's pixels, retrying the sibling encoding when the preferred URL is gone
+// (a CDN evicts one tier while the other survives; the tiers are different files, so only the
+// alternate the enumerator captured can reach it). `onRetry` reports why, for diagnostics.
+// Pure control flow — the fetch itself is injected so the retry contract is unit-tested.
+export async function fetchSourceWithAlternate<T>(
+    primary: string, alt: string | undefined,
+    load: (url: string) => Promise<T>, onRetry?: (message: string) => void,
+): Promise<T> {
+    try {
+        return await load(primary);
+    } catch (e) {
+        if (!alt) throw e;
+        onRetry?.((e as Error).message);
+        return load(alt);
+    }
 }
 
 export function remainingPages<T>(pages: T[], anchor: number): T[] {

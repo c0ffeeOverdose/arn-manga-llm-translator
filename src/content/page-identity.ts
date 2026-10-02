@@ -84,3 +84,19 @@ export async function verifyView(ref: PageRef, snapshot: PageSnapshot, identity:
     } catch { return false; }
     finally { current?.bitmap.close(); }
 }
+
+// Attach-time verification: the reader may have minted a fresh blob for the SAME page while
+// the artifact was in flight, so the recorded token is stale — but the pixels are still the
+// authority. Re-read the current view and require the artifact's identity to match IT. A
+// recycled element showing another page fails verifyBitmap and is still refused, so dropping
+// the token-equality requirement costs no safety here (verifyView stays strict for callers
+// that need "nothing moved at all").
+export async function verifyViewFresh(ref: PageRef, identity: ImageIdentity): Promise<boolean> {
+    if (!ref.el.isConnected) return false;
+    let current: PageSnapshot | undefined;
+    try {
+        current = await readView(ref);
+        return verifyBitmap(current.bitmap, identity);
+    } catch { return false; }
+    finally { current?.bitmap.close(); }
+}

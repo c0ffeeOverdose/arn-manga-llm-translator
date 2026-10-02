@@ -10,7 +10,7 @@ import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverla
 import { ensureDebugViews } from './ocr';
 import { applyOverlays } from './overlays';
 import { lookaheadActive } from './auto';
-import { sweepActive } from './sweep';
+import { sweepActive, sweepStatus } from './sweep';
 
 // ---- status ownership: one pill, many writers ----
 // The pill is a VIEW: activities (live jobs keyed by page, kind = priority:
@@ -45,8 +45,16 @@ export function lastMsgSet(m: { text: string; phase: MtState; until?: number } |
     lastMsg = m;
 }
 
-// page-count status for the pill/popup: loaded pages with translations + queued count
+// page-count status for the pill/popup: loaded pages with translations + queued count.
+// A windowed reader (a paged MangaDex keeps ~5 images in the DOM) would otherwise report
+// "1/5 pages" forever — a window size, not chapter progress. While a chapter run owns this
+// reader, its own ready/total is the honest pair, so the pill and the popup agree with the
+// run instead of counting whichever neighbours happen to be mounted.
 export function pageCounts(): { loaded: number; translated: number; queued: number } {
+    // An active chapter run is the authority on this reader's progress. (sweepStatus is a
+    // function-level cross-import: sweep.ts imports this module too, no top-level TDZ.)
+    const sweep = sweepActive() ? sweepStatus() : null;
+    if (sweep && sweep.total > 0) return { loaded: sweep.total, translated: sweep.done, queued: 0 };
     const refs = getPages();
     let translated = 0;
     for (const ref of refs) if (stateFor(ref)?.det) translated++;

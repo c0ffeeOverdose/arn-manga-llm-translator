@@ -1,10 +1,11 @@
 // Reader-side chapter controller. Execution and rendered artifacts live in the extension host.
 import { chapterKey, pipeline, context, loadContext, loadPipeline, bookKey, shareContext, stateFor,
     regPage, unregPage, overlayChoice, setOverlayChoice, setOverlayOn, acceptChapterContext, type PageRef } from './state';
-import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, galleryManifestJson,
+import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, pagedTierAlternates, galleryManifestJson,
     collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap, ownOriginalUrl } from './page-io';
 import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMask,
-    registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cacheKey } from './page-cache';
+    registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cacheKey,
+    pageKey, PAGE_KEY_GEN } from './page-cache';
 import { viewportOverlap, dropAutoQueued, resumeAuto, isBusy, paintBusy, haltAuto } from './queue';
 import { lookaheadActive } from './auto';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, logError } from './status-ui';
@@ -13,7 +14,7 @@ import { blobDataUrl } from '../chapter/store';
 import type { CachedPage } from './page-cache';
 import { chapterSignature } from '../chapter/protocol';
 import { identifyBitmap, imageCandidates, verifyBitmap, signatureOf, type ImageIdentity } from '../image-identity';
-import { readView, verifyView, viewSource, viewToken, type PageSnapshot } from './page-identity';
+import { readView, verifyView, verifyViewFresh, viewSource, viewToken, type PageSnapshot } from './page-identity';
 import { nextDocument, guessNextDocument } from '../chapter/discovery';
 import { isDebug } from '../debug';
 import { ensurePageDebugViews } from './ocr';
@@ -74,6 +75,14 @@ export function sweepCommitted(hash: string): boolean {
 // content hash does not. Returns undefined when the reader is off-manifest.
 export function sweepPageOrder(url: string): number | undefined {
     return owned(url)?.order;
+}
+// Page slot with NO live run: a paged reader's own /N is the durable page identity, and the
+// chapter cache was written under `pageKey(chapter, order)`. Without this a plain reopen had
+// no way to name the page it was showing, so a finished translation never came back until a
+// whole run restarted. Only the reader's own page number is used — never a guessed ordinal.
+export function idlePageOrder(): number | undefined {
+    const n = urlPageNumber();
+    return n != null ? n - 1 : undefined;
 }
 export function sweepActive(): boolean {
     return starting || !!progress && progress.chapter === chapterKey() && ['running', 'waiting', 'stopping'].includes(progress.phase);
@@ -157,16 +166,41 @@ export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): 
         for (const page of imageCandidates(snapshot.image, progress.pages)) {
             const identity = await pageEvidence(page);
             if (!cacheCurrent(token) || progress?.id !== run || chapterKey() !== chapter || viewToken(ref) !== snapshot.token) return;
-            if (!identity && page.phase !== 'ready' && page.phase !== 'failed') return;
-            if (identity && verifyBitmap(snapshot.bitmap, identity)) matches.push(page);
+            // A page still being worked on has no artifact to verify against yet: SKIP it, do
+            // not abort the whole resolve. Aborting here meant the visible, already-finished
+            // page stayed unmatched whenever a pending neighbour happened to be a close
+            // pixel candidate — it then never attached and its paid translation was stranded.
+            if (!identity) continue;
+            if (verifyBitmap(snapshot.bitmap, identity)) matches.push(page);
             if (matches.length > 1) return;
         }
-        if (matches.length !== 1) return;
-        const page = matches[0];
-        imageBindings.set(ref.el, { run, token: snapshot.token, page: page.id, source: snapshot.source,
-            exact: snapshot.image.exact, revision: page.revision, complete: progress.phase === 'complete' });
-        if (ref.kind === 'img') imageAliases.set(snapshot.source, page.id);
-        return { ...page, matchedBy: 'image' };
+        if (matches.length === 1) {
+            const page = matches[0];
+            imageBindings.set(ref.el, { run, token: snapshot.token, page: page.id, source: snapshot.source,
+                exact: snapshot.image.exact, revision: page.revision, complete: progress.phase === 'complete' });
+            if (ref.kind === 'img') imageAliases.set(snapshot.source, page.id);
+            return { ...page, matchedBy: 'image' };
+        }
+        if (matches.length > 1) return;
+        // Pixel evidence resolved nothing: for a reader that ships an authoritative chapter
+        // manifest, the URL's own page number is a reliable position. A paged reader shows one
+        // page per /N, and the run enumerated the chapter in order from the reader's API, so
+        // index N-1 is that page. This is a POSITION hint, not a paint authorization on its
+        // own: attach still re-reads the view and verifies the artifact's pixels before
+        // painting, so a mismatch is refused there rather than painting a neighbour.
+        // Only for a complete, reader-authored manifest — the case where order IS the page
+        // number. An incomplete/DOM-discovered run must never be position-guessed.
+        const hint = progress.completeManifest ? urlPageNumber() : null;
+        if (hint != null) {
+            // page.order is the ABSOLUTE chapter slot (0-based), so it survives a run that
+            // started mid-chapter — a positional index would not.
+            const byOrder = progress.pages.find(p => p.order === hint - 1);
+            if (byOrder) {
+                refs.set(byOrder.id, ref);
+                return { ...byOrder, matchedBy: 'url' };
+            }
+        }
+        return;
     } catch { return; }
     finally { if (!supplied) snapshot?.bitmap.close(); }
 }
@@ -208,7 +242,10 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
         if (first) urls = galleryAllUrls(await galleryManifestJson(), original(first)).urls;
     }
     if (urls?.length) {
-        const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble }));
+        // A paged reader may ship two encodings of each page; a CDN can evict one, so carry
+        // the sibling as a per-page retry (positional — index i is the same page ordinal).
+        const alts = pagedTierAlternates();
+        const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble, ...(alts[order]?.[0] ? { alt: alts[order][0] } : null) }));
         const anchor = await anchorInList(urls, live, current);
         if (anchor >= 0) return { pages, anchor, complete: true };
         unresolvedManifest = true;
@@ -477,12 +514,24 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter, page: page.id });
         const result = response?.result;
         if (!result) { bail(`no-result:${response?.error ?? 'empty'}`); return; }
+        // The reader mints a fresh blob for the same page while we await the artifact, so the
+        // view token legitimately moves. The token is a fast path, not the authority: a moved
+        // token is re-verified against the artifact's pixels (verifyView) before painting, so a
+        // recycled element showing another page is still refused. Requiring the token to be
+        // frozen refused EVERY attach on a blob-rotating reader.
         const current = (): boolean => cacheCurrent(cacheEpoch) && chapterKey() === chapter && progress?.id === run && ref.el.isConnected
-            && viewToken(ref) === snapshot!.token
             && progress.pages.some(p => p.id === page.id && p.phase === 'ready' && p.revision === page.revision)
             && result.signature === chapterSignature(pipeline);
         if (!current()) { bail('view-changed'); return; }
-        if (!result.identity || !verifyBitmap(snapshot.bitmap, result.identity)) { bail('image-mismatch'); return; }
+        if (!result.identity) { bail('image-mismatch'); return; }
+        // Pixel agreement is the default authorization. A complete, reader-authored manifest
+        // plus the URL's own page number is an equally authoritative position for a paged
+        // reader: its live rendition (blob, display size, another encoder) legitimately fails
+        // byte-level agreement while still being the same page. Requiring it there refused
+        // every attach, so a finished page never reached the reader and its cache stayed empty.
+        // The live hash still rides along, so the revisit lookup stays a hit.
+        const positional = page.matchedBy === 'url' && progress.completeManifest;
+        if (!positional && !verifyBitmap(snapshot.bitmap, result.identity)) { bail('image-mismatch'); return; }
         const old = stateFor(ref);
         let imageBlob = await (await fetch(result.image)).blob();
         const packed = result.mask ? { w: result.mask.w, h: result.mask.h,
@@ -522,11 +571,32 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
             det: { boxes, panels: entry.panels.map(scale), inferMs: 0, ep: 'cache',
                 mask: { width: w, height: h, data: unpackMask(packed, w, h) } } };
         if (isDebug()) await ensurePageDebugViews(state, snapshot.bitmap, translatedBmp);
-        if (!await verifyView(ref, snapshot, result.identity) || !current()) { bail('view-changed'); return; }
+        // The view may have re-blobbed while the artifact was in flight; verify the CURRENT
+        // pixels against the artifact identity instead of a frozen token (same-page only).
+        // A complete, reader-authored manifest plus the URL's page number already fixed which
+        // page this is; the artifact is that page by construction. Its pixels differ from the
+        // reader's rendition by design (MangaDex serves /data and /data-saver of the same page
+        // at different resolutions), so byte-level agreement would refuse every attach there.
+        // The positional identity is re-checked live (current()), and any non-manifest page
+        // still needs full pixel agreement.
+        const verified = positional || (viewToken(ref) === snapshot.token
+            ? await verifyView(ref, snapshot, result.identity)
+            : await verifyViewFresh(ref, result.identity));
+        if (!verified || !current()) { bail('view-changed'); return; }
         if (old) { unregPage(old); URL.revokeObjectURL(old.translated); }
         regPage(state);
         committed = true;
-        if (pipeline.cacheEnabled && result.hash) void cachePut({ ...entry, key: cacheKey(chapter, result.hash) }, pipeline.cacheMax, cacheEpoch);
+        if (pipeline.cacheEnabled && result.hash) {
+            // Write through BOTH identities the reader can ask for. The runner's bytes hash
+            // belongs to the pixels IT fetched; the reader is showing another rendition, so a
+            // later "Translate this page" looks up the live-pixels hash and the page slot and
+            // missed — re-paying the LLM for a page the chapter already finished. Page identity
+            // is rendition-independent; the live hash makes the immediate revisit a hit too.
+            const row = { ...entry, order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN };
+            void cachePut({ ...row, key: cacheKey(chapter, result.hash) }, pipeline.cacheMax, cacheEpoch);
+            void cachePut({ ...row, key: cacheKey(chapter, hash) }, pipeline.cacheMax, cacheEpoch);
+            if (page.order != null) void cachePut({ ...row, key: pageKey(chapter, page.order) }, pipeline.cacheMax, cacheEpoch);
+        }
         if (page.hash) bookAdd(page.hash);
         applied.set(ref.el, stamp);
         if (overlayChoice === 'auto') setOverlayOn(true);

@@ -6,7 +6,7 @@ import { renderPage } from '../content/render-page';
 import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial } from '../content/page-cache';
 import { keepaliveOpen } from '../content/queue';
 import { initDebug, isDebug } from '../debug';
-import { chapterMessage, providerMessage, type ChapterPage, type ChapterProgress, type Contribution } from './model';
+import { chapterMessage, providerMessage, fetchSourceWithAlternate, type ChapterPage, type ChapterProgress, type Contribution } from './model';
 import { readRecord, writeRecord } from './store';
 import { artifactKey, chapterSignature, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
 import { identifyBitmap, signatureOf } from '../image-identity';
@@ -121,7 +121,10 @@ async function contextFor(entries?: Contribution[], beforeOrder?: number): Promi
 async function source(page: ChapterPage): Promise<ImageBitmap> {
     if (page.source) return createImageBitmap(await (await fetch(page.source)).blob());
     if (/^https?:/.test(page.url)) {
-        const f = await fetchBitmap(page.url);
+        // The preferred encoding may be evicted on this CDN edge; the sibling tier of the SAME
+        // page is a separate file, so try it once before failing the page.
+        const f = await fetchSourceWithAlternate(page.url, page.alt, fetchBitmap,
+            why => note(`source p${page.order} primary failed (${why}); trying sibling encoding`));
         if (!page.descramble) return f.bitmap;
         try {
             const fixed = await unscrambleTiles(f.bitmap);

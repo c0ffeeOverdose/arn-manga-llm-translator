@@ -10,7 +10,7 @@ mkdirSync('.test-build', { recursive: true });
 await build({
   stdin: {
     contents: [
-      `export { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage } from './src/content/page-io.ts';`
+      `export { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage, healImgBinding } from './src/content/page-io.ts';`
       + `\nexport { setOverlayOn, setDebugOn } from './src/content/state.ts';`
       + `\nexport { identifyBitmap } from './src/image-identity.ts';`,
       `export { regPage, pages, retireBlob } from './src/content/state.ts';`,
@@ -26,7 +26,7 @@ await build({
 // state.ts computes contextChapter at import time (needs location)
 globalThis.location = { origin: 'https://test.local', pathname: '/chapter/1', search: '', hash: '' };
 
-const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage, identifyBitmap, setOverlayOn, setDebugOn,
+const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage, healImgBinding, identifyBitmap, setOverlayOn, setDebugOn,
   regPage, pages, retireBlob, readView, cacheGeneration, acceptCacheGeneration } =
   await import(new URL('../.test-build/page-io.mjs', import.meta.url).href);
 
@@ -201,5 +201,38 @@ test('a retired translated view cannot be decoded as an original after Clear', a
     const el = { src: 'blob:retired-render', currentSrc: 'blob:retired-render', complete: true, isConnected: true,
         naturalWidth: pixels.width, naturalHeight: pixels.height, pixels };
     await assert.rejects(() => readView({ kind: 'img', el }), /Original image is no longer available/);
+    pages.clear();
+});
+
+test('healImgBinding rebinds the same page across a rendition/encoder change', async () => {
+    installCanvas();
+    pages.clear();
+    // The page was translated from one rendition; the reader now mints another blob of the
+    // SAME page at a different size (proportional) — it must rebind, not drop the binding.
+    const source = bitmap(grayPage(4));
+    const state = { orig: 'blob:dead-source', translated: 'blob:ext-translated',
+        image: identifyBitmap(source), hash: 'h4' };
+    regPage(state);
+    const decoded = bitmap(grayPage(4), { width: 300, height: 400 }); // proportional, smaller
+    const el = { src: 'blob:fresh-rendition', currentSrc: 'blob:fresh-rendition', complete: true, isConnected: true,
+        naturalWidth: 300, naturalHeight: 400, pixels: decoded };
+    globalThis.createImageBitmap = async () => decoded;
+    await healImgBinding(el, state);
+    assert.equal(pages.get('blob:fresh-rendition'), state, 'the fresh rendition must alias the state');
+    pages.clear();
+});
+
+test('healImgBinding still drops a binding showing a DIFFERENT page', async () => {
+    installCanvas();
+    pages.clear();
+    const state = { orig: 'blob:dead-source', translated: 'blob:ext-translated',
+        image: identifyBitmap(bitmap(grayPage(4))), hash: 'h4' };
+    regPage(state);
+    const decoded = bitmap(grayPage(5), { width: 600, height: 800 }); // different art
+    const el = { src: 'blob:recycled', currentSrc: 'blob:recycled', complete: true, isConnected: true,
+        naturalWidth: 600, naturalHeight: 800, pixels: decoded };
+    globalThis.createImageBitmap = async () => decoded;
+    await healImgBinding(el, state);
+    assert.equal(pages.get('blob:recycled'), undefined, 'a different page must never be bound');
     pages.clear();
 });
