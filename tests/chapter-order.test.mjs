@@ -41,11 +41,11 @@ await build({ entryPoints: ['src/content/sweep.ts'], bundle: true, format: 'esm'
         });
         build.onLoad({ filter: /./, namespace: 'fixture' }, args => ({ contents: stubs[args.path], loader: 'js' }));
         build.onLoad({ filter: /src\/content\/sweep\.ts$/ }, args => ({ loader: 'ts', contents:
-            readFileSync(args.path, 'utf8') + '\nexport const testProgress = p => { progress = p; evidence.clear(); imageAliases.clear(); };\nexport { attach as testAttach };' }));
+            readFileSync(args.path, 'utf8') + '\nexport const testProgress = p => { progress = p; evidence.clear(); imageAliases.clear(); };\nexport { attach as testAttach };\nexport { settingsFingerprint } from \'./page-cache\';' }));
     } }] });
 await build({ entryPoints: ['src/image-identity.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-order-image.mjs' });
 const { identifyBitmap, signatureOf } = await import('../.test-build/chapter-order-image.mjs');
-const { testProgress, resolveChapterRef, elementMap, testAttach, idlePageOrder } = await import('../.test-build/chapter-order.mjs');
+const { testProgress, resolveChapterRef, elementMap, testAttach, idlePageOrder, settingsFingerprint } = await import('../.test-build/chapter-order.mjs');
 
 beforeEach(() => {
     installCanvas();
@@ -138,6 +138,30 @@ test('a late attachment cannot overwrite a recycled image', async () => {
     await testAttach(ref, page);
     assert.deepEqual(fixture.paints, []);
     assert.equal(ref.el.src, 'blob:next');
+});
+test('a positional page paints from the artifact without reading cross-origin pixels', async () => {
+    // The reader's page image is not origin-clean (a cross-origin CDN): decoding it for pixels
+    // fails and fetchBitmap is stubbed to fail — the pre-fix attach refused the page here.
+    // A page identified by the manifest + its own URL number must paint regardless; its pixel
+    // identity is metadata that resolves after the paint.
+    const shown = identifyBitmap(bitmap(grayPage(2)), [{ x1: 10, y1: 10, x2: 200, y2: 200 }]);
+    testProgress({ id: 'pos', chapter: 'chapter:test', phase: 'running', completeManifest: true,
+        pages: [{ id: 'p2', url: 'https://cdn.test/2.png', order: 2, phase: 'ready', revision: 1, image: signatureOf(shown) }] });
+    fixture.artifacts.set('p2', {
+        identity: shown, signature: 'test:signature', hash: 'deadbeef',
+        image: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+        entry: { key: 'k', fp: settingsFingerprint({}), w: 600, h: 800,
+            boxes: [{ x1: 10, y1: 10, x2: 200, y2: 200 }], panels: [], outputs: [], extras: [],
+            mask: { w: 1, h: 1, data: Uint8Array.of(1).buffer }, order: 2, keyGen: 1 },
+        mask: { w: 1, h: 1, data: 'data:application/octet-stream;base64,AA==' },
+    });
+    const pixels = bitmap(grayPage(2));
+    pixels.clean = false; // origin-clean check fails, exactly like a cross-origin page image
+    const ref = imageRef('https://cdn.test/2.png', pixels);
+    const page = await resolveChapterRef(ref);
+    assert.equal(page?.matchedBy, 'url');
+    await testAttach(ref, page);
+    assert.equal(fixture.paints.length, 1, 'the artifact must paint without the original pixels');
 });
 test('a different aspect ratio never matches one page of a composite', async () => {
     const ref = imageRef('blob:spread', bitmap(grayPage(2), { width: 1200, height: 800 }));

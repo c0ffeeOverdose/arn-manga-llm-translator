@@ -14,7 +14,7 @@ import { blobDataUrl } from '../chapter/store';
 import type { CachedPage } from './page-cache';
 import { chapterSignature } from '../chapter/protocol';
 import { identifyBitmap, imageCandidates, verifyBitmap, signatureOf, type ImageIdentity } from '../image-identity';
-import { readView, verifyView, verifyViewFresh, viewSource, viewToken, type PageSnapshot } from './page-identity';
+import { readView, readViewLocal, savedOriginal, verifyView, verifyViewFresh, viewSource, viewToken, type PageSnapshot } from './page-identity';
 import { nextDocument, guessNextDocument, hasNextPage } from '../chapter/discovery';
 import { isDebug } from '../debug';
 import { ensurePageDebugViews } from './ocr';
@@ -114,7 +114,7 @@ function owned(url: string) {
         ?? progress.pages.find(p => p.id === imageAliases.get(url));
 }
 // Page number the reader URL itself declares, compared against the chapter key we are on.
-// `/g/685252/4/` (gallery readers) and `/chapter|read/<id>/N` both resolve; anything unsure
+// `/g/123456/4/` (gallery readers) and `/chapter|read/<id>/N` both resolve; anything unsure
 // yields null so the caller falls back to pixel evidence instead of a guessed slot.
 function urlPageNumber(): number | null {
     return readerPageNumber(location.origin, location.pathname, location.search, location.hash, chapterKey());
@@ -514,9 +514,28 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
     let committed = false;
     try {
         const cacheEpoch = await cacheReady();
-        snapshot = await readView(ref);
+        // A positionally identified page (reader-authored manifest + its own URL page number)
+        // paints from the artifact alone. Reading the reader's pixels there is metadata work
+        // only — and on a cross-origin CDN it costs a full-image proxy roundtrip, so
+        // it must not sit on the paint path. Pixels resolve after the paint.
+        const positional = page.matchedBy === 'url' && progress.completeManifest;
+        let deferredIdentity = false;
+        let img: HTMLImageElement | undefined;
+        if (positional && ref.kind === 'img') {
+            img = ref.el as HTMLImageElement;
+            snapshot = await readViewLocal(ref);
+            deferredIdentity = !snapshot;
+        } else {
+            snapshot = await readView(ref);
+        }
         mark('readView'); // decode of what the reader is showing
-        const src = snapshot.source;
+        if (deferredIdentity && (!img!.complete || img!.naturalWidth < 1 || img!.naturalHeight < 1)) {
+            bail('image-not-ready'); // not decoded yet: the next refresh tick retries
+            return;
+        }
+        const w = snapshot?.bitmap.width ?? img!.naturalWidth;
+        const h = snapshot?.bitmap.height ?? img!.naturalHeight;
+        const src = snapshot?.source ?? viewSource(ref);
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter, page: page.id });
         mark('result'); // background roundtrip incl. the artifact transfer
         const result = response?.result;
@@ -537,8 +556,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         // byte-level agreement while still being the same page. Requiring it there refused
         // every attach, so a finished page never reached the reader and its cache stayed empty.
         // The live hash still rides along, so the revisit lookup stays a hit.
-        const positional = page.matchedBy === 'url' && progress.completeManifest;
-        if (!positional && !verifyBitmap(snapshot.bitmap, result.identity)) { bail('image-mismatch'); return; }
+        if (!positional && (!snapshot || !verifyBitmap(snapshot.bitmap, result.identity))) { bail('image-mismatch'); return; }
         const old = stateFor(ref);
         let imageBlob = await (await fetch(result.image)).blob();
         mark('image'); // data-url → blob
@@ -547,7 +565,6 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         const entry = { ...result.entry, mask: packed } as CachedPage;
         if (!packed) { bail('no-mask'); return; }
         if (entry.fp !== settingsFingerprint(pipeline)) { bail('fingerprint'); return; }
-        const w = snapshot.bitmap.width, h = snapshot.bitmap.height;
         translatedBmp = await createImageBitmap(imageBlob);
         mark('decode');
         if (translatedBmp.width !== entry.w || translatedBmp.height !== entry.h) { bail('artifact-dims'); return; }
@@ -563,19 +580,20 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
             ...b, x1: b.x1 * sx, y1: b.y1 * sy, x2: b.x2 * sx, y2: b.y2 * sy,
         });
         const boxes = entry.boxes.map(b => ({ ...scale(b), ...(b.clip ? { clip: scale(b.clip) } : {}) }));
-        const image = identifyBitmap(snapshot.bitmap, boxes);
-        const hash = pageHashFromBitmap(snapshot.bitmap);
+        const image = snapshot ? identifyBitmap(snapshot.bitmap, boxes) : undefined;
+        const hash = snapshot ? pageHashFromBitmap(snapshot.bitmap) : undefined;
         mark('identity');
         translated = URL.createObjectURL(imageBlob);
         let origBytes: ArrayBuffer | undefined;
-        if (ref.kind === 'img' && src.startsWith('blob:')) origOwn = await ownOriginalUrl(snapshot.bitmap);
+        if (ref.kind === 'img' && src.startsWith('blob:') && snapshot) origOwn = await ownOriginalUrl(snapshot.bitmap);
         if (ref.kind === 'canvas') {
+            if (!snapshot) { bail('view-unavailable'); return; }
             const originalCanvas = new OffscreenCanvas(w, h);
             originalCanvas.getContext('2d')!.drawImage(snapshot.bitmap, 0, 0);
             const data = await blobDataUrl(await originalCanvas.convertToBlob({ type: 'image/png' }));
             origBytes = Uint8Array.from(atob(data.split(',')[1]), c => c.charCodeAt(0)).buffer;
         }
-        const paintedImage = ref.kind === 'canvas' ? identifyBitmap(translatedBmp, boxes) : undefined;
+        const paintedImage = ref.kind === 'canvas' && snapshot ? identifyBitmap(translatedBmp, boxes) : undefined;
         const state = { cacheEpoch, orig: src, origOwn, translated, translatedBmp: ref.kind === 'canvas' ? translatedBmp : undefined,
             origBytes, outputs: entry.outputs, mentions: entry.mentions, hash, image, paintedImage,
             det: { boxes, panels: entry.panels.map(scale), inferMs: 0, ep: 'cache',
@@ -588,9 +606,9 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         // at different resolutions), so byte-level agreement would refuse every attach there.
         // The positional identity is re-checked live (current()), and any non-manifest page
         // still needs full pixel agreement.
-        const verified = positional || (viewToken(ref) === snapshot.token
+        const verified = positional || (!!snapshot && (viewToken(ref) === snapshot.token
             ? await verifyView(ref, snapshot, result.identity)
-            : await verifyViewFresh(ref, result.identity));
+            : await verifyViewFresh(ref, result.identity)));
         mark('verify');
         if (!verified || !current()) { bail('view-changed'); return; }
         if (old) { unregPage(old); URL.revokeObjectURL(old.translated); }
@@ -604,7 +622,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
             // is rendition-independent; the live hash makes the immediate revisit a hit too.
             const row = { ...entry, order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN };
             void cachePut({ ...row, key: cacheKey(chapter, result.hash) }, pipeline.cacheMax, cacheEpoch);
-            void cachePut({ ...row, key: cacheKey(chapter, hash) }, pipeline.cacheMax, cacheEpoch);
+            if (hash) void cachePut({ ...row, key: cacheKey(chapter, hash) }, pipeline.cacheMax, cacheEpoch);
             if (page.order != null) void cachePut({ ...row, key: pageKey(chapter, page.order) }, pipeline.cacheMax, cacheEpoch);
         }
         if (page.hash) bookAdd(page.hash);
@@ -614,11 +632,42 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         mark('paint');
         // Debug frames are two full-page encodes; paint first, then build them. With debug on,
         // the sweep swaps to the debug view on its next pass.
-        if (isDebug()) await ensurePageDebugViews(state, snapshot.bitmap, translatedBmp);
+        if (isDebug() && snapshot) await ensurePageDebugViews(state, snapshot.bitmap, translatedBmp);
         mark('debug');
         if (isDebug()) console.log('[mt] attach', JSON.stringify({ page: page.id, via: 'chapter', ms: marks, total: marks.paint }));
         if (isDebug()) console.log('[mt] page result', JSON.stringify({ via: 'chapter', page: `${w}x${h}`, hash,
             boxes: state.det.boxes, outputs: state.outputs, ep: state.det.ep }));
+        if (deferredIdentity) {
+            // The paint is done; pixels are metadata now. Read them off the critical path (the
+            // proxy roundtrip can take seconds under load), then fill the durable identity in
+            // place so healing, the repaint index, the live-hash cache entry and debug frames
+            // all still arrive.
+            void (async () => {
+                try {
+                    if (!ref.el.isConnected || stateFor(ref) !== state) return;
+                    // The element now shows OUR render, so the source pixels come from the
+                    // state's own reference — never from the freshly assigned blob, whose
+                    // load would race this pass.
+                    const bitmap = await savedOriginal(state);
+                    try {
+                        if (!ref.el.isConnected || stateFor(ref) !== state) return;
+                        const liveHash = pageHashFromBitmap(bitmap);
+                        state.hash = liveHash;
+                        state.image = identifyBitmap(bitmap, boxes);
+                        regPage(state); // index the hash for the repaint lane now that it exists
+                        if (pipeline.cacheEnabled && result.hash) {
+                            const row = { ...entry, order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN };
+                            void cachePut({ ...row, key: cacheKey(chapter, liveHash) }, pipeline.cacheMax, cacheEpoch);
+                        }
+                        if (isDebug()) {
+                            const tb = await createImageBitmap(imageBlob);
+                            try { await ensurePageDebugViews(state, bitmap, tb); } finally { tb.close(); }
+                            console.log('[mt] attach identity', JSON.stringify({ page: page.id, ms: Date.now() - startedAt }));
+                        }
+                    } finally { bitmap.close(); }
+                } catch (e) { if (isDebug()) console.warn('[mt] attach identity failed', page.id, String(e).slice(0, 160)); }
+            })();
+        }
     } catch (e) { console.debug('[mt] chapter image attach deferred', e); }
     finally {
         snapshot?.bitmap.close();

@@ -71,6 +71,28 @@ export async function readView(ref: PageRef): Promise<PageSnapshot> {
         return { token, source, bitmap, image, fromNetwork };
     } catch (e) { bitmap?.close(); throw e; }
 }
+
+// Element-local read only: same-origin and blob images decode with no network roundtrip. A
+// cross-origin https image is not origin-clean, so its pixels are not readable here — the
+// caller gets undefined and decides whether it can proceed without them (a positionally
+// identified page can paint first and resolve pixel identity later) or needs the full read.
+export async function readViewLocal(ref: PageRef): Promise<PageSnapshot | undefined> {
+    if (!ref.el.isConnected || (ref.kind === 'img' && !ref.el.complete)) return undefined;
+    const token = viewToken(ref);
+    let bitmap: ImageBitmap | undefined;
+    let keep = false;
+    try {
+        bitmap = await createImageBitmap(ref.el);
+        if (!ref.el.isConnected || viewToken(ref) !== token) return undefined;
+        const image = identifyBitmap(bitmap);
+        keep = true;
+        return { token, source: viewSource(ref), bitmap, image, fromNetwork: false };
+    } catch {
+        return undefined;
+    } finally {
+        if (bitmap && !keep) bitmap.close();
+    }
+}
 export async function verifyView(ref: PageRef, snapshot: PageSnapshot, identity: ImageIdentity): Promise<boolean> {
     if (!ref.el.isConnected || viewToken(ref) !== snapshot.token) return false;
     let current: PageSnapshot | undefined;
