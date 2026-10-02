@@ -46,15 +46,15 @@ export function lastMsgSet(m: { text: string; phase: MtState; until?: number } |
 }
 
 // page-count status for the pill/popup: loaded pages with translations + queued count.
+// The chapter run is the authority while it exists for this chapter — active OR finished.
 // A windowed reader (a paged MangaDex keeps ~5 images in the DOM) would otherwise report
-// "1/5 pages" forever — a window size, not chapter progress. While a chapter run owns this
-// reader, its own ready/total is the honest pair, so the pill and the popup agree with the
-// run instead of counting whichever neighbours happen to be mounted.
+// "4/5 pages" for a chapter that is fully translated, because a mounted neighbour the reader
+// preloaded has not been painted yet; that neighbour is not work remaining. Solo work keeps
+// the DOM counts (and its queued feedback rides along either way).
 export function pageCounts(): { loaded: number; translated: number; queued: number } {
-    // An active chapter run is the authority on this reader's progress. (sweepStatus is a
-    // function-level cross-import: sweep.ts imports this module too, no top-level TDZ.)
-    const sweep = sweepActive() ? sweepStatus() : null;
-    if (sweep && sweep.total > 0) return { loaded: sweep.total, translated: sweep.done, queued: 0 };
+    // sweepStatus is a function-level cross-import: sweep.ts imports this module too, no TDZ.
+    const sweep = sweepStatus();
+    if (sweep && sweep.total > 0) return { loaded: sweep.total, translated: sweep.done, queued: queue.length + paintQueued() };
     const refs = getPages();
     let translated = 0;
     for (const ref of refs) if (stateFor(ref)?.det) translated++;

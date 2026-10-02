@@ -67,3 +67,13 @@ test('an active but empty run never blanks the pill with a zero total', () => {
     fixture.sweepStatus = { ...fixture.sweepStatus, done: 0, total: 0 };
     assert.deepEqual(pageCounts(), { loaded: 1, translated: 1, queued: 0 });
 });
+
+test('a finished chapter run keeps reporting the chapter, not the reader window', () => {
+    // Five mounted pages, four painted: "4/5 pages" would read as unfinished work for a
+    // chapter the run just completed — the unpainted neighbour is a preloaded image, not work.
+    fixture.pages = Array.from({ length: 5 }, (_, i) => ({ kind: 'img', el: {}, key: `k${i}` }));
+    for (const p of fixture.pages.slice(0, 4)) fixture.states.set(p, { det: {} });
+    fixture.sweepActive = false;
+    fixture.sweepStatus = { ...fixture.sweepStatus, active: false, done: 24, total: 24 };
+    assert.deepEqual(pageCounts(), { loaded: 24, translated: 24, queued: 0 });
+});
