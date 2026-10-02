@@ -15,6 +15,41 @@ export function nextDocument(doc: Document, base: string, chapter: string): stri
     return url !== base && sameChapterDocument(url, base, chapter) ? url : undefined;
 }
 
+// The reader's own anchor to the next page, even without rel=next: a paginated reader that
+// swaps content in place declares no next link, and treating it as complete stopped "to the
+// end of the chapter" on the visible page. The anchor must point exactly at the URL the
+// chapter's page-turn shape predicts — evidence, not a guess.
+export function hasNextPage(doc: Document, base: string, chapter: string): boolean {
+    const guess = guessNextDocument(base, chapter);
+    if (!guess) return false;
+    const want = pageShape(guess);
+    if (!want) return false;
+    for (const a of doc.querySelectorAll('a[href]')) {
+        const href = a.getAttribute('href');
+        if (!href) continue;
+        try {
+            if (pageShape(new URL(href, base).href) === want) return true;
+        } catch { /* malformed href */ }
+    }
+    return false;
+}
+
+// Reader URLs are compared without a trailing slash: the next-page guess and the reader's own
+// anchor may declare it differently, and both name the same document.
+function pageShape(url: string): string | null {
+    try {
+        const u = new URL(url);
+        return `${u.origin}${u.pathname.replace(/\/+$/, '')}${u.search}`;
+    } catch { return null; }
+}
+
+// Walking forward happens one reader document at a time; the reader answers the guessed next
+// URL with 404/410 once past the last page. That is the chapter's natural end, not a failure
+// of the run.
+export function discoverEnded(status: number): boolean {
+    return status === 404 || status === 410;
+}
+
 // A page image is never a 1px spacer, an icon or a tracker: readers annotate thumbnails
 // with width/height attributes and full page art is always tall. These are the only
 // non-DOM signals that survive a fetched (undragged, undecoded) document.
@@ -99,7 +134,9 @@ export function guessNextDocument(current: string, chapter: string, step = 1): s
     if (segs.length >= 2 && /^\d+$/.test(tail) && /\d/.test(stem)) {
         const next = new URL(url.href);
         segs[segs.length - 1] = String(Number(tail) + step);
-        next.pathname = '/' + segs.join('/');
+        // Keep the reader's own trailing slash: gallery-style readers 404-redirect without it,
+        // and a redirect per page is paid on every walk step.
+        next.pathname = '/' + segs.join('/') + (url.pathname.endsWith('/') ? '/' : '');
         shapes.push(next.href);
     }
     // Numeric hash routes: normalizeChapterKey keeps a hash verbatim (it may BE the story

@@ -5,7 +5,7 @@ import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, pagedTierAlterna
     collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap, ownOriginalUrl } from './page-io';
 import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMask,
     registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cacheKey,
-    pageKey, PAGE_KEY_GEN } from './page-cache';
+    pageKey, PAGE_KEY_GEN, readerPageNumber } from './page-cache';
 import { viewportOverlap, dropAutoQueued, resumeAuto, isBusy, paintBusy, haltAuto } from './queue';
 import { lookaheadActive } from './auto';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, logError } from './status-ui';
@@ -15,7 +15,7 @@ import type { CachedPage } from './page-cache';
 import { chapterSignature } from '../chapter/protocol';
 import { identifyBitmap, imageCandidates, verifyBitmap, signatureOf, type ImageIdentity } from '../image-identity';
 import { readView, verifyView, verifyViewFresh, viewSource, viewToken, type PageSnapshot } from './page-identity';
-import { nextDocument, guessNextDocument } from '../chapter/discovery';
+import { nextDocument, guessNextDocument, hasNextPage } from '../chapter/discovery';
 import { isDebug } from '../debug';
 import { ensurePageDebugViews } from './ocr';
 import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
@@ -113,12 +113,11 @@ function owned(url: string) {
     return progress.pages.find(p => p.url === url || samePagePath(p.url, url))
         ?? progress.pages.find(p => p.id === imageAliases.get(url));
 }
-const PAGE_IN_URL = /\/(?:chapter|read)\/[^/]+\/(\d+)(?:\/|$)/;
+// Page number the reader URL itself declares, compared against the chapter key we are on.
+// `/g/685252/4/` (gallery readers) and `/chapter|read/<id>/N` both resolve; anything unsure
+// yields null so the caller falls back to pixel evidence instead of a guessed slot.
 function urlPageNumber(): number | null {
-    const m = location.pathname.match(PAGE_IN_URL);
-    if (!m) return null;
-    const n = Number(m[1]);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    return readerPageNumber(location.origin, location.pathname, location.search, location.hash, chapterKey());
 }
 
 function ownedRef(ref: PageRef): ProgressPage | undefined {
@@ -272,8 +271,11 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
     // as "this site is not supported".
     let anchor = current ? ordered.findIndex(p => p.ref?.el === current.el) : -1;
     if (anchor < 0) anchor = highestKnown(ordered, live);
-    // A paginated/virtualized reader without a manifest is discovery-incomplete.
-    const hasNext = !!document.querySelector('a[rel="next"], link[rel="next"], [data-next-page], [data-infinite-scroll]');
+    // A paginated/virtualized reader without a manifest is discovery-incomplete. A plain
+    // next-page anchor counts too, even without rel=next — otherwise "to the end of the
+    // chapter" stopped on the visible page, which read as an unsupported reader.
+    const hasNext = !!document.querySelector('a[rel="next"], link[rel="next"], [data-next-page], [data-infinite-scroll]')
+        || hasNextPage(document, location.href, chapterKey());
     const unresolved = live.some(r => r.kind === 'canvas' && !r.el.width);
     return { pages, anchor, complete: !unresolvedManifest && !hasNext && !unresolved };
 }
@@ -504,14 +506,19 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
     if (applied.get(ref.el) === stamp && stateFor(ref)) return;
     const chapter = chapterKey(), run = progress.id;
     attaching.add(ref.el);
+    const startedAt = Date.now();
+    const marks: Record<string, number> = {};
+    const mark = (name: string): void => { marks[name] = Date.now() - startedAt; };
     let snapshot: PageSnapshot | undefined;
     let translated = '', origOwn: string | undefined, translatedBmp: ImageBitmap | undefined;
     let committed = false;
     try {
         const cacheEpoch = await cacheReady();
         snapshot = await readView(ref);
+        mark('readView'); // decode of what the reader is showing
         const src = snapshot.source;
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter, page: page.id });
+        mark('result'); // background roundtrip incl. the artifact transfer
         const result = response?.result;
         if (!result) { bail(`no-result:${response?.error ?? 'empty'}`); return; }
         // The reader mints a fresh blob for the same page while we await the artifact, so the
@@ -534,6 +541,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         if (!positional && !verifyBitmap(snapshot.bitmap, result.identity)) { bail('image-mismatch'); return; }
         const old = stateFor(ref);
         let imageBlob = await (await fetch(result.image)).blob();
+        mark('image'); // data-url → blob
         const packed = result.mask ? { w: result.mask.w, h: result.mask.h,
             data: Uint8Array.from(atob(result.mask.data.split(',')[1]), c => c.charCodeAt(0)).buffer } : undefined;
         const entry = { ...result.entry, mask: packed } as CachedPage;
@@ -541,6 +549,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         if (entry.fp !== settingsFingerprint(pipeline)) { bail('fingerprint'); return; }
         const w = snapshot.bitmap.width, h = snapshot.bitmap.height;
         translatedBmp = await createImageBitmap(imageBlob);
+        mark('decode');
         if (translatedBmp.width !== entry.w || translatedBmp.height !== entry.h) { bail('artifact-dims'); return; }
         if (w !== entry.w || h !== entry.h) {
             const resized = new OffscreenCanvas(w, h);
@@ -556,6 +565,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         const boxes = entry.boxes.map(b => ({ ...scale(b), ...(b.clip ? { clip: scale(b.clip) } : {}) }));
         const image = identifyBitmap(snapshot.bitmap, boxes);
         const hash = pageHashFromBitmap(snapshot.bitmap);
+        mark('identity');
         translated = URL.createObjectURL(imageBlob);
         let origBytes: ArrayBuffer | undefined;
         if (ref.kind === 'img' && src.startsWith('blob:')) origOwn = await ownOriginalUrl(snapshot.bitmap);
@@ -570,7 +580,6 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
             origBytes, outputs: entry.outputs, mentions: entry.mentions, hash, image, paintedImage,
             det: { boxes, panels: entry.panels.map(scale), inferMs: 0, ep: 'cache',
                 mask: { width: w, height: h, data: unpackMask(packed, w, h) } } };
-        if (isDebug()) await ensurePageDebugViews(state, snapshot.bitmap, translatedBmp);
         // The view may have re-blobbed while the artifact was in flight; verify the CURRENT
         // pixels against the artifact identity instead of a frozen token (same-page only).
         // A complete, reader-authored manifest plus the URL's page number already fixed which
@@ -582,6 +591,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         const verified = positional || (viewToken(ref) === snapshot.token
             ? await verifyView(ref, snapshot, result.identity)
             : await verifyViewFresh(ref, result.identity));
+        mark('verify');
         if (!verified || !current()) { bail('view-changed'); return; }
         if (old) { unregPage(old); URL.revokeObjectURL(old.translated); }
         regPage(state);
@@ -601,6 +611,12 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         applied.set(ref.el, stamp);
         if (overlayChoice === 'auto') setOverlayOn(true);
         writePage(ref, state);
+        mark('paint');
+        // Debug frames are two full-page encodes; paint first, then build them. With debug on,
+        // the sweep swaps to the debug view on its next pass.
+        if (isDebug()) await ensurePageDebugViews(state, snapshot.bitmap, translatedBmp);
+        mark('debug');
+        if (isDebug()) console.log('[mt] attach', JSON.stringify({ page: page.id, via: 'chapter', ms: marks, total: marks.paint }));
         if (isDebug()) console.log('[mt] page result', JSON.stringify({ via: 'chapter', page: `${w}x${h}`, hash,
             boxes: state.det.boxes, outputs: state.outputs, ep: state.det.ep }));
     } catch (e) { console.debug('[mt] chapter image attach deferred', e); }

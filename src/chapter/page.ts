@@ -12,7 +12,7 @@ import { artifactKey, chapterSignature, type HostConfig, type HostCheckpoint, ty
 import { identifyBitmap, signatureOf } from '../image-identity';
 import type { ContextState } from '../llm/core';
 import { Attempt } from './lifecycle';
-import { nextDocument, chapterImages, guessNextDocument, sameChapterDocument } from './discovery';
+import { nextDocument, chapterImages, guessNextDocument, sameChapterDocument, discoverEnded } from './discovery';
 import { nextBatch, pagePhase } from './plan';
 import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 
@@ -44,7 +44,18 @@ async function discover(generation: number): Promise<boolean> {
     if (visitedDocuments.has(url)) throw new Error('Reader pagination repeats a page');
     if (!sameChapterDocument(url, config.readerUrl, config.chapter)) return false;
     const response = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(30000) });
-    if (!response.ok) throw new Error(`Could not load the next reader page (HTTP ${response.status})`);
+    if (!response.ok) {
+        // Past the last page the reader answers the guessed next URL with 404/410 — the
+        // chapter ends here. Any other status is a real failure of the walk.
+        if (discoverEnded(response.status)) {
+            note(`discover: next reader page answered ${response.status} — end of chapter`);
+            config.completeManifest = true;
+            status.completeManifest = true;
+            await publish();
+            return false;
+        }
+        throw new Error(`Could not load the next reader page (HTTP ${response.status})`);
+    }
     if (!sameChapterDocument(response.url, config.readerUrl, config.chapter)) throw new Error('Reader redirected outside this chapter');
     const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
     if (generation !== epoch) return false;
@@ -108,6 +119,14 @@ function showFatal(e: unknown): void {
     const el = statusElement();
     if (el) el.textContent = msg;
     console.error('[mt] chapter runner', e);
+    // A session that already has a status must say it failed — an attach-phase crash used to
+    // leave the reader with a snapshot that could never advance while the runner looked alive.
+    if (status) {
+        status.phase = 'error';
+        status.message = msg;
+        status.inflight = 0;
+        void publish().catch(() => {});
+    }
     // Persist the reason: an offscreen document has no console a user can open, so a crash
     // would otherwise be invisible and the reader would only see "no chapter session".
     if (id) void writeRecord(`error:${id}`, { message: msg, stack: (e as Error)?.stack ?? '' }).catch(() => {});
@@ -403,15 +422,20 @@ async function attach(runnerId: string): Promise<void> {
     if (!response?.ok) throw new Error(response?.error || 'Chapter session expired');
     config = response.config;
     assertCacheCurrent(config.cacheEpoch ?? '');
+    // A session with no status record is indistinguishable from a dead one. Publish a
+    // placeholder BEFORE the slow setup (fonts, checkpoint) so a start that fails later still
+    // lands as a visible session with an honest error instead of silent nothing.
+    status = { id, chapter: config.chapter, phase: 'running', done: 0, total: config.pages.length,
+        inflight: 0, errors: 0, completeManifest: config.completeManifest,
+        pages: config.pages.map(p => ({ id: p.id, url: p.url, order: p.order, phase: 'queued' })) };
+    await publish();
     // Load custom fonts before pinning the execution session's settings.
     await loadPipeline();
     configureChapterHost(config.chapter, config.bookKey, config.pipeline, config.context);
     setShareContext(config.shareContext);
     const checkpoint = await readRecord<HostCheckpoint>(`checkpoint:${id}`);
     if (checkpoint) config = { ...config, ...checkpoint.config };
-    status = checkpoint?.progress ?? { id, chapter: config.chapter, phase: 'running', done: 0, total: config.pages.length,
-        inflight: 0, errors: 0, completeManifest: config.completeManifest,
-        pages: config.pages.map(p => ({ id: p.id, url: p.url, order: p.order, phase: 'queued' })) };
+    if (checkpoint?.progress) status = checkpoint.progress;
     for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
     // Storage-change events are optional: an offscreen document is given only the runtime
     // API, and the shim may not cover every area this build talks to. A missing event must

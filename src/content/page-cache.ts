@@ -373,6 +373,28 @@ export function normalizeChapterKey(origin: string, path: string, search: string
     return origin + p + (q ? '?' + q : '') + hash;
 }
 
+// Page number encoded in a reader URL when its own chapter key folds it away. Explicit paged
+// shapes (/chapter|read/<id>/N) first; otherwise the trailing numeric segment when removing it
+// yields EXACTLY the chapter key we are on — the same guard normalizeChapterKey uses for page
+// turns. null when unsure: a guessed slot must never authorize a paint, only hint a lookup.
+export function readerPageNumber(origin: string, pathname: string, search: string, hash: string, chapter: string): number | null {
+    const explicit = pathname.match(/\/(?:chapter|read)\/[^/]+\/(\d+)(?:\/|$)/);
+    if (explicit) {
+        const n = Number(explicit[1]);
+        return n > 0 ? n : null;
+    }
+    const segs = pathname.split('/').filter(Boolean);
+    if (segs.length < 3) return null;
+    const tail = segs[segs.length - 1];
+    if (!/^\d+$/.test(tail)) return null;
+    const stem = segs.slice(0, -1).join('/');
+    // A digit-less stem may be using /9 AS the story id; fail-split stands.
+    if (!/\d/.test(stem)) return null;
+    if (normalizeChapterKey(origin, '/' + stem, search, hash) !== chapter) return null;
+    const n = Number(tail);
+    return n > 0 ? n : null;
+}
+
 // ---- hotlink Referer rule: some image CDNs 403 any request without a page Referer — and an
 // MV3 service worker cannot send one (Chrome strips referrer from SW fetch silently), so the
 // SW proxy 403s where a plain <img> loads fine. Fix at the network layer: a

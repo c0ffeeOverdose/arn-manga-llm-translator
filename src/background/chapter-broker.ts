@@ -4,6 +4,7 @@ import { artifactKey, runnerHtml, chapterSignature, type HostConfig, type Chapte
 import type { ChapterProgress, ChapterStart } from '../chapter/model';
 import { chapterContext } from './chapter-context';
 import { createRunner, runnerKind, runnerUrl, type ChapterRunner } from '../chapter/runner';
+import { AttachWatch } from '../chapter/attach-watch';
 import { readerStartAllowed } from '../chapter/reader';
 import { cacheClear } from '../content/page-cache';
 import { CACHE_GENERATION_KEY, cacheReady, cacheGeneration, acceptCacheGeneration, assertCacheCurrent } from '../cache-generation';
@@ -11,6 +12,11 @@ import { CACHE_GENERATION_KEY, cacheReady, cacheGeneration, acceptCacheGeneratio
 interface Binding { id: string; kind: 'offscreen' | 'background'; chapter: string }
 const bindingKey = (tab: number) => `mtChapterTab:${tab}`;
 const starts = new Map<number, Promise<unknown>>();
+// How long a freshly created runner context gets to ask for its host config before the start
+// is treated as failed. Generous enough for a cold document load, short enough that a user who
+// clicks start is never left without an answer.
+const ATTACH_TIMEOUT_MS = 15_000;
+const attachWatch = new AttachWatch();
 let runner: ChapterRunner = createRunner();
 let liveId = '';
 let clearing: Promise<unknown> | undefined;
@@ -75,6 +81,16 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
     liveId = id;
     await sessSet({ [bindingKey(tab)]: { id, kind: config.kind, chapter: data.chapter } });
     await runner.ensure(id);
+    // A created runner context can still fail to attach (a stale document no-ops, or its module
+    // dies before the handshake). Without this the start reports a session that nothing will
+    // ever progress. One hard retry with a fresh context, then fail with a reason.
+    if (!await attachWatch.wait(id, ATTACH_TIMEOUT_MS)) {
+        await runner.stop(id);
+        await runner.ensure(id);
+        if (!await attachWatch.wait(id, ATTACH_TIMEOUT_MS)) {
+            return { ok: false, error: 'The translator background task did not start — reload the extension and try again' };
+        }
+    }
     return { ok: true, id, total: data.pages.length };
 }
 
@@ -117,7 +133,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         if (msg.type === 'mt:chapter-host-init' || msg.type === 'mt:chapter-publish' || msg.type === 'mt:chapter-context') {
             const config = await authenticatedRunner(sender, msg);
             if (!config) return { ok: false, error: 'Unknown chapter session' };
-            if (msg.type === 'mt:chapter-host-init') return { ok: true, config };
+            if (msg.type === 'mt:chapter-host-init') { attachWatch.hit(config.id); return { ok: true, config }; }
             if (msg.type === 'mt:chapter-context') {
                 const context = await chapterContext(config.chapter, config.bookKey, config.pipeline.useCharacters,
                     config.pipeline.contextPairs, msg.entries, msg.beforeOrder);
@@ -159,6 +175,19 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         if (!b || b.chapter !== msg.chapter) return { ok: true, status: null };
         if (msg.type === 'mt:chapter-status') {
             const status = await readRecord<ChapterProgress>(`status:${b.id}`);
+            if (!status) {
+                // No publish ever landed. Surface the runner's own crash record instead of
+                // leaving the reader with an eternal "0 of N" that nothing will advance.
+                const err = await readRecord<{ message?: string }>(`error:${b.id}`);
+                if (err?.message) {
+                    const cfg = await readRecord<HostConfig>(`host:${b.id}`);
+                    return { ok: true, id: b.id, status: {
+                        id: b.id, chapter: b.chapter, phase: 'error', done: 0,
+                        total: cfg?.pages.length ?? 0, inflight: 0, errors: 0,
+                        completeManifest: cfg?.completeManifest ?? false, pages: [], message: err.message,
+                    } satisfies ChapterProgress };
+                }
+            }
             if (status && ['running', 'waiting', 'stopping'].includes(status.phase) && !(await runner.live(b.id))) {
                 status.phase = 'error';
                 status.message = 'Translation paused — the background task stopped; start again to continue';

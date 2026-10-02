@@ -39,7 +39,7 @@ test('guessNextDocument walks ?page=N, a trailing segment and a hash route', () 
     assert.equal(discovery.guessNextDocument('https://r.test/ch/1?page=3', 'https://r.test/ch/1'),
         'https://r.test/ch/1?page=4');
     assert.equal(discovery.guessNextDocument('https://r.test/g/9/2/', 'https://r.test/g/9'),
-        'https://r.test/g/9/3');
+        'https://r.test/g/9/3/');
     assert.equal(discovery.guessNextDocument('https://r.test/ch/1#2', 'https://r.test/ch/1'),
         'https://r.test/ch/1#3');
 });
@@ -61,6 +61,31 @@ test('no selector gate remains in the runner discovery path', () => {
     assert.ok(!/imageSelector/.test(src), 'a missing selector must never stop discovery');
     assert.match(src, /chapterImages\(/, 'discovery must read page images from the fetched document');
     assert.match(src, /guessNextDocument\(/, 'a reader without rel=next must still be walkable');
+    assert.match(src, /discoverEnded\(/, 'walking past the last page must end the chapter cleanly');
+});
+
+test('hasNextPage: a plain next anchor (no rel) still marks the reader paginated', () => {
+    const doc = hrefs => ({
+        querySelectorAll: sel => sel === 'a[href]'
+            ? hrefs.map(h => ({ getAttribute: k => (k === 'href' ? h : null) }))
+            : [],
+    });
+    // gallery: /g/123456/5/ is the predicted next page, /64/ is the last page's link
+    const base = 'https://gallery.example.org/g/123456/4/', chapter = 'https://gallery.example.org/g/123456';
+    assert.equal(discovery.hasNextPage(doc(['/g/123456/3/', '/g/123456/5/', '/g/123456/64/']), base, chapter), true);
+    // only a prev link: no evidence of a document after this one
+    assert.equal(discovery.hasNextPage(doc(['/g/123456/3/']), base, chapter), false);
+    // a link to a different page is not the predicted next page
+    assert.equal(discovery.hasNextPage(doc(['/g/123456/7/']), base, chapter), false);
+    // a non-paginated URL has no predictable next document at all
+    assert.equal(discovery.hasNextPage(doc(['/g/123456/5/']), 'https://r.test/title/9', 'https://r.test/title/9'), false);
+});
+
+test('discoverEnded: only 404/410 mean the chapter is over', () => {
+    assert.equal(discovery.discoverEnded(404), true);
+    assert.equal(discovery.discoverEnded(410), true);
+    assert.equal(discovery.discoverEnded(403), false);
+    assert.equal(discovery.discoverEnded(500), false);
 });
 
 test('the sweep anchors on the nearest known page instead of giving up', () => {

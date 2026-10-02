@@ -7,7 +7,7 @@ import { bitmap, grayPage, imageRef, installCanvas } from './helpers/image-fixtu
 const stubs = {
     state: `export const pipeline = {}; export const context = {}; export const shareContext = false;
         export const pages = new Map(); export const elStates = new WeakMap(); export const retiredBlobs = new Map(); export const overlayChoice = 'auto';
-        export const chapterKey = () => 'chapter:test'; export const stateFor = () => undefined;
+        export const chapterKey = () => globalThis.fixture.chapter ?? 'chapter:test'; export const stateFor = () => undefined;
         export const bookKey = () => 'book'; export const loadContext = async () => {}; export const loadPipeline = async () => {};
         export const regPage = state => globalThis.fixture.paints.push(state);
         export const unregPage = () => {}; export const setOverlayChoice = () => {}; export const setOverlayOn = () => {};
@@ -29,7 +29,7 @@ const stubs = {
         export const logError = async () => {};`,
     protocol: `export const chapterSignature = () => 'test:signature';`,
     store: `export const blobDataUrl = async () => '';`,
-    discovery: `export const nextDocument = () => undefined; export const guessNextDocument = () => undefined;`,
+    discovery: `export const nextDocument = () => undefined; export const guessNextDocument = () => undefined; export const hasNextPage = () => false;`,
     debug: `export const isDebug = () => false;`,
     ocr: `export const ensurePageDebugViews = async () => {};`,
 };
@@ -71,6 +71,16 @@ test('idlePageOrder names the page from the reader URL so a reopen can find its 
     assert.equal(idlePageOrder(), 0);
     globalThis.location = { origin: 'https://reader.test', pathname: '/', search: '', hash: '', href: 'https://reader.test/' };
     assert.equal(idlePageOrder(), undefined, 'no page number → never guess a slot');
+});
+
+test('idlePageOrder reads a gallery page number (/g/<id>/<n>/) as the slot', () => {
+    // gallery: /g/123456/4/ is page 4 of the gallery — slot 3, the key the chapter wrote.
+    fixture.chapter = 'https://gallery.example.org/g/123456';
+    globalThis.location = { origin: 'https://gallery.example.org', pathname: '/g/123456/4/', search: '', hash: '', href: 'https://gallery.example.org/g/123456/4/' };
+    assert.equal(idlePageOrder(), 3);
+    // the gallery cover carries no page: never guess a slot from /g/123456/
+    globalThis.location = { origin: 'https://gallery.example.org', pathname: '/g/123456/', search: '', hash: '', href: 'https://gallery.example.org/g/123456/' };
+    assert.equal(idlePageOrder(), undefined);
 });
 
 test('a not-yet-finished neighbour does not abort resolving the shown page', async () => {

@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -184,6 +184,29 @@ test('normalizeChapterKey: page-turns share a key, story changes do not', () => 
   // origins and trailing slashes
   assert.notEqual(K('https://a.com/manga/x'), K('https://b.com/manga/x'));
   assert.equal(K('https://site.com/manga/x/'), K('https://site.com/manga/x'));
+});
+
+test('readerPageNumber: the reader URL names the page when its own key folds it', () => {
+  const P = (u, chapter) => {
+    const { origin, pathname, search, hash } = new URL(u);
+    return readerPageNumber(origin, pathname, search, hash, chapter);
+  };
+  const NH = 'https://gallery.example.org/g/123456';
+  // gallery pages: /g/123456/4/ is page 4 of the same chapter
+  assert.equal(P('https://gallery.example.org/g/123456/4/', NH), 4);
+  assert.equal(P('https://gallery.example.org/g/123456/4', NH), 4);
+  assert.equal(P('https://gallery.example.org/g/123456/64/', NH), 64);
+  // the gallery/cover URL carries no page number
+  assert.equal(P('https://gallery.example.org/g/123456/', NH), null);
+  assert.equal(P('https://gallery.example.org/g/123456', NH), null);
+  // another gallery must never answer with a page of ours
+  assert.equal(P('https://gallery.example.org/g/123456/4/', 'https://gallery.example.org/g/999999'), null);
+  // explicit paged-reader shapes
+  assert.equal(P('https://mangadex.org/chapter/abc/7', 'https://mangadex.org/chapter/abc'), 7);
+  assert.equal(P('https://reader.example/read/some-slug/12', 'https://reader.example/read/some-slug'), 12);
+  // a digit-less stem may use the number AS the story id — refuse
+  assert.equal(P('https://site.com/manga/foo/123', 'https://site.com/manga/foo/123'), null);
+  assert.equal(P('https://site.com/viewer#5', 'https://site.com/viewer'), null);
 });
 
 test('sessionKey over normalizeChapterKey: one provider session per chapter, no URL survives', () => {
