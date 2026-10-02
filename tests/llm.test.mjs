@@ -19,7 +19,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription } =
+const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
@@ -967,15 +967,16 @@ test('parse <m>: sameAs/correct/now/why attrs', () => {
 });
 
 test('sameAs merges two entries and logs the op', () => {
+  // not string-matchable (a nickname the model resolved), so only the op can merge them
   const book = [
-    { desc: '40-year-old cop', gender: 'M', name: 'เอย์จิ', fullName: 'คิริซาเมะ เอย์จิ', source: 'vlm' },
-    { desc: 'เอย์จิ', gender: 'M', source: 'mention' },
+    { desc: '40-year-old cop', gender: 'M', name: 'คิริซาเมะ', fullName: 'คิริซาเมะ เอย์จิ', source: 'vlm' },
+    { desc: 'the scarred man', gender: 'M', name: 'เอย์จิ', source: 'mention' },
   ];
   const { ctx, bookOps } = updateContext({ pairs: [], characters: book }, [],
-    [{ name: 'เอย์จิ', gender: 'M', desc: 'cop', sameAs: 'คิริซาเมะ เอย์จิ' }]);
+    [{ name: 'เอย์จิ', gender: 'M', desc: 'cop', sameAs: 'คิริซาเมะ' }]);
   assert.equal(ctx.characters.length, 1);
   assert.equal(ctx.characters[0].fullName, 'คิริซาเมะ เอย์จิ');
-  assert.deepEqual(bookOps, [{ kind: 'merge', from: 'เอย์จิ', into: 'เอย์จิ' }]);
+  assert.deepEqual(bookOps, [{ kind: 'merge', from: 'คิริซาเมะ', into: 'เอย์จิ' }]);
 });
 
 test('sameAs rejected: M/F clash, unknown target, user rows', () => {
@@ -1432,4 +1433,128 @@ test('provider roles: a rejected system role retries once as a single user messa
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// ---- character identity: script-agnostic matching, folds, notes (2026-10-03) ----
+
+test('identity: Thai re-descriptions fold when they share the anchor; a different outfit does not', () => {
+  // containment of a long anchor = the same person re-described
+  let book = mergeCharacter([], { desc: 'ชายหนุ่มผมดำสวมชุดสูทโอบกอดหญิงสาวจากด้านหลัง', gender: 'M', source: 'vlm' });
+  book = mergeCharacter(book, { desc: 'ชายหนุ่มผมดำสวมชุดสูท', gender: 'M', source: 'vlm' });
+  assert.equal(book.length, 1, 'contained Thai anchor folds');
+  // suit vs t-shirt: no containment and ~0.73 bigram dice — two different anchors
+  book = mergeCharacter([], { desc: 'ชายหนุ่มผมดำสวมชุดสูท', gender: 'M', source: 'vlm' });
+  book = mergeCharacter(book, { desc: 'ชายหนุ่มผมดำสวมเสื้อยืด', gender: 'M', source: 'vlm' });
+  assert.equal(book.length, 2, 'a different outfit is not the same person');
+});
+
+test('identity: short near-identical anchors stay apart (alpha1 vs alpha2)', () => {
+  let book = mergeCharacter([], { desc: 'alpha1', gender: '?', source: 'speech' });
+  book = mergeCharacter(book, { desc: 'alpha2', gender: '?', source: 'speech' });
+  assert.equal(book.length, 2);
+});
+
+test('identity: vowel-length spelling variance folds one name, unrelated vowels stay apart', () => {
+  let book = mergeCharacter([], { desc: 'เด็กสาว', gender: 'F', name: 'ยูซุรุ', source: 'vlm' });
+  book = mergeCharacter(book, { desc: 'เด็กสาวผมสั้น', gender: 'F', name: 'ยุซุรุ', source: 'vlm' });
+  assert.equal(book.length, 1, 'ยูซุรุ / ยุซุรุ is one person');
+  let two = mergeCharacter([], { desc: 'a', gender: 'F', name: 'มาลี', source: 'vlm' });
+  two = mergeCharacter(two, { desc: 'b', gender: 'F', name: 'มาลา', source: 'vlm' });
+  assert.equal(two.length, 2, 'different vowels are different people');
+});
+
+test('identity: junk anchors are rejected (single letter/digit, box label)', () => {
+  const ctx = updateContext(EMPTY_CONTEXT, [
+    { index: 1, source: '', translation: 'x', spk: { desc: 'B', gender: '?' } },
+    { index: 2, source: '', translation: 'y', spk: { desc: '7', gender: '?' } },
+    { index: 3, source: '', translation: 'z', spk: { desc: 'sign', gender: '?' } },
+    { index: 4, source: '', translation: 'w', spk: { desc: 'girl with short black hair', gender: 'F' } },
+  ]).ctx;
+  assert.equal(ctx.characters.length, 1);
+  assert.equal(ctx.characters[0].desc, 'girl with short black hair');
+});
+
+test('normalizeBook heals a book forked by the old matcher', () => {
+  const rows = normalizeBook([
+    { desc: 'ชายหนุ่มผมดำสวมชุดสูทโอบกอดหญิงสาวจากด้านหลัง', gender: 'M', source: 'vlm' },
+    { desc: 'ชายหนุ่มผมดำสวมชุดสูท', gender: 'M', source: 'vlm' },
+    { desc: 'ยูซุรุ', gender: '?', name: 'ยูซุรุ', source: 'vlm' },
+    { desc: 'เด็กสาว', gender: '?', name: 'ยุซุรุ', source: 'vlm' },
+  ]);
+  assert.equal(rows.length, 2, 'one man + one ยูซุรุ');
+});
+
+test('normalizeBook folds an unnamed anchor that is just the named row, never two user rows', () => {
+  const rows = normalizeBook([
+    { desc: 'ชายหนุ่มผมดำ', gender: 'M', source: 'vlm' },
+    { desc: 'เพื่อนของนางเอก', gender: 'M', name: 'ชายหนุ่มผมดำ', source: 'mention' },
+  ]);
+  assert.equal(rows.length, 1, 'a desc that repeats the name is not a second person');
+  const users = normalizeBook([
+    { desc: 'หญิงผมสั้น', gender: 'F', source: 'user' },
+    { desc: 'หญิงผมสั้นผมยาว', gender: 'F', source: 'user' },
+  ]);
+  assert.equal(users.length, 2, 'two user rows are never auto-merged');
+});
+
+test('note op: quote-gated, appends to the listed row, user rows untouched', () => {
+  const book = [
+    { id: 'c1', desc: 'หญิงผมสั้นถือสมุด', gender: 'F', source: 'vlm' },
+    { id: 'c2', desc: 'mine', gender: 'M', source: 'user' },
+  ];
+  const { ctx, bookOps } = updateContext({ pairs: [], characters: book }, [], [
+    { id: 'c1', note: 'คิริซาเมะเรียกเธอว่า โทริ', gender: '?', desc: '', why: '「トーリ」' },
+    { id: 'c1', note: 'ไม่มี quote', gender: '?', desc: '' },
+    { id: 'c2', note: 'x', gender: '?', desc: '', why: 'y' },
+  ]);
+  assert.equal(ctx.characters.find(c => c.id === 'c1').note, 'คิริซาเมะเรียกเธอว่า โทริ');
+  assert.equal(ctx.characters.find(c => c.id === 'c2').note, undefined);
+  assert.equal(bookOps.length, 1);
+  assert.equal(bookOps[0].field, 'note');
+});
+
+test('parse <m>: note attr captured', () => {
+  const r = parseResponse('<r n="1">x</r>\n<names>\n<m id="c2" note="พี่ชายของนางเอก" why="お兄ちゃん"/>\n</names>', 1);
+  assert.equal(r.mentions[0].note, 'พี่ชายของนางเอก');
+  assert.equal(r.mentions[0].id, 'c2');
+});
+
+test('mentions: role text lands in note, not the visual desc', () => {
+  const ctx = updateContext(EMPTY_CONTEXT, [
+    { index: 1, source: '', translation: '...', spk: { desc: 'girl with red ribbon', gender: 'F', name: 'อากิ' } },
+  ], [{ name: 'อากิ', gender: 'F', desc: 'เพื่อนร่วมชั้นของพระเอก' }]).ctx;
+  const c = ctx.characters[0];
+  assert.equal(c.note, 'เพื่อนร่วมชั้นของพระเอก');
+  assert.equal(c.desc, 'girl with red ribbon');
+});
+
+test('roster carries the note on the compact line', () => {
+  const p = buildPrompt([{ index: 1, source: '' }],
+    { pairs: [], characters: [{ id: 'c1', desc: 'girl', gender: 'F', name: 'อากิ', note: 'พี่สาวของยูซุรุ', source: 'vlm' }] }, true, {});
+  assert.ok(p.user.includes('<c id="c1" g="F">อากิ — girl · พี่สาวของยูซุรุ</c>'));
+});
+
+test('overrides: desc/note win and mark the row user; a stale roster id adds nothing', () => {
+  const ctx = { pairs: [], characters: [{ id: 'c1', desc: 'old anchor', gender: 'F', source: 'vlm' }] };
+  const out = applyOverrides(ctx, { c1: { gender: 'F', desc: 'หญิงผมสั้นถือสมุด', note: 'คู่หมั้นของคิริซาเมะ' } });
+  assert.equal(out.characters[0].desc, 'หญิงผมสั้นถือสมุด');
+  assert.equal(out.characters[0].note, 'คู่หมั้นของคิริซาเมะ');
+  assert.equal(out.characters[0].source, 'user');
+  assert.equal(applyOverrides(EMPTY_CONTEXT, { c9: { gender: 'M', name: 'ผี' } }).characters.length, 0);
+});
+
+test('merge/split round-trip: absorbed rows come back as user rows', () => {
+  let book = [
+    { id: 'c1', desc: 'ชายหนุ่มผมดำสวมชุดสูท', gender: 'M', source: 'vlm' },
+    { id: 'c2', desc: 'หนุ่มผมดำใส่แว่น', gender: 'M', source: 'vlm' },
+  ];
+  book = mergeBookRows(book, 'c1', 'c2');
+  assert.equal(book.length, 1);
+  assert.equal(book[0].id, 'c1');
+  assert.equal(book[0].absorbed.length, 1);
+  assert.equal(charKey(book[0]), 'c1');
+  book = splitBookRow(book, 'c1');
+  assert.equal(book.length, 2);
+  assert.equal(book[1].desc, 'หนุ่มผมดำใส่แว่น');
+  assert.equal(book[1].source, 'user');
 });

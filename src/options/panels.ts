@@ -4,23 +4,41 @@ import { autoSiteList, autoSiteRemove } from '../llm/pipeline-settings';
 import { sessGet, sessRemove } from '../storage-session';
 import { baberuInstalled, ocrInstalled, detModelsInstalled } from '../llm/ocr-models';
 import { FONT_PRESETS, fontList, fontDownload, fontDelete, fontAddCustom, fontName, fontIdFromUrl, fontRead } from '../llm/font-store';
+import { charKey, type CharOverride } from '../llm/core';
 import { $ } from './shell';
 import { pipeline, markCustom, savePipeline } from './pipeline-section';
 
-interface CharOverride { gender: 'M' | 'F' | '?'; name?: string }
 const mtCharOverridesKey = 'mtCharOverrides';
+
+interface BookRow { id?: string; desc: string; gender: string; source: string; name?: string; fullName?: string; note?: string }
 
 // ---- characters ----
 
-async function getBook(): Promise<{ desc: string; gender: string; source: string; name?: string; fullName?: string }[]> {
+async function getBook(): Promise<BookRow[]> {
     const { mtCharBook } = await chrome.storage.local.get('mtCharBook');
-    return (mtCharBook as { desc: string; gender: string; source: string; name?: string }[]) ?? [];
+    return (mtCharBook as BookRow[]) ?? [];
 }
 async function getOverrides(): Promise<Record<string, CharOverride>> {
     const { mtCharOverrides } = await chrome.storage.local.get(mtCharOverridesKey);
     return (mtCharOverrides as Record<string, CharOverride>) ?? {};
 }
 
+function rowLabel(c: { name?: string; fullName?: string; desc: string }): string {
+    return c.name || c.fullName || c.desc || '(unnamed)';
+}
+
+function textInput(value: string, placeholder: string, aria: string): HTMLInputElement {
+    const el = document.createElement('input');
+    el.type = 'text';
+    el.value = value;
+    el.placeholder = placeholder;
+    el.setAttribute('aria-label', aria);
+    return el;
+}
+
+// One row shows its roster id and lets the user edit every field that reaches the model:
+// name, gender, description (visual anchor), note (social facts). Unchanged values are not
+// stored, so touching one field never pins the others as user data.
 export async function renderCharacters(overrides: Record<string, CharOverride>): Promise<void> {
     const book = await getBook();
     const box = $('characters');
@@ -30,54 +48,82 @@ export async function renderCharacters(overrides: Record<string, CharOverride>):
         return;
     }
     for (const c of book) {
-        const row = document.createElement('div');
-        row.className = 'char-row';
-        const desc = document.createElement('div');
-        desc.className = 'desc';
+        const key = charKey(c);
+        const ov = overrides[key] ?? overrides[c.desc];
+        const item = document.createElement('div');
+        item.className = 'char-item';
+        const head = document.createElement('div');
+        head.className = 'head';
+        const idTag = document.createElement('span');
+        idTag.className = 'char-id';
+        idTag.textContent = c.id ?? '—';
+        idTag.title = 'Roster id — the model answers spk="…" with this id';
         const label = c.fullName && c.fullName !== c.name ? (c.name ? `${c.name} (${c.fullName})` : c.fullName) : c.name;
-        desc.textContent = (label ? `${label}: ` : '') + c.desc;
-        const src = document.createElement('div');
-        src.className = 'src';
-        src.textContent = `learned via ${c.source}`;
-        desc.append(src);
-        const ov = overrides[c.desc];
-
-        const name = document.createElement('input');
-        name.type = 'text';
-        name.placeholder = 'name (optional)';
-        name.value = (ov?.name ?? c.name) ?? '';
+        const name = textInput(ov?.name ?? label ?? '', 'name', `Name for ${rowLabel(c)}`);
         const sel = document.createElement('select');
-        for (const [v, label] of [['?', 'unknown'], ['F', 'female'], ['M', 'male']] as const) {
+        sel.setAttribute('aria-label', `Gender for ${rowLabel(c)}`);
+        for (const [v, text] of [['?', 'unknown'], ['F', 'female'], ['M', 'male']] as const) {
             const o = document.createElement('option');
-            o.value = v; o.textContent = label;
+            o.value = v; o.textContent = text;
             sel.append(o);
         }
         sel.value = ov ? ov.gender : c.gender;
+        head.append(idTag, name, sel);
+
+        const descLine = document.createElement('div');
+        descLine.className = 'line';
+        const descLabel = document.createElement('label');
+        descLabel.textContent = 'desc';
+        const desc = textInput(ov?.desc ?? c.desc ?? '', 'how to recognize them', `Description for ${rowLabel(c)}`);
+        desc.title = 'Visual anchor sent to the model — what makes this person recognizable';
+        descLine.append(descLabel, desc);
+        const noteLine = document.createElement('div');
+        noteLine.className = 'line';
+        const noteLabel = document.createElement('label');
+        noteLabel.textContent = 'note';
+        const note = textInput(ov?.note ?? c.note ?? '', 'relation, rank, how they are called', `Note for ${rowLabel(c)}`);
+        note.title = 'Page-stated facts (relations, rank, how others address them)';
+        noteLine.append(noteLabel, note);
+
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        const src = document.createElement('span');
+        src.className = 'src';
+        src.textContent = `learned via ${c.source}`;
+        meta.append(src);
+
         const saveRow = async () => {
-            const all = await getOverrides();
-            const n = name.value.trim();
-            const g = sel.value;
-            if (g === '?' && !n) delete all[c.desc];
-            else all[c.desc] = { gender: g as 'M' | 'F' | '?', ...(n ? { name: n } : {}) };
+            const all = { ...await getOverrides() };
+            const n = name.value.trim(), d = desc.value.trim(), nt = note.value.trim();
+            const next: CharOverride = { gender: sel.value as 'M' | 'F' | '?' };
+            if (n && n !== (c.name ?? '')) next.name = n;
+            if (d && d !== (c.desc ?? '')) next.desc = d;
+            if (nt && nt !== (c.note ?? '')) next.note = nt;
+            // migrate a legacy desc-keyed override onto the row's id
+            if (key !== c.desc) delete all[c.desc];
+            if (next.gender === '?' && !next.name && !next.desc && !next.note) delete all[key];
+            else all[key] = next;
             await chrome.storage.local.set({ [mtCharOverridesKey]: all });
             // inline feedback on the row itself — the footer status belongs to save/test
             const saved = document.createElement('span');
             saved.className = 'char-saved';
             saved.textContent = 'saved — retranslate the page to apply';
-            row.append(saved);
+            item.append(saved);
             setTimeout(() => saved.remove(), 2500);
             renderCharacters(all); // rows may have merged under a shared name
         };
         name.onchange = saveRow;
         sel.onchange = saveRow;
+        desc.onchange = saveRow;
+        note.onchange = saveRow;
         if (ov) {
             const tag = document.createElement('span');
             tag.className = 'src';
             tag.textContent = '✓ user';
-            row.append(tag);
+            meta.append(tag);
         }
-        row.append(desc, name, sel);
-        box.append(row);
+        item.append(head, descLine, noteLine, meta);
+        box.append(item);
     }
 }
 

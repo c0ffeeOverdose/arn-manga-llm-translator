@@ -310,6 +310,17 @@
   .char-row select { width: 96px; }
   .char-row input[type=text] { width: 130px; }
   .char-saved { color: var(--ok); font-size: 11px; }
+  .char-item { padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .char-item:last-child { border-bottom: 0; }
+  .char-item .head { display: flex; align-items: center; gap: 10px; }
+  .char-item .char-id { flex: none; min-width: 24px; text-align: center; background: var(--accent); color: #fff; border-radius: 4px; padding: 2px 5px; font-size: 11px; font-weight: 600; }
+  .char-item .head input[type=text] { flex: 1; width: auto; min-width: 0; }
+  .char-item .head select { width: 96px; flex: none; }
+  .char-item .line { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .char-item .line label { flex: none; width: 46px; text-align: right; font-size: 11px; color: var(--muted); }
+  .char-item .line input[type=text] { flex: 1; width: auto; min-width: 0; }
+  .char-item .meta { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .char-item .meta .src { font-size: 11px; color: var(--muted); }
   .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
 
   /* font preview: previews render on white manga paper — stays white in both themes */
@@ -675,7 +686,7 @@
   <div class="tab" id="tab-characters">
     <div class="card">
       <h2>Characters</h2>
-      <div class="hint" style="margin:-8px 0 12px">Set a name or gender and your choice always wins.</div>
+      <div class="hint" style="margin:-8px 0 12px">Names, descriptions, and notes are yours to edit and always win. The id (c1, c2, …) is how the model references each row.</div>
       <div id="characters"><div class="empty">No characters yet — translate some pages first.</div></div>
       <div style="margin-top:16px">
         <button id="clearChars" class="btn danger">Clear character memory</button>

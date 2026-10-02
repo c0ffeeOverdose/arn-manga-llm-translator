@@ -1,6 +1,9 @@
 // LLM prompt building + response parsing + character book merge.
 // Pure logic — unit tested in tests/llm.test.mjs (node:test, no browser APIs).
 
+// A row folded into another by coalesce or a user merge; kept so Split can restore it.
+export interface AbsorbedRow { desc: string; name?: string; fullName?: string; gender: 'M' | 'F' | '?' }
+
 export interface CharacterEntry {
     id?: string;           // stable roster id ("c3") — spk and <m> ops reference this row
     desc: string;          // visual/behavioral description ("twintail girl in school uniform")
@@ -8,6 +11,8 @@ export interface CharacterEntry {
     source: 'user' | 'vlm' | 'speech' | 'mention'; // priority for merges: user > vlm > speech = mention
     name?: string;         // short/display name ("ยามาดะ")
     fullName?: string;     // full name ONLY when a page states it — never assembled or guessed
+    note?: string;         // page-stated social facts (relation, rank, how addressed) — never looks
+    absorbed?: AbsorbedRow[]; // rows folded into this one; the panel's Split restores them
 }
 
 // A person NAMED in page dialogue/narration — page-level, unlike per-region spk.
@@ -22,6 +27,7 @@ export interface Mention {
     correct?: string;      // book op: field to fix ('gender'|'name'|'desc'|'full')
     now?: string;          // book op: replacement value for `correct`
     why?: string;          // book op: exact quote from THIS page proving it (required)
+    note?: string;         // book op: one page-stated social fact appended to a listed row (needs why)
 }
 
 export interface BookOp {
@@ -175,7 +181,7 @@ After the regions, if anyone is NAMED in the dialogue or narration (the speaker,
 Omit the whole block when no one is named. full: never assemble or guess a surname. g: only when the page makes it obvious (particles, pronouns, explicit words); otherwise leave it out. Never invent a person. Never describe where or how the name appeared (a name tag, someone mentioning them, the chapter title) — that is not a role.
 Credits, bylines and copyright text (author/artist names on a cover or credits panel) are not story characters — never report them.
 Two entries in <known_characters> are the same person: <m id="c4" sameAs="c2"/> or <m name="A" sameAs="B">…</m> (both must be in the book).
-The book is wrong and THIS page proves it: <m id="c2" correct="gender|name|desc|full" now="new value" why="exact quote from this page"/> — no quote, no change. Reference an entry by id or by its listed name. Never touch entries marked "confirmed by user".
+Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c2" correct="gender|name|desc|full" now="value" why="quote"/> · <m id="c2" name="name stated on this page"/> (attach on that row) · <m id="c2" note="page-stated relation/rank/addressing" why="quote"/>. Reference an entry by id or listed name.
 ` : ``}</output_format>\n`;
     p += `<rules>\n- ${LANG_RULES[lang] ?? GENERIC_RULE(lang)}\n`;
     if (chars && vision && !opts.textOnly && !opts.ocr) {
@@ -323,6 +329,7 @@ function parseXml(text: string, expected: number): ParsedResponse | null {
             desc: (e[3] ?? '').trim().slice(0, 160),
             sameAs: attrs.sameas?.trim() || undefined, correct: attrs.correct?.trim().toLowerCase() || undefined,
             now: attrs.now?.trim() || undefined, why: attrs.why?.trim().slice(0, 160) || undefined,
+            note: attrs.note?.trim().slice(0, 120) || undefined,
         });
     }
     return any || extras.length || mentions.length ? { regions, extras, mentions } : null;
@@ -381,6 +388,17 @@ function isMetaNoText(t: string): boolean {
 // ---- character book ----
 const PRIORITY: Record<CharacterEntry['source'], number> = { user: 3, vlm: 2, speech: 1, mention: 1 };
 
+// Notes accumulate one short page-stated fact at a time; duplicates never stack.
+const NOTE_MAX = 140;
+function joinNote(a?: string, b?: string): string | undefined {
+    const parts: string[] = [];
+    for (const s of [a, b]) {
+        const t = (s ?? '').trim();
+        if (t && !parts.some(p => p.includes(t))) parts.push(t);
+    }
+    return parts.length ? parts.join(' · ').slice(0, NOTE_MAX) : undefined;
+}
+
 // Box types reported as speaker on person-less regions. Learning them burns the book and teaches spk forever.
 const NON_PERSON_LABEL = /^(?:narration|narrator|caption|subtitle|subtitle text|sfx|sound effect|sound effects|onomatopoeia|sign|signage|shop sign|text|no text|translation note|tn|บรรยาย|บรรยายภาพ|คำบรรยาย|ผู้บรรยาย|ป้าย|ป้ายข้อความ|ข้อความ|เสียง|เสียงประกอบ|ไม่มีข้อความ)$/i;
 const isNonPersonLabel = (s: string | undefined): boolean => !!s && NON_PERSON_LABEL.test(s.trim());
@@ -393,11 +411,13 @@ function stripHonorific(s: string): string {
 }
 
 // Placeholders carry no identity ("spk=?" rows poisoned the book and the prompt):
-// punctuation-only text and box-type labels are not a description of a person.
+// punctuation-only text and box-type labels are not a description of a person. A lone
+// Latin letter/digit is box-label noise too ("B" rows rode the roster as fake people).
 const JUNK_TEXT = /^[?？!！。．.\-–—~〜*＊_×xX\s]+$/;
+const SINGLE_ALNUM = /^[A-Za-z0-9]$/;
 function usableText(s: string | undefined): string {
     const t = (s ?? '').trim();
-    return t && !JUNK_TEXT.test(t) && !isNonPersonLabel(t) ? t : '';
+    return t && !JUNK_TEXT.test(t) && !SINGLE_ALNUM.test(t) && !isNonPersonLabel(t) ? t : '';
 }
 
 // Deterministic roster ids: existing ids are kept; missing ones get c<max+1> in row order.
@@ -417,42 +437,80 @@ export function ensureIds(book: CharacterEntry[]): CharacterEntry[] {
     return changed ? out : book;
 }
 
-// One hygiene pass: drop non-user rows with no usable identity (legacy "?" junk), then give
-// every remaining row an id. User rows survive even when malformed — their call, not ours.
+// One hygiene pass: drop non-user rows with no usable identity (legacy "?" junk), fold rows
+// that are one person, then give every remaining row an id. User rows survive even when
+// malformed — their call, not ours.
 export function normalizeBook(book: CharacterEntry[]): CharacterEntry[] {
     const kept = book.filter(c => c.source === 'user' || !!(c.name || c.fullName || usableText(c.desc)));
-    return ensureIds(kept);
+    return ensureIds(coalesceBook(kept));
 }
 
 // Roster line for the prompt: name — role; "(unnamed)" anchors are how a speaker without a
-// name still gets matched across pages.
+// name still gets matched across pages; note is the accumulated page-stated social fact.
 function rosterText(c: CharacterEntry): string {
     const label = c.fullName && c.fullName !== c.name
         ? (c.name ? `${c.name} (${c.fullName})` : c.fullName)
         : c.name;
     // a user row shows exactly what the user typed; learned rows were filtered at admission
     const desc = c.source === 'user' ? (c.desc ?? '').trim() : usableText(c.desc);
-    if (label && desc && desc !== label) return `${label} — ${desc}`;
-    if (label) return label;
-    return desc ? `(unnamed) ${desc}` : '(unnamed)';
+    const line = label && desc && desc !== label ? `${label} — ${desc}`
+        : label ? label
+            : desc ? `(unnamed) ${desc}` : '(unnamed)';
+    const note = (c.source === 'user' ? (c.note ?? '') : usableText(c.note)).trim().slice(0, 120);
+    return note ? `${line} · ${note}` : line;
 }
 
-function similar(a: string, b: string): boolean {
-    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9ก-๙ ]/g, ' ').replace(/\s+/g, ' ').trim();
-    const wa = new Set(norm(a).split(' ').filter(w => w.length > 2));
-    const wb = new Set(norm(b).split(' ').filter(w => w.length > 2));
+// Word-token overlap alone fails for scripts without spaces (Thai/Japanese/CJK read as one
+// token), so one person re-described on the next page forked into two rows. Add character
+// bigram Dice + containment of a long anchor; short distinct anchors (alpha1/alpha2) stay apart.
+const normText = (s: string): string =>
+    s.toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+function wordSimilar(a: string, b: string): boolean {
+    const wa = new Set(normText(a).split(' ').filter(w => w.length > 2));
+    const wb = new Set(normText(b).split(' ').filter(w => w.length > 2));
     if (!wa.size || !wb.size) return false;
     let shared = 0;
     for (const w of wa) if (wb.has(w)) shared++;
     return shared / Math.min(wa.size, wb.size) >= 0.5;
 }
+function diceBigrams(a: string, b: string): number {
+    const grams = (s: string): Set<string> => {
+        const t = normText(s).replace(/ /g, '');
+        const g = new Set<string>();
+        if (t.length < 2) { if (t) g.add(t); return g; }
+        for (let i = 0; i < t.length - 1; i++) g.add(t.slice(i, i + 2));
+        return g;
+    };
+    const ga = grams(a), gb = grams(b);
+    if (!ga.size || !gb.size) return 0;
+    let shared = 0;
+    for (const g of ga) if (gb.has(g)) shared++;
+    return (2 * shared) / (ga.size + gb.size);
+}
+function similar(a: string, b: string): boolean {
+    const na = normText(a), nb = normText(b);
+    if (!na || !nb) return false;
+    if (na === nb || wordSimilar(a, b)) return true;
+    const [shorter, longer] = na.length <= nb.length ? [na, nb] : [nb, na];
+    const sFlat = shorter.replace(/ /g, '');
+    if (sFlat.length >= 10 && longer.replace(/ /g, '').includes(sFlat)) return true;
+    // near-identical only: a reworded outfit ("ชุดสูท" vs "เสื้อยืด") measures 0.73
+    return sFlat.length >= 12 && diceBigrams(a, b) >= 0.85;
+}
 
-// Two names = one person: exact match or token subset. User override is the escape hatch.
+// Thai long/short vowel pairs are the same vowel and models/OCR drop the length mark
+// (ยูซุรุ vs ยุซุรุ); fold only those three pairs so มาลี/มาลา stay two people.
+const foldThai = (s: string): string => s.replace(/ู/g, 'ุ').replace(/ี/g, 'ิ').replace(/ื/g, 'ึ');
+const nameKey = (s: string): string => foldThai(stripHonorific(s).toLowerCase()).replace(/[^\p{L}\p{N}\p{M}]/gu, '');
+
+// Two names = one person: exact match, vowel-length variance, or token subset. User override is the escape hatch.
 function samePerson(a: string | undefined, b: string | undefined): boolean {
     if (!a || !b) return false;
     const na = stripHonorific(a.toLowerCase().trim()), nb = stripHonorific(b.toLowerCase().trim());
     if (!na || !nb) return false;
     if (na === nb) return true;
+    const ka = nameKey(na), kb = nameKey(nb);
+    if (ka.length >= 3 && ka === kb) return true;
     const ta = new Set(na.split(/\s+/)), tb = new Set(nb.split(/\s+/));
     const [shorter, longer] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
     for (const t of shorter) if (!longer.has(t)) return false;
@@ -474,6 +532,85 @@ function enforceCap(book: CharacterEntry[], max: number): CharacterEntry[] {
         if (victim === -1) break; // all user rows: never evict the user's own
         next.splice(victim, 1);
     }
+    return next;
+}
+
+// A book forked by the old matcher (or a merge the model never ordered) heals here:
+// rows with one name, an unnamed anchor that is just the other row's name, and two
+// unnamed rows describing the same anchor fold. Conservative: a gender clash blocks the
+// merge, and desc similarity alone never overrules a user row.
+function canCoalesce(a: CharacterEntry, b: CharacterEntry): boolean {
+    if (a.source === 'user' && b.source === 'user') return false; // two user rows: the user's call
+    if (a.gender !== '?' && b.gender !== '?' && a.gender !== b.gender) return false;
+    const an = a.name ?? a.fullName, bn = b.name ?? b.fullName;
+    if (an && bn) return samePerson(an, bn);
+    if (an || bn) return samePerson(an ?? bn, an ? b.desc : a.desc);
+    if (a.source === 'user' || b.source === 'user') return false;
+    return similar(a.desc, b.desc);
+}
+
+function absorbedSnap(c: CharacterEntry): AbsorbedRow {
+    return { desc: c.desc, name: c.name, fullName: c.fullName, gender: c.gender };
+}
+
+// One row survives (a user row beats a learned one; otherwise the earlier row keeps its id);
+// the dropped row is remembered in `absorbed` so the panel's Split can restore it.
+function mergeRow(a: CharacterEntry, b: CharacterEntry): CharacterEntry {
+    const keep = a.source === 'user' ? a : b.source === 'user' ? b : a;
+    const drop = keep === a ? b : a;
+    const sameText = drop.desc === keep.desc && drop.name === keep.name;
+    return {
+        ...keep,
+        id: keep.id ?? drop.id,
+        desc: keep.source === 'user' ? (keep.desc || drop.desc)
+            : (drop.desc.length > keep.desc.length ? drop.desc : keep.desc),
+        name: keep.name ?? drop.name,
+        fullName: keep.fullName ?? drop.fullName,
+        gender: keep.gender !== '?' ? keep.gender : drop.gender,
+        source: PRIORITY[keep.source] >= PRIORITY[drop.source] ? keep.source : drop.source,
+        note: joinNote(keep.note, drop.note),
+        absorbed: sameText ? keep.absorbed
+            : [...(keep.absorbed ?? []), absorbedSnap(drop), ...(drop.absorbed ?? [])].slice(-12),
+    };
+}
+
+export function coalesceBook(book: CharacterEntry[]): CharacterEntry[] {
+    const rows: CharacterEntry[] = [];
+    for (const c of book) {
+        const i = rows.findIndex(r => canCoalesce(r, c));
+        if (i === -1) rows.push(c);
+        else rows[i] = mergeRow(rows[i], c);
+    }
+    return rows;
+}
+
+// Panel/options row identity: the roster id once a row has one, else the desc (legacy rows).
+export const charKey = (c: { id?: string; desc: string }): string => c.id ?? c.desc;
+
+// User-driven row surgery. Merge keeps the target's id and never loses the dropped row —
+// Split restores everything kept in `absorbed`.
+export function mergeBookRows(book: CharacterEntry[], keepKey: string, dropKey: string): CharacterEntry[] {
+    if (keepKey === dropKey) return book;
+    const ki = book.findIndex(c => charKey(c) === keepKey);
+    const di = book.findIndex(c => charKey(c) === dropKey);
+    if (ki < 0 || di < 0) return book;
+    const next = [...book];
+    next[ki] = mergeRow(next[ki], next[di]);
+    next.splice(di, 1);
+    return next;
+}
+
+export function splitBookRow(book: CharacterEntry[], key: string): CharacterEntry[] {
+    const i = book.findIndex(c => charKey(c) === key);
+    if (i < 0 || !book[i].absorbed?.length) return book;
+    const row = book[i];
+    const restored: CharacterEntry[] = row.absorbed!.map(a => ({
+        desc: a.desc, name: a.name, fullName: a.fullName,
+        gender: a.gender !== '?' ? a.gender : row.gender,
+        source: 'user' as const, // the split is the user's call: never re-fold it automatically
+    }));
+    const next = [...book];
+    next.splice(i, 1, { ...row, absorbed: undefined }, ...restored);
     return next;
 }
 
@@ -505,6 +642,8 @@ export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry, maxC
         fullName: cur.fullName ?? obs.fullName,
         gender: cur.gender,
         source: cur.source,
+        note: joinNote(cur.note, obs.note),
+        absorbed: cur.absorbed,
     };
     // upgrade gender if current is unknown/lower-confidence
     if (obs.gender !== '?' && (cur.gender === '?' || PRIORITY[obs.source] > PRIORITY[cur.source])) {
@@ -550,7 +689,7 @@ export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
     const ops: BookOp[] = [];
     const done: number[] = [];
     mentions.forEach((m, i) => {
-        if ((!m.name && !m.id) || isNonPersonLabel(m.name) || (!m.sameAs && !m.correct)) return;
+        if ((!m.name && !m.id) || isNonPersonLabel(m.name) || (!m.sameAs && !m.correct && !m.note)) return;
         if (m.sameAs) {
             // resolve target first — main entry often matches BOTH refs, so source is searched outside target
             const si = findEntry(characters, m.sameAs);
@@ -559,16 +698,19 @@ export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
             if (ti < 0 || characters[ti].source === 'user') return;
             const t = characters[ti], s = characters[si];
             if (t.gender !== '?' && s.gender !== '?' && t.gender !== s.gender) return;
-            const mdesc = m.desc ?? '';
             const knownGender = t.gender !== '?' ? t.gender : s.gender;
             const merged: CharacterEntry = {
-                desc: mdesc.length > Math.max(t.desc.length, s.desc.length) ? mdesc : (t.desc.length >= s.desc.length ? t.desc : s.desc),
+                // desc stays a visual anchor; the <m>'s role text is a social fact, not a look
+                desc: t.desc.length >= s.desc.length ? t.desc : s.desc,
                 // the <m>'s gender fills only a blank (priority 1 must not overrule vlm)
                 gender: knownGender !== '?' ? knownGender : m.gender,
                 source: PRIORITY[t.source] >= PRIORITY[s.source] ? t.source : s.source,
                 name: t.name ?? s.name,
                 fullName: t.fullName ?? s.fullName,
                 id: t.id ?? s.id,
+                note: joinNote(joinNote(t.note, s.note), usableText(m.desc)),
+                absorbed: t.desc === s.desc && t.name === s.name ? t.absorbed
+                    : [...(t.absorbed ?? []), absorbedSnap(s), ...(s.absorbed ?? [])].slice(-12),
             };
             const next = characters.filter((_, j) => j !== si);
             next[si < ti ? ti - 1 : ti] = merged;
@@ -602,6 +744,17 @@ export function applyBookOps(book: CharacterEntry[], mentions: Mention[]): {
             next[ci] = nt;
             characters = next;
             ops.push({ kind: 'correct', from: bookLabel(t), field: f, was, now: val });
+            done.push(i);
+        } else if (m.note) {
+            const val = usableText(m.note);
+            if (!val || !m.why?.trim()) return; // no quote, no note
+            const ci = m.id ? findEntry(characters, m.id) : findEntry(characters, m.name ?? '');
+            if (ci < 0 || characters[ci].source === 'user') return;
+            const t = characters[ci];
+            const next = [...characters];
+            next[ci] = { ...t, note: joinNote(t.note, val) };
+            characters = next;
+            ops.push({ kind: 'correct', from: bookLabel(t), field: 'note', was: t.note, now: val });
             done.push(i);
         }
     });
@@ -646,22 +799,33 @@ export function updateContext(
             const name = usableText(m.name);
             if (!name || applied.done.includes(idx) || isNonPersonLabel(m.desc)) return;
             characters = mergeCharacter(characters, {
-                id: m.id, desc: usableText(m.desc) || name, name,
+                id: m.id, desc: '', name,
                 fullName: usableText(m.fullName) || undefined, gender: m.gender, source: 'mention',
+                // role/relation text is a social fact — it must not pollute the visual anchor
+                note: joinNote(usableText(m.note), usableText(m.desc)),
             }, maxChars);
         });
     }
     return { ctx: { pairs: pairs.slice(-maxPairs), characters }, bookOps };
 }
 
-// User overrides are law: gender forced, source promoted. Same-named entries collapse to one.
+// A user edit on one roster row (options page / in-page panel). Keys are roster ids
+// (charKey) with desc as the legacy fallback; every present field wins over learned data.
+export interface CharOverride {
+    gender: 'M' | 'F' | '?';
+    name?: string;
+    desc?: string;
+    note?: string;
+}
+
+// User overrides are law: fields forced, source promoted. Same-named entries collapse to one.
 // The override key is a roster id when the row has one, otherwise the desc/name (legacy rows).
 export function applyOverrides(
     ctx: ContextState,
-    overrides: Record<string, { gender: 'M' | 'F' | '?'; name?: string }>,
+    overrides: Record<string, CharOverride>,
 ): ContextState {
     if (!Object.keys(overrides).length) return ctx;
-    const byName = new Map<string, { gender: 'M' | 'F' | '?'; name?: string }>();
+    const byName = new Map<string, CharOverride>();
     for (const ov of Object.values(overrides)) {
         if (!ov.name) continue;
         const cur = byName.get(ov.name);
@@ -675,26 +839,38 @@ export function applyOverrides(
     for (const c of ctx.characters) {
         const ov = named(c);
         const entry: CharacterEntry = ov
-            ? { ...c, gender: ov.gender === '?' ? c.gender : ov.gender, source: 'user' as const, name: ov.name ?? c.name }
+            ? {
+                ...c,
+                gender: ov.gender === '?' ? c.gender : ov.gender,
+                source: 'user' as const,
+                name: ov.name ?? c.name,
+                desc: ov.desc ?? c.desc,
+                note: ov.note ?? c.note,
+            }
             : c;
         // same user name (or same desc) = same person: merge into one entry
         const i = collapsed.findIndex(e =>
-            (entry.name && byName.has(entry.name) && e.name === entry.name) || e.desc === entry.desc);
+            (entry.name && byName.has(entry.name) && e.name === entry.name) ||
+            (entry.desc !== '' && e.desc === entry.desc));
         if (i === -1) { collapsed.push(entry); continue; }
         const cur = collapsed[i];
         collapsed[i] = {
             ...cur,
             // union the descriptions — more visual anchors for the model to match
-            desc: cur.desc === entry.desc ? cur.desc : `${cur.desc}; ${entry.desc}`,
+            desc: cur.desc === entry.desc ? cur.desc : [cur.desc, entry.desc].filter(Boolean).join('; '),
             name: entry.name ?? cur.name,
             gender: entry.gender !== '?' ? entry.gender : cur.gender,
+            note: joinNote(cur.note, entry.note),
         };
     }
-    // overrides for characters not yet in the book (user knows better)
+    // overrides for characters not yet in the book (user knows better); a stale roster id
+    // points at a row that no longer exists — nothing to attach it to
     const known = new Set(collapsed.map(c => c.desc));
-    for (const [desc, ov] of Object.entries(overrides)) {
+    for (const [key, ov] of Object.entries(overrides)) {
+        if (/^c\d+$/i.test(key)) continue;
+        const desc = ov.desc ?? key;
         if (!known.has(desc) && !(ov.name && collapsed.some(c => c.name === ov.name))) {
-            collapsed.push({ desc, gender: ov.gender, source: 'user', name: ov.name });
+            collapsed.push({ desc, gender: ov.gender, source: 'user', name: ov.name, note: ov.note });
         }
     }
     collapsed = ensureIds(collapsed).slice(0, MAX_CHARACTERS);
