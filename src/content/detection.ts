@@ -3,6 +3,7 @@
 // it via postMessage.
 import { unpackMask } from './page-cache';
 import { isDebug } from '../debug';
+import { fetchWorkerToken } from './worker-token';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -617,11 +618,9 @@ function installListener(): void {
             // its result is void.
             const fr = iframe;
             if (!fr || !fr.isConnected) return;
-            try {
-                const t = ((await chrome.runtime.sendMessage({ type: 'mt:get-worker-token', nonce: ev.data.nonce })) as { token?: string } | undefined)?.token ?? null;
-                if (iframe !== fr || !fr.isConnected) return; // stale generation
-                if (workerToken === null) workerToken = t;
-            } catch { /* keep existing token */ }
+            const t = await fetchWorkerToken(ev.data.nonce);
+            if (iframe !== fr || !fr.isConnected) return; // stale generation
+            if (workerToken === null) workerToken = t;
             ready = true;
             for (const w of waiters.splice(0)) w.resolve();
         } else if (ev.data?.type === 'mt:detect-result' || ev.data?.type === 'mt:rpc-result') {
@@ -667,6 +666,18 @@ function ensureIframe(): Promise<void> {
     });
 }
 
+// A worker whose startup registration was lost (service-worker hiccup during the handshake)
+// leaves the token null and every inference call in this document failing until a reload.
+// Rebuild the iframe so a fresh worker registers again. One rebuild per call; callers bound
+// how many times they try.
+async function healToken(): Promise<boolean> {
+    if (workerToken !== null) return true;
+    if (iframe) { try { iframe.remove(); } catch { /* already gone */ } iframe = null; }
+    ready = false;
+    try { await ensureIframe(); } catch { return false; }
+    return workerToken !== null;
+}
+
 // pipeline stage for the status pill's stepper (typed so phases never ride inside message
 // strings). Order = read → detect → ocr → llm → render.
 export type MtStage = 'read' | 'detect' | 'ocr' | 'llm' | 'render';
@@ -696,6 +707,13 @@ export async function detect(
     // alive-check BEFORE the PNG encode: a hostile remove-loop must not earn a full-page
     // re-encode per cycle
     if (!iframeAlive()) await ensureIframe();
+    if (workerToken === null) {
+        // A lost handshake registration used to fail this page (and every later attempt in the
+        // document) until a reload. Rebuild the worker once per attempt; a fresh worker
+        // registers again.
+        if (attempt >= 2 || !(await healToken())) throw new Error('worker auth token missing — reload the page');
+        return detect(img, onStatus, thresholds, attempt + 1);
+    }
     const w = 'naturalWidth' in img ? img.naturalWidth : img.width;
     const h = 'naturalHeight' in img ? img.naturalHeight : img.height;
     if (w < 10 || h < 10) throw new Error(`image too small: ${w}x${h}`);
@@ -707,7 +725,6 @@ export async function detect(
     });
 
     onStatus?.('Detecting text…', 'detect');
-    if (workerToken === null) throw new Error('worker auth token missing — reload the page');
     if (!iframeAlive()) {
         if (attempt >= 2) throw new Error('inference iframe kept being torn down — the page may be hostile');
         return detect(img, onStatus, thresholds, attempt + 1); // rebuild + bounded retry
@@ -1030,10 +1047,10 @@ function b64buf(s: string): ArrayBuffer {
 // generic request/response over the iframe postMessage channel
 async function iframeRpc(msg: object, transfer?: Transferable[]): Promise<unknown> {
     // null token = handshake failed — the worker would silently drop the RPC and we'd wait out
-    // the full 180s per call. Fail fast instead.
-    if (workerToken === null) throw new Error('worker auth token missing — reload the page');
+    // the full 180s per call. Rebuild once (a fresh worker re-registers), then fail fast.
+    if (workerToken === null && !(await healToken())) throw new Error('worker auth token missing — reload the page');
     if (!iframeAlive()) await ensureIframe(); // page tore the iframe down — rebuild
-    if (workerToken === null) throw new Error('worker auth token missing — reload the page');
+    if (workerToken === null && !(await healToken())) throw new Error('worker auth token missing — reload the page');
     const cw = iframe?.contentWindow;
     if (!cw) throw new Error('inference iframe unavailable'); // torn down again mid-await
     const id = nextId++;
