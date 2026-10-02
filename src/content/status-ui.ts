@@ -4,6 +4,7 @@
 import { pickActivity, cooldownParked } from './page-cache';
 import type { MtStage } from './detection';
 import { initDebug, isDebug } from '../debug';
+import { haltMessage } from './halt-message';
 import { pipeline, ui, mtPal, mtDot, stateFor, setDebugOn, type MtState } from './state';
 import { getPages } from './page-io';
 import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap, paintFind, paintHas, paintQueued, autoHalted } from './queue';
@@ -62,14 +63,9 @@ export function pageCounts(): { loaded: number; translated: number; queued: numb
 }
 
 export function idleStatus(): string {
-    // a provider halt outranks the counts: nothing else runs until the user acts (see haltAuto)
+    // a provider/cache halt outranks the counts: nothing else runs until the user acts (see haltAuto)
     const halted = autoHalted();
-    if (halted) {
-        if (halted.kind === 'chapter') return 'Chapter translation paused — start chapter translation to continue';
-        if (halted.kind !== 'ratelimit') return 'Auth/quota error — fix the key, then press Translate';
-        const left = halted.until > Date.now() ? ` (${Math.ceil((halted.until - Date.now()) / 1000)}s)` : '';
-        return `Rate limited${left} — stopped; press Translate to resume`;
-    }
+    if (halted) return haltMessage(halted);
     const { loaded, translated, queued } = pageCounts();
     // pages parked after errors — shown only while auto is on. Counts loaded pages only.
     let parked = 0;
@@ -203,6 +199,17 @@ export async function logError(msg: string, hint?: string, kind?: string): Promi
     const log = (mtErrLog as ErrLogEntry[] | undefined) ?? [];
     log.unshift({ t: Date.now(), msg, hint, kind });
     await sessSet({ mtErrLog: log.slice(0, 20) });
+}
+
+// The adaptive split means empty replies were paid for. Say it once per document on the pill
+// and leave a note in the popup log — the wording must stay human (no chunk/starve jargon).
+let starveNotified = false;
+export function starveNotice(): void {
+    if (starveNotified) return;
+    starveNotified = true;
+    const text = 'Some replies came back empty — retrying with smaller batches';
+    setStatus(text, 'busy', 6000);
+    void logError(text, 'Translation continues — no action needed.', 'parse');
 }
 
 // Minimal status pill (all controls live in the action popup). Keeps id `#mt-ui` + span so

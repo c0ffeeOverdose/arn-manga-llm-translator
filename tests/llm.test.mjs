@@ -19,10 +19,13 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitStablePrefix, transcriptionMatches, joinTranscription } =
+const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
+
+// buildPrompt returns {system, user} (rules vs page data); tests assert against both as one text.
+const all = (p) => p.system + '\n' + p.user;
 const { langOk, fetchWithProgress } =
   await import(new URL('../.test-build/ocr-models.mjs', import.meta.url).href);
 
@@ -188,40 +191,51 @@ test('context accumulates pairs and characters, respects caps', () => {
 
 // ---- buildPrompt ----
 
-test('splitStablePrefix: everything before <regions> is stable; no boundary → null', () => {
+test('system/user split: rules live in system, page data in user; two pages share one system', () => {
   const p = buildPrompt([{ index: 1, source: 'こんにちは' }], EMPTY_CONTEXT, false, { ocr: true });
-  const s = splitStablePrefix(p);
-  assert.ok(s, 'boundary exists in a normal prompt');
-  assert.ok(s.stable.includes('<rules>'));
-  assert.ok(!s.stable.includes('<regions>'));
-  assert.ok(s.varying.startsWith('<regions>'));
-  assert.equal(s.stable + s.varying, p, 'roundtrip: parts reassemble to the original');
-  // two pages of the same manga share the same stable prefix
+  const s = p.system;
+  assert.ok(s.includes('<rules>'));
+  assert.ok(!s.includes('<regions>'), 'regions never ride the cached system block');
+  assert.ok(!s.includes('こんにちは'), 'page text never rides the cached system block');
+  assert.ok(p.user.startsWith('<regions>'), 'user ends with the page data');
+  assert.ok(p.user.includes('こんにちは'));
+  // two pages of the same manga share the same system block (cacheable), user differs
   const q = buildPrompt([{ index: 1, source: 'ちがう台詞' }], EMPTY_CONTEXT, false, { ocr: true });
-  assert.equal(splitStablePrefix(q).stable, s.stable);
-  assert.equal(splitStablePrefix('no boundary here'), null);
+  assert.equal(q.system, s);
+  assert.notEqual(q.user, p.user);
+});
+
+test('splitUserForCache: head ends at the book, tail is the volatile remainder; null without a book', () => {
+  const p = buildPrompt([{ index: 1, source: '' }],
+    { pairs: [['a', 'b']], characters: [{ desc: 'hero girl', gender: 'F', source: 'vlm' }] }, true, {});
+  const seg = splitUserForCache(p.user);
+  assert.ok(seg, 'book block exists');
+  assert.ok(seg.head.endsWith('</known_characters>'), 'head carries exactly the book');
+  assert.ok(seg.tail.includes('<recent_translations>') && seg.tail.includes('<regions>'));
+  const noBook = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {});
+  assert.equal(splitUserForCache(noBook.user), null);
 });
 
 test('text-only vision mode: crops-only images section + no-guess spk rule; extras rule dropped', () => {
-  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {
+  const p = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {
     textOnly: true, vlmAssisted: true, pageW: 907, pageH: 1280,
-  });
+  }));
   assert.ok(p.includes('There is no full-page image'));
   assert.ok(p.includes('omit spk and g rather than guess'));
   assert.ok(!p.includes('<extra'));
   // page mode keeps the full-page wording and (when asked) the extras rule
-  const q = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {
+  const q = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {
     vlmAssisted: true, pageW: 907, pageH: 1280,
-  });
+  }));
   assert.ok(q.includes('full page with red number badges'));
   assert.ok(q.includes('<extra'));
 });
 
 test('OCR mode: no images section, source text inline, SFX + no-guess rules', () => {
-  const p = buildPrompt(
+  const p = all(buildPrompt(
     [{ index: 1, source: 'こんにちは、先輩！' }, { index: 2, source: 'ドン' }],
     EMPTY_CONTEXT, false, { ocr: true },
-  );
+  ));
   assert.ok(!p.includes('<images>'));
   assert.ok(p.includes('read by local OCR'));
   assert.ok(p.includes('こんにちは、先輩！'));
@@ -235,55 +249,58 @@ test('prompt includes regions, book, honorific rule — and no size numbers', ()
     { pairs: [['こんにちは', 'สวัสดี']], characters: [{ desc: 'hero girl', gender: 'F', source: 'vlm' }] },
     true,
   );
-  assert.ok(p.includes('honorifics'));
-  assert.ok(p.includes('hero girl'));
-  assert.ok(p.includes('こんにちは'));
+  const t = all(p);
+  assert.ok(t.includes('honorifics'));
+  assert.ok(t.includes('hero girl'));
+  assert.ok(t.includes('こんにちは'));
   // no char-budget hints anywhere: numeric anchors shorten translations even
   // next to "translate fully" — the renderer fits whatever comes back
-  assert.ok(!p.includes('box fits'));
-  assert.ok(!p.includes('auto-shrunk'));
-  assert.ok(!/\d+ chars/.test(p));
+  assert.ok(!t.includes('box fits'));
+  assert.ok(!t.includes('auto-shrunk'));
+  assert.ok(!/\d+ chars/.test(t));
   // completeness rule — the anti-elision fix
-  assert.ok(p.includes('never drop the subject, tense/aspect, or emphasis'));
-  assert.ok(p.includes('สวัสดี'));
+  assert.ok(t.includes('never drop the subject, tense/aspect, or emphasis'));
+  assert.ok(t.includes('สวัสดี'));
   // XML output format with the keep form as a distinct structural element
-  assert.ok(p.includes('<r n="REGION" keep="true"/>'));
-  assert.ok(p.includes('r n="1" spk="boy with spiky hair" g="M" name="ยามาดะ">ไปด้วยกันไหมครับ</r>'));
+  assert.ok(t.includes('<r n="REGION" keep="true"/>'));
+  assert.ok(t.includes('<r n="1" spk="c1" g="F">ไปด้วยกันไหมครับ</r>'), 'example shows id-based spk');
+  // the book is canonical and referenced by id
+  assert.ok(t.includes('<c id="c1" g="F">(unnamed) hero girl</c>'), 'compact roster row');
 });
 
 test('style prompt appended as a rule; absent when empty', () => {
   const regions = [{ index: 1, source: '' }];
-  const withStyle = buildPrompt(regions, EMPTY_CONTEXT, true, { stylePrompt: 'Casual tone — drop polite endings' });
+  const withStyle = all(buildPrompt(regions, EMPTY_CONTEXT, true, { stylePrompt: 'Casual tone — drop polite endings' }));
   assert.ok(withStyle.includes('Style (applies to every region): Casual tone'));
-  const noStyle = buildPrompt(regions, EMPTY_CONTEXT, true, { stylePrompt: '   ' });
+  const noStyle = all(buildPrompt(regions, EMPTY_CONTEXT, true, { stylePrompt: '   ' }));
   assert.ok(!noStyle.includes('Style'));
 });
 
 test('named character marked as canonical in the book section', () => {
-  const p = buildPrompt(
+  const p = all(buildPrompt(
     [{ index: 1, source: '' }],
     { pairs: [], characters: [{ desc: 'spiky guy', gender: 'M', source: 'user', name: 'Kirisame' }] },
     true,
-  );
-  assert.ok(p.includes('Kirisame: spiky guy'));
-  assert.ok(p.includes('always use this name'));
+  ));
+  assert.ok(p.includes('<c id="c1" g="M" u="1">Kirisame — spiky guy</c>'), 'user row carries the confirmed marker');
+  assert.ok(p.includes('use its exact names and spellings'), 'canonical rule present');
 });
 
 test('target language parameterizes the prompt; Thai keeps particle rule, others get the generic rule', () => {
   const regions = [{ index: 1, source: '' }];
-  const th = buildPrompt(regions, EMPTY_CONTEXT, true, { targetLang: 'Thai' });
+  const th = all(buildPrompt(regions, EMPTY_CONTEXT, true, { targetLang: 'Thai' }));
   assert.ok(th.includes('into Thai'));
   assert.ok(th.includes('ครับ/ค่ะ/คะ'));
   assert.ok(th.includes('Thai translation</r>'));
 
-  const en = buildPrompt(regions, EMPTY_CONTEXT, true, { targetLang: 'English' });
+  const en = all(buildPrompt(regions, EMPTY_CONTEXT, true, { targetLang: 'English' }));
   assert.ok(en.includes('into English'));
   assert.ok(en.includes('English translation</r>'));
   assert.ok(!en.includes('ครับ/ค่ะ/คะ'));
   assert.ok(en.includes('gendered speech forms'));
 
   // default (no targetLang) = Thai
-  const dflt = buildPrompt(regions, EMPTY_CONTEXT, true);
+  const dflt = all(buildPrompt(regions, EMPTY_CONTEXT, true));
   assert.ok(dflt.includes('into Thai'));
 });
 
@@ -611,13 +628,38 @@ test('cfBody: explicit max_tokens, images as data-URL parts, no model field', ()
 test('cfParse: result.response and result.choices both parse; usage + cached tokens map', () => {
   assert.deepEqual(
     cfParse({ result: { response: 'abc', usage: { prompt_tokens: 7, completion_tokens: 3 } } }),
-    { text: 'abc', usage: { inTok: 7, outTok: 3, cachedInTok: undefined } });
+    { text: 'abc', finishReason: undefined, usage: { inTok: 7, outTok: 3, cachedInTok: undefined, reasonTok: undefined } });
   assert.equal(cfParse({ result: { choices: [{ message: { content: 'def' } }] } }).text, 'def');
   assert.equal(cfParse({ result: {} }).text, '');
   assert.equal(cfParse(null).text, '');
   // Workers AI surfaces prefix-cache hits here; the dump's cachedInTok reads it
   const hit = cfParse({ result: { response: 'x', usage: { prompt_tokens: 2000, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 1536 } } } });
   assert.equal(hit.usage.cachedInTok, 1536);
+  // a starved reasoning reply names itself: finish_reason + reasoning token count
+  const starved = cfParse({ result: { choices: [{ message: { content: '' }, finish_reason: 'length' }], usage: { prompt_tokens: 10, completion_tokens: 4096, completion_tokens_details: { reasoning_tokens: 4096 } } } });
+  assert.equal(starved.finishReason, 'length');
+  assert.equal(starved.usage.reasonTok, 4096);
+});
+
+test('callLLM surfaces finishReason + reasoning tokens (a 200 with no content names its cause)', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    async text() {
+      return JSON.stringify({
+        choices: [{ message: { content: '' }, finish_reason: 'length' }],
+        usage: { prompt_tokens: 4768, completion_tokens: 4096, completion_tokens_details: { reasoning_tokens: 4096 } },
+      });
+    },
+  });
+  try {
+    const r = await callLLM({ provider: 'openai', baseUrl: 'https://fin-reason.test/v1', model: 'm', apiKey: 'k' }, 'p');
+    assert.equal(r.text, '');
+    assert.equal(r.finishReason, 'length');
+    assert.equal(r.usage.reasonTok, 4096);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test('cfError: errors[] → LlmHttpError (covers HTTP 200 + success:false) with providerCode', () => {
@@ -684,7 +726,7 @@ test('cfBody pins temperature 0 (CF default 0.6 drifts the XML format)', () => {
 });
 
 test('transcribeOne prompt: one element, all lines joined, no multi-image wording', () => {
-  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false });
+  const p = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false }));
   assert.match(p, /single manga region/);
   assert.match(p, /Exactly one element/);
   assert.doesNotMatch(p, /following images/, 'no crop-list wording — the request carries one image');
@@ -757,18 +799,18 @@ test('mentions: speaker name and mention of the same person collapse', () => {
 });
 
 test('buildPrompt: known_characters shows full name once', () => {
-  const p = buildPrompt([{ index: 1, source: '' }],
+  const p = all(buildPrompt([{ index: 1, source: '' }],
     { pairs: [], characters: [{ desc: 'a boy', gender: 'M', name: 'ยามาดะ', fullName: 'ยามาดะ ทาโร่', source: 'mention' }] },
-    true, {});
-  assert.match(p, /ยามาดะ \(ยามาดะ ทาโร่\):/);
+    true, {}));
+  assert.match(p, /<c id="c1" g="M">ยามาดะ \(ยามาดะ ทาโร่\) — a boy<\/c>/);
 });
 
 // ---- useCharacters off: pairs-only context ----
 
 test('buildPrompt chars=false: no spk request, no names block, no known_characters', () => {
-  const p = buildPrompt([{ index: 1, source: '' }],
+  const p = all(buildPrompt([{ index: 1, source: '' }],
     { pairs: [['สวัสดี', 'hello']], characters: [{ desc: 'a boy', gender: 'M', name: 'ยามาดะ', source: 'mention' }] },
-    true, { chars: false });
+    true, { chars: false }));
   assert.ok(!p.includes('spk='), 'must not request spk attrs');
   assert.ok(!p.includes('<names>'), 'must not request names block');
   assert.ok(!p.includes('<known_characters>'), 'must not send the book');
@@ -778,10 +820,10 @@ test('buildPrompt chars=false: no spk request, no names block, no known_characte
 });
 
 test('buildPrompt chars default: unchanged (spk + names + book)', () => {
-  const p = buildPrompt([{ index: 1, source: '' }],
+  const p = all(buildPrompt([{ index: 1, source: '' }],
     { pairs: [], characters: [{ desc: 'a boy', gender: 'M', source: 'vlm' }] },
-    true, {});
-  assert.ok(p.includes('spk="who is speaking'), 'spk requested');
+    true, {}));
+  assert.ok(p.includes('spk="c1|new"'), 'id-based spk requested');
   assert.ok(p.includes('<names>'), 'names block requested');
   assert.ok(p.includes('<known_characters>'), 'book sent');
 });
@@ -831,9 +873,10 @@ test('book hygiene: polluted label rows are not sent; user rows survive the filt
       { desc: 'sign', gender: '?', source: 'user' },
       { desc: 'hero girl', gender: 'F', name: 'ยามาดะ', source: 'vlm' },
     ] }, true, {});
-  assert.ok(p.includes('hero girl'), 'real character sent');
-  assert.ok(!p.includes('- narration'), 'learned label row not sent');
-  assert.ok(p.includes('- sign [gender'), 'user-added row is the user\'s call');
+  const roster = p.user.slice(p.user.indexOf('<known_characters>'), p.user.indexOf('</known_characters>'));
+  assert.ok(roster.includes('hero girl'), 'real character sent');
+  assert.ok(!roster.includes('narration'), 'learned label row not sent');
+  assert.ok(roster.includes('sign'), "user-added row is the user's call");
 });
 
 test('book hygiene: honorific forms of one name merge (คุจินาชิคุง / ฮิมุโระ-ซัง / Kuchinashi-kun)', () => {
@@ -860,8 +903,8 @@ test('book hygiene: cap evicts the oldest low-priority row — the new character
 });
 
 test('buildPrompt: box-type spk rule + credits rule ride the prompt', () => {
-  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {});
-  assert.ok(p.includes('spk is a PERSON'), 'speaker-only rule present');
+  const p = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {}));
+  assert.ok(p.includes('not a person speaking'), 'speaker-only rule present');
   assert.ok(p.includes('Credits, bylines'), 'credits rule present');
 });
 
@@ -894,8 +937,8 @@ test('updateContext: sourceless outputs still fold pairs', () => {
 });
 
 test('buildPrompt: sourceless pairs render as (previous page)', () => {
-  const p = buildPrompt([{ index: 1, source: '' }],
-    { pairs: [['src', 'th'], ['', 'prev page line']], characters: [] }, true, {});
+  const p = all(buildPrompt([{ index: 1, source: '' }],
+    { pairs: [['src', 'th'], ['', 'prev page line']], characters: [] }, true, {}));
   assert.ok(p.includes('- src => th'), 'sourced pair keeps arrow form');
   assert.ok(p.includes('- (previous page) prev page line'), 'sourceless pair labelled');
   assert.ok(!p.includes('=> prev'), 'no dangling arrow');
@@ -906,8 +949,8 @@ test('maxPairs caps both fold and send', () => {
   const { ctx } = updateContext(EMPTY_CONTEXT, outs, [], true, 2);
   assert.equal(ctx.pairs.length, 2);
   assert.deepEqual(ctx.pairs[0], ['s2', 't2']);
-  const p = buildPrompt([{ index: 1, source: '' }],
-    { pairs: [['a', '1'], ['b', '2'], ['c', '3']], characters: [] }, true, { maxPairs: 1 });
+  const p = all(buildPrompt([{ index: 1, source: '' }],
+    { pairs: [['a', '1'], ['b', '2'], ['c', '3']], characters: [] }, true, { maxPairs: 1 }));
   assert.ok(!p.includes('- a => 1') && p.includes('- c => 3'), 'only the newest pair sent');
 });
 
@@ -977,7 +1020,7 @@ test('mergeCharacter: sourceless spk name matches a real name (deterministic C)'
 });
 
 test('buildPrompt: names block documents sameAs/correct', () => {
-  const p = buildPrompt([{ index: 1, source: '' }], { pairs: [], characters: [] }, true, {});
+  const p = all(buildPrompt([{ index: 1, source: '' }], { pairs: [], characters: [] }, true, {}));
   assert.ok(p.includes('sameAs'), 'merge op documented');
   assert.ok(p.includes('confirmed by user'), 'user rows off-limits in the contract');
 });
@@ -989,28 +1032,36 @@ test('parse <r>: src attr captured as source', () => {
 });
 
 test('buildPrompt transcribeSrc: src requested + verbatim rule, ocr exempt, default off', () => {
-  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeSrc: true });
+  const p = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeSrc: true }));
   assert.ok(p.includes('src="this region\'s original text'), 'element requests src');
   assert.ok(p.includes('Transcribe first'), 'verbatim rule present');
-  const po = buildPrompt([{ index: 1, source: 'x' }], EMPTY_CONTEXT, false, { transcribeSrc: true, ocr: true });
+  const po = all(buildPrompt([{ index: 1, source: 'x' }], EMPTY_CONTEXT, false, { transcribeSrc: true, ocr: true }));
   assert.ok(!po.includes('Transcribe first') && !po.includes('src="this region'), 'ocr mode exempt');
-  const pn = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {});
+  const pn = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {}));
   assert.ok(!pn.includes('src="this region'), 'default off');
 });
 
 test('buildPrompt transcribeOnly: transcribe task, no translate/book/pairs', () => {
-  const p = buildPrompt([{ index: 1, source: '' }, { index: 2, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false });
+  const p = all(buildPrompt([{ index: 1, source: '' }, { index: 2, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false }));
   assert.ok(p.includes('Transcribe the text'), 'transcribe task');
   assert.ok(!p.includes('Translate the numbered'), 'no translate task');
   assert.ok(p.includes('Do NOT translate') || p.includes('Never translate'), 'never-translate rule');
   assert.ok(p.includes('sound-effect'), 'SFX transcribed, not kept');
   assert.ok(!p.includes('<names>') && !p.includes('known_characters') && !p.includes('recent_translations'), 'no book/pairs');
-  const pc = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false, textOnly: true });
+  const pc = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false, textOnly: true }));
   assert.ok(pc.includes('There is no full-page image'), 'crops-only variant');
   // same XML shape: translation field carries the transcription
   const r = parseResponse('<r n="1">一緒に来て</r>\n<r n="2" keep="true"/>', 2);
   assert.equal(r.regions[0].translation, '一緒に来て');
   assert.equal(r.regions[1].translation, 'keep');
+});
+
+test('transcribe split: instructions in system, only the region list in user (unbiased read)', () => {
+  const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false });
+  assert.ok(p.system.includes('Transcribe the text') && p.system.includes('Do NOT translate'));
+  assert.ok(!p.system.includes('<regions>'), 'regions are data, not instructions');
+  assert.equal(p.user, '<regions>\n1 (read from image)\n</regions>\n');
+  assert.ok(!p.user.includes('<known_characters>') && !p.user.includes('<recent_translations>'));
 });
 
 test('transcriptionMatches: whitespace-blind, case-strict, empty-expected never matches', () => {
@@ -1228,4 +1279,157 @@ test('mergeRegions: empty later leg preserves the earlier partial answer', () =>
 test('mergeRegions: output is index-sorted so order/dedup stays stable', () => {
   const merged = mergeRegions([{ index: 9 }, { index: 2 }], [{ index: 5 }]);
   assert.deepEqual(merged.map(r => r.index), [2, 5, 9]);
+});
+
+// ---- Phase 1: roster ids, admission, eviction, role split ----
+
+test('roster ids: placeholder spk ("?", "...") learns nothing and never reaches the prompt', () => {
+  let ctx = updateContext(EMPTY_CONTEXT, [
+    { index: 1, source: '', translation: 'สวัสดี', spk: { desc: '?', gender: '?' } },
+    { index: 2, source: '', translation: '…', spk: { desc: '...', gender: 'F' } },
+    { index: 3, source: '', translation: '!', spk: { desc: 'sign', gender: '?' } },
+  ]).ctx;
+  assert.equal(ctx.characters.length, 0, 'no identity = no row');
+  ctx = updateContext(ctx, [
+    { index: 1, source: '', translation: 'สวัสดี', spk: { desc: 'girl with red ribbon', gender: 'F' } },
+  ]).ctx;
+  assert.equal(ctx.characters.length, 1);
+  assert.equal(ctx.characters[0].id, 'c1');
+  const bp = buildPrompt([{ index: 1, source: '' }], ctx, true, {});
+  const roster = bp.user.slice(bp.user.indexOf('<known_characters>'), bp.user.indexOf('</known_characters>'));
+  assert.ok(roster.includes('<c id="c1" g="F">(unnamed) girl with red ribbon</c>'));
+  assert.ok(!roster.includes('?'), 'no junk row in the roster');
+});
+
+test('roster ids: same speaker over 3 pages keeps one id and one row', () => {
+  let ctx = EMPTY_CONTEXT;
+  for (let page = 0; page < 3; page++) {
+    ctx = updateContext(ctx, [
+      { index: 1, source: '', translation: `t${page}`, spk: { id: page === 0 ? undefined : 'c1', desc: page === 0 ? 'twintail girl' : '', gender: 'F' } },
+    ]).ctx;
+    assert.equal(ctx.characters.length, 1, `page ${page}: one row`);
+    assert.equal(ctx.characters[0].id, 'c1');
+  }
+  assert.equal(ctx.characters[0].desc, 'twintail girl', 'id-matched observations never re-describe');
+});
+
+test('roster ids: an unknown id with no anchor is dropped; a valid id upgrades gender in place', () => {
+  const book = [{ id: 'c1', desc: 'hero girl', gender: '?', source: 'vlm' }];
+  const dropped = updateContext({ pairs: [], characters: book }, [
+    { index: 1, source: '', translation: 'x', spk: { id: 'c9', desc: '', gender: 'M' } },
+  ]).ctx;
+  assert.equal(dropped.characters.length, 1);
+  assert.equal(dropped.characters[0].gender, '?', 'unknown id never retargets an entry');
+  const upgraded = updateContext({ pairs: [], characters: book }, [
+    { index: 1, source: '', translation: 'x', spk: { id: 'c1', desc: '', gender: 'F' } },
+  ]).ctx;
+  assert.equal(upgraded.characters.length, 1);
+  assert.equal(upgraded.characters[0].gender, 'F');
+});
+
+test('eviction: unnamed rows go first; named rows survive a full book', () => {
+  let book = [{ id: 'c1', desc: 'named hero', gender: 'M', name: 'ยามาดะ', source: 'vlm' }];
+  for (let i = 0; i < 9; i++) book = mergeCharacter(book, { desc: `unnamed${i}`, gender: '?', source: 'vlm' });
+  assert.equal(book.length, 10);
+  book = mergeCharacter(book, { desc: 'brand new face', gender: 'F', source: 'vlm' });
+  assert.equal(book.length, 10);
+  assert.ok(book.some(c => c.name === 'ยามาดะ'), 'named row protected');
+  assert.ok(book.some(c => c.desc === 'brand new face'), 'the new row survives');
+  assert.ok(!book.some(c => c.desc === 'unnamed0'), 'oldest unnamed evicted');
+});
+
+test('prompt: mention desc is optional and provenance descriptions are banned', () => {
+  const p = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {}));
+  assert.ok(p.includes('role or relation ONLY when the page states one'));
+  assert.ok(p.includes('Never describe where or how the name appeared'));
+});
+
+test('prompt budget: rules + roster + pairs stay compact', () => {
+  const regions = Array.from({ length: 8 }, (_, i) => ({ index: i + 1, source: '' }));
+  const characters = Array.from({ length: 6 }, (_, i) => ({
+    id: `c${i + 1}`, desc: `character description number ${i}`, gender: 'F', name: `ชื่อตัวละคร${i}`, source: 'vlm',
+  }));
+  const pairs = Array.from({ length: 15 }, (_, i) => ['', `บทพูดหน้า ${i + 1}: ประโยคแปลตัวอย่างที่มีความยาวระดับหนึ่ง`]);
+  const p = buildPrompt(regions, { pairs, characters }, true, { textOnly: true, targetLang: 'Thai', maxPairs: 15 });
+  // Same config on the pre-id prompt measured 5,483 chars (verbose roster) — the speaker
+  // contract adds instructions while the compact roster shrinks each entry ~77%; a full
+  // 10-character book is where the new format actually saves.
+  assert.ok(all(p).length < 5700, `prompt grew past the budget: ${all(p).length}`);
+});
+
+test('provider roles: system block rides each protocol with its cache hint', async () => {
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return {
+      ok: true, status: 200,
+      async text() {
+        if (String(url).includes('/v1/messages')) return JSON.stringify({ content: [{ type: 'text', text: 'ok' }], usage: {} });
+        if (String(url).includes(':generateContent')) return JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
+        if (String(url).includes('/responses')) return JSON.stringify({ output: [], usage: {} });
+        return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} });
+      },
+    };
+  };
+  const bp = buildPrompt([{ index: 1, source: '' }],
+    { pairs: [], characters: [{ id: 'c1', desc: 'hero girl', gender: 'F', source: 'vlm' }] }, true, {});
+  try {
+    const openai = { provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' };
+    await callLLM(openai, bp);
+    assert.equal(seen.at(-1).body.messages[0].role, 'system');
+    assert.equal(seen.at(-1).body.messages[0].content, bp.system);
+    assert.deepEqual(seen.at(-1).body.messages[1].content[0], { type: 'text', text: bp.user });
+
+    const anthropic = { provider: 'anthropic', baseUrl: 'https://a.test', model: 'm', apiKey: 'k' };
+    await callLLM(anthropic, bp);
+    const ab = seen.at(-1).body;
+    assert.equal(ab.system[0].text, bp.system);
+    assert.deepEqual(ab.system[0].cache_control, { type: 'ephemeral' });
+    assert.ok(ab.messages[0].content[0].cache_control, 'book segment carries its own breakpoint');
+    assert.ok(ab.messages[0].content[0].text.includes('<known_characters>'));
+    assert.ok(!ab.messages[0].content[1].cache_control, 'volatile tail stays uncached');
+
+    const gemini = { provider: 'gemini', baseUrl: 'https://g.test/v1beta', model: 'm', apiKey: 'k' };
+    await callLLM(gemini, bp);
+    assert.equal(seen.at(-1).body.systemInstruction.parts[0].text, bp.system);
+
+    const responses = { provider: 'responses', baseUrl: 'https://r.test/v1', model: 'm', apiKey: 'k' };
+    await callLLM(responses, bp);
+    assert.equal(seen.at(-1).body.instructions, bp.system);
+
+    const cf = cfBody(bp);
+    assert.equal(cf.messages[0].role, 'system');
+    assert.equal(cf.messages[0].content, bp.system);
+    assert.equal(cf.messages[1].role, 'user');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('provider roles: a rejected system role retries once as a single user message', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  const bodies = [];
+  globalThis.fetch = async (url, init) => {
+    calls++;
+    bodies.push(JSON.parse(String(init?.body)));
+    if (calls === 1) {
+      return { ok: false, status: 400, async text() { return JSON.stringify({ error: { message: 'system role is not supported by this model' } }); } };
+    }
+    return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); } };
+  };
+  try {
+    const s = { provider: 'openai', baseUrl: 'https://sys-role.test/v1', model: 'm', apiKey: 'k' };
+    const bp = { system: 'RULES', user: 'DATA' };
+    const r = await callLLM(s, bp);
+    assert.equal(calls, 2, 'rejected request + one merge retry');
+    assert.equal(r.systemDropped, true);
+    assert.equal(bodies[1].messages.length, 1, 'retry has no system role');
+    assert.equal(bodies[1].messages[0].role, 'user');
+    assert.ok(bodies[1].messages[0].content[0].text.includes('RULES'));
+    assert.ok(bodies[1].messages[0].content[0].text.includes('DATA'));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

@@ -64,6 +64,9 @@ test('status distinguishes ready pages, failures and incomplete discovery', () =
     assert.equal(chapterMessage(s), '2 of 4 pages ready to read · Working on 1 page');
     assert.match(chapterMessage({ ...s, phase: 'waiting' }), /Waiting for more page images/);
     assert.doesNotMatch(chapterMessage({ ...s, phase: 'complete' }), /complete/);
+    // a transient notice (adaptive split) rides the running line; absent without one
+    assert.equal(chapterMessage({ ...s, notice: 'Retrying some pages with smaller batches' }),
+        '2 of 4 pages ready to read · Working on 1 page · Retrying some pages with smaller batches');
 });
 test('a 404 on the preferred encoding retries the sibling of the SAME page', async () => {
     const tried = [];

@@ -104,16 +104,18 @@ export function paintLaneSize(gpu: boolean): number {
     return gpu ? 3 : 1;
 }
 
-// Vision translation sends the full page plus one crop per region, and a provider burns its
-// output budget long before it runs out of regions: a request with ~10+ crops routinely came
-// back 200 with no content while a 3-6 region request answered fine. Split the region list so
-// no single request is large enough to starve its own answer. Pure — unit-tested.
-export const LLM_REGIONS_PER_REQUEST = 6;
-export function regionChunks<T>(regions: T[], size = LLM_REGIONS_PER_REQUEST): T[][] {
+// Split a region list for one request. The caller picks the size: the whole page first, then
+// halved per observed starvation (`nextChunkSize`) — there is no fixed per-request cap. Pure.
+export function regionChunks<T>(regions: T[], size: number): T[][] {
     if (!regions.length || size < 1) return [];
     const out: T[][] = [];
     for (let i = 0; i < regions.length; i += size) out.push(regions.slice(i, i + size));
     return out;
+}
+
+// After a starved (empty/formatless) reply at this size, halve it; one region is the floor.
+export function nextChunkSize(failed: number): number {
+    return Math.max(1, Math.floor(failed / 2));
 }
 
 export interface CachedPage {

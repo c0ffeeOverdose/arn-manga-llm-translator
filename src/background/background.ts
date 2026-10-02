@@ -2,7 +2,7 @@
 // content script's iframe — this worker owns LLM calls only.
 
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
-import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention } from '../llm/core';
+import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl } from './chapter-broker';
 import { bootChapterRunner } from '../chapter/boot';
@@ -120,7 +120,7 @@ interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage
 // the handler owns retry/backoff (rate-limit aware) — helpers just call through.
 // Deliberately 6 params: OCR must NOT opt into retryEmpty (it has its own
 // per-region fallback and an explicit zero-text gate), so the knob is not exposed here.
-type LlmCaller = (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }>;
+type LlmCaller = (s: LLMSettings, p: string | BuiltPrompt, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }>;
 // transcribe calls send NO output cap: the cap includes reasoning tokens on
 // reasoning models, and a drifting generation is bounded by the adapter default.
 
@@ -572,11 +572,12 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             // retryEmpty: a provider can return a 200 with no content (empty parse) — a
             // transient flake, not a real answer. Retried once HERE, where the caller's
             // alternative is an identical full-page call that re-uploads every crop.
-            const callWithRetry = async (s: LLMSettings, p: string, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number, retryEmpty = false): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }> => {
+            const callWithRetry = async (s: LLMSettings, p: string | BuiltPrompt, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number, retryEmpty = false): Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean; finishReason?: string }> => {
                 let calls = 0;
                 let ms = 0;
                 let tempDropped = false;
                 let thinkingDropped = false;
+                let finishReason: string | undefined;
                 let emptyRetried = false;
                 // TEMP TRACE: identifies which leg (r1/r2/r3) is slow/hanging in the field.
                 const traceTag = `r${retryEmpty ? '1+' : ''}${msg.regions.length}reg${imgs?.length ? `/${imgs.length}img` : ''}`;
@@ -587,11 +588,12 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 // caller's `usage.inTok != null` gate keeps its old meaning.
                 let usage: LlmUsage | undefined;
                 const addUsage = (u?: LlmUsage): void => {
-                    if (!u || (u.inTok == null && u.outTok == null && u.cachedInTok == null)) return;
+                    if (!u || (u.inTok == null && u.outTok == null && u.cachedInTok == null && u.reasonTok == null)) return;
                     usage = {
                         inTok: (usage?.inTok ?? 0) + (u.inTok ?? 0),
                         outTok: (usage?.outTok ?? 0) + (u.outTok ?? 0),
                         cachedInTok: (usage?.cachedInTok ?? 0) + (u.cachedInTok ?? 0),
+                        reasonTok: (usage?.reasonTok ?? 0) + (u.reasonTok ?? 0),
                     };
                 };
                 // error-attempt counter is separate from the loop var: an empty retry
@@ -607,14 +609,18 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                         addUsage(r.usage);
                         if (r.tempDropped) tempDropped = true;
                         if (r.thinkingDropped) thinkingDropped = true;
+                        finishReason = r.finishReason;
                         if (isDebug()) console.log(`[mt:trace] ${traceTag} attempt#${calls} OK in ${Date.now() - tAttempt}ms, text.len=${r.text.trim().length}`);
                         if (retryEmpty && !emptyRetried && !r.text.trim()) {
                             emptyRetried = true;
-                            console.warn(`[mt:trace] ${traceTag} EMPTY response (200, no content) — retrying once`);
+                            // Name the failure: model/finish/usage separate reasoning starvation
+                            // (finish=length/max_tokens, reasonTok near outTok) from a gateway
+                            // that answered 200 with no usable body at all.
+                            console.warn(`[mt:trace] ${traceTag} EMPTY response (200, no content) model=${s.model} finish=${r.finishReason ?? '-'} inTok=${r.usage?.inTok ?? '-'} outTok=${r.usage?.outTok ?? '-'} reasonTok=${r.usage?.reasonTok ?? '-'} — retrying once`);
                             continue;
                         }
                         if (isDebug()) console.log(`[mt:trace] callWithRetry DONE ${traceTag} total=${Date.now() - tCall}ms calls=${calls}`);
-                        return { text: r.text, usage, calls, ms, tempDropped, thinkingDropped };
+                        return { text: r.text, usage, calls, ms, tempDropped, thinkingDropped, finishReason };
                     } catch (e) {
                         const m = toMtError(e);
                         const retryable = m.kind === 'server' || m.kind === 'network';
@@ -736,6 +742,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 textOnly: split ? true : msg.textOnly,
                 ocr: split ? true : msg.ocr,
                 chars: pipeline.useCharacters,
+                charLimit: pipeline.charLimit,
                 maxPairs: pipeline.contextPairs,
                 transcribeSrc: split ? false : pipeline.transcribeSrc,
             });
@@ -768,6 +775,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     textOnly: split ? true : msg.textOnly,
                     ocr: split ? true : msg.ocr,
                     chars: pipeline.useCharacters,
+                    charLimit: pipeline.charLimit,
                     maxPairs: pipeline.contextPairs,
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
@@ -797,6 +805,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     textOnly: split ? true : msg.textOnly,
                     ocr: split ? true : msg.ocr,
                     chars: pipeline.useCharacters,
+                    charLimit: pipeline.charLimit,
                     maxPairs: pipeline.contextPairs,
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
@@ -827,7 +836,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 }
             }
             const mentions = [...parsed.mentions, ...retryMentions];
-            const { ctx: newCtx, bookOps } = updateContext(msgCtx, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs);
+            const { ctx: newCtx, bookOps } = updateContext(msgCtx, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs, pipeline.charLimit);
             if (isDebug()) console.log('[mt:bg] llm raw', rawAll);
             if (isDebug() && bookOps.length) console.log('[mt:bg] book ops', JSON.stringify(bookOps));
             settle({

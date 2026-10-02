@@ -84,7 +84,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     useCharacters: true,
     crossChapter: true,
     stylePrompt: '',
-    contextPairs: 40,
+    contextPairs: 15,
     charLimit: 10,
     thinkingLevel: 'auto',
     temperature: null,
@@ -243,8 +243,11 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.cacheEnabled !== 'boolean') out.cacheEnabled = true;
     if (typeof out.cacheMax !== 'number' || !(out.cacheMax >= 10 && out.cacheMax <= 2000)) out.cacheMax = 200;
     else out.cacheMax = Math.round(out.cacheMax);
-    if (typeof out.contextPairs !== 'number' || !(out.contextPairs >= 0 && out.contextPairs <= 200)) out.contextPairs = 40;
+    if (typeof out.contextPairs !== 'number' || !(out.contextPairs >= 0 && out.contextPairs <= 200)) out.contextPairs = 15;
     else out.contextPairs = Math.round(out.contextPairs);
+    // roster cap: small enough to stay cheap, big enough for a chapter cast
+    if (typeof out.charLimit !== 'number' || !(out.charLimit >= 3 && out.charLimit <= 30)) out.charLimit = 10;
+    else out.charLimit = Math.round(out.charLimit);
     return out as unknown as PipelineSettings;
 }
 

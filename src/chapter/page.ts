@@ -114,6 +114,19 @@ function stop(message?: string): void {
     status.message = message;
     void publish().catch(showFatal);
 }
+
+// Empty replies were split into smaller batches — tell the reader once per session. The runner
+// has no console anyone can open, so the notice rides the published progress and clears itself.
+let starveNoticeShown = false;
+function starveNotice(): void {
+    if (starveNoticeShown || !status) return;
+    starveNoticeShown = true;
+    status.notice = 'Retrying some pages with smaller batches';
+    void publish().catch(() => {});
+    setTimeout(() => {
+        if (status?.notice) { status.notice = undefined; void publish().catch(() => {}); }
+    }, 8000);
+}
 function showFatal(e: unknown): void {
     const msg = `Translation paused — ${(e as Error).message || String(e)}`;
     const el = statusElement();
@@ -234,7 +247,7 @@ async function work(page: ChapterPage, snapshot: ContextState, generation: numbe
         stage('translating');
         let out;
         try {
-            out = cached ?? await translateRegions(bitmap, det, () => {}, { fold: false, lo: true, context: snapshot, fresh: force, cacheEpoch });
+            out = cached ?? await translateRegions(bitmap, det, () => {}, { fold: false, lo: true, context: snapshot, fresh: force, cacheEpoch, onStarve: starveNotice });
         } catch (e) {
             note(`llm p${page.order} ${(e as Error).message}`.slice(0, 200));
             throw e;
@@ -416,6 +429,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 
 async function attach(runnerId: string): Promise<void> {
     id = runnerId;
+    starveNoticeShown = false; // a new session re-arms the one-time notice
     await cacheReady();
     await initDebug();
     const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-host-init', id });
@@ -436,6 +450,7 @@ async function attach(runnerId: string): Promise<void> {
     const checkpoint = await readRecord<HostCheckpoint>(`checkpoint:${id}`);
     if (checkpoint) config = { ...config, ...checkpoint.config };
     if (checkpoint?.progress) status = checkpoint.progress;
+    status.notice = undefined; // transient — never resurrect a stale banner from a checkpoint
     for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
     // Storage-change events are optional: an offscreen document is given only the runtime
     // API, and the shim may not cover every area this build talks to. A missing event must

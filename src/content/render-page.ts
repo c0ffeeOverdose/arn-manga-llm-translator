@@ -16,6 +16,7 @@ import { ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { translateRegions, ensurePageDebugViews } from './ocr';
 import { rewindContextBefore, replayPagesAfter } from './queue';
 import { bookHas, bookAdd, bookDrop } from './sweep';
+import { starveNotice } from './status-ui';
 import { saveContext } from './state';
 import { identifyBitmap } from '../image-identity';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
@@ -100,7 +101,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         rawLLM = '(cached — no LLM call)';
         // already folded by whoever produced this entry — refolding would duplicate
         // its pairs. Otherwise fold + register.
-        if (shareContext && !paintOnly && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
+        if (shareContext && !paintOnly && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs, pipeline.charLimit); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
     } else {
         onStatus('Translating…');
         ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, errorRetryAfterMs, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
@@ -108,6 +109,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled,
                 fresh: force,
                 cacheEpoch,
+                onStarve: starveNotice,
                 // AI cleanup warm: starts the moment OCR ends (the infer lock
                 // is about to go idle) and runs through the LLM's network
                 // wait — a cold inpaint session uploads 112MB here too
@@ -269,7 +271,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         // chosen layout per region: {i, fontSize, line count} — null layout
         // (skipped/degenerate) is simply absent
         layout: layouts,
-        outputs: outputs.map(o => ({ i: o.index, t: o.translation, s: o.source || null, spk: o.spk ? { d: o.spk.desc, g: o.spk.gender, n: o.spk.name ?? null } : null })),
+        outputs: outputs.map(o => ({ i: o.index, t: o.translation, s: o.source || null, spk: o.spk ? { d: o.spk.desc || o.spk.id || '', g: o.spk.gender, n: o.spk.name ?? null } : null })),
         extras,
         ...(bookOps?.length ? { bookOps } : null),
     }));

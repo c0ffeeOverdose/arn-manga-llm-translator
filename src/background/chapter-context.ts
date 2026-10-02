@@ -3,7 +3,7 @@ import { sessGet, sessSet } from '../storage-session';
 import { recordEdits, replaceContribution, replayLedger, type ContextLedger } from '../chapter/context';
 import type { Contribution } from '../chapter/model';
 
-interface Ledger extends ContextLedger { bookKey: string; learn: boolean; maxPairs: number; last?: ContextState }
+interface Ledger extends ContextLedger { bookKey: string; learn: boolean; maxPairs: number; maxChars?: number; last?: ContextState }
 let writes: Promise<unknown> = Promise.resolve();
 export function contextTransaction<T>(fn: () => Promise<T>): Promise<T> {
     const result = writes.then(fn);
@@ -36,18 +36,19 @@ async function persist(chapter: string, bookKey: string, ctx: ContextState, ledg
     });
     if (bookKey.startsWith('mtBook:')) await chrome.storage.local.set({ [bookKey]: JSON.stringify(ctx.characters) });
 }
-export async function chapterContext(chapter: string, bookKey: string, learn: boolean, maxPairs: number,
+export async function chapterContext(chapter: string, bookKey: string, learn: boolean, maxPairs: number, maxChars: number,
     entries?: Contribution[], beforeOrder?: number): Promise<ContextState> {
     return contextTransaction(async () => {
         const key = `mtChapterLedger:${chapter}`;
         let ledger = (await sessGet(key))[key] as Ledger | undefined;
         if (!ledger || ledger.bookKey !== bookKey) {
-            ledger = { base: await storedContext(chapter, bookKey), entries: [], edits: [], bookKey, learn, maxPairs };
+            ledger = { base: await storedContext(chapter, bookKey), entries: [], edits: [], bookKey, learn, maxPairs, maxChars };
         } else if (ledger.last) {
             recordEdits(ledger, ledger.last, await storedContext(chapter, bookKey));
         }
         ledger.learn = learn;
         ledger.maxPairs = maxPairs;
+        ledger.maxChars = maxChars;
         for (const entry of entries ?? []) replaceContribution(ledger, entry);
         const ctx = replayLedger(ledger, learn, maxPairs);
         await persist(chapter, bookKey, ctx, ledger);

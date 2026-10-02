@@ -29,6 +29,7 @@ let discoverAt = 0;
 let notified = '';
 let foldedChapter = '';
 let attachWhy = ''; // why the last attach attempt refused — a page translated but not painted
+let noticeLogged = ''; // last runner notice copied into the popup log (dedupe across publishes)
 const folded = new Set<string>();
 const refs = new Map<string, PageRef>();
 const attaching = new WeakSet<Element>();
@@ -463,6 +464,12 @@ export function cancelSweep(): { ok: boolean } {
 }
 function showProgress(): void {
     if (!progress || progress.chapter !== chapterKey()) return;
+    // A runner notice (adaptive split) also belongs in the popup log — the pill line is gone
+    // after ~8s and the reader may miss it. Human wording comes from the runner.
+    if (progress.notice && progress.notice !== noticeLogged) {
+        noticeLogged = progress.notice;
+        void logError(progress.notice, 'Translation continues — no action needed.', 'parse');
+    }
     const text = chapterMessage(progress);
     if (sweepActive()) setActivity('sweep', text, 'sweep', progress.inflight ? 'llm' : 'read');
     else {

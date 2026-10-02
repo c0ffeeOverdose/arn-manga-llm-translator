@@ -27,6 +27,9 @@ export interface ChapterProgress {
     pages: { id: string; url: string; phase: PagePhase; hash?: string; revision?: number; order?: number;
         image?: ImageSignature; matchedBy?: 'url' | 'image' }[];
     message?: string;
+    // Transient, user-facing line shown with the running progress (e.g. "retrying with smaller
+    // batches" after an empty reply was split). Set and cleared by the runner.
+    notice?: string;
     // Last breadcrumbs from the runner, for a harness debugging a failure. Never shown
     // to the user: the pill reads `message`, this is diagnosis only.
     diagnostics?: string;
@@ -105,7 +108,8 @@ export function chapterMessage(s: ChapterProgress): string {
     if (s.phase === 'complete') return s.errors
         ? `${ready} · ${s.errors} ${s.errors === 1 ? 'page' : 'pages'} could not be translated`
         : `Chapter translation complete · ${s.done} ${s.done === 1 ? 'page' : 'pages'} ready to read`;
-    return `${ready}${s.inflight ? ` · Working on ${s.inflight} ${s.inflight === 1 ? 'page' : 'pages'}` : ''}`;
+    const working = `${ready}${s.inflight ? ` · Working on ${s.inflight} ${s.inflight === 1 ? 'page' : 'pages'}` : ''}`;
+    return s.notice ? `${working} · ${s.notice}` : working;
 }
 
 export function providerMessage(kind?: string): string {

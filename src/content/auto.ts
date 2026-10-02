@@ -13,7 +13,7 @@ import { translateRegions, warmPatches, type TranslateOutcome } from './ocr';
 import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto, keepaliveOpen } from './queue';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { cooldownMark, cooldownParked } from './page-cache';
-import { setActivity, removeActivity, lastMsgSet, renderStatus, registerAutoTranslateFlag } from './status-ui';
+import { setActivity, removeActivity, lastMsgSet, renderStatus, starveNotice, registerAutoTranslateFlag } from './status-ui';
 
 let autoTranslate = false;          // user toggle (persisted in storage.local)
 export function resetWarmedPages(): void { warmedUrls.clear(); }
@@ -113,7 +113,7 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         let o: TranslateOutcome;
         try {
             o = await translateRegions(bitmap, det, onStatus,
-                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled, lo: true, cacheEpoch });
+                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled, lo: true, cacheEpoch, onStarve: starveNotice });
         } finally {
             endKeepalive();
         }

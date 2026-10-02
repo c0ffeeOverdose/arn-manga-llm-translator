@@ -107,7 +107,7 @@ export async function rewindContextBefore(...targets: (PageState | undefined)[])
     let rebuilt: { pairs: [string, string][]; characters: CharacterEntry[] } = { pairs: [], characters: [] };
     for (const st of uniquePages()) {
         if (targets.includes(st) || !st.outputs?.length) continue;
-        rebuilt = updateContext(rebuilt, st.outputs, [], false, pipeline.contextPairs).ctx;
+        rebuilt = updateContext(rebuilt, st.outputs, [], false, pipeline.contextPairs, pipeline.charLimit).ctx;
     }
     setContext({ pairs: rebuilt.pairs, characters: context.characters });
 }
@@ -120,7 +120,7 @@ export function replayPagesAfter(target: PageState): void {
     if (at === -1) return;
     for (const ref of refs.slice(at + 1)) {
         const st = pages.get(refKey(ref));
-        if (st?.outputs?.length) setContext(updateContext(context, st.outputs, st.mentions ?? [], pipeline.useCharacters, pipeline.contextPairs).ctx);
+        if (st?.outputs?.length) setContext(updateContext(context, st.outputs, st.mentions ?? [], pipeline.useCharacters, pipeline.contextPairs, pipeline.charLimit).ctx);
     }
 }
 

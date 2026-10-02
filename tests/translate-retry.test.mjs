@@ -39,3 +39,12 @@ test('retryEmpty is threaded through callWithRetry, not hardcoded', () => {
   assert.match(BG.join('\n'), /retryEmpty\s*=\s*false/, 'callWithRetry signature must default retryEmpty=false');
   assert.match(BG.join('\n'), /if\s*\(\s*retryEmpty\s*&&\s*!emptyRetried/, 'the empty-retry guard must exist');
 });
+
+test('an empty completion names the model, finish reason and usage', () => {
+  // 2026-09-30: an empty 200 was blamed on starvation without recording which model it was.
+  // The log must identify model/finish/reasoning tokens so the next occurrence is diagnosable.
+  const src = BG.join('\n');
+  assert.match(src, /EMPTY response \(200, no content\) model=/, 'empty log carries the model');
+  assert.match(src, /finish=\$\{r\.finishReason/, 'empty log carries the finish reason');
+  assert.match(src, /reasonTok=\$\{r\.usage\?\.reasonTok/, 'empty log carries the reasoning token count');
+});

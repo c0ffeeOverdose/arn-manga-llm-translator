@@ -1,6 +1,6 @@
 // BYOK LLM adapters — 4 protocols, plain fetch, no SDKs. Run in the background service worker.
 
-import { splitStablePrefix, type ContextState, type RegionInput } from './core';
+import { splitUserForCache, type BuiltPrompt, type ContextState, type RegionInput } from './core';
 
 // A page can think for minutes — 240s timeout, shorter aborts mid-generation and double-bills via fallback.
 const LLM_TIMEOUT_MS = 240_000;
@@ -34,7 +34,7 @@ export const DEFAULT_BASES: Record<LLMSettings['provider'], string> = {
 
 export async function callLLM(
     s: LLMSettings,
-    prompt: string,
+    prompt: string | BuiltPrompt, // strings are legacy/test callers: no system block
     imagesB64?: string[], // jpeg base64 (no data: prefix); [0] = full page, rest = region crops
     thinkingLevel: string = 'auto', // preset, custom text, or a numeric token budget
     cacheKey?: string, // stable per conversation (manga) — routes provider-side prompt caching
@@ -56,43 +56,57 @@ export async function callLLM(
     const thinking = !t || t === 'auto' ? null : t;
     const temp = typeof temperature === 'number' && Number.isFinite(temperature) ? temperature : null;
     const imgs = imagesB64?.length ? imagesB64 : undefined;
+    const bp = asPrompt(prompt);
     const t0 = Date.now();
     try {
-        const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, temp, maxTokens);
+        const r = await dispatch(base, s, bp, imgs, thinking, cacheKey, temp, maxTokens);
         return { ...r, ms: Date.now() - t0 };
     } catch (e) {
         // refused by the provider: arm the window for this provider|baseUrl
         if (e instanceof LlmHttpError && e.status === 429) noteRateLimit(s, e.retryAfterMs ?? RATE_LIMIT_DEFAULT_MS);
+        // a provider/proxy that rejects the system role: merge it into the user message and
+        // retry once — the same rules still reach the model, just as a single message.
+        if (bp.system && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /system|role|instruction/i.test(e.message)) {
+            console.warn('[mt:bg] provider rejected the system role, retrying as one user message');
+            const r = await dispatch(base, s, { system: '', user: bp.system + '\n' + bp.user }, imgs, thinking, cacheKey, temp, maxTokens);
+            return { ...r, ms: Date.now() - t0, systemDropped: true };
+        }
         // some models reject the thinking param entirely — retry once without it
         if (thinking && e instanceof LlmHttpError && (e.status === 400 || e.status === 422)) {
             console.warn('[mt:bg] model rejected thinking level, retrying without');
             try {
-                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, temp, maxTokens);
+                const r = await dispatch(base, s, bp, imgs, null, cacheKey, temp, maxTokens);
                 return { ...r, ms: Date.now() - t0, thinkingDropped: true };
             } catch (e2) {
                 if (!(temp != null && e2 instanceof LlmHttpError && /temperature/i.test(e2.message))) throw e2;
                 console.warn('[mt:bg] model rejected pinned temperature, retrying without');
-                const r = await dispatch(base, s, prompt, imgs, null, cacheKey, null, maxTokens);
+                const r = await dispatch(base, s, bp, imgs, null, cacheKey, null, maxTokens);
                 return { ...r, ms: Date.now() - t0, tempDropped: true, thinkingDropped: true };
             }
         }
         // reasoning-first models may reject any non-default temperature — error-driven, no model-name table
         if (temp != null && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /temperature/i.test(e.message)) {
             console.warn('[mt:bg] model rejected pinned temperature, retrying without');
-            const r = await dispatch(base, s, prompt, imgs, thinking, cacheKey, null, maxTokens);
+            const r = await dispatch(base, s, bp, imgs, thinking, cacheKey, null, maxTokens);
             return { ...r, ms: Date.now() - t0, tempDropped: true };
         }
         throw e;
     }
 }
 
-function dispatch(base: string, s: LLMSettings, prompt: string, imgs: string[] | undefined, thinking: string | null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
+// One role pair or a legacy bare string — adapters always render roles explicitly.
+export function asPrompt(p: string | BuiltPrompt): BuiltPrompt {
+    return typeof p === 'string' ? { system: '', user: p } : p;
+}
+
+function dispatch(base: string, s: LLMSettings, prompt: string | BuiltPrompt, imgs: string[] | undefined, thinking: string | null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> {
+    const bp = asPrompt(prompt);
     switch (s.provider) {
-        case 'openai': return openaiChat(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
-        case 'responses': return responses(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
-        case 'anthropic': return anthropic(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
-        case 'gemini': return gemini(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
-        case 'cloudflare': return cloudflareChat(base, s, prompt, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'openai': return openaiChat(base, s, bp, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'responses': return responses(base, s, bp, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'anthropic': return anthropic(base, s, bp, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'gemini': return gemini(base, s, bp, imgs, thinking, cacheKey, temperature, maxTokens);
+        case 'cloudflare': return cloudflareChat(base, s, bp, imgs, thinking, cacheKey, temperature, maxTokens);
     }
 }
 
@@ -133,11 +147,13 @@ export function isImageCapError(e: unknown): boolean {
 }
 
 // result of one LLM call: text + normalized usage (when the provider reports it)
-export interface LlmUsage { inTok?: number; outTok?: number; cachedInTok?: number }
+export interface LlmUsage { inTok?: number; outTok?: number; cachedInTok?: number; reasonTok?: number }
 export interface LlmResult {
     text: string; usage?: LlmUsage; ms: number;
+    finishReason?: string; // provider stop reason — how a 200 with no content names itself
     tempDropped?: boolean; // the model rejected the pinned temperature; retried without it (OCR memoizes this per model)
     thinkingDropped?: boolean; // the model rejected the thinking param; retried without (OCR memoizes this per model)
+    systemDropped?: boolean; // the provider rejected the system role; retried as one user message
 }
 
 // Provider JSON is untrusted (BYOK baseUrl can be a proxy): coerce usage counters
@@ -246,12 +262,15 @@ export async function checkThinking(s: LLMSettings, thinking: string, cacheKey?:
 }
 
 // OpenAI-compatible chat/completions (OpenAI, OpenRouter, ollama, gemini-compat...)
-async function openaiChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
-    const content: unknown[] = [{ type: 'text', text: prompt }];
+async function openaiChat(base: string, s: LLMSettings, prompt: BuiltPrompt, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> {
+    const content: unknown[] = [{ type: 'text', text: prompt.user }];
     for (const b64 of images ?? []) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
+    const messages: unknown[] = prompt.system
+        ? [{ role: 'system', content: prompt.system }, { role: 'user', content }]
+        : [{ role: 'user', content }];
     const body: Record<string, unknown> = {
         model: s.model,
-        messages: [{ role: 'user', content }],
+        messages,
         max_tokens: maxTokens ?? 4096,
     };
     if (thinking) body.reasoning_effort = thinking; // GPT-5/o-series via chat; ignored by older
@@ -271,15 +290,21 @@ async function openaiChat(base: string, s: LLMSettings, prompt: string, images?:
     const data = JSON.parse(text);
     return {
         text: data.choices?.[0]?.message?.content ?? '',
-        usage: { inTok: num(data.usage?.prompt_tokens), outTok: num(data.usage?.completion_tokens), cachedInTok: num(data.usage?.prompt_tokens_details?.cached_tokens) },
+        finishReason: typeof data.choices?.[0]?.finish_reason === 'string' ? data.choices[0].finish_reason : undefined,
+        usage: {
+            inTok: num(data.usage?.prompt_tokens), outTok: num(data.usage?.completion_tokens),
+            cachedInTok: num(data.usage?.prompt_tokens_details?.cached_tokens),
+            reasonTok: num(data.usage?.completion_tokens_details?.reasoning_tokens),
+        },
     };
 }
 
 // Responses API (OpenAI responses, OpenCode Zen/Go, Muse Spark)
-async function responses(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
-    const content: unknown[] = [{ type: 'input_text', text: prompt }];
+async function responses(base: string, s: LLMSettings, prompt: BuiltPrompt, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> {
+    const content: unknown[] = [{ type: 'input_text', text: prompt.user }];
     for (const b64 of images ?? []) content.push({ type: 'input_image', image_url: `data:image/jpeg;base64,${b64}` });
     const body: Record<string, unknown> = { model: s.model, input: [{ role: 'user', content }] };
+    if (prompt.system) body.instructions = prompt.system;
     if (thinking) body.reasoning = { effort: thinking };
     if (temperature != null) body.temperature = temperature;
     // max_output_tokens only when explicitly set — the cap INCLUDES reasoning tokens,
@@ -319,7 +344,14 @@ async function responses(base: string, s: LLMSettings, prompt: string, images?: 
     }
     return {
         text: answer,
-        usage: { inTok: num(data.usage?.input_tokens), outTok: num(data.usage?.output_tokens), cachedInTok: num(data.usage?.input_tokens_details?.cached_tokens) },
+        finishReason: data.status === 'incomplete'
+            ? `incomplete:${String(data.incomplete_details?.reason ?? 'unknown')}`
+            : (typeof data.status === 'string' ? data.status : undefined),
+        usage: {
+            inTok: num(data.usage?.input_tokens), outTok: num(data.usage?.output_tokens),
+            cachedInTok: num(data.usage?.input_tokens_details?.cached_tokens),
+            reasonTok: num(data.usage?.output_tokens_details?.reasoning_tokens),
+        },
     };
 }
 
@@ -328,24 +360,26 @@ const ANTHROPIC_BUDGET: Record<string, number> = { low: 2048, medium: 4096, high
 const ANTHROPIC_MAXTOK: Record<string, number> = { low: 8192, medium: 8192, high: 16384, xhigh: 32768, max: 65536 };
 
 // Anthropic messages API (direct browser access header)
-async function anthropic(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
-    // cache needs explicit breakpoint on the STABLE part: split at <regions>.
+async function anthropic(base: string, s: LLMSettings, prompt: BuiltPrompt, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> {
+    // Two cache segments: the system block (stable instructions) stays cached across pages,
+    // and the book block is cached separately so book changes don't invalidate the rules.
     // Text-first so volatile images can't cut the prefix.
-    const split = splitStablePrefix(prompt);
     const content: unknown[] = [];
-    if (split) {
-        content.push({ type: 'text', text: split.stable, cache_control: { type: 'ephemeral' } });
-        content.push({ type: 'text', text: split.varying });
+    const seg = splitUserForCache(prompt.user);
+    if (seg) {
+        content.push({ type: 'text', text: seg.head, cache_control: { type: 'ephemeral' } });
+        content.push({ type: 'text', text: seg.tail });
     } else {
-        content.push({ type: 'text', text: prompt });
+        content.push({ type: 'text', text: prompt.user });
     }
     for (const b64 of images ?? []) {
         content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } });
     }
     const baseBody: Record<string, unknown> = { model: s.model, max_tokens: maxTokens ?? 4096, messages: [{ role: 'user', content }] };
+    if (prompt.system) baseBody.system = [{ type: 'text', text: prompt.system, cache_control: { type: 'ephemeral' } }];
     // temperature and extended thinking are mutually exclusive (API 400) — drop temperature, keep talking
     if (temperature != null && (!thinking || thinking === 'none')) baseBody.temperature = temperature;
-    const send = async (patch: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage }> => {
+    const send = async (patch: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> => {
         const body = { ...baseBody, ...patch };
         const resp = await fetch(`${base}/v1/messages`, {
             method: 'POST',
@@ -363,6 +397,7 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
         const data = JSON.parse(text);
         return {
             text: (data.content ?? []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n'),
+            finishReason: typeof data.stop_reason === 'string' ? data.stop_reason : undefined,
             usage: { inTok: num(data.usage?.input_tokens), outTok: num(data.usage?.output_tokens), cachedInTok: num(data.usage?.cache_read_input_tokens) },
         };
     };
@@ -392,11 +427,13 @@ async function anthropic(base: string, s: LLMSettings, prompt: string, images?: 
 const GEMINI_BUDGET: Record<string, number> = { none: 0, low: 2048, medium: 4096, high: 8192, xhigh: 16384, max: 24576 };
 
 // Gemini generateContent
-async function gemini(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
-    const parts: unknown[] = [{ text: prompt }];
+async function gemini(base: string, s: LLMSettings, prompt: BuiltPrompt, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> {
+    const parts: unknown[] = [{ text: prompt.user }];
     for (const b64 of images ?? []) parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
-    const send = async (thinkingConfig?: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage }> => {
+    const send = async (thinkingConfig?: Record<string, unknown>): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> => {
         const body: Record<string, unknown> = { contents: [{ parts }] };
+        // systemInstruction is a first-class field; a stable instruction block feeds implicit caching
+        if (prompt.system) body.systemInstruction = { parts: [{ text: prompt.system }] };
         const generationConfig: Record<string, unknown> = {};
         if (temperature != null) generationConfig.temperature = temperature;
         if (maxTokens != null) generationConfig.maxOutputTokens = maxTokens;
@@ -416,7 +453,11 @@ async function gemini(base: string, s: LLMSettings, prompt: string, images?: str
         const data = JSON.parse(text);
         return {
             text: (data.candidates?.[0]?.content?.parts ?? []).map((p: any) => p.text ?? '').join(''),
-            usage: { inTok: num(data.usageMetadata?.promptTokenCount), outTok: num(data.usageMetadata?.candidatesTokenCount) },
+            finishReason: typeof data.candidates?.[0]?.finishReason === 'string' ? data.candidates[0].finishReason : undefined,
+            usage: {
+                inTok: num(data.usageMetadata?.promptTokenCount), outTok: num(data.usageMetadata?.candidatesTokenCount),
+                reasonTok: num(data.usageMetadata?.thoughtsTokenCount),
+            },
         };
     };
     if (!thinking) return send();
@@ -441,11 +482,15 @@ export function cfRunUrl(base: string, model: string): string {
     const b = base.replace(/\/+$/, '').replace(/\/v1$/, '');
     return `${b}/run/${model.replace(/^\/+/, '')}`;
 }
-export function cfBody(prompt: string, images?: string[], thinking?: string | null, temperature?: number | null, maxTokens?: number): Record<string, unknown> {
-    const content: unknown[] = [{ type: 'text', text: prompt }];
+export function cfBody(prompt: string | BuiltPrompt, images?: string[], thinking?: string | null, temperature?: number | null, maxTokens?: number): Record<string, unknown> {
+    const bp = asPrompt(prompt);
+    const content: unknown[] = [{ type: 'text', text: bp.user }];
     for (const b64 of images ?? []) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
+    const messages: unknown[] = bp.system
+        ? [{ role: 'system', content: bp.system }, { role: 'user', content }]
+        : [{ role: 'user', content }];
     // max_tokens explicit: native default 256 truncates. Temperature defaults 0 (CF 0.6 drifts); explicit setting overrides.
-    const body: Record<string, unknown> = { messages: [{ role: 'user', content }], max_tokens: maxTokens ?? 4096, temperature: temperature ?? 0 };
+    const body: Record<string, unknown> = { messages, max_tokens: maxTokens ?? 4096, temperature: temperature ?? 0 };
     // 'none' = omit the param (CF 400s the literal); other levels ride along with the same fallback
     if (thinking && thinking !== 'none') body.reasoning_effort = thinking;
     return body;
@@ -453,19 +498,22 @@ export function cfBody(prompt: string, images?: string[], thinking?: string | nu
 export function cfParse(data: {
     result?: {
         response?: unknown;
-        choices?: Array<{ message?: { content?: unknown } }>;
-        usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } };
+        choices?: Array<{ message?: { content?: unknown }; finish_reason?: unknown }>;
+        usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown }; completion_tokens_details?: { reasoning_tokens?: unknown } };
     };
-} | null): { text: string; usage?: LlmUsage } {
+} | null): { text: string; usage?: LlmUsage; finishReason?: string } {
     const r = data?.result ?? {};
     const msg = r.choices?.[0]?.message;
     const text = typeof r.response === 'string' ? r.response : (typeof msg?.content === 'string' ? msg.content : '');
+    const finish = r.choices?.[0]?.finish_reason;
     return {
         text,
+        finishReason: typeof finish === 'string' ? finish : undefined,
         usage: {
             inTok: num(r.usage?.prompt_tokens),
             outTok: num(r.usage?.completion_tokens),
             cachedInTok: num(r.usage?.prompt_tokens_details?.cached_tokens),
+            reasonTok: num(r.usage?.completion_tokens_details?.reasoning_tokens),
         },
     };
 }
@@ -482,7 +530,7 @@ export function cfImageCapHint(providerCode: number | undefined, imageCount: num
     if (providerCode !== 3030 || imageCount < 2) return undefined;
     return `This Cloudflare model may not accept ${imageCount} images in one request — switch "How the model reads text" to OCR text (local Baberu), or pick a model that takes multiple images`;
 }
-async function cloudflareChat(base: string, s: LLMSettings, prompt: string, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage }> {
+async function cloudflareChat(base: string, s: LLMSettings, prompt: BuiltPrompt, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> {
     if (/<ACCOUNT_ID>/.test(base))
         throw new MtError('auth', 'Cloudflare Base URL still contains <ACCOUNT_ID>',
             'Replace <ACCOUNT_ID> with your Cloudflare account id (Settings → Model → Base URL)');

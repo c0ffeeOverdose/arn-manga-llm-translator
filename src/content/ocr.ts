@@ -7,7 +7,7 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
-import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, INPAINT_PATCH_GEN } from './page-cache';
+import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, nextChunkSize, INPAINT_PATCH_GEN } from './page-cache';
 import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './render';
 import { erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
@@ -39,6 +39,11 @@ export function abortLiveRpcs(): number {
     for (const r of [...liveRpcs]) { if (r.abort) { n++; try { r.abort(); } catch { /* already gone */ } } }
     return n;
 }
+
+// Adaptive request size for region translation: null = try the whole page in one request.
+// A reply that comes back empty/formatless halves this for the rest of this script instance —
+// observed behaviour only, no model table; 6 is no longer a fixed cap.
+let llmChunkSize: number | null = null;
 
 export async function warmPatches(
     bitmap: ImageBitmap, det: DetectResult, outputs: RegionOutput[],
@@ -416,10 +421,13 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void },
 ): Promise<TranslateOutcome> {
     const cacheEpoch = opts?.cacheEpoch ?? await cacheReady();
     assertCacheCurrent(cacheEpoch);
+    // A fresh user intent (Re-translate) re-probes the whole page — one-off starvation must not
+    // keep every later request small for the rest of the script instance. A reload resets too.
+    if (opts?.fresh) llmChunkSize = null;
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
     // ponytail: region cap 150 — dense art pages can drown a single LLM call.
     if (det.boxes.length > 150) det.boxes = det.boxes.slice(0, 150);
@@ -531,11 +539,12 @@ export async function translateRegions(
             onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
         }, 1000);
         opts?.afterOcr?.();
-        // A single request carrying the full page plus a crop per region starves the model's
-        // output budget: ~10+ regions routinely answered 200 with no content while a 3-6 region
-        // request answered fine. Split into chunks and merge. The annotated full page (index 0)
-        // rides only the chunk's own regions, so the prompt stays consistent per request.
-        const chunks = regionChunks(regions);
+        // No fixed per-request cap: try the whole page first. A reply that comes back empty or
+        // without a parseable answer halves the size for this script instance and retries the
+        // same regions smaller (see the work loop). The annotated full page (index 0) rides only
+        // the chunk's own regions, so the prompt stays consistent per request.
+        const work = regionChunks(regions, llmChunkSize ?? Math.max(1, regions.length));
+        if (!work.length) work.push(regions); // parity: an empty region list still runs one request
         // Renumber each chunk to 1..n and pair it with its own crops. The prompt numbers
         // regions by `index` while the crops travel positionally, and the background reads
         // `imagesB64[index]` — so a chunk carrying page-global indices (7..12) asked for
@@ -622,7 +631,8 @@ export async function translateRegions(
             usage: Record<string, number>; calls: number; ms: number; context?: ContextState; bookOps: BookOp[] } =
             { outputs: [], extras: [], mentions: [], raw: '', usage: {}, calls: 0, ms: 0, bookOps: [] };
         try {
-            for (const chunk of chunks.length ? chunks : [regions]) {
+            while (work.length) {
+                const chunk = work.shift()!;
                 assertCacheCurrent(cacheEpoch);
                 const one = chunkPayload(chunk);
                 try {
@@ -655,6 +665,15 @@ export async function translateRegions(
                 if (!resp?.ok) {
                     const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string; retryAfterMs?: number };
                     err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
+                    // Size-sensitive failure (empty answer / ignored format): split the same
+                    // regions and retry smaller before failing the page; remember the size.
+                    if (resp?.kind === 'parse' && chunk.length > 1) {
+                        llmChunkSize = nextChunkSize(chunk.length);
+                        console.warn(`[mt:trace] chunk starved at ${chunk.length} regions — retrying as ${llmChunkSize}`);
+                        opts?.onStarve?.();
+                        work.unshift(...regionChunks(chunk, llmChunkSize));
+                        continue;
+                    }
                     throw err;
                 }
                 // Replies carry chunk-local indices; map them back to the page's own

@@ -5,8 +5,10 @@ export interface ContextLedger {
     base: ContextState;
     entries: Contribution[];
     edits: { key: string; value: CharacterEntry | null }[];
+    maxChars?: number; // roster cap the replay was recorded under (undefined = module default)
 }
-const keyOf = (c: CharacterEntry) => c.fullName || c.name || c.desc;
+// Ids are the stable identity: a user edit keyed by id survives a desc rewrite from later pages.
+const keyOf = (c: CharacterEntry) => c.id || c.fullName || c.name || c.desc;
 
 // User edits are replayed after page contributions, including explicit removals.
 export function recordEdits(ledger: ContextLedger, before: ContextState, after: ContextState): void {
@@ -18,11 +20,11 @@ export function recordEdits(ledger: ContextLedger, before: ContextState, after: 
         ledger.edits.push({ key, value: next.get(key) ?? null });
     }
 }
-export function replayLedger(ledger: ContextLedger, learn: boolean, maxPairs: number, beforeOrder = Infinity): ContextState {
+export function replayLedger(ledger: ContextLedger, learn: boolean, maxPairs: number, beforeOrder = Infinity, maxChars?: number): ContextState {
     let ctx = structuredClone(ledger.base);
     for (const e of [...ledger.entries].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))) {
         if (e.order >= beforeOrder) continue;
-        ctx = updateContext(ctx, e.outputs, e.mentions, learn, maxPairs).ctx;
+        ctx = updateContext(ctx, e.outputs, e.mentions, learn, maxPairs, maxChars ?? ledger.maxChars).ctx;
     }
     for (const edit of ledger.edits) {
         ctx.characters = ctx.characters.filter(c => keyOf(c) !== edit.key);

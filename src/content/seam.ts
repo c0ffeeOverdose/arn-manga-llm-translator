@@ -15,6 +15,7 @@ import { detectPage, orderDetection, paintRegions, paintExtras, type Prep } from
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
 import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet, paintFind } from './queue';
 import { bookAdd, bookDrop } from './sweep';
+import { starveNotice } from './status-ui';
 
 interface SeamMember { ref: PageRef; key: string; srcUrl: string; bitmap: ImageBitmap; hash: string; det: DetectResult }
 export const SEAM_MAX = 4; // owner + 3 — bounds the stitch canvas + pulled jobs
@@ -282,7 +283,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         await loadContext();
         const bookBefore = context.characters;
         const pairsBefore = context.pairs;
-        const outcome = await translateRegions(stitchBmp, det, onStatus, { cacheEpoch });
+        const outcome = await translateRegions(stitchBmp, det, onStatus, { cacheEpoch, onStarve: starveNotice });
         if (outcome.error) { prune(); return null; } // members fall back to solo (parked normally)
         for (const m of chain) bookAdd(m.hash); // folded above (whole-stitch context) — arrivals skip refold
         const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = outcome;

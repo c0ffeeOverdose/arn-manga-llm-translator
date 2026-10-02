@@ -136,7 +136,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             if (msg.type === 'mt:chapter-host-init') { attachWatch.hit(config.id); return { ok: true, config }; }
             if (msg.type === 'mt:chapter-context') {
                 const context = await chapterContext(config.chapter, config.bookKey, config.pipeline.useCharacters,
-                    config.pipeline.contextPairs, msg.entries, msg.beforeOrder);
+                    config.pipeline.contextPairs, config.pipeline.charLimit, msg.entries, msg.beforeOrder);
                 if (msg.entries) void chrome.tabs.sendMessage(config.readerTab, { type: 'mt:chapter-context-updated', chapter: config.chapter, context }).catch(() => {});
                 return { ok: true, context };
             }

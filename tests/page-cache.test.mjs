@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, nextChunkSize, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -931,13 +931,19 @@ test('pageKey is a page identity, distinct from the bytes key', () => {
   assert.notEqual(pageKey('ch1', 4), cacheKey('ch1', 'deadbeef'));
 });
 
-test('regionChunks splits a page so no request starves its own answer', () => {  // A single request with the page plus a crop per region came back 200 with no content
-  // once a page had ~10+ regions, while 3-6 region requests answered fine.
-  assert.deepEqual(regionChunks([1, 2, 3, 4, 5, 6, 7]), [[1, 2, 3, 4, 5, 6], [7]]);
-  assert.deepEqual(regionChunks([1, 2, 3]), [[1, 2, 3]]);
-  assert.deepEqual(regionChunks([]), []);
+test('regionChunks splits exactly by the caller-chosen size (no fixed cap built in)', () => {
+  assert.deepEqual(regionChunks([1, 2, 3], 10), [[1, 2, 3]], 'size above the list = one request');
   assert.deepEqual(regionChunks([1, 2, 3, 4], 2), [[1, 2], [3, 4]]);
+  assert.deepEqual(regionChunks([1, 2, 3, 4, 5], 4), [[1, 2, 3, 4], [5]]);
+  assert.deepEqual(regionChunks([]), []);
   assert.deepEqual(regionChunks([1, 2, 3], 0), []); // defensive: never loop forever
+});
+
+test('nextChunkSize halves a starved request, floored at one region', () => {
+  assert.equal(nextChunkSize(12), 6);
+  assert.equal(nextChunkSize(7), 3);
+  assert.equal(nextChunkSize(2), 1);
+  assert.equal(nextChunkSize(1), 1);
 });
 
 test('readerChapterFiles reads the shapes a reader chapter endpoint returns', () => {

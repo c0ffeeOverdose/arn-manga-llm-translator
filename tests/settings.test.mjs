@@ -219,13 +219,23 @@ test('autoSiteList sanitizes; add/remove are idempotent', () => {
   assert.deepEqual(autoSiteRemove(['https://a.org'], 'https://x.org'), ['https://a.org']);
 });
 
-test('contextPairs validated 0-200, rounded, default 40', () => {
+test('contextPairs validated 0-200, rounded, default 15', () => {
   assert.equal(loadPipelineSettings({ contextPairs: 80 }).contextPairs, 80);
   assert.equal(loadPipelineSettings({ contextPairs: 200 }).contextPairs, 200);
-  assert.equal(loadPipelineSettings({ contextPairs: 201 }).contextPairs, 40);
-  assert.equal(loadPipelineSettings({ contextPairs: -1 }).contextPairs, 40);
+  assert.equal(loadPipelineSettings({ contextPairs: 201 }).contextPairs, 15);
+  assert.equal(loadPipelineSettings({ contextPairs: -1 }).contextPairs, 15);
   assert.equal(loadPipelineSettings({ contextPairs: 67.7 }).contextPairs, 68);
-  assert.equal(loadPipelineSettings({}).contextPairs, 40);
+  assert.equal(loadPipelineSettings({}).contextPairs, 15);
+});
+
+test('charLimit validated 3-30, rounded, default 10', () => {
+  assert.equal(loadPipelineSettings({}).charLimit, 10);
+  assert.equal(loadPipelineSettings({ charLimit: 12 }).charLimit, 12);
+  assert.equal(loadPipelineSettings({ charLimit: 30 }).charLimit, 30);
+  assert.equal(loadPipelineSettings({ charLimit: 7.6 }).charLimit, 8);
+  assert.equal(loadPipelineSettings({ charLimit: 99 }).charLimit, 10);
+  assert.equal(loadPipelineSettings({ charLimit: -1 }).charLimit, 10);
+  assert.equal(loadPipelineSettings({ charLimit: 'many' }).charLimit, 10);
 });
 
 test('detConf clamps to 0-1, showToasts defaults true, wrong types reset', () => {
