@@ -39,10 +39,10 @@ test('a finishing attempt never fires its expiry', async () => {
 test('the runner expires one page, never the whole run', () => {
     const src = readFileSync(new URL('../src/chapter/page.ts', import.meta.url), 'utf8');
     const lease = src.slice(src.indexOf('const attempt = new Attempt({'), src.indexOf('attempts.add(attempt)'));
-    assert.match(lease, /slot\.phase = 'failed'/, 'expiry must fail that page only');
+    assert.match(lease, /item\.phase = 'failed'/, 'expiry must fail that page only');
     assert.ok(!/stop\(/.test(lease), 'an expired page must never stop the run');
     // The stall is named for the log: an offscreen runner has no console to inspect.
     assert.match(lease, /stuck in/, 'the expired stage must be recorded');
-    // And a batch that made no progress at all must say so.
-    assert.match(src, /batch stalled/, 'a stalled batch must name the pages holding it');
+    // A merged group that outlives its lease must say so and degrade to per-page calls.
+    assert.match(src, /trying per-page/, 'a stalled group must name what held it');
 });

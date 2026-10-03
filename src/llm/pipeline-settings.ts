@@ -42,6 +42,7 @@ export interface PipelineSettings {
     ocrTemperature: number | null; // VLM reader's transcribe calls; default 0 (glyph copying wants no sampling); null = provider default
     ocrThinking: string; // thinking level for the separate VLM reader's transcribe call (default 'none' — copying glyphs needs no reasoning)
     parallelLlm: number;        // concurrent LLM calls when context is OFF (1 = serial)
+    mergePages: number;         // chapter runner: pages sent in one LLM request (1 = one page per request)
     prefetchN: number;         // auto pre-translate window: queued pages ahead (1-30)
     // rendering
     renderFont: string;         // 'default' = bundled Sriracha/system per language; else a font-store id
@@ -91,6 +92,7 @@ export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     ocrTemperature: 0,
     ocrThinking: 'none',
     parallelLlm: 3,
+    mergePages: 1,
     prefetchN: 3,
     minFont: 12,
     renderFont: 'default',
@@ -240,6 +242,9 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (out.detEp !== 'auto' && out.detEp !== 'wasm') out.detEp = 'auto';
     if (typeof out.prefetchN !== 'number' || !(out.prefetchN >= 1 && out.prefetchN <= 30)) out.prefetchN = 3;
     else out.prefetchN = Math.round(out.prefetchN);
+    // batching knob: 1 = one page per request (the pre-merge behaviour)
+    if (typeof out.mergePages !== 'number' || !(out.mergePages >= 1 && out.mergePages <= 6)) out.mergePages = 1;
+    else out.mergePages = Math.round(out.mergePages);
     if (typeof out.cacheEnabled !== 'boolean') out.cacheEnabled = true;
     if (typeof out.cacheMax !== 'number' || !(out.cacheMax >= 10 && out.cacheMax <= 2000)) out.cacheMax = 200;
     else out.cacheMax = Math.round(out.cacheMax);

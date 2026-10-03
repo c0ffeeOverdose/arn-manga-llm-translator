@@ -421,7 +421,7 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean },
 ): Promise<TranslateOutcome> {
     const cacheEpoch = opts?.cacheEpoch ?? await cacheReady();
     assertCacheCurrent(cacheEpoch);
@@ -429,8 +429,10 @@ export async function translateRegions(
     // keep every later request small for the rest of the script instance. A reload resets too.
     if (opts?.fresh) llmChunkSize = null;
     if (!det.boxes.length) return { outputs: [], extras: [], mentions: [], usedLLM: false, annW: bitmap.width, annH: bitmap.height };
-    // ponytail: region cap 150 — dense art pages can drown a single LLM call.
-    if (det.boxes.length > 150) det.boxes = det.boxes.slice(0, 150);
+    // ponytail: region cap 150 — dense art pages can drown a single LLM call. A merged
+    // multi-page call raises the cap to its own box total (the cap exists per request).
+    const regionCap = opts?.regionCap ?? 150;
+    if (det.boxes.length > regionCap) det.boxes = det.boxes.slice(0, regionCap);
     await loadContext();
     onStatus('Translating…');
     const regions: RegionInput[] = det.boxes.map((b, i) => ({
@@ -441,7 +443,7 @@ export async function translateRegions(
     // detect wrote, so a reload/retry resumes at translation instead of
     // re-paying the OCR. Written even with the cache off (in-flight work).
     const checkpointOcr = (texts: string[]) => {
-        if (det.cloudTexts || !texts.some(t => t)) return;
+        if (opts?.checkpoint === false || det.cloudTexts || !texts.some(t => t)) return;
         const boxes = det.boxes.length === texts.length ? det.boxes : det.boxes.slice(0, texts.length);
         void cachePut(partialEntry(cacheKey(chapterKey(), pageHashFromBitmap(bitmap)), settingsFingerprint(pipeline),
             { ...det, boxes, cloudTexts: texts }, bitmap.width, bitmap.height), pipeline.cacheMax, cacheEpoch);

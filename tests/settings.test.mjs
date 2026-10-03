@@ -299,3 +299,12 @@ test('presets never touch the AI cleanup choice', () => {
   assert.equal(applyPreset('fast').inpaint, DEFAULT_PIPELINE_SETTINGS.inpaint);
   assert.equal(applyPreset('best').inpaint, DEFAULT_PIPELINE_SETTINGS.inpaint);
 });
+
+test('mergePages is a batching knob with defensive bounds', () => {
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.mergePages, 1);
+  assert.equal(loadPipelineSettings({ mergePages: 3 }).mergePages, 3);
+  assert.equal(loadPipelineSettings({ mergePages: 0 }).mergePages, 1);
+  assert.equal(loadPipelineSettings({ mergePages: 99 }).mergePages, 1);
+  assert.equal(loadPipelineSettings({ mergePages: 2.6 }).mergePages, 3);
+  assert.equal(loadPipelineSettings({ mergePages: 'x' }).mergePages, 1);
+});

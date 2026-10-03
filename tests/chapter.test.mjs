@@ -9,7 +9,7 @@ await build({ entryPoints: ['src/chapter/plan.ts'], bundle: true, format: 'esm',
 const { replayLedger, replaceContribution, recordEdits } = await import('../.test-build/chapter-context.mjs');
 const { remainingPages, chapterMessage, fetchSourceWithAlternate } = await import('../.test-build/chapter-model.mjs');
 const { sameChapterDocument } = await import('../.test-build/chapter-discovery.mjs');
-const { nextBatch, pagePhase } = await import('../.test-build/chapter-plan.mjs');
+const { nextBatch, nextGroup, pagePhase } = await import('../.test-build/chapter-plan.mjs');
 const empty = () => ({ base: { pairs: [], characters: [] }, entries: [], edits: [] });
 const contribution = (order, translation = `page ${order}`) => ({ id: `page:${order}`, order, hash: `hash${order}`,
     outputs: [{ index: 1, source: `source ${order}`, translation }], mentions: [] });
@@ -128,4 +128,21 @@ test('a waiting page is skipped, never allowed to stall the queue', () => {
     assert.equal(pagePhase('waiting'), 'waiting');
     assert.equal(pagePhase('rendering'), 'rendering');
     assert.equal(pagePhase('ready'), 'ready');
+});
+test('a rolling group takes up to its size, priority first, and skips waiting pages', () => {
+    const all = pages(6).map(() => 'queued');
+    assert.deepEqual(nextGroup(all, pages(6), { size: 2, priority: '' }).map(b => b.order), [0, 1]);
+    assert.deepEqual(nextGroup(all, pages(6), { size: 3, priority: 'p4' }).map(b => b.order), [4, 0, 1]);
+    assert.deepEqual(nextGroup(['waiting', 'queued', 'queued'], pages(3), { size: 3, priority: '' }).map(b => b.order), [1, 2]);
+    // the planner never asks for more than 6 — slots bound concurrency, not the group size
+    assert.equal(nextGroup(all, pages(6), { size: 99, priority: '' }).length, 6);
+});
+test('rolling groups drain every queued page in reading order', () => {
+    const seen = [];
+    const phases = pages(7).map(() => 'queued');
+    let group;
+    while ((group = nextGroup(phases, pages(7), { size: 2, priority: '' })).length) {
+        for (const g of group) { seen.push(g.order); phases[g.order] = 'ready'; }
+    }
+    assert.deepEqual(seen, [0, 1, 2, 3, 4, 5, 6]);
 });
