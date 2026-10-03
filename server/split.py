@@ -6,7 +6,7 @@ import math
 # ---- box splitting (ported 1:1 from src/content/detection.ts) ----
 # Preserve two JS-isms: Math.round halves UP on positives (use _r) and medians are the UPPER middle (use _med).
 # Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on children); comps are plain rects (no count/psum).
-SPLIT_GEN = 9  # bump when this section's logic changes; /v1/page reports it
+SPLIT_GEN = 10  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
@@ -103,6 +103,32 @@ def extend_mask_box(c, candidates, overlaps_box):
     r = {"x1": min(c["x1"], best["x1"] - pad), "y1": min(c["y1"], best["y1"] - pad),
          "x2": max(c["x2"], best["x2"] + pad), "y2": max(c["y2"], best["y2"] + pad)}
     return c if overlaps_box(r) else r
+
+
+def corroborated_core(members, corr, gap, eligible):
+    """Mirror of corroboratedCore (src/content/detection.ts): a merged mask group can
+    chain an uncorroborated tail (SFX strokes, artwork marks) onto model-corroborated
+    text. When every uncorroborated cluster fails eligibility on its own and at least
+    one corroborated cluster passes, return the corroborated clusters; any other
+    mixture returns None (keep the whole group, never split a real second mass away)."""
+    corr_members = [m for m, c in zip(members, corr) if c]
+    uncorr_members = [m for m, c in zip(members, corr) if not c]
+    if not corr_members or not uncorr_members:
+        return None
+
+    def aggregate(ms):
+        return {"x1": min(m["x1"] for m in ms), "y1": min(m["y1"] for m in ms),
+                "x2": max(m["x2"] for m in ms), "y2": max(m["y2"] for m in ms),
+                "count": sum(m["count"] for m in ms), "psum": sum(m["psum"] for m in ms),
+                "labs": set().union(*[m.get("labs", set()) for m in ms])}
+
+    def clusters(ms):
+        return [aggregate([ms[i] for i in idx]) for idx in group_mask_components(ms, gap)]
+
+    if any(eligible(c) for c in clusters(uncorr_members)):
+        return None
+    core = [c for c in clusters(corr_members) if eligible(c)]
+    return core or None
 
 
 def split_merged_boxes(boxes, comps, same_block_gap, box_comps=None):

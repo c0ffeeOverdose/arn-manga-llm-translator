@@ -400,8 +400,10 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     // Already-boxed glyphs cannot bridge two unclaimed text groups. Split evidence
     // above still retains every component for the head boxes themselves.
     const maskComps = comps.filter(c => !overlap(c));
+    const mergedMembers: Comp[][] = [];
     const mergedComps = groupMaskComponents(maskComps, GAP).map(indices => {
         const members = indices.map(i => maskComps[i]);
+        mergedMembers.push(members);
         return {
             x1: Math.min(...members.map(c => c.x1)), y1: Math.min(...members.map(c => c.y1)),
             x2: Math.max(...members.map(c => c.x2)), y2: Math.max(...members.map(c => c.y2)),
@@ -435,18 +437,27 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
             (x1, y1, x2, y2) => recount(c.ids, x1, y1, x2, y2),
             overlap, compBoxConf);
     };
-    for (const c of mergedComps) {
+    for (let gi = 0; gi < mergedComps.length; gi++) {
         if (maskBoxes.length >= 16) break;
-        if (!maskComponentEligible(c, pageArea, compBoxConf(c))) continue;
-        if (!overlap(c)) {
-            const grown = extendMaskBox(c, maskCandidates, overlap);
-            maskBoxes.push({ x1: Math.max(0, grown.x1), y1: Math.max(0, grown.y1), x2: Math.min(w, grown.x2), y2: Math.min(h, grown.y2), conf: 0.5 });
-            continue;
-        }
-        // sole killer was the overlap gate — second chance via split
-        for (const r of rescueSplitCompW(c)) {
+        const c = mergedComps[gi];
+        const members = mergedMembers[gi];
+        // A corroborated text cluster with an uncorroborated tail (SFX strokes) emits the
+        // cluster alone; removal of a real second mass never happens (see corroboratedCore).
+        const core = corroboratedCore(members, members.map(m => compBoxConf(m) >= 0.20), GAP,
+            p => maskComponentEligible(p, pageArea, compBoxConf(p)));
+        for (const piece of core ?? [c]) {
             if (maskBoxes.length >= 16) break;
-            maskBoxes.push(r);
+            if (!maskComponentEligible(piece, pageArea, compBoxConf(piece))) continue;
+            if (!overlap(piece)) {
+                const grown = extendMaskBox(piece, maskCandidates, overlap);
+                maskBoxes.push({ x1: Math.max(0, grown.x1), y1: Math.max(0, grown.y1), x2: Math.min(w, grown.x2), y2: Math.min(h, grown.y2), conf: 0.5 });
+                continue;
+            }
+            // sole killer was the overlap gate — second chance via split
+            for (const r of rescueSplitCompW(piece)) {
+                if (maskBoxes.length >= 16) break;
+                maskBoxes.push(r);
+            }
         }
     }
 
@@ -530,7 +541,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
 // scripts; only the language data is downloaded on demand and cached in IDB).
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
-import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
+import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
 import { windowIndex } from '../content/inpaint';
 import { pickInferIndex } from '../content/page-cache';
 import { initDebug, isDebug } from '../debug';

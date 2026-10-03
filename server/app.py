@@ -186,7 +186,7 @@ def merge_tile_boxes(tiled):
     return [(x1, y1, x2, y2, c) for x1, y1, x2, y2, c, _ in allb]
 
 
-from split import (SPLIT_GEN, expand_crop_to_ink, extend_mask_box, group_mask_components,
+from split import (SPLIT_GEN, corroborated_core, expand_crop_to_ink, extend_mask_box, group_mask_components,
                    mask_component_eligible, pack_mask, rescue_split_comp, split_merged_boxes)
 def infer_once(pil, conf_thr):
     w, h = pil.size
@@ -324,9 +324,11 @@ def run_detect(pil, conf_thr, min_size):
         if mean >= 0.75:
             box_comps.append(r)
     merged_comps = []
+    merged_members = []
     mask_comps = [c for c in comps if not overlaps((c["x1"], c["y1"], c["x2"], c["y2"]))]
     for indices in group_mask_components(mask_comps, COMP_GAP):
         members = [mask_comps[i] for i in indices]
+        merged_members.append(members)
         merged_comps.append({"x1": min(c["x1"] for c in members), "y1": min(c["y1"] for c in members),
                              "x2": max(c["x2"] for c in members), "y2": max(c["y2"] for c in members),
                              "count": sum(c["count"] for c in members), "psum": sum(c["psum"] for c in members),
@@ -345,36 +347,44 @@ def run_detect(pil, conf_thr, min_size):
                 return True
         return False
 
-    for c in merged_comps:
+    for ci, c in enumerate(merged_comps):
         if len(mask_boxes) >= 16:
             break
-        x1, y1, x2, y2 = c["x1"], c["y1"], c["x2"], c["y2"]
-        if not mask_component_eligible(c, page_area, comp_box_conf(c)):
-            continue
-        if not overlaps((x1, y1, x2, y2)):
-            grown = extend_mask_box(c, mask_candidates, overlaps_rect)
-            mask_boxes.append({"x1": max(0.0, float(grown["x1"])), "y1": max(0.0, float(grown["y1"])),
-                                "x2": min(float(w), float(grown["x2"])), "y2": min(float(h), float(grown["y2"])), "conf": 0.5})
-            continue
-        # overlap-gate kills get a second chance via split: outside pieces survive as own regions
-        labs = c["labs"]
-
-        def count_in(rx1, ry1, rx2, ry2, _labs=labs):
-            win_lab = labels[max(0, ry1):min(h, ry2), max(0, rx1):min(w, rx2)]
-            win_pr = prob[max(0, ry1):min(h, ry2), max(0, rx1):min(w, rx2)]
-            m = np.isin(win_lab, list(_labs))
-            return int(m.sum()), float(win_pr[m].sum())
-
-        for r in rescue_split_comp(
-                {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                [t for t in texty_comps if split_labs[id(t)] in labs],
-                [t for t in box_comps if split_labs[id(t)] in labs], COMP_GAP, page_area,
-                count_in, overlaps_rect, comp_box_conf):
+        members = merged_members[ci]
+        # A corroborated text cluster with an uncorroborated tail (SFX strokes) emits the
+        # cluster alone; removal of a real second mass never happens (see corroborated_core).
+        core = corroborated_core(members, [comp_box_conf(m) >= 0.20 for m in members], COMP_GAP,
+                                 lambda p: mask_component_eligible(p, page_area, comp_box_conf(p)))
+        for piece in (core if core is not None else [c]):
             if len(mask_boxes) >= 16:
                 break
-            mask_boxes.append({"x1": float(r["x1"]), "y1": float(r["y1"]),
-                               "x2": float(r["x2"]), "y2": float(r["y2"]),
-                               "conf": 0.5})
+            x1, y1, x2, y2 = piece["x1"], piece["y1"], piece["x2"], piece["y2"]
+            if not mask_component_eligible(piece, page_area, comp_box_conf(piece)):
+                continue
+            if not overlaps((x1, y1, x2, y2)):
+                grown = extend_mask_box(piece, mask_candidates, overlaps_rect)
+                mask_boxes.append({"x1": max(0.0, float(grown["x1"])), "y1": max(0.0, float(grown["y1"])),
+                                   "x2": min(float(w), float(grown["x2"])), "y2": min(float(h), float(grown["y2"])), "conf": 0.5})
+                continue
+            # overlap-gate kills get a second chance via split: outside pieces survive as own regions
+            labs = piece["labs"]
+
+            def count_in(rx1, ry1, rx2, ry2, _labs=labs):
+                win_lab = labels[max(0, ry1):min(h, ry2), max(0, rx1):min(w, rx2)]
+                win_pr = prob[max(0, ry1):min(h, ry2), max(0, rx1):min(w, rx2)]
+                m = np.isin(win_lab, list(_labs))
+                return int(m.sum()), float(win_pr[m].sum())
+
+            for r in rescue_split_comp(
+                    {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    [t for t in texty_comps if split_labs[id(t)] in labs],
+                    [t for t in box_comps if split_labs[id(t)] in labs], COMP_GAP, page_area,
+                    count_in, overlaps_rect, comp_box_conf):
+                if len(mask_boxes) >= 16:
+                    break
+                mask_boxes.append({"x1": float(r["x1"]), "y1": float(r["y1"]),
+                                   "x2": float(r["x2"]), "y2": float(r["y2"]),
+                                   "conf": 0.5})
     # split AFTER the mask-only pass: merged coverage still suppresses swallowed clusters, then each balloon splits.
     boxes = split_merged_boxes(out_boxes + mask_boxes, texty_comps, COMP_GAP, box_comps)
     # packed is 0/1 — packMask mirrors the client byte mask; the bool mask rides along for the merged inpaint pass

@@ -36,6 +36,28 @@ class MaskGroups(unittest.TestCase):
         self.assertFalse(mask_component_eligible(dict(c, psum=1700 * 0.4), 100000, 0.1))
         self.assertFalse(mask_component_eligible(c, 1000, 0.8))
 
+    def test_corroborated_core_drops_uncorroborated_sfx_tail(self):
+        from split import corroborated_core
+
+        def gc(x1, y1, x2, y2, count, psum, lab):
+            return {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "count": count, "psum": psum, "labs": {lab}}
+        # Live mask group (worker comps verbatim, mass rounded): speech bubble text is
+        # model-corroborated, the walking-SFX strokes chained to it are not.
+        members = [gc(380, 1670, 443, 1703, 1500, 1290, 10), gc(371, 1704, 450, 1738, 1800, 1530, 11),
+                   gc(377, 1758, 410, 1805, 1200, 924, 12), gc(308, 1760, 341, 1844, 1200, 444, 13),
+                   gc(358, 1777, 383, 1844, 1170, 971, 14), gc(382, 1794, 447, 1875, 2100, 1827, 15)]
+        corr = [True, True, False, False, False, False]
+        eligible = lambda c: c["psum"] / c["count"] >= 0.75  # noqa: E731
+        self.assertEqual(corroborated_core(members, corr, GAP, eligible),
+                         [{"x1": 371, "y1": 1670, "x2": 450, "y2": 1738, "count": 3300,
+                           "psum": 2820, "labs": {10, 11}}])
+        # an uncorroborated cluster that stands on its own keeps the whole group
+        strong = [m if i < 2 else dict(m, psum=int(m["count"] * 0.9)) for i, m in enumerate(members)]
+        self.assertIsNone(corroborated_core(strong, corr, GAP, eligible))
+        # homogeneous groups are untouched
+        self.assertIsNone(corroborated_core(members, [True] * 6, GAP, eligible))
+        self.assertIsNone(corroborated_core(members, [False] * 6, GAP, eligible))
+
     def test_matching_head_can_extend_faint_edges_but_not_across_another_region(self):
         c = box(10, 10, 50, 30)
         candidates = [box(0, 6, 60, 36, 0.25), box(0, 0, 200, 200, 0.99), box(45, 10, 100, 30, 0.99)]

@@ -11,7 +11,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/box-split-detection.mjs', sourcemap: 'inline',
 });
 
-const { splitMergedBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, shiftDetectionBoxY } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
+const { splitMergedBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, shiftDetectionBoxY } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
 
 const box = (x1, y1, x2, y2, conf = 0.9) => ({ x1, y1, x2, y2, conf });
 const GAP = 28;
@@ -58,6 +58,29 @@ test('mask boxes recover faint glyph edges only from bounded matching head evide
   assert.equal(extendMaskBox(c, [box(0, 6, 60, 36, 0.1)], () => false), c);
   assert.deepEqual(extendMaskBox(c, [box(9, 10, 51, 30, 0.4), ...candidates], () => false),
     { x1: -3, y1: 3, x2: 63, y2: 39 }, 'a tight prediction cannot hide corroborated faint edges');
+});
+
+// Live mask group (worker comps verbatim, mass rounded): the speech bubble text is
+// model-corroborated, the walking-SFX strokes chained to it are not — the SFX tail
+// fails the gate alone, so only the corroborated cluster is emitted.
+const gc = (x1, y1, x2, y2, count, probSum, id) => ({ x1, y1, x2, y2, count, probSum, ids: [id] });
+const SPEECH_SFX = [
+  gc(380, 1670, 443, 1703, 1500, 1290, 0), gc(371, 1704, 450, 1738, 1800, 1530, 1),
+  gc(377, 1758, 410, 1805, 1200, 924, 2), gc(308, 1760, 341, 1844, 1200, 444, 3),
+  gc(358, 1777, 383, 1844, 1170, 971, 4), gc(382, 1794, 447, 1875, 2100, 1827, 5),
+];
+const meanEligible = c => c.probSum / c.count >= 0.75;
+
+test('corroboratedCore drops an uncorroborated SFX tail, keeps its text cluster', () => {
+  const corr = [true, true, false, false, false, false];
+  assert.deepEqual(corroboratedCore(SPEECH_SFX, corr, GAP, meanEligible),
+    [{ x1: 371, y1: 1670, x2: 450, y2: 1738, count: 3300, probSum: 2820, ids: [0, 1] }]);
+  // an uncorroborated cluster that stands on its own keeps the whole group
+  const strong = SPEECH_SFX.map((c, i) => i >= 2 ? { ...c, probSum: Math.round(c.count * 0.9) } : c);
+  assert.equal(corroboratedCore(strong, corr, GAP, meanEligible), null);
+  // homogeneous groups are untouched
+  assert.equal(corroboratedCore(SPEECH_SFX, SPEECH_SFX.map(() => true), GAP, meanEligible), null);
+  assert.equal(corroboratedCore(SPEECH_SFX, SPEECH_SFX.map(() => false), GAP, meanEligible), null);
 });
 test('short lateral lobe separates from a non-nested multi-line block', () => {
   const parent = box(0, 0, 250, 200);

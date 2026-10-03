@@ -209,6 +209,36 @@ export function extendMaskBox(c: SplitComp, candidates: DetBox[], overlapsBox: (
     return overlapsBox(r) ? c : r;
 }
 
+// Split-input comps carry their mask mass; mask-only groups aggregate it.
+export interface GroupComp extends SplitComp { count: number; probSum: number; ids: number[] }
+
+// A merged mask group can chain an uncorroborated tail (SFX strokes, artwork marks) onto
+// model-corroborated text. When every uncorroborated cluster fails eligibility on its own
+// and at least one corroborated cluster passes, the corroborated clusters are the real text —
+// emit them and drop the tail. Any other mixture keeps the whole group, so a genuine second
+// text mass is never split away. Pure — unit tested.
+export function corroboratedCore(
+    members: GroupComp[],
+    corr: boolean[],
+    gap: number,
+    eligible: (c: GroupComp) => boolean,
+): GroupComp[] | null {
+    const corrMembers = members.filter((_c, i) => corr[i]);
+    const uncorrMembers = members.filter((_c, i) => !corr[i]);
+    if (!corrMembers.length || !uncorrMembers.length) return null;
+    const aggregate = (ss: GroupComp[]): GroupComp => ({
+        x1: Math.min(...ss.map(c => c.x1)), y1: Math.min(...ss.map(c => c.y1)),
+        x2: Math.max(...ss.map(c => c.x2)), y2: Math.max(...ss.map(c => c.y2)),
+        count: ss.reduce((n, c) => n + c.count, 0), probSum: ss.reduce((n, c) => n + c.probSum, 0),
+        ids: ss.flatMap(c => c.ids),
+    });
+    const clusters = (ss: GroupComp[]) =>
+        groupMaskComponents(ss, gap).map(idx => aggregate(idx.map(i => ss[i])));
+    if (clusters(uncorrMembers).some(eligible)) return null;
+    const core = clusters(corrMembers).filter(eligible);
+    return core.length ? core : null;
+}
+
 export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number, boxComps: SplitComp[] = comps): T[] {
     if (comps.length < 2) return [...boxes];
     const out: T[] = [];
