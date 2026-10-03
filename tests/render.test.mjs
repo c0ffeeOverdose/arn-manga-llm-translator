@@ -305,6 +305,35 @@ test('layoutText: spaceless 12-char Thai run splits instead of collapsing the fo
   assert.ok(r.lines.join('').replace(/ /g, '') === 'สุดยอดไปเลย~', 'rejoin is lossless');
 });
 
+test('layoutText: ICU-missed Thai word keeps its letters together', () => {
+  // live case: ICU splits จริง|เห|รอ, so the wrap parked "เห" at a line end
+  // (เห / รอ). 72px at f20 fits จริง+เห but not +รอ — the old units reproduce it.
+  const r = layoutText(fakeCtx(), 'จริงเหรอ', 72, 72, 20);
+  assert.ok(r.lines.some(l => l.includes('เหรอ')), `"เหรอ" must not split across lines, got ${JSON.stringify(r.lines)}`);
+});
+
+test('layoutText: a misaligned ICU cut inside a short word is merged', () => {
+  // live case: ICU splits ชิ|ลมาก (boundary lands mid-word); the unit stays whole
+  const r = layoutText(fakeCtx(), 'ชิลมาก', 60, 72, 20);
+  assert.ok(r.lines.some(l => l.includes('ชิล')), `"ชิล" must stay whole, got ${JSON.stringify(r.lines)}`);
+});
+
+test('layoutText: a word ICU cannot resync before a colloquial tail stays whole', () => {
+  // live case: ...ไร้ประโยชน์เนี่ยนะ → ICU cuts ประ|โย|ชน์เนี่ย (ชน์ stays whole
+  // standalone). The tail is split off before ICU segments, so ประโยชน์ is one unit.
+  const t = 'กินที่ไร้ประโยชน์เนี่ยนะ';
+  const r = layoutText(fakeCtx(), t, 60, 100, 20);
+  assert.ok(r.lines.some(l => l.includes('ประโยชน์')), `"ประโยชน์" must not split, got ${JSON.stringify(r.lines)}`);
+  assert.ok(r.lines.join('') === t, 'rejoin is lossless');
+});
+
+test('layoutText: a real word ending with a trigger tail is not split', () => {
+  // ขันหมาก ends with the trigger มาก; the unsafe guard must keep it one word
+  // (a naive tail split would produce ขันห / มาก at this width)
+  const r = layoutText(fakeCtx(), 'ขันหมาก', 54, 72, 20);
+  assert.ok(r.lines.some(l => l.includes('ขันหมาก')), `"ขันหมาก" must stay whole, got ${JSON.stringify(r.lines)}`);
+});
+
 test('layoutText: English short words do not gain mid-word breaks', () => {
   const r = layoutText(fakeCtx(), 'hello world', 1000, 10000, 40);
   assert.deepEqual(r.lines, ['hello world']);

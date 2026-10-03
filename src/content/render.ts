@@ -2,6 +2,7 @@
 // LLM spaces are phrase boundaries, " / " pre-broken lines, ICU splits Thai runs.
 
 import { SPLIT_CLIP_SLACK, type DetBox } from './detection';
+import { THAI_SPLIT_WORDS, THAI_TAIL_TRIGGERS, THAI_TAIL_UNSAFE } from './thai-words';
 
 const FONT = 'Sriracha';           // Thai handwriting font (bundled)
 const TRACKING = 0.1;      // letter spacing as fraction of font size
@@ -16,7 +17,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 30;
+export const RENDER_GEN = 31;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -57,11 +58,72 @@ export function ensureFont(): Promise<void> {
     return fontReady;
 }
 
-// ICU Thai word breaking.
+// ICU Thai word breaking, repaired from generated data (scripts/make-thai-words.mjs):
+// 1) a colloquial tail ICU cannot resync on (ประโยชน์เนี่ยนะ → ประ|โย|ชน์เนี่ย) is split
+//    off before ICU sees the run; THAI_TAIL_UNSAFE keeps real words ending with a tail whole;
+// 2) boundaries strictly inside a THAI_SPLIT_WORDS entry are merged away.
+const THAI_WORD_MAX = 6; // longest word in thai-words.ts
 let segmenter: Intl.Segmenter | null = null;
+const thaiSplitWords = new Set(THAI_SPLIT_WORDS.split('\n'));
+const thaiTriggerTails = THAI_TAIL_TRIGGERS.split('\n').filter(Boolean).sort((a, b) => b.length - a.length);
+const thaiTailUnsafe = new Map<string, string[]>(thaiTriggerTails.map(t => [t, []]));
+for (const w of THAI_TAIL_UNSAFE.split('\n')) {
+    if (!w) continue;
+    const t = thaiTriggerTails.find(t => w.length > t.length && w.endsWith(t));
+    if (t) thaiTailUnsafe.get(t)!.push(w);
+}
+
+// Cuts the run before each trigger tail. A tail followed by Thai text (mid-run) or ending
+// a real word (ขันหมาก ends with มาก) is not a boundary.
+function splitTriggerTails(text: string): string[] {
+    const parts: string[] = [];
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+        let hit = '';
+        for (const t of thaiTriggerTails) {
+            if (!text.startsWith(t, i)) continue;
+            const after = text[i + t.length];
+            if (after !== undefined && hasThai(after)) continue;
+            const end = i + t.length;
+            if (thaiTailUnsafe.get(t)!.some(w => end >= w.length && text.startsWith(w, end - w.length))) continue;
+            hit = t;
+            break;
+        }
+        if (hit) { if (i > start) parts.push(text.slice(start, i)); start = i; i += hit.length - 1; }
+    }
+    parts.push(text.slice(start));
+    return parts;
+}
+
 function thaiWords(text: string): string[] {
     if (!segmenter) segmenter = new Intl.Segmenter('th', { granularity: 'word' });
-    return [...segmenter.segment(text)].map(s => s.segment).filter(w => w.trim());
+    const out: string[] = [];
+    for (const part of splitTriggerTails(text)) {
+        const segs = [...segmenter.segment(part)];
+        const forbidden = new Uint8Array(part.length + 1);
+        for (let i = 0; i < part.length; i++) {
+            for (let L = Math.min(THAI_WORD_MAX, part.length - i); L >= 2; L--) {
+                if (thaiSplitWords.has(part.slice(i, i + L))) {
+                    for (let k = i + 1; k < i + L; k++) forbidden[k] = 1;
+                    break;
+                }
+            }
+        }
+        let cur = '', pos = 0;
+        for (const s of segs) {
+            const piece = s.segment;
+            if (!piece.trim()) { // whitespace breaks units (filtered before)
+                if (cur) { out.push(cur); cur = ''; }
+                pos += piece.length;
+                continue;
+            }
+            cur += piece;
+            pos += piece.length;
+            if (pos < part.length && !forbidden[pos]) { out.push(cur); cur = ''; }
+        }
+        if (cur) out.push(cur);
+    }
+    return out;
 }
 
 // Wrap units: Thai words join WITHOUT spaces; explicit LLM spaces are phrase boundaries.
