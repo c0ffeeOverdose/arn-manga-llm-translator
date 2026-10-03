@@ -3,8 +3,8 @@
 // Overrides are stored per book — ids restart at c1 in every story, so an unscoped key would
 // leak this story's edit onto the next one. Rows can be merged; absorbed rows can be split.
 
-import { context, saveContext, loadContext, mtPal, bookKey, bookScopeNote } from './state';
-import { normalizeBook, charKey, mergeBookRows, splitBookRow, overrideKey, claimLegacyOverrides, type CharacterEntry, type CharOverride } from '../llm/core';
+import { context, saveContext, loadContext, mtPal, bookKey, bookScopeNote, chapterKey } from './state';
+import { normalizeBook, charKey, mergeBookRows, splitBookRow, overrideKey, claimLegacyOverrides, moveOverrides, type CharacterEntry, type CharOverride } from '../llm/core';
 
 let charsPanel: HTMLDivElement | null = null;
 
@@ -82,6 +82,14 @@ export async function renderCharsPanel(): Promise<void> {
     await loadContext();
     const scope = bookKey();
     let overrides = await getOverrides();
+    // A chapter book promoted to a story book keeps its edits: move their scope.
+    if (scope.startsWith('mtBook:')) {
+        const moved = moveOverrides(overrides, `mtCtx:${chapterKey()}`, scope);
+        if (moved.changed) {
+            overrides = moved.overrides;
+            await chrome.storage.local.set({ mtCharOverrides: overrides });
+        }
+    }
     if (!charsPanel) return;
     const box = charsPanel.querySelector('#mt-chars-list') as HTMLDivElement;
     box.innerHTML = '';

@@ -19,7 +19,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow, claimLegacyOverrides, overrideKey, bareKey } =
+const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow, claimLegacyOverrides, overrideKey, bareKey, moveOverrides } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
@@ -374,6 +374,18 @@ test('claimLegacyOverrides pins a bare key to the book showing the row', () => {
   assert.ok(overrides[overrideKey('mtBook:A', 'c1')], 'row key claimed');
   assert.ok(!overrides.c1, 'bare key removed');
   assert.ok(overrides.c9, 'unrelated bare keys stay for their own book');
+});
+
+test('moveOverrides: a chapter book promoted to a story book keeps its edits', () => {
+  const { overrides, changed } = moveOverrides(
+    { [overrideKey('mtCtx:https://reader.test/series/abc/chapter/1', 'c1')]: { gender: 'F', name: 'อากิ' }, c9: { gender: 'M' } },
+    'mtCtx:https://reader.test/series/abc/chapter/1',
+    'mtBook:https://reader.test/series/abc',
+  );
+  assert.equal(changed, true);
+  assert.equal(overrides[overrideKey('mtBook:https://reader.test/series/abc', 'c1')]?.name, 'อากิ');
+  assert.ok(!overrides[overrideKey('mtCtx:https://reader.test/series/abc/chapter/1', 'c1')], 'old scope cleared');
+  assert.ok(overrides.c9, 'other keys untouched');
 });
 
 test('keep directive parsed and preserved', () => {

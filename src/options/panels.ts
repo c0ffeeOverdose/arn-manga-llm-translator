@@ -51,56 +51,77 @@ function findOv(overrides: Record<string, CharOverride>, scope: string | undefin
     return undefined;
 }
 
-// Titles for persistent per-story books, fetched once per id and cached; while offline (or
-// for non-MangaDex ids) the short id stays the label.
-const titleAttempted = new Set<string>();
-let titleFetch: Promise<boolean> | null = null;
-async function ensureTitles(ids: string[]): Promise<boolean> {
-    if (!ids.length) return false;
-    const { [mtCharTitlesKey]: cached } = await chrome.storage.local.get(mtCharTitlesKey);
-    const titles = { ...((cached as Record<string, string> | undefined) ?? {}) };
-    const missing = ids.filter(id => !titles[id] && !titleAttempted.has(id) && /^[0-9a-f-]{36}$/i.test(id));
-    if (!missing.length) return false;
-    if (!titleFetch) {
-        titleFetch = (async () => {
-            let got = false;
-            for (const id of missing) {
-                titleAttempted.add(id);
-                try {
-                    const r = await fetch(`https://api.mangadex.org/manga/${id}`, { signal: AbortSignal.timeout(6000) });
-                    if (!r.ok) continue;
-                    const t = ((await r.json()) as { data?: { attributes?: { title?: Record<string, string> } } })?.data?.attributes?.title ?? {};
-                    const name = t.en ?? t.ja ?? Object.values(t)[0];
-                    if (typeof name === 'string' && name) { titles[id] = name; got = true; }
-                } catch { /* offline → the id stays the label */ }
-            }
-            if (got) await chrome.storage.local.set({ [mtCharTitlesKey]: titles });
-            return got;
-        })().finally(() => { titleFetch = null; });
+// Book labels: a title captured from the reader's breadcrumb (mtCharTitles, written by the
+// content script) when there is one, otherwise the scope itself — never a network call.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function scopeLabel(scope: string, titles: Record<string, string>): string {
+    const raw = scope.replace(/^mt(?:Book|Ctx):/, '');
+    if (UUID_RE.test(raw)) return `${titles[scope] ?? 'Manga'} (${raw.slice(0, 8)})`;
+    if (/^https?:/.test(raw)) {
+        try {
+            const u = new URL(raw);
+            const path = u.pathname.length > 28 ? u.pathname.slice(0, 28) + '…' : u.pathname;
+            return titles[scope] ? `${titles[scope]} · ${u.host}${path}` : `${u.host}${path}`;
+        } catch { return titles[scope] ?? raw; }
     }
-    return titleFetch;
+    return titles[scope] ?? raw;
 }
 
-// Sections: the snapshot the open tab last pushed, plus every per-story book in storage.local.
+// Sections: the snapshot the open tab last pushed, every per-story book in storage.local, and
+// the session-only chapter books (fail-safe readers) so nothing learned stays invisible.
 async function getBooks(): Promise<BookSection[]> {
     const all = await chrome.storage.local.get(null);
     const raw = all.mtCharBook as { bookKey?: string; characters?: BookRow[] } | BookRow[] | undefined;
     const titles = (all[mtCharTitlesKey] as Record<string, string> | undefined) ?? {};
     const sections: BookSection[] = [];
-    const snapRows = Array.isArray(raw) ? raw : raw?.characters;
-    const snapScope = Array.isArray(raw) ? undefined : raw?.bookKey;
-    if (snapRows?.length) sections.push({ scope: snapScope, label: 'Currently open', rows: snapRows, current: true });
+    const seen = new Set<string>();
+    const storyHosts = new Set<string>();
+    const storySignatures = new Set<string>();
+    const parseRows = (v: unknown): BookRow[] => {
+        try {
+            const parsed = typeof v === 'string' ? JSON.parse(v) : v;
+            return Array.isArray(parsed) ? parsed as BookRow[] : [];
+        } catch { return []; }
+    };
+    // register every persistent story book first: the snapshot may BE one of them, and its
+    // host/rows must still hide the per-chapter session copies below
     for (const [k, v] of Object.entries(all)) {
         if (!k.startsWith('mtBook:')) continue;
-        if (sections.some(s => s.scope === k)) continue; // the snapshot already shows that book
+        const rows = parseRows(v);
+        if (!rows.length) continue;
+        const rawKey = k.slice('mtBook:'.length);
+        if (/^https?:/.test(rawKey)) {
+            try { storyHosts.add(new URL(rawKey).host); } catch { /* keep the host unset */ }
+        }
+        storySignatures.add(JSON.stringify(rows));
+    }
+    const snapRows = Array.isArray(raw) ? raw : raw?.characters;
+    const snapScope = Array.isArray(raw) ? undefined : raw?.bookKey;
+    if (snapRows?.length) {
+        sections.push({ scope: snapScope, label: snapScope ? `Currently open · ${scopeLabel(snapScope, titles)}` : 'Currently open', rows: snapRows, current: true });
+        if (snapScope) seen.add(snapScope);
+    }
+    for (const [k, v] of Object.entries(all)) {
+        if (!k.startsWith('mtBook:') || seen.has(k)) continue;
+        const rows = parseRows(v);
+        if (!rows.length) continue;
+        sections.push({ scope: k, label: scopeLabel(k, titles), rows, current: false });
+    }
+    const sess = await sessGet(null);
+    for (const [k, v] of Object.entries(sess)) {
+        if (!k.startsWith('mtCtx:') || seen.has(k)) continue;
         let rows: BookRow[] = [];
         try {
             const parsed = typeof v === 'string' ? JSON.parse(v) : v;
-            if (Array.isArray(parsed)) rows = parsed as BookRow[];
+            const chars = ((parsed as { context?: { characters?: unknown } } | undefined)?.context)?.characters;
+            if (Array.isArray(chars)) rows = chars as BookRow[];
         } catch { continue; }
         if (!rows.length) continue;
-        const id = k.slice('mtBook:'.length);
-        sections.push({ scope: k, label: `${titles[id] ?? 'Manga'} (${id.slice(0, 8)})`, rows, current: false });
+        // a session chapter book is the story book's working copy once the reader has a story
+        // book: hide the duplicate (same host, or literally the same rows)
+        try { if (storyHosts.has(new URL(k.slice('mtCtx:'.length)).host)) continue; } catch { /* not a URL — keep it */ }
+        if (storySignatures.has(JSON.stringify(rows))) continue;
+        sections.push({ scope: k, label: `This session · ${scopeLabel(k, titles)}`, rows, current: false });
     }
     return sections;
 }
@@ -221,7 +242,6 @@ export async function renderCharacters(overrides: Record<string, CharOverride>):
     }
     if (claimed) await chrome.storage.local.set({ [mtCharOverridesKey]: overrides });
 
-    const titleIds: string[] = [];
     for (const section of sections) {
         const head = document.createElement('div');
         head.className = 'char-book';
@@ -240,9 +260,7 @@ export async function renderCharacters(overrides: Record<string, CharOverride>):
         head.append(nameEl, count, clear);
         box.append(head);
         for (const c of section.rows) box.append(charRow(section, c, overrides));
-        if (!section.current && section.scope?.startsWith('mtBook:')) titleIds.push(section.scope.slice('mtBook:'.length));
     }
-    if (titleIds.length) void ensureTitles(titleIds).then(got => { if (got) void renderCharacters(overrides); });
 }
 
 export async function clearCharacters(): Promise<void> {

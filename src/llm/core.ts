@@ -889,6 +889,26 @@ export function claimLegacyOverrides(
     return { overrides: next, changed };
 }
 
+// Move every override stored under one scope onto another (a chapter book promoted to a story
+// book) so user edits survive the key change.
+export function moveOverrides(
+    overrides: Record<string, CharOverride>,
+    from: string,
+    to: string,
+): { overrides: Record<string, CharOverride>; changed: boolean } {
+    if (!from || from === to) return { overrides, changed: false };
+    const next = { ...overrides };
+    let changed = false;
+    for (const k of Object.keys(next)) {
+        if (!k.startsWith(from + OV_SEP)) continue;
+        const target = to + k.slice(from.length);
+        if (!next[target]) next[target] = next[k];
+        delete next[k];
+        changed = true;
+    }
+    return { overrides: next, changed };
+}
+
 // User overrides are law: fields forced, source promoted. Same-named entries collapse to one.
 // The override key is a roster id when the row has one, otherwise the desc/name (legacy rows).
 export function applyOverrides(

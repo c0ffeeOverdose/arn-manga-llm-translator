@@ -397,6 +397,91 @@ export function readerPageNumber(origin: string, pathname: string, search: strin
     return n > 0 ? n : null;
 }
 
+// ---- story identity for readers we do not know ----
+// The character book should span the chapters of one story. URL-first and deterministic; a
+// breadcrumb link is only the fallback and the title source (state.ts wires it). Fail direction
+// is a split (null → chapter scope), never a merge, so every guard below rejects anything
+// ambiguous. Generic URL vocabulary only — no site names.
+const NAV_SEGMENT = /^(?:read|view|watch|list|page|pages)$/i;
+// listing/navigation vocabulary is never a story container, wherever it appears
+const NAV_ANYWHERE = /^(?:genre|genres|tag|tags|author|authors|artist|artists|group|groups|search|popular|latest|browse|category|categories)$/i;
+const isNavPath = (segs: string[]): boolean =>
+    segs.some(s => NAV_ANYWHERE.test(s)) || NAV_SEGMENT.test(segs[segs.length - 1] ?? '');
+const CHAPTER_WORD = /^(?:chapter|ch|episode|ep)[-_]?\d+$/i;
+const UUID_SEG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// The story path (origin-relative) a reader URL names, or null when it does not. The caller
+// compares the result with its own chapter key: an unchanged result is not a story signal.
+export function deriveStoryPath(path: string, search: string): string | null {
+    let segs = path.split('/').filter(Boolean);
+    if (!segs.length) return null;
+    for (;;) {
+        // /series/abc/chapter/12 — the container names the chapter, everything before it the story
+        // (and only the container decides where the story ends: a numeric tail there is the
+        // story id, like /title/4, not another chapter number)
+        const container = ('/' + segs.join('/')).match(/^(.*)\/(?:chapter|episode|ep|ch)\/[^/]+$/i);
+        if (container) {
+            segs = container[1].split('/').filter(Boolean);
+            break;
+        }
+        const last = segs[segs.length - 1];
+        // trailing numbers/uuids are chapter or page numbers — strip down to depth 2 (never the
+        // last segment of a 2-segment path: /read/12345 must keep its story id)
+        if (segs.length > 2 && (/^\d+$/.test(last) || UUID_SEG.test(last))) { segs.pop(); continue; }
+        // a glued chapter word: chapter-12, ch_3, ep5
+        if (segs.length > 2 && CHAPTER_WORD.test(last)) { segs.pop(); continue; }
+        break;
+    }
+    if (segs.length < 2) return null;
+    if (isNavPath(segs)) return null;
+    // chapter-ish query params name the chapter; page params never belong to a story key
+    const sp = new URLSearchParams(search);
+    for (const k of ['page', 'p', 'pg', 'chapter', 'ch', 'ep', 'episode', 'vol', 'volume']) sp.delete(k);
+    const q = sp.toString();
+    return '/' + segs.join('/') + (q ? '?' + q : '');
+}
+
+export interface SeriesLink { path: string; title?: string }
+
+// The best same-origin link that is a strict prefix of the current page: the reader's own
+// breadcrumb back to the story. Returns the normalized path plus the link text (the title).
+export function pickSeriesLink(currentHref: string, links: { href: string; text: string }[]): SeriesLink | null {
+    let cur: URL;
+    try { cur = new URL(currentHref); } catch { return null; }
+    let best: SeriesLink | null = null;
+    for (const l of links) {
+        let u: URL;
+        try { u = new URL(l.href, cur); } catch { continue; }
+        if (u.origin !== cur.origin) continue;
+        const p = u.pathname.replace(/\/+$/, '');
+        const segs = p.split('/').filter(Boolean);
+        if (segs.length < 2) continue;
+        if (isNavPath(segs)) continue;
+        // strict prefix at a segment boundary — the page itself is not its own series
+        if (!cur.pathname.startsWith(p + '/')) continue;
+        if (!best || p.length > best.path.length) {
+            const title = l.text.replace(/\s+/g, ' ').trim().slice(0, 80);
+            best = { path: p, title: title || undefined };
+        }
+    }
+    return best;
+}
+
+// The book scope for a reader page: the URL-derived story when it is strictly shorter than the
+// chapter key, or the chapter key itself when a breadcrumb link confirms it as the story page
+// (promotion only changes storage lifetime, not grouping). Anything else is null → chapter
+// scope, the fail-safe. A hash is never dropped: it may BE the story id.
+export function pickStoryScope(origin: string, path: string, search: string, chapter: string, link: SeriesLink | null): string | null {
+    if (chapter.includes('#')) return null;
+    const derived = deriveStoryPath(path, search);
+    const fromUrl = derived ? origin + derived : null;
+    const fromLink = link ? origin + link.path : null;
+    const candidate = fromUrl ?? fromLink;
+    if (!candidate) return null;
+    if (candidate === chapter) return fromLink === chapter ? chapter : null;
+    return candidate;
+}
+
 // ---- hotlink Referer rule: some image CDNs refuse a request without a page Referer — and an
 // MV3 service worker cannot send one (Chrome strips referrer from SW fetch silently), so the
 // SW proxy fails where a plain <img> loads fine. Some answer 403, MangaDex's network answers

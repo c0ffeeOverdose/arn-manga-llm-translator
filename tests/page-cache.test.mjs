@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, nextChunkSize, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, nextChunkSize, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -207,6 +207,65 @@ test('readerPageNumber: the reader URL names the page when its own key folds it'
   // a digit-less stem may use the number AS the story id — refuse
   assert.equal(P('https://site.com/manga/foo/123', 'https://site.com/manga/foo/123'), null);
   assert.equal(P('https://site.com/viewer#5', 'https://site.com/viewer'), null);
+});
+
+test('deriveStoryPath: chapter tails strip to a story, ambiguous shapes fail to null', () => {
+  const S = (u) => {
+    const { pathname, search } = new URL(u);
+    return deriveStoryPath(pathname, search);
+  };
+  // container rule: /chapter/<id> names the chapter, not the story
+  assert.equal(S('https://title.example.org/en/title/4/chapter/1945'), '/en/title/4');
+  assert.equal(S('https://reader.test/series/abc/ep/3'), '/series/abc');
+  assert.equal(S('https://reader.test/series/abc/chapter/12/3'), '/series/abc');
+  // numeric tails strip down to depth 2 (chapter + page numbers)
+  assert.equal(S('https://reader.test/series/frieren/12'), '/series/frieren');
+  assert.equal(S('https://reader.test/series/frieren/12/3'), '/series/frieren');
+  assert.equal(S('https://reader.test/read/12345/6'), '/read/12345');
+  assert.equal(S('https://reader.test/gallery/9001/2'), '/gallery/9001');
+  // glued chapter words
+  assert.equal(S('https://strip.example/manga/some-slug/chapter-12'), '/manga/some-slug');
+  assert.equal(S('https://strip.example/manga/some-slug/ch_3'), '/manga/some-slug');
+  // chapter-ish query params belong to the chapter
+  assert.equal(S('https://site.com/reader/abc?chapter=5'), '/reader/abc');
+  assert.equal(S('https://site.com/manga/x?chapter=5&lang=en'), '/manga/x?lang=en');
+  assert.equal(S('https://site.com/r?chapter=5'), null, 'a one-segment path cannot name a story');
+  // fail-safe: no story signal
+  assert.equal(S('https://reader.test/read/12345'), '/read/12345'); // unchanged → the caller rejects it
+  assert.equal(S('https://reader.test/frieren/12'), '/frieren/12'); // unchanged → caller rejects
+  assert.equal(S('https://reader.test/genre/action/5'), null, 'nav vocabulary is not a story');
+  assert.equal(S('https://reader.test/'), null);
+  assert.equal(S('https://reader.test/chapter/abc'), null, 'chapter-only URL has no story prefix');
+});
+
+test('pickStoryScope: strict shortening wins, equality needs a breadcrumb, hash fails safe', () => {
+  const O = 'https://reader.test';
+  // strict shortening (container rule) is the story signal
+  assert.equal(pickStoryScope(O, '/manga/abc/chapter/12', '', O + '/manga/abc/chapter/12', null), O + '/manga/abc');
+  // equality is not a story signal…
+  assert.equal(pickStoryScope(O, '/read/12345', '', O + '/read/12345', null), null);
+  // …unless the breadcrumb names it as the story page (promotion only changes storage lifetime)
+  assert.equal(pickStoryScope(O, '/series/frieren/12', '', O + '/series/frieren', { path: '/series/frieren', title: 'Frieren' }), O + '/series/frieren');
+  assert.equal(pickStoryScope(O, '/series/frieren/12', '', O + '/series/frieren', null), null);
+  // a hash may BE the story id — never dropped
+  assert.equal(pickStoryScope(O, '/viewer', '', O + '/viewer#123', { path: '/viewer', title: 'x' }), null);
+});
+
+test('pickSeriesLink: the longest same-origin breadcrumb prefix wins, text is the title', () => {
+  const cur = 'https://reader.test/series/abc/chapter/12';
+  const best = pickSeriesLink(cur, [
+    { href: 'https://other.test/series/abc', text: 'Other' },
+    { href: '/', text: 'Home' },
+    { href: '/series', text: 'All series' },
+    { href: '/series/abc', text: '  Test   Story  ' },
+    { href: '/series/abc/chapter/12', text: 'self' },
+    { href: '/genre/action', text: 'Action' },
+  ]);
+  assert.deepEqual(best, { path: '/series/abc', title: 'Test Story' });
+  // no strict prefix → null
+  assert.equal(pickSeriesLink(cur, [{ href: '/series/abc/chapter/12', text: 'self' }]), null);
+  // nav word as the last segment is rejected
+  assert.equal(pickSeriesLink('https://reader.test/read/123/4', [{ href: '/read', text: 'Read' }]), null);
 });
 
 test('sessionKey over normalizeChapterKey: one provider session per chapter, no URL survives', () => {

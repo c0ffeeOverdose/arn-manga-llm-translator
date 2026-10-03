@@ -5,7 +5,7 @@ import { EMPTY_CONTEXT, type ContextState, type CharacterEntry, type Mention, ty
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { fontStackFor, setRenderTuning } from './render';
 import { sessGet } from '../storage-session';
-import { normalizeChapterKey, type EpisodeManifest } from './page-cache';
+import { normalizeChapterKey, type EpisodeManifest, pickSeriesLink, pickStoryScope } from './page-cache';
 import type { DetectResult } from './detection';
 import type { ImageIdentity } from '../image-identity';
 import { cacheGeneration, cacheCurrent } from '../cache-generation';
@@ -242,7 +242,49 @@ export async function resolveMangaId(): Promise<string | null> {
 // the manga resolved; otherwise per-chapter session.
 export function bookKey(): string {
     if (hostIdentity) return hostIdentity.bookKey;
-    return pipeline.crossChapter && mangaId ? `mtBook:${mangaId}` : `mtCtx:${chapterKey()}`;
+    if (!pipeline.crossChapter) return `mtCtx:${chapterKey()}`;
+    if (mangaId) return `mtBook:${mangaId}`;
+    const story = resolveStoryScope();
+    return story ? `mtBook:${story.scope}` : `mtCtx:${chapterKey()}`;
+}
+
+// Story identity for readers we do not know: URL-first (pure rules in page-cache), a breadcrumb
+// link only as the fallback and the title source. Resolution is sync (URL + DOM) so bookKey
+// stays sync; cached per chapter. Fail-safe: null → chapter scope.
+let storyScope: { chapter: string; scope: string | null; title?: string } | null = null;
+
+function collectLinks(): { href: string; text: string }[] {
+    const out: { href: string; text: string }[] = [];
+    try {
+        for (const a of document.querySelectorAll('a[href]')) {
+            out.push({ href: (a as HTMLAnchorElement).href, text: (a.textContent ?? '').trim() });
+            if (out.length >= 300) break; // the breadcrumb is near the top; a link-soup page must not stall
+        }
+    } catch { /* no DOM — the offscreen runner goes through hostIdentity */ }
+    return out;
+}
+
+async function rememberTitle(scope: string, title: string): Promise<void> {
+    try {
+        const { mtCharTitles } = await chrome.storage.local.get('mtCharTitles');
+        const map = { ...((mtCharTitles as Record<string, string> | undefined) ?? {}) };
+        if (map[scope] === title) return;
+        map[scope] = title;
+        await chrome.storage.local.set({ mtCharTitles: map });
+    } catch { /* a title is a nicety, never a failure */ }
+}
+
+function resolveStoryScope(): { scope: string; title?: string } | null {
+    const chapter = chapterKey();
+    if (storyScope?.chapter === chapter) {
+        return storyScope.scope ? { scope: storyScope.scope, title: storyScope.title } : null;
+    }
+    const dom = typeof document !== 'undefined';
+    const link = dom ? pickSeriesLink(location.href, collectLinks()) : null;
+    const scope = dom ? pickStoryScope(location.origin, location.pathname, location.search, chapter, link) : null;
+    storyScope = { chapter, scope, title: link?.title };
+    if (scope && link?.title) void rememberTitle(`mtBook:${scope}`, link.title);
+    return scope ? { scope, title: link?.title } : null;
 }
 
 // Human wording for the in-page panel: which book these rows belong to.
@@ -285,7 +327,16 @@ async function readContext(chapter: string): Promise<void> {
         const raw = bk.startsWith('mtBook:')
             ? (await chrome.storage.local.get(bk))[bk]
             : (entry.context ?? entry.ctx)?.characters;
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        let parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        // A chapter book just promoted to a story book has no local entry yet: seed from this
+        // chapter's session rows so the promotion does not blank the book.
+        if (bk.startsWith('mtBook:') && (!Array.isArray(parsed) || !parsed.length) && stored[key]) {
+            try {
+                const v = JSON.parse(stored[key] as string) as { ctx?: ContextState; context?: ContextState };
+                const chars = (v.context ?? v.ctx)?.characters;
+                if (Array.isArray(chars) && chars.length) parsed = chars;
+            } catch { /* keep the empty book */ }
+        }
         if (Array.isArray(parsed)) characters = parsed as CharacterEntry[];
     } catch { /* corrupt — start fresh */ }
     if (chapterKey() !== chapter) return;
@@ -327,6 +378,7 @@ export function resetContextIfNewChapter() {
         shareContext = true;
         mangaId = null;
         mangaIdTried = false;
+        storyScope = null; // re-derive for the new chapter (URL/DOM may have changed)
         resolveMangaId(); // resolve for the new chapter (async, non-blocking)
     }
 }
