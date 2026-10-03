@@ -321,6 +321,9 @@
   .char-item .line input[type=text] { flex: 1; width: auto; min-width: 0; }
   .char-item .meta { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
   .char-item .meta .src { font-size: 11px; color: var(--muted); }
+  .char-book { display: flex; align-items: center; gap: 10px; margin: 18px 0 2px; }
+  .char-book:first-child { margin-top: 0; }
+  .char-book .char-book-name { flex: 1; font-weight: 600; }
   .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
 
   /* font preview: previews render on white manga paper — stays white in both themes */
@@ -686,7 +689,7 @@
   <div class="tab" id="tab-characters">
     <div class="card">
       <h2>Characters</h2>
-      <div class="hint" style="margin:-8px 0 12px">Names, descriptions, and notes are yours to edit and always win. The id (c1, c2, …) is how the model references each row.</div>
+      <div class="hint" style="margin:-8px 0 12px">Names, descriptions, and notes are yours to edit and always win — saved per story, so one manga's edits never touch another. The id (c1, c2, …) is how the model references each row.</div>
       <div id="characters"><div class="empty">No characters yet — translate some pages first.</div></div>
       <div style="margin-top:16px">
         <button id="clearChars" class="btn danger">Clear character memory</button>

@@ -1,9 +1,10 @@
-// In-page characters panel (per-chapter book inspection + overrides).
+// In-page characters panel (book inspection + overrides).
 // Identity-first: each row shows its roster id, and name/desc/note are the user's to edit.
-// Rows can be merged (fold one row into another) and split (restore absorbed rows).
+// Overrides are stored per book — ids restart at c1 in every story, so an unscoped key would
+// leak this story's edit onto the next one. Rows can be merged; absorbed rows can be split.
 
-import { context, saveContext, loadContext, mtPal } from './state';
-import { normalizeBook, charKey, mergeBookRows, splitBookRow, type CharacterEntry, type CharOverride } from '../llm/core';
+import { context, saveContext, loadContext, mtPal, bookKey, bookScopeNote } from './state';
+import { normalizeBook, charKey, mergeBookRows, splitBookRow, overrideKey, claimLegacyOverrides, type CharacterEntry, type CharOverride } from '../llm/core';
 
 let charsPanel: HTMLDivElement | null = null;
 
@@ -12,20 +13,41 @@ async function getOverrides(): Promise<Record<string, CharOverride>> {
     return (mtCharOverrides ?? {}) as Record<string, CharOverride>;
 }
 
-async function dropOverride(key: string): Promise<void> {
+// Every key a row's override may live under: scoped first (current form), then the legacy
+// bare keys (id, then desc) so edits made before scoping still resolve.
+function keysFor(scope: string, c: CharacterEntry): string[] {
+    const out: string[] = [];
+    const add = (k: string | undefined): void => { if (k && !out.includes(k)) out.push(k); };
+    add(overrideKey(scope, charKey(c)));
+    add(overrideKey(scope, c.desc));
+    add(charKey(c));
+    add(c.desc);
+    return out;
+}
+
+function findOverride(overrides: Record<string, CharOverride>, scope: string, c: CharacterEntry): CharOverride | undefined {
+    for (const k of keysFor(scope, c)) {
+        const ov = overrides[k];
+        if (ov) return ov;
+    }
+    return undefined;
+}
+
+async function dropOverrides(keys: string[]): Promise<void> {
     const all = { ...await getOverrides() };
-    delete all[key];
+    for (const k of keys) delete all[k];
     await chrome.storage.local.set({ mtCharOverrides: all });
 }
 
 // The dropped row's user edits move onto the row that survives the merge.
-async function transferOverride(from: string, to: string): Promise<void> {
+async function transferOverride(fromKeys: string[], toKeys: string[]): Promise<void> {
     const all = { ...await getOverrides() };
-    const src = all[from];
-    delete all[from];
-    if (src) {
-        const dst = all[to];
-        all[to] = {
+    const src = fromKeys.map(k => all[k]).find(Boolean);
+    for (const k of fromKeys) delete all[k];
+    const dstKey = toKeys.find(k => all[k]) ?? toKeys[0];
+    if (src && dstKey) {
+        const dst = all[dstKey];
+        all[dstKey] = {
             gender: dst && dst.gender !== '?' ? dst.gender : src.gender,
             name: dst?.name ?? src.name,
             desc: dst?.desc ?? src.desc,
@@ -58,14 +80,24 @@ function mkButton(text: string, title: string): HTMLButtonElement {
 
 export async function renderCharsPanel(): Promise<void> {
     await loadContext();
-    const overrides = await getOverrides();
+    const scope = bookKey();
+    let overrides = await getOverrides();
     if (!charsPanel) return;
     const box = charsPanel.querySelector('#mt-chars-list') as HTMLDivElement;
     box.innerHTML = '';
     // hygiene view: junk rows ("?") are not editable rows; ids shown here are the ones the
     // next translation will use (same deterministic assignment as the pipeline).
     const rows = normalizeBook(context.characters);
-    const ovOf = (c: CharacterEntry) => overrides[charKey(c)] ?? overrides[c.desc];
+    // A legacy bare key that matches a row of THIS book gets pinned here, before it can leak
+    // onto the next story that happens to reuse the same c1.
+    const claim = claimLegacyOverrides(overrides, scope, [...new Set(rows.flatMap(c => [charKey(c), c.desc].filter(Boolean)))]);
+    if (claim.changed) {
+        overrides = claim.overrides;
+        await chrome.storage.local.set({ mtCharOverrides: overrides });
+    }
+    const scopeEl = charsPanel.querySelector('#mt-chars-scope');
+    if (scopeEl) scopeEl.textContent = `Rows are ${bookScopeNote()}`;
+    const ovOf = (c: CharacterEntry) => findOverride(overrides, scope, c);
     if (!rows.length) {
         box.innerHTML = '<div style="color:#888;padding:6px">No characters yet — translate some pages first.</div>';
     }
@@ -106,7 +138,7 @@ export async function renderCharsPanel(): Promise<void> {
         sel.value = ov?.gender ?? c.gender;
         const del = document.createElement('button');
         del.textContent = '×';
-        del.title = 'Remove from this chapter';
+        del.title = 'Remove from this book';
         del.setAttribute('aria-label', `Remove ${rowLabel(c)}`);
         del.style.cssText = 'flex:none;background:none;color:#888;border:0;cursor:pointer;font-size:15px;padding:4px 6px';
         top.append(idTag, name, sel, del);
@@ -142,9 +174,9 @@ export async function renderCharsPanel(): Promise<void> {
             mergeSel.onchange = async () => {
                 const target = mergeSel.value;
                 if (!target) return;
-                const key = charKey(c);
-                context.characters = mergeBookRows(normalizeBook(context.characters), target, key);
-                await transferOverride(key, target);
+                const targetRow = rows.find(r => charKey(r) === target);
+                context.characters = mergeBookRows(normalizeBook(context.characters), target, charKey(c));
+                await transferOverride(keysFor(scope, c), targetRow ? keysFor(scope, targetRow) : [overrideKey(scope, target)]);
                 await saveContext();
                 renderCharsPanel();
             };
@@ -163,14 +195,14 @@ export async function renderCharsPanel(): Promise<void> {
         // Unchanged values are not stored, so touching one field never pins the others as user.
         const saveRow = async () => {
             const all = { ...await getOverrides() };
-            const key = charKey(c);
+            const key = overrideKey(scope, charKey(c));
             const n = name.value.trim(), d = desc.value.trim(), nt = note.value.trim();
             const next: CharOverride = { gender: sel.value as 'M' | 'F' | '?' };
             if (n && n !== (c.name ?? '')) next.name = n;
             if (d && d !== (c.desc ?? '')) next.desc = d;
             if (nt && nt !== (c.note ?? '')) next.note = nt;
-            // migrate a legacy desc-keyed override onto the row's id
-            if (key !== c.desc) delete all[c.desc];
+            // the scoped key replaces every legacy bare key for this row
+            for (const k of keysFor(scope, c)) if (k !== key) delete all[k];
             if (next.gender === '?' && !next.name && !next.desc && !next.note) delete all[key];
             else all[key] = next;
             await chrome.storage.local.set({ mtCharOverrides: all });
@@ -188,8 +220,7 @@ export async function renderCharsPanel(): Promise<void> {
             context.characters = c.id
                 ? rowsNow.filter(x => x.id !== c.id)
                 : rowsNow.filter(x => x.desc !== c.desc);
-            await dropOverride(charKey(c));
-            if (charKey(c) !== c.desc) await dropOverride(c.desc);
+            await dropOverrides(keysFor(scope, c));
             await saveContext();
             renderCharsPanel();
         };
@@ -231,13 +262,13 @@ export async function renderCharsPanel(): Promise<void> {
 }
 
 // clear all: this book only (the global wipe stays in options). Cleared rows' overrides go
-// too (both id- and desc-keyed) — applyOverrides would resurrect them otherwise.
+// too — scoped and legacy forms — or applyOverrides would resurrect them.
 async function clearAllChars(): Promise<void> {
-    const keys = normalizeBook(context.characters).map(c => charKey(c));
-    const descs = context.characters.map(x => x.desc);
+    const scope = bookKey();
+    const rows = normalizeBook(context.characters);
     context.characters = [];
     const all = { ...await getOverrides() };
-    for (const k of new Set([...keys, ...descs])) delete all[k];
+    for (const c of rows) for (const k of keysFor(scope, c)) delete all[k];
     await chrome.storage.local.set({ mtCharOverrides: all });
     await saveContext();
     renderCharsPanel();
@@ -246,10 +277,11 @@ async function clearAllChars(): Promise<void> {
 export function makeCharsPanel(): HTMLDivElement {
     const p = document.createElement('div');
     p.style.cssText = `position:fixed;bottom:64px;right:16px;z-index:99999;background:${mtPal.bg};color:${mtPal.text};padding:12px;border:1px solid ${mtPal.border};border-radius:12px;font:13px system-ui;box-shadow:0 4px 16px rgba(0,0,0,.4);width:340px;max-height:480px;overflow:auto;display:none`;
-    p.innerHTML = '<div style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">' +
-        '<span style="flex:1">Characters (this chapter)</span>' +
-        '<button id="mt-chars-clear" title="Remove all characters from this chapter" style="background:none;color:' + mtPal.err + ';border:0;cursor:pointer;font-size:12px;font-weight:400;padding:4px 6px">Clear all</button>' +
+    p.innerHTML = '<div style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:2px">' +
+        '<span style="flex:1">Characters</span>' +
+        '<button id="mt-chars-clear" title="Remove all characters from this book" style="background:none;color:' + mtPal.err + ';border:0;cursor:pointer;font-size:12px;font-weight:400;padding:4px 6px">Clear all</button>' +
         '<button id="mt-chars-close" title="Close" style="background:none;color:#888;border:0;cursor:pointer;font-size:15px;line-height:1;padding:4px 6px">×</button></div>' +
+        '<div id="mt-chars-scope" style="color:#888;font-size:11px;margin-bottom:4px"></div>' +
         '<div id="mt-chars-list"></div>' +
         '<div id="mt-char-status" style="color:#7f7;font-size:11px;margin-top:4px"></div>';
     // popup polls charsOpen, so it follows without a message round-trip

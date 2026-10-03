@@ -2,7 +2,7 @@
 // content script's iframe — this worker owns LLM calls only.
 
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
-import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt } from '../llm/core';
+import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type CharOverride, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl } from './chapter-broker';
 import { bootChapterRunner } from '../chapter/boot';
@@ -26,6 +26,7 @@ interface TranslateMsg {
     pageW: number;            // px — for validating VLM-reported extra regions
     pageH: number;
     cacheKey?: string;        // stable per manga — routes provider-side prompt caching
+    bookKey?: string;         // the book this context belongs to — scopes user overrides per story
     interim?: boolean;        // caller understands {type:'mt:ocr-texts'} mid-flight messages (new content only — an old listener would read the interim as the final reply and fail the job)
     requestNonce?: string;    // fresh user intent; transport retries reuse the same nonce
     cacheEpoch?: string;
@@ -67,6 +68,7 @@ type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMs
 interface CharBookMsg {
     type: 'mt:char-book';
     book: { desc: string; gender: 'M' | 'F' | '?'; source: 'user' | 'vlm' | 'speech'; name?: string }[];
+    bookKey?: string; // which book this snapshot belongs to (options lists it under that story)
 }
 
 async function getSettings(): Promise<LLMSettings & { useVision?: boolean }> {
@@ -392,7 +394,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:char-book') {
-        chrome.storage.local.set({ mtCharBook: msg.book })
+        chrome.storage.local.set({ mtCharBook: { bookKey: msg.bookKey, characters: msg.book } })
             .then(() => sendResponse({ ok: true }))
             .catch(e => sendResponse({ ok: false, error: String(e) }));
         return true;
@@ -556,7 +558,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             if (msg.cacheEpoch !== undefined && msg.cacheEpoch !== cacheEpoch) throw new DOMException('Translation cache was cleared', 'AbortError');
             const settings = await getSettings();
             const pipeline = await getPipeline();
-            // user gender overrides from the options page are law
+            // user gender overrides from the options page are law — scoped to this book
             const { mtCharOverrides } = await chrome.storage.local.get('mtCharOverrides');
             // provider-visible session id: opaque digest of the chapter key, salted
             // per install (the raw reader URL never leaves the extension).
@@ -564,7 +566,8 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             // guard: a corrupt/absent context must not crash the pipeline.
             const msgCtx = (msg.context && Array.isArray(msg.context.characters) && Array.isArray(msg.context.pairs))
                 ? msg.context : EMPTY_CONTEXT;
-            const ctx = applyOverrides(msgCtx, (mtCharOverrides ?? {}) as Record<string, { gender: 'M' | 'F' | '?'; name?: string }>);
+            const ctx = applyOverrides(msgCtx, (mtCharOverrides ?? {}) as Record<string, CharOverride>,
+                typeof msg.bookKey === 'string' ? msg.bookKey : undefined);
             const vision = !msg.ocr && !!msg.imagesB64?.length;
             // LLM call with strategic retry: 5xx/network get backoff retries;
             // auth/quota errors fail fast — retrying can't fix them; a 429 is

@@ -245,6 +245,14 @@ export function bookKey(): string {
     return pipeline.crossChapter && mangaId ? `mtBook:${mangaId}` : `mtCtx:${chapterKey()}`;
 }
 
+// Human wording for the in-page panel: which book these rows belong to.
+export function bookScopeNote(): string {
+    const k = bookKey();
+    if (k.startsWith('mtBook:')) return 'shared across this story';
+    if (k.startsWith('mtCtx:')) return 'this chapter only';
+    return 'shared with this reader';
+}
+
 export async function loadContext(): Promise<void> {
     if (contextLoaded) return;
     const chapter = chapterKey();
@@ -296,9 +304,9 @@ export async function saveContext(): Promise<void> {
     if (chapterKey() !== chapter || revision !== contextSaveRevision) return;
     context = result.context;
     savedContext = structuredClone(context);
-    // surface the character book to the options page
+    // surface the character book to the options page (with the scope it belongs to)
     if (context.characters.length) {
-        chrome.runtime.sendMessage({ type: 'mt:char-book', book: context.characters }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'mt:char-book', book: context.characters, bookKey: bookKey() }).catch(() => {});
     }
 }
 

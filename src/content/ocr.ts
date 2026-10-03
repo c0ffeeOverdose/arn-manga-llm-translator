@@ -4,7 +4,7 @@
 import { ocrInWorker, ocrLangsInstalled, baberuOcr, baberuInstalled, panelReadingOrder, type DetectResult, type DetBox, type MtOnStatus } from './detection';
 import { EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
-import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, uniquePages, pages } from './state';
+import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, bookKey, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, nextChunkSize, INPAINT_PATCH_GEN } from './page-cache';
@@ -578,6 +578,7 @@ export async function translateRegions(
             pageW: annW,
             pageH: annH,
             cacheKey: await resolveMangaId() ?? chapterKey(), // stable per manga → prompt-cache affinity
+            bookKey: bookKey(), // scopes user overrides to this story's book
             interim: true, // this version handles the mid-flight transcripts message (see portSend)
             requestNonce: opts?.fresh ? crypto.randomUUID() : undefined,
             cacheEpoch,

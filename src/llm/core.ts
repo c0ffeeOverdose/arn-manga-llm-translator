@@ -852,22 +852,68 @@ export interface CharOverride {
     note?: string;
 }
 
+// Overrides are stored per book: ids restart at c1 in every story, so a bare id key leaked one
+// manga's edit onto every other story that also had a c1. The scope prefix is the book key;
+// a key without the separator is the legacy (unscoped) form and still resolves as a fallback.
+const OV_SEP = '|';
+export const overrideKey = (scope: string | undefined, key: string): string =>
+    scope ? `${scope}${OV_SEP}${key}` : key;
+export const bareKey = (k: string): string => {
+    const i = k.lastIndexOf(OV_SEP);
+    return i < 0 ? k : k.slice(i + 1);
+};
+// A book sees its own scoped keys plus the unscoped legacy ones; nothing from other books.
+const ovBelongsTo = (k: string, scope: string | undefined): boolean => {
+    const i = k.lastIndexOf(OV_SEP);
+    if (i < 0) return true; // legacy/unscoped
+    return scope !== undefined && k.slice(0, i) === scope;
+};
+
+// One-time claim: a legacy bare key matching a row of THIS book gets pinned to it before it
+// can leak further. The claim can be no wronger than the unscoped behavior it replaces, and
+// every book opened afterwards is clean.
+export function claimLegacyOverrides(
+    overrides: Record<string, CharOverride>,
+    scope: string,
+    keys: string[],
+): { overrides: Record<string, CharOverride>; changed: boolean } {
+    const next = { ...overrides };
+    let changed = false;
+    for (const k of keys) {
+        if (!next[k]) continue;
+        const scoped = overrideKey(scope, k);
+        if (!next[scoped]) next[scoped] = next[k];
+        delete next[k];
+        changed = true;
+    }
+    return { overrides: next, changed };
+}
+
 // User overrides are law: fields forced, source promoted. Same-named entries collapse to one.
 // The override key is a roster id when the row has one, otherwise the desc/name (legacy rows).
 export function applyOverrides(
     ctx: ContextState,
     overrides: Record<string, CharOverride>,
+    scope?: string,
 ): ContextState {
     if (!Object.keys(overrides).length) return ctx;
     const byName = new Map<string, CharOverride>();
-    for (const ov of Object.values(overrides)) {
-        if (!ov.name) continue;
+    for (const [k, ov] of Object.entries(overrides)) {
+        if (!ov.name || !ovBelongsTo(k, scope)) continue;
         const cur = byName.get(ov.name);
         // gender disagreement between same-named entries: keep the definite one
         if (!cur || ov.gender !== '?') byName.set(ov.name, ov);
     }
-    const named = (c: CharacterEntry) =>
-        (c.id ? overrides[c.id] : undefined) ?? overrides[c.desc] ?? (c.name ? overrides[c.name] : undefined) ?? (c.name ? byName.get(c.name) : undefined);
+    const named = (c: CharacterEntry): CharOverride | undefined => {
+        const key = charKey(c);
+        const candidates: (CharOverride | undefined)[] = [
+            scope ? overrides[overrideKey(scope, key)] : undefined,
+            overrides[key],
+        ];
+        if (key !== c.desc) candidates.push(overrides[c.desc]);
+        if (c.name) candidates.push(overrides[c.name], byName.get(c.name));
+        return candidates.find(Boolean);
+    };
 
     let collapsed: CharacterEntry[] = [];
     for (const c of ctx.characters) {
@@ -901,8 +947,10 @@ export function applyOverrides(
     // points at a row that no longer exists — nothing to attach it to
     const known = new Set(collapsed.map(c => c.desc));
     for (const [key, ov] of Object.entries(overrides)) {
-        if (/^c\d+$/i.test(key)) continue;
-        const desc = ov.desc ?? key;
+        if (!ovBelongsTo(key, scope)) continue;
+        const bare = bareKey(key);
+        if (/^c\d+$/i.test(bare)) continue;
+        const desc = ov.desc ?? bare;
         if (!known.has(desc) && !(ov.name && collapsed.some(c => c.name === ov.name))) {
             collapsed.push({ desc, gender: ov.gender, source: 'user', name: ov.name, note: ov.note });
         }

@@ -19,7 +19,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow } =
+const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow, claimLegacyOverrides, overrideKey, bareKey } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
@@ -344,6 +344,36 @@ test('same user name collapses fragmented entries into one character', () => {
   // union desc keeps both visual anchors for the model to match
   assert.ok(out.characters[0].desc.includes('spiky-haired guy'));
   assert.ok(out.characters[0].desc.includes('inspector'));
+});
+
+// ---- overrides are scoped per book (2026-10-03) ----
+
+test('overrides are scoped per book; another book cannot leak in', () => {
+  const ctx = { pairs: [], characters: [{ id: 'c1', desc: 'hero girl', gender: '?', source: 'vlm' }] };
+  const ov = {
+    [overrideKey('mtBook:A', 'c1')]: { gender: 'F', name: 'เรื่อง A' },
+    [overrideKey('mtBook:B', 'c1')]: { gender: 'M', name: 'เรื่อง B' },
+  };
+  assert.equal(applyOverrides(ctx, ov, 'mtBook:A').characters[0].name, 'เรื่อง A');
+  assert.equal(applyOverrides(ctx, ov, 'mtBook:B').characters[0].name, 'เรื่อง B');
+  assert.equal(applyOverrides(ctx, ov, 'mtBook:C').characters[0].name, undefined, 'other books stay clean');
+  assert.equal(applyOverrides(ctx, ov).characters[0].source, 'vlm', 'no scope = legacy keys only');
+  assert.equal(bareKey(overrideKey('mtBook:A', 'หญิงผมสั้น')), 'หญิงผมสั้น');
+});
+
+test('legacy bare overrides still apply; a stale scoped id adds no row', () => {
+  const ctx = { pairs: [], characters: [{ id: 'c1', desc: 'hero girl', gender: '?', source: 'vlm' }] };
+  assert.equal(applyOverrides(ctx, { c1: { gender: 'F' } }, 'mtBook:A').characters[0].gender, 'F');
+  const out = applyOverrides(EMPTY_CONTEXT, { [overrideKey('mtBook:A', 'c9')]: { gender: 'M', name: 'ผี' } }, 'mtBook:A');
+  assert.equal(out.characters.length, 0, 'a scoped id for a missing row is not a new character');
+});
+
+test('claimLegacyOverrides pins a bare key to the book showing the row', () => {
+  const { overrides, changed } = claimLegacyOverrides({ c1: { gender: 'F', name: 'อากิ' }, c9: { gender: 'M' } }, 'mtBook:A', ['c1']);
+  assert.equal(changed, true);
+  assert.ok(overrides[overrideKey('mtBook:A', 'c1')], 'row key claimed');
+  assert.ok(!overrides.c1, 'bare key removed');
+  assert.ok(overrides.c9, 'unrelated bare keys stay for their own book');
 });
 
 test('keep directive parsed and preserved', () => {
