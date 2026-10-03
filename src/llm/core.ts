@@ -179,8 +179,8 @@ Speaker attributes:
 - Omit spk/desc/g/name for anything that is not a person speaking (narration, signs, labels, SFX); if you cannot tell who speaks, omit spk rather than guess.
 - name: only when THIS page states the character's name, in ${lang} form; never repeat a name the book already lists.
 <example>
-<r n="1"${opts.transcribeSrc && !opts.ocr ? ' src="一緒に来てくれないか"' : ''} ${roster.length ? 'spk="c1" g="F"' : 'spk="new" desc="girl with red ribbon" g="F"'}>ไปด้วยกันไหมครับ</r>
-<r n="2"${opts.transcribeSrc && !opts.ocr ? ' src="山田、やめてよね"' : ''} spk="new" desc="boy with spiky hair" g="M" name="ยามาดะ">ยามาดะ หยุดเถอะนะ</r>
+<r n="1"${opts.transcribeSrc && !opts.ocr ? ' src="一緒に来てくれないか"' : ''} ${roster.length ? 'spk="c1" g="F"' : 'spk="new" desc="girl with red ribbon" g="F"'}>ไปด้วยกันไหมคะ</r>
+<r n="2"${opts.transcribeSrc && !opts.ocr ? ' src="山田、やめてよね"' : ''} spk="new" desc="boy with spiky hair" g="M" name="ยามาดะ">ยามาดะ หยุดเถอะครับ</r>
 <r n="3" keep="true"/>
 </example>
 
@@ -196,7 +196,7 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
     p += `<rules>\n- ${LANG_RULES[lang] ?? GENERIC_RULE(lang)}\n`;
     if (chars && vision && !opts.textOnly && !opts.ocr) {
         const pages = (opts.pageCount ?? 1) > 1 ? 'full pages' : 'full page';
-        p += `- Speaker: match each spoken region to a listed id — use the ${pages}: a balloon tail points at the speaker; a thought cloud belongs to the thinker (keep their id); a tail-less box or floating text is narration, an off-panel voice, or SFX — tag a speaker only when the page makes it clear (who reacts, who is addressed, who shares the panel, continuity with earlier pages); otherwise omit spk.\n`;
+        p += `- Speaker — decide each region from the ${pages}, never from the crop alone. The balloon tail is the primary cue: its tip points at the speaker — when a bubble has a tail, THE TAIL DECIDES; an open mouth or a reacting face elsewhere is NOT the speaker. A thought cloud belongs to the thinker (keep their id). No tail (narration box, caption, floating text, off-panel voice, SFX): no spk — fall back to panel/address/continuity only when the artwork has no tails at all. Tag only when this makes the speaker clear; otherwise omit spk rather than guess.\n`;
     }
     if (chars && vision && opts.textOnly) {
         p += '- You see ONLY text crops, never faces or artwork: identify the speaker from the character book or the dialogue itself. If you cannot tell, omit spk and g rather than guess.\n';

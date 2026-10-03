@@ -238,11 +238,12 @@ test('merged page request: every full page is named, badges stay global, speaker
   assert.ok(p.includes('The first 3 images are full pages with red number badges'));
   assert.ok(p.includes('a badge number is that region\'s number in the list below'));
   assert.ok(p.includes('use the full pages for context'));
-  assert.ok(p.includes('use the full pages: a balloon tail points at the speaker'));
+  assert.ok(p.includes('decide each region from the full pages, never from the crop alone'));
+  assert.ok(p.includes('THE TAIL DECIDES'));
   // single-page wording is untouched (cacheable prompt stability)
   const one = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { chars: true }));
   assert.ok(one.includes('First image = full page with red number badges'));
-  assert.ok(one.includes('use the full page: a balloon tail'));
+  assert.ok(one.includes('decide each region from the full page, never from the crop alone'));
   assert.ok(!one.includes('full pages'));
 });
 
@@ -278,7 +279,8 @@ test('prompt includes regions, book, honorific rule — and no size numbers', ()
   assert.ok(t.includes('สวัสดี'));
   // XML output format with the keep form as a distinct structural element
   assert.ok(t.includes('<r n="REGION" keep="true"/>'));
-  assert.ok(t.includes('<r n="1" spk="c1" g="F">ไปด้วยกันไหมครับ</r>'), 'example shows id-based spk');
+  assert.ok(t.includes('<r n="1" spk="c1" g="F">ไปด้วยกันไหมคะ</r>'), 'example pairs g=F with คะ');
+  assert.ok(t.includes('g="M" name="ยามาดะ">ยามาดะ หยุดเถอะครับ</r>'), 'example pairs g=M with ครับ');
   // the book is canonical and referenced by id
   assert.ok(t.includes('<c id="c1" g="F">(unnamed) hero girl</c>'), 'compact roster row');
 });
@@ -1037,11 +1039,12 @@ test('buildPrompt: recent translations tag the speaker id; dead ids and chars-of
 
 test('buildPrompt: page mode explains balloon shapes; crops mode stays crops-only', () => {
   const page = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {}));
-  assert.ok(page.includes('balloon tail points at the speaker'), 'tail rule present');
+  assert.ok(page.includes('The balloon tail is the primary cue'), 'tail rule present');
+  assert.ok(page.includes('THE TAIL DECIDES'), 'tail outranks other cues');
   assert.ok(page.includes('thought cloud'), 'thought-cloud rule present');
   const crops = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true }));
   assert.ok(crops.includes('You see ONLY text crops'), 'crops mode keeps its own rule');
-  assert.ok(!crops.includes('balloon tail points at the speaker'), 'no page-shape advice without the page');
+  assert.ok(!crops.includes('THE TAIL DECIDES'), 'no page-shape advice without the page');
 });
 
 test('buildPrompt: crops and OCR modes still tag recent lines', () => {
