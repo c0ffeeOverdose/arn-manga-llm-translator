@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, nextChunkSize, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -1003,6 +1003,22 @@ test('nextChunkSize halves a starved request, floored at one region', () => {
   assert.equal(nextChunkSize(7), 3);
   assert.equal(nextChunkSize(2), 1);
   assert.equal(nextChunkSize(1), 1);
+});
+
+// Regression: single-segment page mode used to put the annotated page only in the first
+// images slot, so the chunk rebuild silently sent crops alone while the prompt still
+// promised "first image = full page" — the model mapped every crop by one extra and the
+// last region had no image. The prompt must never describe images the payload lacks.
+test('requestImages: page mode leads with the annotated page in every chunk', () => {
+  assert.deepEqual(requestImages({ mode: 'crops', pages: [], crops: ['c1', 'c2'] }), ['c1', 'c2']);
+  assert.deepEqual(requestImages({ mode: 'page', pages: ['page'], crops: ['c1', 'c2'] }), ['page', 'c1', 'c2']);
+  // a chunk subset keeps the same leading page — crops stay positional after it
+  assert.deepEqual(requestImages({ mode: 'page', pages: ['page'], crops: ['c7', 'c8'] }), ['page', 'c7', 'c8']);
+  // merged page mode: one annotated page per segment, all of them lead
+  assert.deepEqual(requestImages({ mode: 'page', pages: ['p1', 'p2'], crops: ['c1'] }), ['p1', 'p2', 'c1']);
+  // a page-mode request without its page, or a region without its crop, fails loud
+  assert.throws(() => requestImages({ mode: 'page', pages: [], crops: ['c1'] }), /annotated page/);
+  assert.throws(() => requestImages({ mode: 'crops', pages: [], crops: ['c1', undefined] }), /crop image/);
 });
 
 test('readerChapterFiles reads the shapes a reader chapter endpoint returns', () => {

@@ -118,6 +118,18 @@ export function nextChunkSize(failed: number): number {
     return Math.max(1, Math.floor(failed / 2));
 }
 
+// LLM request images for one chunk. Page mode leads with the annotated full page(s); crops
+// follow positionally — the chunk prompt promises that order, so a dropped page shifts every
+// crop by one and starves the last region. A violating call throws instead of sending a lying
+// brief. Pure — unit tested.
+export function requestImages(o: { mode: 'crops' | 'page'; pages: string[]; crops: (string | undefined)[] }): string[] {
+    if (o.crops.some(c => !c)) throw new Error('requestImages: every region must own its crop image');
+    const order = o.crops as string[];
+    if (o.mode === 'crops') return [...order];
+    if (!o.pages.length) throw new Error('requestImages: page mode must lead with the annotated page');
+    return [...o.pages, ...order];
+}
+
 export interface CachedPage {
     cacheEpoch?: string;
     key: string;      // chapter#contentHash — bytes identity: which pixels this was made from

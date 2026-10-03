@@ -7,7 +7,7 @@ import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, bookKey, uniquePages, pages } from './state';
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
-import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, nextChunkSize, INPAINT_PATCH_GEN } from './page-cache';
+import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, nextChunkSize, requestImages, INPAINT_PATCH_GEN } from './page-cache';
 import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './render';
 import { erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
@@ -511,10 +511,9 @@ export async function translateRegions(
             checkpointOcr(regions.map(r => r.source));
         } else {
             const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
-            if (cropsOnly) {
-                imagesB64 = [];
-                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
-            } else if (segs.length > 1) {
+            const crops: string[] = [];
+            for (const box of det.boxes) crops.push(await cropRegion(bitmap, box, gs, pageImg));
+            if (!cropsOnly && segs.length > 1) {
                 // merged page mode: one annotated page per segment, badges numbered globally.
                 // Extras stay off — their coordinates would need one shared page space.
                 let offset = 0;
@@ -524,16 +523,14 @@ export async function translateRegions(
                     offset += segBoxes.length;
                 }
                 annW = 0; annH = 0; badgeR = undefined;
-                imagesB64 = [...pageImages];
-                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
-            } else {
+            } else if (!cropsOnly) {
                 const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
                 annW = Math.round(bitmap.width * scale);
                 annH = Math.round(bitmap.height * scale);
                 badgeR = Math.round(annotFont(scale) * 0.9);
-                imagesB64 = [await annotateForVLM(bitmap, det.boxes, gs)];
-                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
+                pageImages.push(await annotateForVLM(bitmap, det.boxes, gs));
             }
+            imagesB64 = requestImages({ mode: cropsOnly ? 'crops' : 'page', pages: pageImages, crops });
         }
         // build what we send: shareContext off = standalone page (ablation);
         // toggles strip pairs / characters independently (also ablation arms)
@@ -583,7 +580,7 @@ export async function translateRegions(
         const chunkPayload = (subset: RegionInput[]): Record<string, unknown> => {
             const local = subset.map((r, i) => ({ ...r, index: i + 1 }));
             const chunkImages = imagesB64
-                ? [...pageImages, ...subset.map(r => cropOf.get(r.index)).filter((b): b is string => !!b)]
+                ? requestImages({ mode: cropsOnly ? 'crops' : 'page', pages: pageImages, crops: subset.map(r => cropOf.get(r.index)) })
                 : imagesB64;
             return { ...payload, imagesB64: chunkImages, regions: local };
         };
