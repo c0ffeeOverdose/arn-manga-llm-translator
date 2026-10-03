@@ -247,6 +247,79 @@ class SplitTest(unittest.TestCase):
                   box(48, 770, 150, 790), box(48, 802, 150, 822)]
         self.assertEqual(split_merged_boxes([p], comps2, GAP, comps2), [p])
 
+    def test_weak_comp_cannot_veto_vertical_twin_cut(self):
+        # Live vertical-text twin balloons: a hand-drawn SFX comp between them
+        # (weak mask evidence, no strict core nearby) used to stretch the left
+        # group's cross span and veto the x cut through nesting.
+        parent = box(606, 90, 797, 473)
+        loose = rects([[596, 82, 623, 126], [725, 93, 753, 184], [763, 93, 793, 203],
+                       [764, 203, 791, 230], [763, 229, 792, 258], [766, 259, 790, 285],
+                       [768, 288, 791, 310], [602, 312, 629, 341], [678, 313, 707, 340],
+                       [639, 314, 668, 341], [602, 340, 629, 368], [639, 342, 668, 396],
+                       [679, 342, 705, 368], [603, 369, 628, 396], [678, 369, 707, 423],
+                       [602, 398, 629, 422], [602, 424, 628, 449]])
+        strict = [c for c in loose if c["x1"] != 596]
+        self.assertEqual(split_merged_boxes([parent], loose, GAP, strict), [
+            {"x1": 606, "y1": 312, "x2": 716, "y2": 449, "conf": 0.9,
+             "clip": {"x1": 606, "y1": 90, "x2": 725, "y2": 473}, "cutAxis": "x"},
+            {"x1": 716, "y1": 93, "x2": 793, "y2": 310, "conf": 0.9,
+             "clip": {"x1": 707, "y1": 90, "x2": 797, "y2": 473}, "cutAxis": "x"},
+        ])
+
+    def test_weak_comp_outside_strict_core_stays_out_of_merge_evidence(self):
+        parent = box(0, 0, 220, 400)
+        loose = rects([[10, 10, 30, 80], [40, 220, 70, 380], [80, 220, 110, 380],
+                       [130, 20, 160, 200], [170, 20, 200, 200]])
+        strict = [c for c in loose if c["y1"] >= 200]
+        self.assertEqual(split_merged_boxes([parent], loose, GAP, strict), [
+            {"x1": 40, "y1": 220, "x2": 120, "y2": 380, "conf": 0.9,
+             "clip": {"x1": 0, "y1": 0, "x2": 130, "y2": 400}, "cutAxis": "x"},
+            {"x1": 120, "y1": 20, "x2": 200, "y2": 200, "conf": 0.9,
+             "clip": {"x1": 110, "y1": 0, "x2": 220, "y2": 400}, "cutAxis": "x"},
+        ])
+
+    def test_live_vertical_glyphs_square_comps_do_not_fake_twin(self):
+        # Live single balloon, large vertical type: the mask breaks every glyph into
+        # a ~square comp, so the twin cut's old w>h test passed half of them and read
+        # the column gutters as avenues. Worker comps verbatim (raw texty set).
+        parent = box(1033, 630, 1119, 758)
+        comps = rects([[1036, 631, 1060, 656], [1063, 631, 1090, 657], [1094, 631, 1120, 657],
+                       [1094, 657, 1120, 681], [1064, 658, 1081, 680], [1038, 660, 1060, 679],
+                       [1077, 660, 1090, 673], [1035, 681, 1059, 706], [1064, 681, 1089, 708],
+                       [1095, 681, 1118, 706], [1094, 706, 1120, 731], [1034, 707, 1060, 731],
+                       [1064, 731, 1090, 757], [1094, 732, 1120, 756], [1034, 733, 1060, 756]])
+        self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [parent])
+
+    def test_twin_cut_needs_clearly_wide_runs_not_square_glyphs(self):
+        parent = box(0, 0, 120, 200)
+        comps = [box(10 + col * 40, 10 + row * 30, 36 + col * 40, 34 + row * 30)
+                 for col in range(3) for row in range(6)]
+        self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [parent])
+
+    def test_live_peanut_lobes_sub_floor_diagonal_gap_splits(self):
+        # Live peanut balloon: two diagonal text masses whose lobe gap is under the
+        # lane floor and which share no cross-axis space. Worker comps verbatim.
+        parent = box(985, 182, 1127, 647, 0.92)
+        comps = rects([[1050, 181, 1086, 250], [1094, 182, 1127, 216], [1112, 217, 1127, 232],
+                       [1094, 233, 1127, 268], [1052, 252, 1084, 284], [1098, 268, 1127, 281],
+                       [1050, 286, 1086, 354], [1095, 286, 1124, 302], [1093, 307, 1115, 336],
+                       [1112, 309, 1127, 325], [1105, 339, 1116, 371], [1052, 356, 1084, 390],
+                       [1055, 391, 1083, 424], [1063, 426, 1074, 458], [990, 466, 1014, 491],
+                       [1019, 466, 1046, 567], [990, 492, 1016, 542], [990, 543, 1016, 566],
+                       [1020, 568, 1044, 592], [994, 570, 1016, 589], [992, 592, 1012, 641]])
+        self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [
+            {"x1": 1050, "y1": 182, "x2": 1127, "y2": 462, "conf": 0.92,
+             "clip": {"x1": 985, "y1": 182, "x2": 1127, "y2": 466}, "cutAxis": "y"},
+            {"x1": 990, "y1": 462, "x2": 1046, "y2": 641, "conf": 0.92,
+             "clip": {"x1": 985, "y1": 458, "x2": 1127, "y2": 647}, "cutAxis": "y"},
+        ])
+
+    def test_same_balloon_columns_with_sub_floor_gutters_stay_fused(self):
+        parent = box(0, 0, 120, 220)
+        comps = [box(10 + col * 36, 10 + row * 34, 34 + col * 36, 38 + row * 34)
+                 for col in range(3) for row in range(6)]
+        self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [parent])
+
 
 def white_with(rects_ink=(), gray=(), size=200):
     img = np.full((size, size, 3), 255, np.uint8)

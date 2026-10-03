@@ -6,7 +6,7 @@ import math
 # ---- box splitting (ported 1:1 from src/content/detection.ts) ----
 # Preserve two JS-isms: Math.round halves UP on positives (use _r) and medians are the UPPER middle (use _med).
 # Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on children); comps are plain rects (no count/psum).
-SPLIT_GEN = 5  # bump when this section's logic changes; /v1/page reports it
+SPLIT_GEN = 8  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
@@ -23,6 +23,15 @@ TWIN_GUTTER_MIN = 4
 TWIN_SIDE_MIN = 2
 TWIN_SPAN_MIN = 16
 TWIN_SPAN_FACTOR = 2
+# A per-glyph text mask (large vertical type) yields ~square single-glyph comps; w>h alone
+# then passes half of them by a pixel and fakes multi-row text. A real word/line run spans
+# at least this many glyph units horizontally.
+TWIN_WIDE_GLYPHS = 1.5
+
+
+def _median_minor(rs):
+    # median minor extent = one glyph unit
+    return _med([min(r["x2"] - r["x1"], r["y2"] - r["y1"]) for r in rs])
 
 
 def _r(x):
@@ -229,10 +238,15 @@ def _split_twin_cut(box, cs, box_comps):
                 start = x
     if depth == 0 and box["x2"] - start >= TWIN_GUTTER_MIN:
         ivs.append((start, box["x2"]))
+    glyph = _median_minor(cs)
+
+    def wide(c):
+        return (c["x2"] - c["x1"] > c["y2"] - c["y1"]
+                and c["x2"] - c["x1"] >= TWIN_WIDE_GLYPHS * glyph)
     for a, b in ivs:
         mid = (a + b) / 2
-        L = [c for c in cl if c["x2"] <= mid and c["x2"] - c["x1"] > c["y2"] - c["y1"]]
-        R = [c for c in cl if c["x1"] >= mid and c["x2"] - c["x1"] > c["y2"] - c["y1"]]
+        L = [c for c in cl if c["x2"] <= mid and wide(c)]
+        R = [c for c in cl if c["x1"] >= mid and wide(c)]
         if len(L) < TWIN_SIDE_MIN or len(R) < TWIN_SIDE_MIN:
             continue
         span = (lambda ss: max(c["y2"] for c in ss) - min(c["y1"] for c in ss))
@@ -246,8 +260,11 @@ def _split_twin_cut(box, cs, box_comps):
 
 
 def _split_overhang_columns(box, cs, box_comps):
+    glyph = _median_minor(cs)
+
     def wide(ss):
-        return [c for c in ss if c["x2"] - c["x1"] > c["y2"] - c["y1"]]
+        return [c for c in ss if c["x2"] - c["x1"] > c["y2"] - c["y1"]
+                and c["x2"] - c["x1"] >= TWIN_WIDE_GLYPHS * glyph]
 
     ws = wide(cs)
     if len(ws) < TWIN_SIDE_MIN * 2:
@@ -313,44 +330,87 @@ def _split_box_lane1(box, cs, same_block_gap, box_comps):
 def _split_box_lane2(box, cs, box_comps):
     if len(cs) < 2:
         return None
-    unit = _med([min(c["x2"] - c["x1"], c["y2"] - c["y1"]) for c in cs])
+    unit = _median_minor(cs)
     floor = max(SPLIT2_FLOOR_MIN, _r(SPLIT2_FLOOR_RATIO * unit))
+    # Cross-axis evidence reads the strict text core plus loose comps within the
+    # same glyph leash _emit_split gives child boxes: a weak comp (corroborated
+    # texture, a hand-drawn mark) far from any text must not stretch a group
+    # across a sibling block and veto the cut through nesting.
+    def in_box(c, g):
+        return ((c["x1"] + c["x2"]) / 2 >= g["x1"]
+                and (c["x1"] + c["x2"]) / 2 <= g["x2"]
+                and (c["y1"] + c["y2"]) / 2 >= g["y1"]
+                and (c["y1"] + c["y2"]) / 2 <= g["y2"])
+
+    def is_strict(c):
+        return any(k["x1"] == c["x1"] and k["y1"] == c["y1"]
+                   and k["x2"] == c["x2"] and k["y2"] == c["y2"] for k in box_comps)
+
+    def cross_span(g, axis):
+        own = [c for c in box_comps if in_box(c, g)]
+        ss = own
+        if own:
+            core = {"x1": min(c["x1"] for c in own), "y1": min(c["y1"] for c in own),
+                    "x2": max(c["x2"] for c in own), "y2": max(c["y2"] for c in own)}
+            ss = [c for c in cs if in_box(c, g)
+                  and c["x1"] <= core["x2"] + SPLIT_CORE_LEASH
+                  and c["x2"] >= core["x1"] - SPLIT_CORE_LEASH
+                  and c["y1"] <= core["y2"] + SPLIT_CORE_LEASH
+                  and c["y2"] >= core["y1"] - SPLIT_CORE_LEASH]
+        if not ss:
+            ss = [g]
+        if axis == "y":
+            return min(c["x1"] for c in ss), max(c["x2"] for c in ss)
+        return min(c["y1"] for c in ss), max(c["y2"] for c in ss)
+
     for axis in ("y", "x"):
         lo = (lambda g: g["y1"]) if axis == "y" else (lambda g: g["x1"])
         hi = (lambda g: g["y2"]) if axis == "y" else (lambda g: g["x2"])
-        c_lo = (lambda g: g["x1"]) if axis == "y" else (lambda g: g["y1"])
-        c_hi = (lambda g: g["x2"]) if axis == "y" else (lambda g: g["y2"])
         srt = sorted(cs, key=lo)
         groups = []
         for c in srt:
             g = groups[-1] if groups else None
             gap = lo(c) - hi(g) if g else 0
-            if g and gap >= floor:
-                groups.append(dict(c))
+            strict = is_strict(c)
+            # A sub-floor gap between strict text masses that share no cross-axis space is
+            # a balloon boundary (diagonal lobes, tight vertical-text clusters), not line
+            # spacing; weak-only clusters stay fused with their neighbour.
+            c_lo = c["x1"] if axis == "y" else c["y1"]
+            c_hi = c["x2"] if axis == "y" else c["y2"]
+            g_lo = (g["x1"] if axis == "y" else g["y1"]) if g else 0
+            g_hi = (g["x2"] if axis == "y" else g["y2"]) if g else 0
+            apart = (bool(g) and gap >= 0 and g.get("strict") and strict
+                     and min(c_hi, g_hi) - max(c_lo, g_lo) <= 0)
+            if g and (gap >= floor or apart):
+                groups.append(dict(c, strict=strict))
             elif g:
                 g["x1"] = min(g["x1"], c["x1"])
                 g["y1"] = min(g["y1"], c["y1"])
                 g["x2"] = max(g["x2"], c["x2"])
                 g["y2"] = max(g["y2"], c["y2"])
+                g["strict"] = g.get("strict") or strict
             else:
-                groups.append(dict(c))
+                groups.append(dict(c, strict=strict))
         if len(groups) < 2:
             continue
         merged = [groups[0]]
         for i in range(1, len(groups)):
             prev, g = merged[-1], groups[i]
             gap = lo(g) - hi(prev)
-            ov = min(c_hi(prev), c_hi(g)) - max(c_lo(prev), c_lo(g))
-            span = min(c_hi(prev) - c_lo(prev), c_hi(g) - c_lo(g))
+            sp_lo, sp_hi = cross_span(prev, axis)
+            sg_lo, sg_hi = cross_span(g, axis)
+            ov = min(sp_hi, sg_hi) - max(sp_lo, sg_lo)
+            span = min(sp_hi - sp_lo, sg_hi - sg_lo)
             ratio = 0 if ov <= 0 else ov / span
-            nested = ((c_lo(prev) >= c_lo(g) and c_hi(prev) <= c_hi(g))
-                      or (c_lo(g) >= c_lo(prev) and c_hi(g) <= c_hi(prev)))
+            nested = ((sp_lo >= sg_lo and sp_hi <= sg_hi)
+                      or (sg_lo >= sp_lo and sg_hi <= sp_hi))
             first_pair = (axis == "y" and len(merged) == 1 and i == 1
                             and nested and gap >= SPLIT2_FIRST_GAP_MULT * floor
                             and hi(g) - lo(g) >= (hi(prev) - lo(prev)) * SPLIT2_FIRST_MIN_RATIO)
-            if gap >= floor and (ratio < SPLIT2_OVERLAP_MAX
-                                 or (gap >= SPLIT2_STRONG_FACTOR * floor and not nested)
-                                 or first_pair):
+            if ((gap >= floor and (ratio < SPLIT2_OVERLAP_MAX
+                                   or (gap >= SPLIT2_STRONG_FACTOR * floor and not nested)
+                                   or first_pair))
+                    or (gap < floor and ov <= 0)):
                 merged.append(g)
             else:
                 prev["x1"] = min(prev["x1"], g["x1"])

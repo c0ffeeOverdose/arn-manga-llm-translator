@@ -508,3 +508,91 @@ test('first-pair: small bottom group under a big top block stays fused (straggle
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
 });
+
+// Live vertical-text twin balloons: a hand-drawn SFX comp between the balloons
+// (weak mask evidence, no strict text core nearby) used to stretch the left
+// group's cross span over the right balloon and veto the x cut through nesting.
+// Worker comps verbatim (loose = all, strict = text-likelihood set).
+const VERTICAL_TWIN_LOOSE = [[596, 82, 623, 126], [725, 93, 753, 184], [763, 93, 793, 203],
+  [764, 203, 791, 230], [763, 229, 792, 258], [766, 259, 790, 285], [768, 288, 791, 310],
+  [602, 312, 629, 341], [678, 313, 707, 340], [639, 314, 668, 341], [602, 340, 629, 368],
+  [639, 342, 668, 396], [679, 342, 705, 368], [603, 369, 628, 396], [678, 369, 707, 423],
+  [602, 398, 629, 422], [602, 424, 628, 449]];
+
+test('live vertical twins: a weak comp cannot veto the cut by nesting', () => {
+  const parent = box(606, 90, 797, 473);
+  const loose = VERTICAL_TWIN_LOOSE.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  const strict = loose.filter(c => c.x1 !== 596);
+  assert.deepEqual(splitMergedBoxes([parent], loose, GAP, strict), [
+    { x1: 606, y1: 312, x2: 716, y2: 449, conf: 0.9, clip: { x1: 606, y1: 90, x2: 725, y2: 473 }, cutAxis: 'x' },
+    { x1: 716, y1: 93, x2: 793, y2: 310, conf: 0.9, clip: { x1: 707, y1: 90, x2: 797, y2: 473 }, cutAxis: 'x' },
+  ]);
+});
+
+// The same mechanism in isolation: the weak comp chains into the left group on
+// x but sits far above its strict core, so the strict spans stay disjoint.
+test('weak comp outside the strict core stays out of the merge evidence', () => {
+  const parent = box(0, 0, 220, 400);
+  const loose = [[10, 10, 30, 80], [40, 220, 70, 380], [80, 220, 110, 380],
+    [130, 20, 160, 200], [170, 20, 200, 200]].map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  const strict = loose.filter(c => c.y1 >= 200);
+  assert.deepEqual(splitMergedBoxes([parent], loose, GAP, strict), [
+    { x1: 40, y1: 220, x2: 120, y2: 380, conf: 0.9, clip: { x1: 0, y1: 0, x2: 130, y2: 400 }, cutAxis: 'x' },
+    { x1: 120, y1: 20, x2: 200, y2: 200, conf: 0.9, clip: { x1: 110, y1: 0, x2: 220, y2: 400 }, cutAxis: 'x' },
+  ]);
+});
+
+// Live single balloon, large vertical type: the mask breaks every glyph into a
+// ~square comp (26x25), so the twin cut's old w>h test passed half of them and
+// read the column gutters as avenues — one balloon shipped as two regions with
+// half a sentence each. Worker comps verbatim (raw texty set).
+const VERTICAL_GLYPHS = [[1036, 631, 1060, 656], [1063, 631, 1090, 657], [1094, 631, 1120, 657],
+  [1094, 657, 1120, 681], [1064, 658, 1081, 680], [1038, 660, 1060, 679],
+  [1077, 660, 1090, 673], [1035, 681, 1059, 706], [1064, 681, 1089, 708],
+  [1095, 681, 1118, 706], [1094, 706, 1120, 731], [1034, 707, 1060, 731],
+  [1064, 731, 1090, 757], [1094, 732, 1120, 756], [1034, 733, 1060, 756]];
+
+test('live vertical glyphs: square comps cannot fake twin multi-row text', () => {
+  const parent = box(1033, 630, 1119, 758);
+  const comps = VERTICAL_GLYPHS.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});
+
+test('twin cut needs clearly wide runs, not square glyphs', () => {
+  const parent = box(0, 0, 120, 200);
+  const comps = [];
+  for (let col = 0; col < 3; col++)
+    for (let row = 0; row < 6; row++)
+      comps.push(box(10 + col * 40, 10 + row * 30, 36 + col * 40, 34 + row * 30));
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});
+
+// Live peanut balloon (large vertical type, per-glyph comps): two lobes whose text
+// masses are diagonal. The lobe gap is under the lane floor, but the masses share no
+// cross-axis space, so lane 2 cuts at the 8px diagonal gap. Worker comps verbatim.
+const PEANUT_LOBE = [[1050, 181, 1086, 250], [1094, 182, 1127, 216], [1112, 217, 1127, 232],
+  [1094, 233, 1127, 268], [1052, 252, 1084, 284], [1098, 268, 1127, 281], [1050, 286, 1086, 354],
+  [1095, 286, 1124, 302], [1093, 307, 1115, 336], [1112, 309, 1127, 325], [1105, 339, 1116, 371],
+  [1052, 356, 1084, 390], [1055, 391, 1083, 424], [1063, 426, 1074, 458], [990, 466, 1014, 491],
+  [1019, 466, 1046, 567], [990, 492, 1016, 542], [990, 543, 1016, 566], [1020, 568, 1044, 592],
+  [994, 570, 1016, 589], [992, 592, 1012, 641]];
+
+test('live peanut lobes: a sub-floor diagonal gap splits the two masses', () => {
+  const parent = box(985, 182, 1127, 647, 0.92);
+  const comps = PEANUT_LOBE.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [
+    { x1: 1050, y1: 182, x2: 1127, y2: 462, conf: 0.92, clip: { x1: 985, y1: 182, x2: 1127, y2: 466 }, cutAxis: 'y' },
+    { x1: 990, y1: 462, x2: 1046, y2: 641, conf: 0.92, clip: { x1: 985, y1: 458, x2: 1127, y2: 647 }, cutAxis: 'y' },
+  ]);
+});
+
+// Same-balloon columns never qualify for that cut: adjacent columns share the cross
+// axis, so their sub-floor gutters stay fused (p4 live case below covers the real page).
+test('same-balloon columns with sub-floor gutters stay fused', () => {
+  const parent = box(0, 0, 120, 220);
+  const comps = [];
+  for (let col = 0; col < 3; col++)
+    for (let row = 0; row < 6; row++)
+      comps.push(box(10 + col * 36, 10 + row * 34, 34 + col * 36, 38 + row * 34));
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});

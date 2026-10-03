@@ -320,14 +320,26 @@ function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: numbe
 // Twin-balloon cut: a straight ink-free avenue across the box with wide multi-row text on
 // both sides splits, whatever the gap width. The avenue must be crossed by ZERO comps — a word
 // gap always has another line's comps crossing it, and a headline spanning both columns unites
-// the block. Sides need ≥2 WIDE (w>h) comps spanning at least two glyph heights: vertical-text columns (tall comps)
-// and single lines can never pass. x-axis only: stacked blocks are lane 2's territory.
+// the block. Sides need ≥2 WIDE comps — wider than tall and at least TWIN_WIDE_GLYPHS glyph
+// units long, so per-glyph vertical text cannot pass — spanning at least two glyph heights.
+// x-axis only: stacked blocks are lane 2's territory.
 // Pure — unit tested.
 export const TWIN_GUTTER_MIN = 4; // px — dust margin on the avenue
 export const TWIN_SIDE_MIN = 2;   // wide comps per side
 export const TWIN_SPAN_MIN = 16;  // px — noise floor for multi-row support
 export const TWIN_SPAN_FACTOR = 2; // × median wide-component height
+// A per-glyph text mask (large vertical type) yields ~square single-glyph comps; w>h alone
+// then passes half of them by a pixel and fakes multi-row text. A real word/line run spans
+// at least this many glyph units horizontally.
+export const TWIN_WIDE_GLYPHS = 1.5;
+// Median minor extent = one glyph unit.
+function medianMinor(rs: SplitComp[]): number {
+    const d = rs.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
+    return d[Math.floor(d.length / 2)];
+}
 function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
+    const unit = medianMinor(cs);
+    const wide = (ss: SplitComp[]) => ss.filter(c => c.x2 - c.x1 > c.y2 - c.y1 && c.x2 - c.x1 >= TWIN_WIDE_GLYPHS * unit);
     // clamp to the box, then sweep for avenues no comp crosses (closes sort before opens at
     // ties, so touching comps leave no avenue)
     const cl = cs.map(c => ({ ...c, x1: Math.max(c.x1, box.x1), x2: Math.min(c.x2, box.x2) }));
@@ -354,7 +366,6 @@ function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Split
         const mid = (iv.a + iv.b) / 2;
         const left = cl.filter(c => c.x2 <= mid);
         const right = cl.filter(c => c.x1 >= mid);
-        const wide = (ss: SplitComp[]) => ss.filter(c => c.x2 - c.x1 > c.y2 - c.y1);
         const L = wide(left), R = wide(right);
         if (L.length < TWIN_SIDE_MIN || R.length < TWIN_SIDE_MIN) continue;
         const span = (ss: SplitComp[]) => Math.max(...ss.map(c => c.y2)) - Math.min(...ss.map(c => c.y1));
@@ -373,7 +384,8 @@ function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Split
 // Multi-row columns may overlap by a glyph fringe; a spanning line must still veto
 // the cut. Each side owns its full component extents, including narrow punctuation.
 function splitOverhangColumns<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
-    const wide = (ss: SplitComp[]) => ss.filter(c => c.x2 - c.x1 > c.y2 - c.y1);
+    const glyph = medianMinor(cs);
+    const wide = (ss: SplitComp[]) => ss.filter(c => c.x2 - c.x1 > c.y2 - c.y1 && c.x2 - c.x1 >= TWIN_WIDE_GLYPHS * glyph);
     const ws = wide(cs);
     if (ws.length < TWIN_SIDE_MIN * 2) return null;
     const dims = ws.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
@@ -445,28 +457,59 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
 // box's glyph size (median cluster minor extent) and a cut needs EITHER strongly disjoint cross
 // spans OR 1.5 times the floor with the cross spans not nested in each other. The nested guard keeps
 // a paragraph's separated last line fused while the caption-block case passes. Same-span lines
-// of one block merge through the overlap ratio. Pure — unit tested.
+// of one block merge through the overlap ratio. Cross spans come from the strict text core plus
+// its glyph leash, so a weak comp cannot fake the nesting. Pure — unit tested.
 function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
     if (cs.length < 2) return null;
-    const dims = cs.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
-    const unit = dims[Math.floor(dims.length / 2)];
+    const unit = medianMinor(cs);
     const floor = Math.max(SPLIT2_FLOOR_MIN, Math.round(SPLIT2_FLOOR_RATIO * unit));
+    // Cross-axis evidence reads the strict text core plus loose comps within the
+    // same glyph leash emitSplit gives child boxes: a weak comp (corroborated texture,
+    // a hand-drawn mark) far from any text must not stretch a group across a sibling
+    // block and veto the cut through nesting — see the live vertical-twin case.
+    const isStrict = (c: SplitComp) => boxComps.some(k => k.x1 === c.x1 && k.y1 === c.y1 && k.x2 === c.x2 && k.y2 === c.y2);
+    const crossSpan = (g: SplitGroup, axis: 'y' | 'x'): { lo: number; hi: number } => {
+        const inBox = (c: SplitComp) =>
+            (c.x1 + c.x2) / 2 >= g.x1 && (c.x1 + c.x2) / 2 <= g.x2 &&
+            (c.y1 + c.y2) / 2 >= g.y1 && (c.y1 + c.y2) / 2 <= g.y2;
+        const own = boxComps.filter(inBox);
+        let ss: SplitComp[] = own;
+        if (own.length) {
+            const core = {
+                x1: Math.min(...own.map(c => c.x1)), y1: Math.min(...own.map(c => c.y1)),
+                x2: Math.max(...own.map(c => c.x2)), y2: Math.max(...own.map(c => c.y2)),
+            };
+            ss = cs.filter(c => inBox(c) &&
+                c.x1 <= core.x2 + SPLIT_CORE_LEASH && c.x2 >= core.x1 - SPLIT_CORE_LEASH &&
+                c.y1 <= core.y2 + SPLIT_CORE_LEASH && c.y2 >= core.y1 - SPLIT_CORE_LEASH);
+        }
+        if (!ss.length) ss = [g];
+        return axis === 'y'
+            ? { lo: Math.min(...ss.map(c => c.x1)), hi: Math.max(...ss.map(c => c.x2)) }
+            : { lo: Math.min(...ss.map(c => c.y1)), hi: Math.max(...ss.map(c => c.y2)) };
+    };
     for (const axis of ['y', 'x'] as const) {
         const lo = (g: SplitGroup) => (axis === 'y' ? g.y1 : g.x1);
         const hi = (g: SplitGroup) => (axis === 'y' ? g.y2 : g.x2);
-        const cLo = (g: SplitGroup) => (axis === 'y' ? g.x1 : g.y1);
-        const cHi = (g: SplitGroup) => (axis === 'y' ? g.x2 : g.y2);
         const sorted = [...cs].sort((a, b) => lo(a) - lo(b));
-        const groups: SplitGroup[] = [];
+        const groups: (SplitGroup & { strict: boolean })[] = [];
         for (const c of sorted) {
             const g = groups[groups.length - 1];
             const gap = g ? lo(c) - hi(g) : 0;
-            if (g && gap >= floor) groups.push({ ...c });
+            const strict = isStrict(c);
+            // A sub-floor gap between strict text masses that share no cross-axis space is
+            // a balloon boundary (diagonal lobes, tight vertical-text clusters), not line
+            // spacing; weak-only clusters stay fused with their neighbour.
+            const apart = !!g && gap >= 0 && g.strict && strict
+                && Math.min(axis === 'y' ? c.x2 : c.y2, axis === 'y' ? g.x2 : g.y2)
+                - Math.max(axis === 'y' ? c.x1 : c.y1, axis === 'y' ? g.x1 : g.y1) <= 0;
+            if (g && (gap >= floor || apart)) groups.push({ ...c, strict });
             else if (g) {
                 g.x1 = Math.min(g.x1, c.x1); g.y1 = Math.min(g.y1, c.y1);
                 g.x2 = Math.max(g.x2, c.x2); g.y2 = Math.max(g.y2, c.y2);
+                g.strict = g.strict || strict;
             } else {
-                groups.push({ ...c });
+                groups.push({ ...c, strict });
             }
         }
         if (groups.length < 2) continue;
@@ -474,16 +517,18 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
         for (let i = 1; i < groups.length; i++) {
             const prev = merged[merged.length - 1], g = groups[i];
             const gap = lo(g) - hi(prev);
-            const ov = Math.min(cHi(prev), cHi(g)) - Math.max(cLo(prev), cLo(g));
-            const ratio = ov <= 0 ? 0 : ov / Math.min(cHi(prev) - cLo(prev), cHi(g) - cLo(g));
-            const nested = (cLo(prev) >= cLo(g) && cHi(prev) <= cHi(g))
-                || (cLo(g) >= cLo(prev) && cHi(g) <= cHi(prev));
+            const sp = crossSpan(prev, axis), sg = crossSpan(g, axis);
+            const ov = Math.min(sp.hi, sg.hi) - Math.max(sp.lo, sg.lo);
+            const ratio = ov <= 0 ? 0 : ov / Math.min(sp.hi - sp.lo, sg.hi - sg.lo);
+            const nested = (sp.lo >= sg.lo && sp.hi <= sg.hi)
+                || (sg.lo >= sp.lo && sg.hi <= sp.hi);
             const firstPair = axis === 'y' && merged.length === 1 && i === 1
                 && nested && gap >= SPLIT2_FIRST_GAP_MULT * floor
                 && hi(g) - lo(g) >= (hi(prev) - lo(prev)) * SPLIT2_FIRST_MIN_RATIO;
-            if (gap >= floor && (ratio < SPLIT2_OVERLAP_MAX
+            if ((gap >= floor && (ratio < SPLIT2_OVERLAP_MAX
                 || (gap >= SPLIT2_STRONG_FACTOR * floor && !nested)
-                || firstPair)) {
+                || firstPair))
+                || (gap < floor && ov <= 0)) {
                 merged.push(g);
             } else {
                 prev.x1 = Math.min(prev.x1, g.x1); prev.y1 = Math.min(prev.y1, g.y1);
