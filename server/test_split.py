@@ -9,9 +9,88 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from split import expand_crop_to_ink, split_merged_boxes
+from split import expand_crop_to_ink, extend_mask_box, group_mask_components, mask_component_eligible, split_merged_boxes
 
 GAP = 28
+
+
+class MaskGroups(unittest.TestCase):
+    def test_union_bbox_cannot_recruit_unconnected_text(self):
+        comps = [{"x1": 0, "y1": 0, "x2": 20, "y2": 20},
+                 {"x1": 35, "y1": 35, "x2": 55, "y2": 55},
+                 {"x1": 0, "y1": 40, "x2": 10, "y2": 50}]
+        self.assertEqual(group_mask_components(comps, 16), [[0, 1], [2]])
+
+    def test_transitive_neighbours_and_empty(self):
+        comps = [{"x1": x, "y1": 0, "x2": x + 20, "y2": 20} for x in [0, 30, 60]]
+        self.assertEqual(group_mask_components(comps, 10), [[0, 1, 2]])
+        self.assertEqual(group_mask_components([], GAP), [])
+
+    def test_glyph_scaled_line_spacing(self):
+        self.assertEqual(group_mask_components(rects([[0, 0, 80, 50], [0, 79, 80, 129], [200, 79, 280, 129]]), GAP), [[0, 1], [2]])
+
+    def test_dense_lettering_not_solid_or_weak_fill(self):
+        c = {"x1": 10, "y1": 10, "x2": 100, "y2": 40, "count": 1700, "psum": 1700 * 0.81}
+        self.assertTrue(mask_component_eligible(c, 100000, 0))
+        self.assertFalse(mask_component_eligible(dict(c, count=2700, psum=2700 * 0.9), 100000, 0))
+        self.assertFalse(mask_component_eligible(dict(c, psum=1700 * 0.4), 100000, 0.1))
+        self.assertFalse(mask_component_eligible(c, 1000, 0.8))
+
+    def test_matching_head_can_extend_faint_edges_but_not_across_another_region(self):
+        c = box(10, 10, 50, 30)
+        candidates = [box(0, 6, 60, 36, 0.25), box(0, 0, 200, 200, 0.99), box(45, 10, 100, 30, 0.99)]
+        self.assertEqual(extend_mask_box(c, candidates, lambda r: False), {"x1": -3, "y1": 3, "x2": 63, "y2": 39})
+        self.assertIs(extend_mask_box(c, candidates, lambda r: True), c)
+        self.assertEqual(extend_mask_box(c, [box(9, 10, 51, 30, 0.4)] + candidates, lambda r: False),
+                         {"x1": -3, "y1": 3, "x2": 63, "y2": 39})
+
+
+class ColumnSplits(unittest.TestCase):
+    def test_short_lateral_lobe(self):
+        comps = rects([[10, 50, 120, 90], [10, 100, 120, 140], [10, 150, 120, 190], [150, 35, 245, 80]])
+        parts = split_merged_boxes([box(0, 0, 250, 200)], comps, GAP)
+        self.assertEqual(len(parts), 2)
+        self.assertLessEqual(parts[0]["x2"], parts[1]["x1"])
+
+    def test_small_overhang_and_spanning_line_guard(self):
+        comps = rects([[20, 100, 120, 125], [40, 135, 140, 160], [90, 168, 160, 193],
+                       [154, 30, 260, 55], [158, 64, 260, 90], [155, 105, 260, 131]])
+        parent = box(0, 0, 300, 220)
+        parts = split_merged_boxes([parent], comps, GAP)
+        self.assertEqual(len(parts), 2)
+        self.assertGreaterEqual(parts[0]["clip"]["x2"], 160)
+        self.assertLessEqual(parts[1]["clip"]["x1"], 154)
+        self.assertEqual(split_merged_boxes([parent], comps + [box(20, 70, 260, 95)], GAP), [parent])
+
+    def test_narrow_punctuation_survives(self):
+        comps = rects([[10, 10, 90, 30], [10, 40, 90, 60], [10, 70, 90, 90], [50, 100, 60, 130],
+                       [100, 10, 180, 30], [100, 40, 180, 60], [100, 70, 180, 90]])
+        parts = split_merged_boxes([box(0, 0, 220, 150)], comps, GAP)
+        self.assertEqual(len(parts), 2)
+        self.assertGreaterEqual(parts[0]["y2"], 130)
+
+    def test_twin_support_scales_with_glyphs(self):
+        comps = rects([[20, 45, 80, 65], [20, 76, 88, 96], [20, 106, 96, 126],
+                       [104, 0, 185, 15], [110, 21, 185, 36], [105, 43, 185, 58], [110, 65, 185, 80],
+                       [105, 86, 185, 101], [110, 108, 185, 123], [105, 130, 185, 145], [110, 150, 185, 165]])
+        for scale in [0.5, 1, 2]:
+            cs = [{k: v * scale for k, v in c.items()} for c in comps]
+            parent = box(0, 0, 200 * scale, 180 * scale)
+            parts = split_merged_boxes([parent], cs, GAP * scale)
+            self.assertEqual(len(parts), 2)
+            self.assertTrue(all(p["cutAxis"] == "x" for p in parts))
+
+
+class CropOwnership(unittest.TestCase):
+    def test_initial_padding_is_clamped_before_any_growth(self):
+        rgb = np.full((240, 240, 3), 255, np.uint8)
+        b = {"x1": 100, "y1": 80, "x2": 140, "y2": 130, "conf": 0.9,
+             "clip": {"x1": 95, "y1": 70, "x2": 160, "y2": 150}, "cutAxis": "x"}
+        rect = {"x": 80, "y": 60, "w": 90, "h": 100}
+        self.assertEqual(expand_crop_to_ink(rgb, b, rect), {"x": 95, "y": 60, "w": 65, "h": 100})
+        self.assertEqual(expand_crop_to_ink(rgb, dict(b, cutAxis="y"), rect), {"x": 83, "y": 70, "w": 87, "h": 80})
+        self.assertEqual(expand_crop_to_ink(rgb, b, {"x": 80, "y": 40, "w": 90, "h": 150}),
+                         {"x": 95, "y": 58, "w": 65, "h": 104})
 
 
 def box(x1, y1, x2, y2, conf=0.9):
@@ -129,12 +208,12 @@ class SplitTest(unittest.TestCase):
         kids = split_merged_boxes([parent], rects(MD4), GAP, rects(MD4))
         self.assertEqual(len(kids), 2)
         self.assertEqual([kids[0]["x1"], kids[0]["y1"], kids[0]["x2"], kids[0]["y2"]],
-                         [482, 120, 558, 207])
+                     [482, 120, 556, 207])
         self.assertEqual([kids[1]["x1"], kids[1]["y1"], kids[1]["x2"], kids[1]["y2"]],
-                         [559, 76, 677, 239])
+                     [556, 76, 677, 239])
         self.assertEqual(kids[0]["cutAxis"], "x")
-        self.assertEqual([kids[0]["clip"]["x1"], kids[0]["clip"]["x2"]], [477, 565])
-        self.assertEqual([kids[1]["clip"]["x1"], kids[1]["clip"]["x2"]], [553, 679])
+        self.assertEqual([kids[0]["clip"]["x1"], kids[0]["clip"]["x2"]], [477, 560])
+        self.assertEqual([kids[1]["clip"]["x1"], kids[1]["clip"]["x2"]], [552, 679])
 
     def test_twin_cut_guards(self):
         # vertical-text columns never x-split
@@ -215,7 +294,8 @@ class CropTest(unittest.TestCase):
         self.assertEqual(noclipr["y"] + noclipr["h"], 128)
         clipped = dict(b, clip={"x1": 0, "y1": 0, "x2": 199, "y2": 106})
         r = expand_crop_to_ink(rgb, clipped, self._rect(b, 4.5))
-        self.assertEqual((r["x"], r["y"], r["w"], r["h"]), (45, 55, 109, 54))
+        self.assertEqual((r["x"], r["y"], r["w"], r["h"]), (45, 55, 109, 51))
+        self.assertLessEqual(r["y"] + r["h"], clipped["clip"]["y2"], "initial padding must also obey the cut")
 
 
 if __name__ == "__main__":

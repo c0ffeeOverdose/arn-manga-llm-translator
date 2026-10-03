@@ -9,7 +9,7 @@ await build({
   entryPoints: ['src/content/inpaint.ts'],
   bundle: true, format: 'esm', outfile: '.test-build/inpaint.mjs', sourcemap: 'inline',
 });
-const { eraseBox, erasePlan, aiCleanupMask, aiCleanupDilate, windowIndex, eraseBgColor } = await import(new URL('../.test-build/inpaint.mjs', import.meta.url).href);
+const { eraseBox, erasePlan, aiCleanupMask, aiCleanupDilate, windowIndex, eraseBgColor, inpaint } = await import(new URL('../.test-build/inpaint.mjs', import.meta.url).href);
 
 function mask(W, H, fill = []) {
   const m = new Uint8Array(W * H);
@@ -18,6 +18,42 @@ function mask(W, H, fill = []) {
 }
 
 const box = { x1: 10, y1: 10, x2: 30, y2: 30 };
+
+function canvasWithTone(W, H, tone) {
+  const data = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) { data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = tone; data[i * 4 + 3] = 255; }
+  return { width: W, height: H, data, getContext: () => ({ getImageData: () => ({ width: W, height: H, data }), putImageData() {} }) };
+}
+
+test('fill cleanup keeps a distant outline in a loose text row and erases its own glyphs', () => {
+  const W = 100, H = 80, c = canvasWithTone(W, H, 255), m = new Uint8Array(W * H);
+  for (let y = 20; y < 50; y++) for (let x = 25; x < 40; x++) {
+    const i = (y * W + x) * 4; c.data[i] = c.data[i + 1] = c.data[i + 2] = 0; m[y * W + x] = 255;
+  }
+  for (let y = 0; y < H; y++) { const i = (y * W + 70) * 4; c.data[i] = c.data[i + 1] = c.data[i + 2] = 0; }
+  inpaint(c, { boxes: [{ x1: 20, y1: 18, x2: 85, y2: 52, conf: 0.4 }], mask: { width: W, height: H, data: m.buffer } });
+  assert.equal(c.data[(30 * W + 30) * 4], 255, 'source text erased');
+  assert.equal(c.data[(30 * W + 70) * 4], 0, 'unrelated outline is not faint text');
+});
+
+test('uniform dark captions recover pale glyph tips while keep regions stay intact', () => {
+  const W = 120, H = 100, c = canvasWithTone(W, H, 0), m = new Uint8Array(W * H);
+  for (let y = 15; y < 75; y++) for (let x = 30; x < 40; x++) {
+    const i = (y * W + x) * 4; c.data[i] = c.data[i + 1] = c.data[i + 2] = 255;
+    if (y >= 24) m[y * W + x] = 255;
+  }
+  const keep = { x1: 60, y1: 20, x2: 70, y2: 30 };
+  for (let y = 20; y <= 30; y++) for (let x = 60; x <= 70; x++) {
+    const i = (y * W + x) * 4; c.data[i] = c.data[i + 1] = c.data[i + 2] = 255;
+  }
+  for (let y = 19; y < 22; y++) for (let x = 82; x < 85; x++) {
+    const i = (y * W + x) * 4; c.data[i] = c.data[i + 1] = c.data[i + 2] = 255;
+  }
+  inpaint(c, { boxes: [{ x1: 20, y1: 24, x2: 90, y2: 75, conf: 0.5 }], keepBoxes: [keep], mask: { width: W, height: H, data: m.buffer } });
+  assert.equal(c.data[(19 * W + 35) * 4], 0, 'the unmasked connected tip is removed');
+  assert.equal(c.data[(25 * W + 65) * 4], 255, 'keep remains protected');
+  assert.equal(c.data[(20 * W + 83) * 4], 255, 'an unmasked, disconnected bright detail remains artwork');
+});
 
 test('eraseBox: keeps the box when nothing touches it', () => {
   const m = mask(60, 60, [[50, 50]]);

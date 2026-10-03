@@ -11,10 +11,96 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/box-split-detection.mjs', sourcemap: 'inline',
 });
 
-const { splitMergedBoxes } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
+const { splitMergedBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, shiftDetectionBoxY } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
 
 const box = (x1, y1, x2, y2, conf = 0.9) => ({ x1, y1, x2, y2, conf });
 const GAP = 28;
+
+test('stacking pages translates split ownership with the box without mutating the source', () => {
+  const clip = { x1: 40, y1: 70, x2: 160, y2: 150 };
+  const source = { ...box(50, 80, 140, 130), clip, cutAxis: 'y' };
+  const shifted = shiftDetectionBoxY(source, 1000);
+  assert.deepEqual(shifted, { ...source, y1: 1080, y2: 1130, clip: { ...clip, y1: 1070, y2: 1150 } });
+  assert.equal(shifted.cutAxis, 'y');
+  assert.equal(source.clip, clip);
+  assert.equal(source.clip.y1, 70);
+  assert.equal(source.y1, 80);
+  assert.equal('clip' in shiftDetectionBoxY(box(0, 0, 40, 40), 1000), false);
+});
+test('mask groups do not recruit text from empty space inside a union bbox', () => {
+  const comps = [box(0, 0, 20, 20), box(35, 35, 55, 55), box(0, 40, 10, 50)];
+  assert.deepEqual(groupMaskComponents(comps, 16), [[0, 1], [2]]);
+  assert.deepEqual(comps.map(c => [c.x1, c.y1, c.x2, c.y2]), [[0, 0, 20, 20], [35, 35, 55, 55], [0, 40, 10, 50]]);
+});
+
+test('mask groups keep genuine transitive neighbours and handle empty input', () => {
+  assert.deepEqual(groupMaskComponents([box(0, 0, 20, 20), box(30, 0, 50, 20), box(60, 0, 80, 20)], 10), [[0, 1, 2]]);
+  assert.deepEqual(groupMaskComponents([], GAP), []);
+});
+
+test('mask grouping allows large-glyph line spacing without unbounded growth', () => {
+  assert.deepEqual(groupMaskComponents([box(0, 0, 80, 50), box(0, 79, 80, 129), box(200, 79, 280, 129)], GAP), [[0, 1], [2]]);
+});
+
+test('dense mask lettering survives while solid, weak and oversized components do not', () => {
+  const dense = { ...box(10, 10, 100, 40), count: 1700, probSum: 1700 * 0.81 };
+  assert.equal(maskComponentEligible(dense, 100000, 0), true);
+  assert.equal(maskComponentEligible({ ...dense, count: 2700, probSum: 2700 * 0.9 }, 100000, 0), false);
+  assert.equal(maskComponentEligible({ ...dense, probSum: 1700 * 0.4 }, 100000, 0.1), false);
+  assert.equal(maskComponentEligible(dense, 1000, 0.8), false);
+});
+
+test('mask boxes recover faint glyph edges only from bounded matching head evidence', () => {
+  const c = box(10, 10, 50, 30);
+  const candidates = [box(0, 6, 60, 36, 0.25), box(0, 0, 200, 200, 0.99), box(45, 10, 100, 30, 0.99)];
+  assert.deepEqual(extendMaskBox(c, candidates, () => false), { x1: -3, y1: 3, x2: 63, y2: 39 });
+  assert.equal(extendMaskBox(c, candidates, () => true), c, 'an existing region vetoes expansion');
+  assert.equal(extendMaskBox(c, [box(0, 6, 60, 36, 0.1)], () => false), c);
+  assert.deepEqual(extendMaskBox(c, [box(9, 10, 51, 30, 0.4), ...candidates], () => false),
+    { x1: -3, y1: 3, x2: 63, y2: 39 }, 'a tight prediction cannot hide corroborated faint edges');
+});
+test('short lateral lobe separates from a non-nested multi-line block', () => {
+  const parent = box(0, 0, 250, 200);
+  const comps = [box(10, 50, 120, 90), box(10, 100, 120, 140), box(10, 150, 120, 190), box(150, 35, 245, 80)];
+  const parts = splitMergedBoxes([parent], comps, GAP);
+  assert.equal(parts.length, 2);
+  assert.ok(parts[0].x2 <= parts[1].x1);
+  assert.ok(parts[0].y2 >= 190 && parts[1].y1 <= 35);
+});
+
+test('multi-row columns tolerate a small glyph overhang but not a spanning headline', () => {
+  const parent = box(0, 0, 300, 220);
+  const comps = [box(20, 100, 120, 125), box(40, 135, 140, 160), box(90, 168, 160, 193),
+    box(154, 30, 260, 55), box(158, 64, 260, 90), box(155, 105, 260, 131)];
+  const parts = splitMergedBoxes([parent], comps, GAP);
+  assert.equal(parts.length, 2);
+  assert.ok(parts[0].x2 <= parts[1].x1);
+  assert.ok(parts[0].clip.x2 >= 160 && parts[1].clip.x1 <= 154, 'crop clips retain the overlapping glyph fringes');
+  assert.deepEqual(splitMergedBoxes([parent], [...comps, box(20, 70, 260, 95)], GAP), [parent]);
+});
+
+test('twin-column extents retain narrow punctuation after the final wide row', () => {
+  const parent = box(0, 0, 220, 150);
+  const comps = [box(10, 10, 90, 30), box(10, 40, 90, 60), box(10, 70, 90, 90), box(50, 100, 60, 130),
+    box(100, 10, 180, 30), box(100, 40, 180, 60), box(100, 70, 180, 90)];
+  const parts = splitMergedBoxes([parent], comps, GAP);
+  assert.equal(parts.length, 2);
+  assert.ok(parts[0].y2 >= 130);
+});
+
+test('multi-row twin support scales with glyph height rather than a fixed page size', () => {
+  const parent = box(0, 0, 200, 180);
+  const comps = [box(20, 45, 80, 65), box(20, 76, 88, 96), box(20, 106, 96, 126),
+    box(104, 0, 185, 15), box(110, 21, 185, 36), box(105, 43, 185, 58), box(110, 65, 185, 80),
+    box(105, 86, 185, 101), box(110, 108, 185, 123), box(105, 130, 185, 145), box(110, 150, 185, 165)];
+  const scaled = (b, s) => ({ ...b, x1: b.x1 * s, y1: b.y1 * s, x2: b.x2 * s, y2: b.y2 * s });
+  for (const s of [0.5, 1, 2]) {
+    const cs = comps.map(b => scaled(b, s));
+    const children = splitMergedBoxes([scaled(parent, s)], cs, GAP * s);
+    assert.equal(children.length, 2, `two groups at scale ${s}`);
+    assert.ok(children.every(b => b.cutAxis === 'x'));
+  }
+});
 
 // Live case (MangaDex page 2, mask comps verbatim): one box over two diagonal
 // balloons — "EM NÀY!" (upper right) and a 4-line block (lower left). Cluster
@@ -292,12 +378,13 @@ test('live md4 twin balloons split at the 8px avenue despite nesting', () => {
   ];
   const kids = splitMergedBoxes([parent], comps, GAP, comps);
   assert.equal(kids.length, 2);
-  assert.deepEqual([kids[0].x1, kids[0].y1, kids[0].x2, kids[0].y2], [482, 120, 558, 207]);
-  assert.deepEqual([kids[1].x1, kids[1].y1, kids[1].x2, kids[1].y2], [559, 76, 677, 239]);
+  assert.deepEqual([kids[0].x1, kids[0].y1, kids[0].x2, kids[0].y2], [482, 120, 556, 207]);
+  assert.deepEqual([kids[1].x1, kids[1].y1, kids[1].x2, kids[1].y2], [556, 76, 677, 239]);
   assert.equal(kids[0].cutAxis, 'x');
   assert.equal(kids[1].cutAxis, 'x');
-  assert.deepEqual([kids[0].clip.x1, kids[0].clip.x2], [477, 565]);
-  assert.deepEqual([kids[1].clip.x1, kids[1].clip.x2], [553, 679]);
+  assert.deepEqual([kids[0].clip.x1, kids[0].clip.x2], [477, 560]);
+  assert.deepEqual([kids[1].clip.x1, kids[1].clip.x2], [552, 679]);
+  assert.ok(kids[1].clip.x1 <= 560, 'the narrow leading component belongs to the right crop');
 });
 
 // Vertical-text columns must never x-split: tall comps fail the wide test.

@@ -13,7 +13,7 @@ await build({
 
 const {
   bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, isLight, layoutText, horizontalFits,
-  widthProfile, runInterval, sourcePitch, sizeCapFrom, layoutTextFit, boxIsVertical, setRenderTuning, renderTuning, ENCLOSED_MIN,
+  widthProfile, surfaceProfile, sourceBoxForLayout, runInterval, sourcePitch, sizeCapFrom, layoutTextFit, boxIsVertical, setRenderTuning, renderTuning, ENCLOSED_MIN,
   clampRunEnd, RUN_JUMP,
   clipArea,
   dividerClips, growDarkArea, expandCropToInk,
@@ -494,6 +494,77 @@ test('layoutArea: no-frame box (white page) stays on the legacy rectangle', () =
   assert.ok(a.w <= 40 * 1.6 + 1, `legacy box+30%/1.5x behavior, got w=${a.w}`);
 });
 
+test('surface profile follows a stroke-free curved background and bridges masked glyphs', () => {
+  const W = 240, H = 240;
+  const img = page(W, H);
+  const mask = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (Math.hypot(x - 120, y - 120) > 90) {
+      const k = (y * W + x) * 4; img.data[k] = img.data[k + 1] = img.data[k + 2] = 60;
+    }
+  }
+  for (let y = 116; y <= 123; y++) for (let x = 80; x < 160; x++) {
+    const k = (y * W + x) * 4; img.data[k] = img.data[k + 1] = img.data[k + 2] = 0;
+    mask[y * W + x] = 255;
+  }
+  const box = { x1: 75, y1: 65, x2: 165, y2: 175, conf: 0.9 };
+  const area = { x: 30, y: 30, w: 180, h: 180 };
+  const profile = surfaceProfile(img, box, area, false, { width: W, height: H, data: mask.buffer });
+  assert.ok(profile, 'a bounded color surface does not require an outline stroke');
+  assert.ok(profile.i2[10] - profile.i1[10] < profile.i2[90] - profile.i1[90], 'the tip is narrower than the middle');
+  assert.ok(profile.i1[90] <= 80 && profile.i2[90] >= 159, 'foreground text does not create a hole');
+  for (let y = 116; y <= 123; y++) for (let x = 86; x < 154; x++) mask[y * W + x] = 0;
+  const faint = surfaceProfile(img, box, area, false, { width: W, height: H, data: mask.buffer });
+  assert.ok(faint && faint.i2[90] - faint.i1[90] > 130, 'a faint glyph fringe does not become the bubble boundary');
+  assert.equal(surfaceProfile(page(W, H), box, area, false, { width: W, height: H, data: mask.buffer }), null, 'open fields do not become shaped bubbles');
+  assert.equal(surfaceProfile(img, box, area, false), null, 'without a text mask the legacy fallback remains');
+});
+
+test('surface profile rejects an artwork background rather than clipping along its texture', () => {
+  const W = 240, H = 240;
+  const img = page(W, H), mask = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = (x + y) % 4 < 2 ? 120 : 255;
+    const k = (y * W + x) * 4; img.data[k] = img.data[k + 1] = img.data[k + 2] = v;
+  }
+  const box = { x1: 60, y1: 60, x2: 180, y2: 180, conf: 0.9 };
+  assert.equal(surfaceProfile(img, box, { x: 30, y: 30, w: 180, h: 180 }, false, { width: W, height: H, data: mask.buffer }), null);
+});
+
+test('compact mask core anchors a loose box without changing detection or trusting dust', () => {
+  const W = 200, H = 200, img = page(W, H), data = new Uint8Array(W * H);
+  const box = { x1: 40, y1: 40, x2: 120, y2: 180, conf: 0.4 };
+  for (let y = 140; y < 165; y++) for (let x = 60; x < 100; x++) data[y * W + x] = 255;
+  const mask = { width: W, height: H, data: data.buffer };
+  assert.deepEqual(sourceBoxForLayout(img, box, false, mask), { ...box, x1: 60, y1: 140, x2: 100, y2: 165 });
+  assert.equal(box.y1, 40, 'the detector/crop box is unchanged');
+  data.fill(0); data[150 * W + 80] = 255;
+  assert.equal(sourceBoxForLayout(img, box, false, mask), box);
+  assert.equal(sourceBoxForLayout(img, box, false, { ...mask, width: 100 }), box);
+});
+
+test('a loose box measures the small source lobe rather than borrowing its neighbour area', () => {
+  const W = 200, H = 240, img = page(W, H), data = new Uint8Array(W * H);
+  for (let y = 170; y < 220; y++) for (let x = 40; x < 100; x++) {
+    if (x === 40 || x === 99 || y === 170 || y === 219) {
+      const k = (y * W + x) * 4; img.data[k] = img.data[k + 1] = img.data[k + 2] = 0;
+    }
+  }
+  for (let y = 185; y < 200; y++) for (let x = 55; x < 85; x++) {
+    const k = (y * W + x) * 4; img.data[k] = img.data[k + 1] = img.data[k + 2] = 0; data[y * W + x] = 255;
+  }
+  const box = { x1: 50, y1: 80, x2: 140, y2: 205, conf: 0.4 };
+  const a = layoutArea(img, box, false, { width: W, height: H, data: data.buffer });
+  assert.ok(a.x >= 40 && a.x + a.w <= 100 && a.y >= 170, 'the compact text core measures its actual speech surface');
+});
+
+test('Thai trailing punctuation stays with its word during narrow wrapping', () => {
+  const out = layoutText(fakeCtx(), 'ได้โปรด อย่าทำแบบนี้...', 70, 200, 20);
+  assert.ok(out.lines.length > 1);
+  assert.ok(out.lines.every(line => !/^[.?!…]+$/.test(line)), 'no line contains only a trailing mark');
+  assert.ok(out.lines.join('').endsWith('แบบนี้...'));
+});
+
 // ---- layoutTextFit: per-line bands (fake ctx) ----
 
 function bandProfile(rows, widthAt, x1 = 0) {
@@ -768,7 +839,9 @@ test('layoutTextFit: last-resort rect layout centers a fitting block', () => {
   const snug = { x: 0, y: 0, w: 200, h: 20, runs: bandProfile(20, () => 40) };
   const small = layoutTextFit(fakeCtx(), 'abcdefgh', snug, 30);
   assert.ok(small && small.lines.length === 1, 'lays out below minFont instead of clipping');
-  assert.equal(small.fontSize, 10, 'largest size fitting 20px at any floor');
+  assert.equal(small.fontSize, 8, 'fits both the 20px height and the measured 39px surface width');
+  assert.ok(fakeCtxMeasure(small.lines[0], small.fontSize) <= 39, 'small-font fallback still respects the shape');
+  assert.equal(layoutTextFit(fakeCtx(), 'abcdefgh', snug, 29).fontSize, 8, 'an odd cap still tries the exact hard floor');
   assert.ok(Math.abs(small.top + small.lineHeight / 2 - 10) <= 1, `centered (top=${small.top})`);
   // a block that truly cannot fit the area keeps the legacy edge anchor
   const tight = { x: 0, y: 0, w: 200, h: 10, runs: bandProfile(10, () => 40) };
@@ -1095,4 +1168,17 @@ test('expandCropToInk: neighbor fragment in daylight is not ours (connectivity)'
   const box = { x1: 90, y1: 50, x2: 145, y2: 130, conf: 0.9 };
   const rect = { x: 80, y: 40, w: 77, h: 100 }; // x2 = 157, sliver starts at 160
   assert.deepEqual(expandCropToInk(img, box, rect), rect, 'untouched');
+});
+
+test('split crop ownership clamps the cut axis and bounds soft-edge recovery', () => {
+  const img = page(240, 240);
+  const box = { x1: 100, y1: 80, x2: 140, y2: 130, conf: 0.9,
+    clip: { x1: 95, y1: 70, x2: 160, y2: 150 }, cutAxis: 'x' };
+  assert.deepEqual(expandCropToInk(img, box, { x: 80, y: 60, w: 90, h: 100 }), { x: 95, y: 60, w: 65, h: 100 });
+  assert.deepEqual(expandCropToInk(img, { ...box, cutAxis: 'y' }, { x: 80, y: 60, w: 90, h: 100 }), { x: 83, y: 70, w: 87, h: 80 });
+  const wide = expandCropToInk(img, box, { x: 80, y: 40, w: 90, h: 150 });
+  assert.equal(wide.y, 58);
+  assert.equal(wide.y + wide.h, 162, 'the recovery axis cannot reach a remote text block');
+  const legacy = { ...box }; delete legacy.cutAxis;
+  assert.deepEqual(expandCropToInk(img, legacy, { x: 80, y: 60, w: 90, h: 100 }), { x: 95, y: 70, w: 65, h: 80 });
 });

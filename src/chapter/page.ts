@@ -11,7 +11,7 @@ import { readRecord, writeRecord } from './store';
 import { artifactKey, chapterSignature, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
 import { identifyBitmap, signatureOf } from '../image-identity';
 import type { ContextState } from '../llm/core';
-import type { DetectResult, DetBox } from '../content/detection';
+import { shiftDetectionBoxY, type DetectResult, type DetBox } from '../content/detection';
 import type { TranslateOutcome } from '../content/ocr';
 import type { CachedPage } from '../content/page-cache';
 import type { ImageIdentity } from '../image-identity';
@@ -431,7 +431,7 @@ async function combinePages(pages: Prepared[]): Promise<{ bitmap: ImageBitmap; d
     for (const p of pages) {
         ctx.drawImage(p.bitmap, 0, y);
         segments.push({ y, h: p.bitmap.height });
-        for (const b of p.det.boxes) boxes.push({ ...b, y1: b.y1 + y, y2: b.y2 + y });
+        for (const b of p.det.boxes) boxes.push(shiftDetectionBoxY(b, y));
         if (p.det.cloudTexts) texts.push(...p.det.cloudTexts);
         else allTexts = false;
         y += p.bitmap.height;

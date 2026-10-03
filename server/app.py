@@ -186,8 +186,8 @@ def merge_tile_boxes(tiled):
     return [(x1, y1, x2, y2, c) for x1, y1, x2, y2, c, _ in allb]
 
 
-from split import (SPLIT_GEN, expand_crop_to_ink, pack_mask, rescue_split_comp,
-                   split_merged_boxes)
+from split import (SPLIT_GEN, expand_crop_to_ink, extend_mask_box, group_mask_components,
+                   mask_component_eligible, pack_mask, rescue_split_comp, split_merged_boxes)
 def infer_once(pil, conf_thr):
     w, h = pil.size
     s = CTD_INPUT / max(w, h)
@@ -308,6 +308,7 @@ def run_detect(pil, conf_thr, min_size):
                           "labs": {lab}})
     # Split-input comps: raw clusters BEFORE merge (merged bbox hides balloon gaps), same text-likelihood gate + 10px floor.
     texty_comps, box_comps = [], []
+    split_labs = {}
     for c in comps:
         bw, bh = c["x2"] - c["x1"], c["y2"] - c["y1"]
         if bw < 10 or bh < 10:
@@ -319,28 +320,20 @@ def run_detect(pil, conf_thr, min_size):
             continue
         r = {"x1": c["x1"], "y1": c["y1"], "x2": c["x2"], "y2": c["y2"]}
         texty_comps.append(r)
+        split_labs[id(r)] = next(iter(c["labs"]))
         if mean >= 0.75:
             box_comps.append(r)
-    # merge touching-when-padded components
-    changed = True
-    while changed:
-        changed = False
-        for i in range(len(comps)):
-            for j in range(i + 1, len(comps)):
-                a, b = comps[i], comps[j]
-                if not (a["x1"] - COMP_GAP > b["x2"] or b["x1"] - COMP_GAP > a["x2"]
-                        or a["y1"] - COMP_GAP > b["y2"] or b["y1"] - COMP_GAP > a["y2"]):
-                    comps[i] = {"x1": min(a["x1"], b["x1"]), "y1": min(a["y1"], b["y1"]),
-                                "x2": max(a["x2"], b["x2"]), "y2": max(a["y2"], b["y2"]),
-                                "count": a["count"] + b["count"], "psum": a["psum"] + b["psum"],
-                                "labs": a["labs"] | b["labs"]}
-                    del comps[j]
-                    changed = True
-                    break
-            if changed:
-                break
+    merged_comps = []
+    mask_comps = [c for c in comps if not overlaps((c["x1"], c["y1"], c["x2"], c["y2"]))]
+    for indices in group_mask_components(mask_comps, COMP_GAP):
+        members = [mask_comps[i] for i in indices]
+        merged_comps.append({"x1": min(c["x1"] for c in members), "y1": min(c["y1"] for c in members),
+                             "x2": max(c["x2"] for c in members), "y2": max(c["y2"] for c in members),
+                             "count": sum(c["count"] for c in members), "psum": sum(c["psum"] for c in members),
+                             "labs": set().union(*(c["labs"] for c in members))})
     page_area = w * h
     mask_boxes = []
+    mask_candidates = [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3], "conf": c} for b, c in zip(low_boxes, low_confs)]
 
     def overlaps_rect(r):
         for o in out_boxes:
@@ -352,22 +345,16 @@ def run_detect(pil, conf_thr, min_size):
                 return True
         return False
 
-    for c in comps:
+    for c in merged_comps:
         if len(mask_boxes) >= 16:
             break
         x1, y1, x2, y2 = c["x1"], c["y1"], c["x2"], c["y2"]
-        bw, bh = x2 - x1, y2 - y1
-        fill = c["count"] / (bw * bh)
-        if bw < 14 or bh < 14 or fill < 0.02 or fill > 0.6:
-            continue
-        if bw * bh > 0.2 * page_area:
-            continue
-        mask_prob = c["psum"] / c["count"]
-        if mask_prob < 0.75 and comp_box_conf(c) < 0.20:
+        if not mask_component_eligible(c, page_area, comp_box_conf(c)):
             continue
         if not overlaps((x1, y1, x2, y2)):
-            mask_boxes.append({"x1": float(x1), "y1": float(y1),
-                               "x2": float(x2), "y2": float(y2), "conf": 0.5})
+            grown = extend_mask_box(c, mask_candidates, overlaps_rect)
+            mask_boxes.append({"x1": max(0.0, float(grown["x1"])), "y1": max(0.0, float(grown["y1"])),
+                                "x2": min(float(w), float(grown["x2"])), "y2": min(float(h), float(grown["y2"])), "conf": 0.5})
             continue
         # overlap-gate kills get a second chance via split: outside pieces survive as own regions
         labs = c["labs"]
@@ -380,7 +367,8 @@ def run_detect(pil, conf_thr, min_size):
 
         for r in rescue_split_comp(
                 {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                texty_comps, box_comps, COMP_GAP, page_area,
+                [t for t in texty_comps if split_labs[id(t)] in labs],
+                [t for t in box_comps if split_labs[id(t)] in labs], COMP_GAP, page_area,
                 count_in, overlaps_rect, comp_box_conf):
             if len(mask_boxes) >= 16:
                 break
@@ -626,7 +614,9 @@ async def page(req: Request,
         "w": pil.width, "h": pil.height,
         "boxes": [{"x1": round(float(b["x1"]), 1), "y1": round(float(b["y1"]), 1),
                    "x2": round(float(b["x2"]), 1), "y2": round(float(b["y2"]), 1),
-                   "conf": round(float(b["conf"]), 4)} for b in boxes],
+                   "conf": round(float(b["conf"]), 4),
+                   **({"clip": {k: float(v) for k, v in b["clip"].items()}} if "clip" in b else {}),
+                   **({"cutAxis": b["cutAxis"]} if "cutAxis" in b else {})} for b in boxes],
         "panels": [],
         "panelSkipped": "cloud-v1: panel runs client-side, banding fallback applies",
         "splitGen": SPLIT_GEN,

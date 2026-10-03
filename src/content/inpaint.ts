@@ -186,21 +186,58 @@ export function inpaint(canvas: OffscreenCanvas, det: DetectResult): void {
     for (const b of det.boxes) {
         const ex = eraseBox(m, W, H, b, Math.max(8, Math.round((b.x2 - b.x1) * 0.08), Math.round((b.y2 - b.y1) * 0.08)));
         const bg = eraseBgColor(d, W, H, m, md, b);
+        // A uniform dark caption can carry pale lettering beyond its partial mask.
+        // Extend only the vertical edge, bounded by the glyph scale and sibling clips.
+        let free = 0, uniform = 0;
+        if (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2] < 110) {
+            for (let y = ex.y1; y <= ex.y2; y++) for (let x = ex.x1; x <= ex.x2; x++) {
+                const p = y * W + x;
+                if (md[p]) continue;
+                free++; if (!isFaintText(d, p, bg)) uniform++;
+            }
+        }
+        const darkCaption = free >= 16 && uniform >= free * 0.9;
+        if (darkCaption) {
+            const pad = Math.max(4, Math.round(Math.min(b.x2 - b.x1, b.y2 - b.y1) * 0.12));
+            ex.y1 = Math.max(0, ex.y1 - pad, b.clip ? Math.ceil(b.clip.y1) : 0);
+            ex.y2 = Math.min(H - 1, ex.y2 + pad, b.clip ? Math.floor(b.clip.y2) : H - 1);
+        }
+        // Outside the raw mask, dark-caption cleanup follows connected pale strokes;
+        // a separate highlight or outline is not lettering merely because it is bright.
+        const roiW = ex.x2 - ex.x1 + 1, roiH = ex.y2 - ex.y1 + 1;
+        const pale = darkCaption ? new Uint8Array(roiW * roiH) : null;
+        if (pale) {
+            const queue: number[] = [];
+            const visit = (x: number, y: number): void => {
+                if (x < ex.x1 || x > ex.x2 || y < ex.y1 || y > ex.y2 || inSkip(x, y)) return;
+                const k = (y - ex.y1) * roiW + x - ex.x1;
+                if (pale[k] || !isFaintText(d, y * W + x, bg)) return;
+                pale[k] = 1; queue.push(k);
+            };
+            for (let y = ex.y1; y <= ex.y2; y++) for (let x = ex.x1; x <= ex.x2; x++) {
+                if (md[y * W + x]) visit(x, y);
+            }
+            for (let i = 0; i < queue.length; i++) {
+                const k = queue[i], x = ex.x1 + k % roiW, y = ex.y1 + Math.floor(k / roiW);
+                visit(x - 1, y); visit(x + 1, y); visit(x, y - 1); visit(x, y + 1);
+            }
+        }
 
         // fill strategy: masked pixels + connected faint text the mask missed.
-        // Rows with meaningful mask coverage are text rows — fill the whole row
-        // span across the erase region. Runs over the EXPANDED region so glyphs
-        // the CTD box clipped are erased too; keep-box interiors are skipped.
+        // Elsewhere faint pixels must hug that row's mask hull, not a wide detector bbox.
         for (let y = ex.y1; y <= ex.y2; y++) {
             const rowStart = y * W;
-            let maskCount = 0;
-            for (let x = ex.x1; x <= ex.x2; x++) if (md[rowStart + x]) maskCount++;
+            let maskCount = 0, inkLo = ex.x2 + 1, inkHi = ex.x1 - 1;
+            for (let x = ex.x1; x <= ex.x2; x++) if (md[rowStart + x]) {
+                maskCount++; inkLo = Math.min(inkLo, x); inkHi = Math.max(inkHi, x);
+            }
             const rowLen = ex.x2 - ex.x1 + 1;
             const rowIsText = maskCount > rowLen * 0.04 && maskCount >= 4;
             for (let x = ex.x1; x <= ex.x2; x++) {
                 const p = rowStart + x;
                 if (inSkip(x, y)) continue;
-                if (md[p] || (rowIsText && isFaintText(d, p, bg))) {
+                if (md[p] || pale?.[(y - ex.y1) * roiW + x - ex.x1]
+                    || (rowIsText && x >= inkLo - 3 && x <= inkHi + 3 && isFaintText(d, p, bg))) {
                     const i = p * 4;
                     d[i] = bg[0]; d[i + 1] = bg[1]; d[i + 2] = bg[2]; d[i + 3] = 255;
                 }
@@ -364,4 +401,3 @@ export function erasePlan(det: DetectResult, outputs: RegionOutput[]): {
     const missedIdx = det.boxes.map((_, i) => i + 1).filter(i => !translatedIdx.has(i) && !keepIdx.has(i));
     return { boxesToErase, keepBoxes, keepIdx, dupIdx, missedIdx };
 }
-

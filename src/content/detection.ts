@@ -135,7 +135,7 @@ export const SPLIT_PAD_CAP = 40;    // px — max half-gap padding of a child bo
 export const SPLIT2_FLOOR_RATIO = 0.5; // × median cluster minor extent (glyph size)
 export const SPLIT2_FLOOR_MIN = 8;     // px — absolute floor on small pages
 export const SPLIT2_OVERLAP_MAX = 0.5; // cross-span overlap / smaller span
-export const SPLIT2_STRONG_FACTOR = 2; // × floor — cuts despite cross overlap
+export const SPLIT2_STRONG_FACTOR = 1.5; // × floor — cuts despite cross overlap when neither span contains the other
 // Stacked twin groups: a detached FIRST group is its own text, not a paragraph fragment —
 // paragraphs never start with a detached top group. Direction matters — a detached LAST group
 // is the dropped-line case and stays fused. y-axis only: columns are twinCut's territory.
@@ -145,6 +145,69 @@ export const SPLIT2_FIRST_GAP_MULT = 3; // × floor — far beyond line spacing
 export const SPLIT2_FIRST_MIN_RATIO = 0.5; // second group ≥ half the first
 
 export interface SplitComp { x1: number; y1: number; x2: number; y2: number }
+
+// Stacked-page crops use one coordinate space; a box's ownership clip moves
+// with its text rectangle, while the original per-page detection stays unchanged.
+export function shiftDetectionBoxY<T extends DetBox>(box: T, offset: number): T {
+    return { ...box, y1: box.y1 + offset, y2: box.y2 + offset,
+        ...(box.clip ? { clip: { ...box.clip, y1: box.clip.y1 + offset, y2: box.clip.y2 + offset } } : null) };
+}
+
+// Connect original mask components, not their expanding union rectangles; empty space
+// inside a group's bbox cannot recruit unrelated neighbouring text.
+export function groupMaskComponents(comps: SplitComp[], gap: number): number[][] {
+    const parent = comps.map((_, i) => i);
+    const find = (i: number): number => {
+        while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+        return i;
+    };
+    for (let i = 0; i < comps.length; i++) {
+        const a = comps[i];
+        for (let j = i + 1; j < comps.length; j++) {
+            const b = comps[j];
+            const unit = Math.min(a.x2 - a.x1, a.y2 - a.y1, b.x2 - b.x1, b.y2 - b.y1);
+            const localGap = Math.max(gap, Math.min(gap * 2, Math.round(unit * 0.6)));
+            if (a.x1 - localGap > b.x2 || b.x1 - localGap > a.x2 || a.y1 - localGap > b.y2 || b.y1 - localGap > a.y2) continue;
+            parent[find(j)] = find(i);
+        }
+    }
+    const groups = new Map<number, number[]>();
+    comps.forEach((_c, i) => {
+        const key = find(i);
+        const group = groups.get(key);
+        if (group) group.push(i); else groups.set(key, [i]);
+    });
+    return [...groups.values()];
+}
+
+// Mask-only regions need text evidence and bounded geometry; dense lettering is
+// allowed, while solid fills, dust and page-sized components are not.
+export function maskComponentEligible(c: SplitComp & { count: number; probSum: number }, pageArea: number, boxConfidence: number): boolean {
+    const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
+    const fill = c.count / (bw * bh);
+    return bw >= 14 && bh >= 14 && fill >= 0.02 && fill <= 0.9 && bw * bh <= 0.2 * pageArea
+        && (c.probSum / c.count >= 0.75 || boxConfidence >= 0.20);
+}
+
+// A corroborating head box may include faint leading/trailing glyphs missed by
+// the mask. Only similarly sized, strongly overlapping candidates can extend it.
+export function extendMaskBox(c: SplitComp, candidates: DetBox[], overlapsBox: (r: SplitComp) => boolean): SplitComp {
+    const area = (c.x2 - c.x1) * (c.y2 - c.y1);
+    let best: DetBox | undefined, score = 0;
+    for (const b of candidates) {
+        const bArea = (b.x2 - b.x1) * (b.y2 - b.y1);
+        if (b.conf < 0.20 || !(bArea > 0) || bArea > area * 2.5) continue;
+        const inter = Math.max(0, Math.min(c.x2, b.x2) - Math.max(c.x1, b.x1))
+            * Math.max(0, Math.min(c.y2, b.y2) - Math.max(c.y1, b.y1));
+        if (inter < area * 0.8) continue;
+        if (bArea > score) { best = b; score = bArea; }
+    }
+    if (!best) return c;
+    const pad = Math.min(4, Math.round(Math.min(c.x2 - c.x1, c.y2 - c.y1) * 0.15));
+    const r = { x1: Math.min(c.x1, best.x1 - pad), y1: Math.min(c.y1, best.y1 - pad),
+        x2: Math.max(c.x2, best.x2 + pad), y2: Math.max(c.y2, best.y2 + pad) };
+    return overlapsBox(r) ? c : r;
+}
 
 export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number, boxComps: SplitComp[] = comps): T[] {
     if (comps.length < 2) return [...boxes];
@@ -251,18 +314,19 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
 // a child is never re-split.
 function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number, boxComps: SplitComp[]): T[] | null {
     if (cs.length < 2) return null;
-    return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps) ?? splitTwinCut(box, cs, boxComps);
+    return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps) ?? splitTwinCut(box, cs, boxComps) ?? splitOverhangColumns(box, cs, boxComps);
 }
 
 // Twin-balloon cut: a straight ink-free avenue across the box with wide multi-row text on
 // both sides splits, whatever the gap width. The avenue must be crossed by ZERO comps — a word
 // gap always has another line's comps crossing it, and a headline spanning both columns unites
-// the block. Sides need ≥2 WIDE (w>h) comps spanning ≥48px: vertical-text columns (tall comps)
+// the block. Sides need ≥2 WIDE (w>h) comps spanning at least two glyph heights: vertical-text columns (tall comps)
 // and single lines can never pass. x-axis only: stacked blocks are lane 2's territory.
 // Pure — unit tested.
 export const TWIN_GUTTER_MIN = 4; // px — dust margin on the avenue
 export const TWIN_SIDE_MIN = 2;   // wide comps per side
-export const TWIN_SPAN_MIN = 48;  // px of y per side (~2 text lines)
+export const TWIN_SPAN_MIN = 16;  // px — noise floor for multi-row support
+export const TWIN_SPAN_FACTOR = 2; // × median wide-component height
 function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
     // clamp to the box, then sweep for avenues no comp crosses (closes sort before opens at
     // ties, so touching comps leave no avenue)
@@ -294,12 +358,40 @@ function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Split
         const L = wide(left), R = wide(right);
         if (L.length < TWIN_SIDE_MIN || R.length < TWIN_SIDE_MIN) continue;
         const span = (ss: SplitComp[]) => Math.max(...ss.map(c => c.y2)) - Math.min(...ss.map(c => c.y1));
-        if (span(L) < TWIN_SPAN_MIN || span(R) < TWIN_SPAN_MIN) continue;
+        const heights = [...L, ...R].map(c => c.y2 - c.y1).sort((a, b) => a - b);
+        const minSpan = Math.max(TWIN_SPAN_MIN, TWIN_SPAN_FACTOR * heights[Math.floor(heights.length / 2)]);
+        if (span(L) < minSpan || span(R) < minSpan) continue;
         const boxOf = (ss: SplitComp[]) => ({
             x1: Math.min(...ss.map(c => c.x1)), y1: Math.min(...ss.map(c => c.y1)),
             x2: Math.max(...ss.map(c => c.x2)), y2: Math.max(...ss.map(c => c.y2)),
         });
-        return emitSplit(box, [boxOf(L), boxOf(R)], 'x', cs, boxComps);
+        return emitSplit(box, [boxOf(left), boxOf(right)], 'x', cs, boxComps);
+    }
+    return null;
+}
+
+// Multi-row columns may overlap by a glyph fringe; a spanning line must still veto
+// the cut. Each side owns its full component extents, including narrow punctuation.
+function splitOverhangColumns<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
+    const wide = (ss: SplitComp[]) => ss.filter(c => c.x2 - c.x1 > c.y2 - c.y1);
+    const ws = wide(cs);
+    if (ws.length < TWIN_SIDE_MIN * 2) return null;
+    const dims = ws.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
+    const unit = dims[Math.floor(dims.length / 2)];
+    const sorted = [...cs].sort((a, b) => a.x1 + a.x2 - b.x1 - b.x2);
+    const bounds = (ss: SplitComp[]): SplitGroup => ({
+        x1: Math.min(...ss.map(c => c.x1)), y1: Math.min(...ss.map(c => c.y1)),
+        x2: Math.max(...ss.map(c => c.x2)), y2: Math.max(...ss.map(c => c.y2)),
+    });
+    for (let i = 1; i < sorted.length; i++) {
+        const left = sorted.slice(0, i), right = sorted.slice(i);
+        if (wide(left).length < TWIN_SIDE_MIN || wide(right).length < TWIN_SIDE_MIN) continue;
+        const l = bounds(left), r = bounds(right);
+        const gap = r.x1 - l.x2;
+        if (gap < -unit * 0.35 || gap >= TWIN_GUTTER_MIN) continue;
+        const span = Math.max(TWIN_SPAN_MIN, unit * TWIN_SPAN_FACTOR);
+        if (l.y2 - l.y1 < span || r.y2 - r.y1 < span) continue;
+        return emitSplit(box, [l, r], 'x', cs, boxComps);
     }
     return null;
 }
@@ -351,7 +443,7 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
 // (under lane 1's gap floor) and side-by-side balloons share cross-axis space, so lane 1's
 // disjointness guard rejects them too. Cut on cluster evidence: the floor gap scales with the
 // box's glyph size (median cluster minor extent) and a cut needs EITHER strongly disjoint cross
-// spans OR twice the floor with the cross spans not nested in each other. The nested guard keeps
+// spans OR 1.5 times the floor with the cross spans not nested in each other. The nested guard keeps
 // a paragraph's separated last line fused while the caption-block case passes. Same-span lines
 // of one block merge through the overlap ratio. Pure — unit tested.
 function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
@@ -985,6 +1077,11 @@ export async function cloudDetect(
         // full-page space here; every consumer downstream works in full-page coords
         const boxes: DetBox[] = (j.boxes ?? []).map((b: any) => ({
             x1: +b.x1 * scale, y1: +b.y1 * scale, x2: +b.x2 * scale, y2: +b.y2 * scale, conf: +b.conf,
+            ...(b.clip ? { clip: {
+                x1: +b.clip.x1 * scale, y1: +b.clip.y1 * scale,
+                x2: +b.clip.x2 * scale, y2: +b.clip.y2 * scale,
+            } } : null),
+            ...(b.cutAxis === 'x' || b.cutAxis === 'y' ? { cutAxis: b.cutAxis } : null),
         }));
         const w = bitmap.width, h = bitmap.height;
         const serverTotal = Math.round(j.ms?.total ?? 0);

@@ -1,7 +1,7 @@
 // Thai text rendering into bubble regions on canvas.
 // LLM spaces are phrase boundaries, " / " pre-broken lines, ICU splits Thai runs.
 
-import type { DetBox } from './detection';
+import { SPLIT_CLIP_SLACK, type DetBox } from './detection';
 
 const FONT = 'Sriracha';           // Thai handwriting font (bundled)
 const TRACKING = 0.1;      // letter spacing as fraction of font size
@@ -16,7 +16,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 29;
+export const RENDER_GEN = 30;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -84,6 +84,7 @@ function wrapUnits(line: string): Unit[] {
         if (hasThai(part)) {
             let first = true;
             for (const w of thaiWords(part)) {
+                if (!first && /^[\p{Pe}\p{Pf}.,!?…:;]+$/u.test(w)) { units[units.length - 1].t += w; continue; }
                 units.push({ t: w, spaceBefore: spaceBefore && first });
                 first = false;
             }
@@ -254,7 +255,7 @@ export function inkStats(img: ImageData, box: DetBox): { frac: number; x1: numbe
 
 // Flood seed = the box's most common color, NOT the center pixel (center may land on a glyph).
 // Colors quantized to 4 bits/channel and averaged so anti-aliased noise doesn't split the vote.
-function interiorSeed(data: Uint8ClampedArray, W: number, H: number, box: DetBox): [number, number, number] {
+function interiorSeed(data: Uint8ClampedArray, W: number, H: number, box: DetBox, mask?: Uint8Array): [number, number, number] {
     const x1 = Math.max(0, Math.floor(box.x1)), y1 = Math.max(0, Math.floor(box.y1));
     const x2 = Math.min(W - 1, Math.ceil(box.x2)), y2 = Math.min(H - 1, Math.ceil(box.y2));
     const stepX = Math.max(1, Math.floor((x2 - x1) / 24));
@@ -263,6 +264,7 @@ function interiorSeed(data: Uint8ClampedArray, W: number, H: number, box: DetBox
     let best: { n: number; r: number; g: number; b: number } | null = null;
     for (let y = y1; y <= y2; y += stepY) {
         for (let x = x1; x <= x2; x += stepX) {
+            if (mask?.[y * W + x]) continue;
             const i = (y * W + x) * 4;
             const r = data[i], g = data[i + 1], b = data[i + 2];
             const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
@@ -621,6 +623,90 @@ export interface RunProfile {
     leakL: number; leakR: number;
 }
 
+// A mostly empty detector box may span artwork or another lobe. A substantial
+// compact text-mask core anchors placement/font measurement, not OCR or erasure.
+export function sourceBoxForLayout(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask): DetBox {
+    const { width: W, height: H } = img;
+    const mk = maskView(mask, W, H);
+    if (!mk) return box;
+    let x1 = W, y1 = H, x2 = -1, y2 = -1, count = 0;
+    for (let y = Math.max(0, Math.floor(box.y1)); y <= Math.min(H - 1, Math.ceil(box.y2)); y++) {
+        for (let x = Math.max(0, Math.floor(box.x1)); x <= Math.min(W - 1, Math.ceil(box.x2)); x++) {
+            if (!mk[y * W + x]) continue;
+            x1 = Math.min(x1, x); y1 = Math.min(y1, y);
+            x2 = Math.max(x2, x); y2 = Math.max(y2, y); count++;
+        }
+    }
+    const span = vertical ? x2 - x1 + 1 : y2 - y1 + 1;
+    if (count < 16 || span < 8 || span >= (vertical ? box.x2 - box.x1 : box.y2 - box.y1) * 0.5) return box;
+    return { ...box, x1, y1, x2: x2 + 1, y2: y2 + 1 };
+}
+
+// Restrict a rectangular fallback to its measured surface without authorizing
+// any extra growth. Text-mask pixels bridge glyphs; open fields stay rectangular.
+export function surfaceProfile(img: ImageData, box: DetBox, area: Area, vertical: boolean, mask?: TextMask): RunProfile | null {
+    const { width: W, height: H, data } = img;
+    const mk = maskView(mask, W, H);
+    if (!mk) return null;
+    const seed = interiorSeed(data, W, H, box, mk);
+    let background = 0, uniform = 0;
+    for (let y = Math.max(0, Math.floor(box.y1)); y <= Math.min(H - 1, Math.ceil(box.y2)); y++) {
+        for (let x = Math.max(0, Math.floor(box.x1)); x <= Math.min(W - 1, Math.ceil(box.x2)); x++) {
+            const p = y * W + x;
+            if (mk[p]) continue;
+            background++; if (seedLike(data, p * 4, seed)) uniform++;
+        }
+    }
+    if (background < 16 || uniform < background * 0.9) return null;
+    const p0 = Math.max(0, Math.ceil(vertical ? area.x : area.y));
+    const p1 = Math.min((vertical ? W : H) - 1, Math.floor((vertical ? area.x + area.w : area.y + area.h) - 1));
+    const lo = Math.max(0, Math.ceil(vertical ? area.y : area.x));
+    const hi = Math.min((vertical ? H : W) - 1, Math.floor((vertical ? area.y + area.h : area.x + area.w) - 1));
+    const center = Math.round(vertical ? (box.y1 + box.y2) / 2 : (box.x1 + box.x2) / 2);
+    if (p1 < p0 || hi < lo || center < lo || center > hi) return null;
+    const i1 = new Int32Array(p1 - p0 + 1).fill(1), i2 = new Int32Array(p1 - p0 + 1).fill(0);
+    const index = (p: number, q: number) => vertical ? q * W + p : p * W + q;
+    let rows = 0, bounded = 0;
+    for (let p = p0; p <= p1; p++) {
+        const boxLo = Math.max(lo, Math.ceil(vertical ? box.y1 : box.x1));
+        const boxHi = Math.min(hi, Math.floor(vertical ? box.y2 : box.x2));
+        let inkLo = hi + 1, inkHi = lo - 1, inkCount = 0;
+        if (p >= (vertical ? box.x1 : box.y1) && p <= (vertical ? box.x2 : box.y2)) {
+            for (let q = boxLo; q <= boxHi; q++) {
+                if (!mk[index(p, q)]) continue;
+                inkLo = Math.min(inkLo, q); inkHi = Math.max(inkHi, q); inkCount++;
+            }
+        }
+        // The hull of a text row bridges faint glyph edges, not unrelated artwork.
+        const pass = (p: number, q: number) => seedLike(data, index(p, q) * 4, seed) || mk[index(p, q)] > 127
+            || (inkCount >= 4 && q >= inkLo - 2 && q <= inkHi + 2);
+        if (!pass(p, center)) continue;
+        let a = center, b = center;
+        while (a > lo && pass(p, a - 1)) a--;
+        while (b < hi && pass(p, b + 1)) b++;
+        if (b - a < RUN_MIN) continue;
+        if (a > lo && b < hi) bounded++;
+        const margin = (b - a) * 0.08;
+        let r1 = Math.ceil(a + margin), r2 = Math.floor(b - margin);
+        for (let q = Math.max(a, boxLo); q <= Math.min(b, boxHi); q++) {
+            if (!mk[index(p, q)]) continue;
+            r1 = Math.min(r1, q); r2 = Math.max(r2, q);
+        }
+        if (r2 <= r1) continue;
+        i1[p - p0] = r1; i2[p - p0] = r2; rows++;
+    }
+    if (!rows || bounded < rows * 0.25) return null;
+    const anchor = Math.round(vertical ? (box.x1 + box.x2) / 2 : (box.y1 + box.y2) / 2) - p0;
+    const valid = (k: number) => k >= 0 && k < i1.length && i2[k] > i1[k];
+    if (!valid(anchor)) return null;
+    let start = anchor, end = anchor;
+    while (valid(start - 1)) start--;
+    while (valid(end + 1)) end++;
+    if (p0 + start > (vertical ? box.x1 : box.y1) || p0 + end < Math.min(p1, Math.floor(vertical ? box.x2 : box.y2) - 1)) return null;
+    return { vertical, p0: p0 + start, p1: p0 + end, i1: i1.slice(start, end + 1), i2: i2.slice(start, end + 1),
+        enclosed: bounded / rows, e0: p0 + start, e1: p0 + end, leakL: 0, leakR: 0 };
+}
+
 // Fraction of run rows needing outline evidence on both sides to trust the profile.
 // Below the bar the no-frame rectangle (bubbleArea) takes over.
 export const ENCLOSED_MIN = 0.5;
@@ -751,11 +837,13 @@ export function runInterval(prof: RunProfile, p0: number, p1: number): [number, 
 
 // Enclosed-bubble path: profile measurement, or the legacy rectangle when no bubble encloses the box.
 function fitArea(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask): LayoutRect {
-    const rect = (why: string, prof?: RunProfile): LayoutRect => ({
-        ...bubbleArea(img, box, mask), why,
-        // The profile's leak counts survive the fallback for diagnosis.
-        ...(prof ? { leakL: prof.leakL, leakR: prof.leakR } : null),
-    });
+    const rect = (why: string, prof?: RunProfile): LayoutRect => {
+        const area = bubbleArea(img, box, mask);
+        const surface = surfaceProfile(img, sourceBoxForLayout(img, box, vertical, mask), area, vertical, mask);
+        const stack = surface ? (vertical ? { x: surface.p0, w: surface.p1 - surface.p0 + 1 } : { y: surface.p0, h: surface.p1 - surface.p0 + 1 }) : {};
+        return { ...area, ...stack, why: surface ? 'surface' : why, ...(surface ? { runs: surface } : null),
+            ...(prof ? { leakL: prof.leakL, leakR: prof.leakR } : null) };
+    };
     // Per-axis leash: stacking axis 0.6/side (≤2.2x), run axis 1.2/side (≤3.4x).
     // A window-clipped end is not outline evidence, so clipped ends keep the rect fallback.
     const fill = interiorFill(img, box, vertical ? 0.6 : 1.2, vertical ? 1.2 : 0.6, true, mask);
@@ -854,7 +942,8 @@ export function clipArea(a: Area, clip?: { x1: number; y1: number; x2: number; y
 }
 
 // OCR-crop expansion (exported pure for tests): a box can clip its own glyphs, so grow an ink-touching edge.
-// Grow to the last ink + margin, capped at half the box's smaller side; split children stay in their clip.
+// Split crops own their cut axis before padding/growth; the other axis gets a
+// bounded glyph-recovery leash rather than borrowing a neighbouring text block.
 export interface CropRect { x: number; y: number; w: number; h: number }
 // Per-side expansion budget for OCR crops (see expandCropToInk).
 export function cropExpandCap(box: DetBox): number {
@@ -865,9 +954,14 @@ export function expandCropToInk(img: ImageData, box: DetBox, rect: CropRect): Cr
     const seed = interiorSeed(data, W, H, box);
     const seedLum = 0.299 * seed[0] + 0.587 * seed[1] + 0.114 * seed[2];
     const cap = cropExpandCap(box);
-    const clip = box.clip;
-    let x1 = Math.max(0, Math.floor(rect.x)), y1 = Math.max(0, Math.floor(rect.y));
-    let x2 = Math.min(W - 1, Math.ceil(rect.x + rect.w)), y2 = Math.min(H - 1, Math.ceil(rect.y + rect.h));
+    const clipX = box.clip && box.cutAxis === 'y'
+        ? { ...box.clip, x1: box.clip.x1 - SPLIT_CLIP_SLACK, x2: box.clip.x2 + SPLIT_CLIP_SLACK } : box.clip;
+    const clipY = box.clip && box.cutAxis === 'x'
+        ? { ...box.clip, y1: box.clip.y1 - SPLIT_CLIP_SLACK, y2: box.clip.y2 + SPLIT_CLIP_SLACK } : box.clip;
+    let x1 = Math.max(0, Math.floor(rect.x), clipX ? Math.ceil(clipX.x1) : 0);
+    let y1 = Math.max(0, Math.floor(rect.y), clipY ? Math.ceil(clipY.y1) : 0);
+    let x2 = Math.min(W - 1, Math.ceil(rect.x + rect.w), clipX ? Math.floor(clipX.x2) : W - 1);
+    let y2 = Math.min(H - 1, Math.ceil(rect.y + rect.h), clipY ? Math.floor(clipY.y2) : H - 1);
     const inkAt = (x: number, y: number): boolean =>
         x >= 0 && y >= 0 && x < W && y < H && cropInk(data, (y * W + x) * 4, seedLum);
     // ink pixels on an edge line (every px — 2px strokes must not be missed)
@@ -924,12 +1018,12 @@ export function expandCropToInk(img: ImageData, box: DetBox, rect: CropRect): Cr
         const edge = side === 'l' ? x1 : side === 'r' ? x2 : side === 't' ? y1 : y2;
         const lo = vertical ? y1 : x1, hi = vertical ? y2 : x2;
         const bound = side === 'l'
-            ? Math.max(0, Math.ceil(box.x1) - cap, clip ? Math.ceil(clip.x1) : 0)
+            ? Math.max(0, Math.ceil(box.x1) - cap, clipX ? Math.ceil(clipX.x1) : 0)
             : side === 'r'
-                ? Math.min(W - 1, Math.floor(box.x2) + cap, clip ? Math.floor(clip.x2) : W - 1)
+                ? Math.min(W - 1, Math.floor(box.x2) + cap, clipX ? Math.floor(clipX.x2) : W - 1)
                 : side === 't'
-                    ? Math.max(0, Math.ceil(box.y1) - cap, clip ? Math.ceil(clip.y1) : 0)
-                    : Math.min(H - 1, Math.floor(box.y2) + cap, clip ? Math.floor(clip.y2) : H - 1);
+                    ? Math.max(0, Math.ceil(box.y1) - cap, clipY ? Math.ceil(clipY.y1) : 0)
+                    : Math.min(H - 1, Math.floor(box.y2) + cap, clipY ? Math.floor(clipY.y2) : H - 1);
         const touch = edgeInk(vertical, edge, lo, hi);
         // A spanning rule/border is not a cut glyph; a clean edge with daylight beyond never moves.
         if (!touch.length || touch.length >= (hi - lo + 1) * 0.6) return;
@@ -1014,7 +1108,7 @@ export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxI
             why: 'ink-bbox',
         };
     }
-    const found = fitArea(img, box, vertical, mask);
+    const found = fitArea(img, sourceBoxForLayout(img, box, vertical, mask), vertical, mask);
     const clamped = clipArea(found, box.clip);
     // The clip shrinks the AREA but the profile still describes runs past the cut.
     // Wrap width, line centres, and paint clip must agree with the returned area, so trim the runs.
@@ -1182,11 +1276,8 @@ export function layoutTextFit(
     const stackFit = Math.min(stackLen, maxStack ?? stackLen);
     const midCross = prof.vertical ? area.y + area.h / 2 : area.x + area.w / 2;
     // Horizontal blocks start at the area top; vertical blocks stack LEFT (JA order) from the RIGHT edge.
-    // Width for a line = interior at the line's CENTRE row, where the glyph body sits.
-    const midIv = (p0: number, p1: number) => {
-        const mid = Math.round((p0 + p1) / 2);
-        return runInterval(prof, mid, mid + 1) ?? runInterval(prof, p0, p1);
-    };
+    // The whole line band owns its width, including accents and strokes near a curved edge.
+    const midIv = (p0: number, p1: number) => runInterval(prof, p0, p1);
     const widthFor = (anchor: number, lh: number) => (j: number) => {
         const b0 = prof.vertical ? anchor - (j + 1) * lh : anchor + j * lh;
         const iv = midIv(b0, b0 + lh);
@@ -1199,7 +1290,7 @@ export function layoutTextFit(
     };
 
     let fallback: LaidOutFit | null = null;
-    for (let size = cap; size >= renderTuning.minFont; size -= 2) {
+    for (let size = cap; size >= HARD_MIN_FONT; size = size > HARD_MIN_FONT ? Math.max(HARD_MIN_FONT, size - 2) : 0) {
         setFont(ctx, size);
         const lh = size * (1 + HEADROOM + LINE_SPACING);
         const anchorA = prof.vertical ? stack0 + stackLen : stack0;
@@ -1312,11 +1403,12 @@ function renderHorizontal(
     const area = pageArea(ctx, img, box, false, mask);
     if (!area) return null;
     const { color, stroke } = resolveColors(img, area, box, mask);
-    const cap = Math.min(hCap(area), sizeCapFrom(img, box, false) ?? MAX_FONT);
+    const sourceBox = sourceBoxForLayout(img, box, false, mask);
+    const cap = Math.min(hCap(area), sizeCapFrom(img, sourceBox, false) ?? MAX_FONT);
 
     // Enclosed bubble: each line fitted to its own measured band, centered on its own run.
     if (area.runs) {
-        const boxC = (box.y1 + box.y2) / 2;
+        const boxC = (sourceBox.y1 + sourceBox.y2) / 2;
         const laid = layoutTextFit(ctx, text, area, cap, Math.round((box.y2 - box.y1) * Math.max(1.15, renderTuning.textScale)), boxC);
         if (!laid || !laid.lines.length) return null;
         // The paint must use the size the wrap MEASURED: the loop leaves ctx font at the last size tried.
@@ -1325,6 +1417,13 @@ function renderHorizontal(
         ctx.save();
         ctx.beginPath();
         ctx.rect(area.x, area.y, area.w, area.h);
+        ctx.clip();
+        ctx.beginPath();
+        const prof = area.runs;
+        for (let p = prof.p0; p <= prof.p1; p++) {
+            const k = p - prof.p0;
+            if (prof.i2[k] > prof.i1[k]) ctx.rect(prof.i1[k], p, prof.i2[k] - prof.i1[k], 1);
+        }
         ctx.clip();
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
@@ -1371,7 +1470,7 @@ function renderHorizontal(
     const totalH = laid.lines.length * laid.lineHeight;
     const overflow = totalH > paintArea.h + 0.5;
     // A fitting block parks on the source box, not the area middle (same boxC rule as the profile path).
-    const boxC = (box.y1 + box.y2) / 2;
+    const boxC = (sourceBox.y1 + sourceBox.y2) / 2;
     let y = overflow
         ? paintArea.y + laid.lineHeight / 2
         : Math.min(Math.max(boxC, paintArea.y + totalH / 2), paintArea.y + paintArea.h - totalH / 2)
@@ -1382,7 +1481,9 @@ function renderHorizontal(
     ctx.beginPath();
     ctx.rect(paintArea.x, paintArea.y, paintArea.w, paintArea.h);
     ctx.clip();
-    const cx = paintArea.x + paintArea.w / 2 + halfTrack() * laid.fontSize; // trailing-spacing compensation
+    const lineWidth = Math.max(...laid.lines.map(line => ctx.measureText(line).width));
+    const sourceC = Math.min(Math.max((sourceBox.x1 + sourceBox.x2) / 2, paintArea.x + lineWidth / 2), paintArea.x + paintArea.w - lineWidth / 2);
+    const cx = (sourceBox === box ? paintArea.x + paintArea.w / 2 : sourceC) + halfTrack() * laid.fontSize;
     for (const line of laid.lines) {
         if (renderTuning.textStroke > 0) {
             ctx.strokeStyle = stroke;

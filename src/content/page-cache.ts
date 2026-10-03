@@ -167,7 +167,7 @@ export const INPAINT_PATCH_GEN = 3;
 // overlap-swallowed text (gen 2), or fused stacked groups (gen 3) — all re-detect instead of
 // rendering from cache. Local entries never carry splitGen (their tile fingerprint already
 // forces re-detect) — isCloud scopes the gate to cloud mode.
-export const CLOUD_SPLIT_GEN = 4;
+export const CLOUD_SPLIT_GEN = 5;
 export function cloudSplitFresh(hit: { ep?: string; splitGen?: number } | undefined, isCloud: boolean): boolean {
     return !isCloud || (hit?.splitGen ?? 0) >= CLOUD_SPLIT_GEN;
 }
@@ -976,11 +976,11 @@ export interface FingerprintOpts {
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
-    // trailing detector-generation tag (currently tile16): entries from older split/render/OCR
+    // trailing detector-generation tag (currently tile17): entries from older split/render/OCR
     // pipeline versions miss once and heal on overwrite — bump it whenever touching the
     // split, layout, or mask recipe, or old entries keep rendering stale regions.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile16'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile17'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

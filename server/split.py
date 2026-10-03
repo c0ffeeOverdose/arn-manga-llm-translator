@@ -6,7 +6,7 @@ import math
 # ---- box splitting (ported 1:1 from src/content/detection.ts) ----
 # Preserve two JS-isms: Math.round halves UP on positives (use _r) and medians are the UPPER middle (use _med).
 # Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on children); comps are plain rects (no count/psum).
-SPLIT_GEN = 4  # bump when this section's logic changes; /v1/page reports it
+SPLIT_GEN = 5  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
@@ -14,14 +14,15 @@ SPLIT_PAD_CAP = 40
 SPLIT2_FLOOR_RATIO = 0.5
 SPLIT2_FLOOR_MIN = 8
 SPLIT2_OVERLAP_MAX = 0.5
-SPLIT2_STRONG_FACTOR = 2
+SPLIT2_STRONG_FACTOR = 1.5
 SPLIT2_FIRST_GAP_MULT = 3
 SPLIT2_FIRST_MIN_RATIO = 0.5
 SPLIT_CLIP_SLACK = 12
 SPLIT_CORE_LEASH = 16
 TWIN_GUTTER_MIN = 4
 TWIN_SIDE_MIN = 2
-TWIN_SPAN_MIN = 48
+TWIN_SPAN_MIN = 16
+TWIN_SPAN_FACTOR = 2
 
 
 def _r(x):
@@ -36,6 +37,60 @@ def _med(xs):
 def _bbox(rs):
     return {"x1": min(r["x1"] for r in rs), "y1": min(r["y1"] for r in rs),
             "x2": max(r["x2"] for r in rs), "y2": max(r["y2"] for r in rs)}
+
+
+def group_mask_components(comps, gap):
+    parent = list(range(len(comps)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, a in enumerate(comps):
+        for j in range(i + 1, len(comps)):
+            b = comps[j]
+            unit = min(a["x2"] - a["x1"], a["y2"] - a["y1"], b["x2"] - b["x1"], b["y2"] - b["y1"])
+            local_gap = max(gap, min(gap * 2, _r(unit * 0.6)))
+            if (a["x1"] - local_gap > b["x2"] or b["x1"] - local_gap > a["x2"]
+                    or a["y1"] - local_gap > b["y2"] or b["y1"] - local_gap > a["y2"]):
+                continue
+            parent[find(j)] = find(i)
+    groups = {}
+    for i in range(len(comps)):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
+def mask_component_eligible(c, page_area, box_confidence):
+    bw, bh = c["x2"] - c["x1"], c["y2"] - c["y1"]
+    if bw < 14 or bh < 14 or c["count"] <= 0:
+        return False
+    fill = c["count"] / (bw * bh)
+    return (0.02 <= fill <= 0.9 and bw * bh <= 0.2 * page_area
+            and (c["psum"] / c["count"] >= 0.75 or box_confidence >= 0.20))
+
+
+def extend_mask_box(c, candidates, overlaps_box):
+    area = (c["x2"] - c["x1"]) * (c["y2"] - c["y1"])
+    best, score = None, 0
+    for b in candidates:
+        b_area = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+        if b["conf"] < 0.20 or not b_area > 0 or b_area > area * 2.5:
+            continue
+        inter = (max(0, min(c["x2"], b["x2"]) - max(c["x1"], b["x1"]))
+                 * max(0, min(c["y2"], b["y2"]) - max(c["y1"], b["y1"])))
+        if inter < area * 0.8:
+            continue
+        if b_area > score:
+            best, score = b, b_area
+    if best is None:
+        return c
+    pad = min(4, _r(min(c["x2"] - c["x1"], c["y2"] - c["y1"]) * 0.15))
+    r = {"x1": min(c["x1"], best["x1"] - pad), "y1": min(c["y1"], best["y1"] - pad),
+         "x2": max(c["x2"], best["x2"] + pad), "y2": max(c["y2"], best["y2"] + pad)}
+    return c if overlaps_box(r) else r
 
 
 def split_merged_boxes(boxes, comps, same_block_gap, box_comps=None):
@@ -145,7 +200,8 @@ def _split_box(box, cs, same_block_gap, box_comps):
         return None
     return (_split_box_lane1(box, cs, same_block_gap, box_comps)
             or _split_box_lane2(box, cs, box_comps)
-            or _split_twin_cut(box, cs, box_comps))
+            or _split_twin_cut(box, cs, box_comps)
+            or _split_overhang_columns(box, cs, box_comps))
 
 
 def _split_twin_cut(box, cs, box_comps):
@@ -180,9 +236,36 @@ def _split_twin_cut(box, cs, box_comps):
         if len(L) < TWIN_SIDE_MIN or len(R) < TWIN_SIDE_MIN:
             continue
         span = (lambda ss: max(c["y2"] for c in ss) - min(c["y1"] for c in ss))
-        if span(L) < TWIN_SPAN_MIN or span(R) < TWIN_SPAN_MIN:
+        min_span = max(TWIN_SPAN_MIN, TWIN_SPAN_FACTOR * _med([c["y2"] - c["y1"] for c in L + R]))
+        if span(L) < min_span or span(R) < min_span:
             continue
-        return _emit_split(box, [_bbox(L), _bbox(R)], "x", cs, box_comps)
+        left = [c for c in cl if c["x2"] <= mid]
+        right = [c for c in cl if c["x1"] >= mid]
+        return _emit_split(box, [_bbox(left), _bbox(right)], "x", cs, box_comps)
+    return None
+
+
+def _split_overhang_columns(box, cs, box_comps):
+    def wide(ss):
+        return [c for c in ss if c["x2"] - c["x1"] > c["y2"] - c["y1"]]
+
+    ws = wide(cs)
+    if len(ws) < TWIN_SIDE_MIN * 2:
+        return None
+    unit = _med([min(c["x2"] - c["x1"], c["y2"] - c["y1"]) for c in ws])
+    srt = sorted(cs, key=lambda c: c["x1"] + c["x2"])
+    for i in range(1, len(srt)):
+        left, right = srt[:i], srt[i:]
+        if len(wide(left)) < TWIN_SIDE_MIN or len(wide(right)) < TWIN_SIDE_MIN:
+            continue
+        l, r = _bbox(left), _bbox(right)
+        gap = r["x1"] - l["x2"]
+        if gap < -unit * 0.35 or gap >= TWIN_GUTTER_MIN:
+            continue
+        span = max(TWIN_SPAN_MIN, unit * TWIN_SPAN_FACTOR)
+        if l["y2"] - l["y1"] < span or r["y2"] - r["y1"] < span:
+            continue
+        return _emit_split(box, [l, r], "x", cs, box_comps)
     return None
 
 
@@ -279,7 +362,7 @@ def _split_box_lane2(box, cs, box_comps):
     return None
 
 # ---- OCR-crop expansion (ported 1:1 from expandCropToInk) ----
-# Padded sides touching ink grow to last ink + margin, capped at half the smaller side. Split children stay in clip.
+# Split crops own their cut axis before padding/growth; the other axis has a bounded glyph-recovery leash.
 def _crop_expand_cap(box):
     return max(16, _r(min(box["x2"] - box["x1"], box["y2"] - box["y1"]) * 0.5))
 
@@ -319,10 +402,14 @@ def expand_crop_to_ink(rgb, box, rect):
     seed_lum = 0.299 * seed[0] + 0.587 * seed[1] + 0.114 * seed[2]
     cap = _crop_expand_cap(box)
     clip = box.get("clip")
-    x1 = max(0, math.floor(rect["x"]))
-    y1 = max(0, math.floor(rect["y"]))
-    x2 = min(W - 1, math.ceil(rect["x"] + rect["w"]))
-    y2 = min(H - 1, math.ceil(rect["y"] + rect["h"]))
+    clip_x = dict(clip, x1=clip["x1"] - SPLIT_CLIP_SLACK, x2=clip["x2"] + SPLIT_CLIP_SLACK) \
+        if clip and box.get("cutAxis") == "y" else clip
+    clip_y = dict(clip, y1=clip["y1"] - SPLIT_CLIP_SLACK, y2=clip["y2"] + SPLIT_CLIP_SLACK) \
+        if clip and box.get("cutAxis") == "x" else clip
+    x1 = max(0, math.floor(rect["x"]), math.ceil(clip_x["x1"]) if clip_x else 0)
+    y1 = max(0, math.floor(rect["y"]), math.ceil(clip_y["y1"]) if clip_y else 0)
+    x2 = min(W - 1, math.ceil(rect["x"] + rect["w"]), math.floor(clip_x["x2"]) if clip_x else W - 1)
+    y2 = min(H - 1, math.ceil(rect["y"] + rect["h"]), math.floor(clip_y["y2"]) if clip_y else H - 1)
 
     def ink_at(x, y):
         if x < 0 or y < 0 or x >= W or y >= H:
@@ -385,13 +472,13 @@ def expand_crop_to_ink(rgb, box, rect):
             else bounds["y1"] if side == "t" else bounds["y2"]
         lo, hi = (bounds["y1"], bounds["y2"]) if vertical else (bounds["x1"], bounds["x2"])
         if side == "l":
-            bound = max(0, math.ceil(box["x1"]) - cap, math.ceil(clip["x1"]) if clip else 0)
+            bound = max(0, math.ceil(box["x1"]) - cap, math.ceil(clip_x["x1"]) if clip_x else 0)
         elif side == "r":
-            bound = min(W - 1, math.floor(box["x2"]) + cap, math.floor(clip["x2"]) if clip else W - 1)
+            bound = min(W - 1, math.floor(box["x2"]) + cap, math.floor(clip_x["x2"]) if clip_x else W - 1)
         elif side == "t":
-            bound = max(0, math.ceil(box["y1"]) - cap, math.ceil(clip["y1"]) if clip else 0)
+            bound = max(0, math.ceil(box["y1"]) - cap, math.ceil(clip_y["y1"]) if clip_y else 0)
         else:
-            bound = min(H - 1, math.floor(box["y2"]) + cap, math.floor(clip["y2"]) if clip else H - 1)
+            bound = min(H - 1, math.floor(box["y2"]) + cap, math.floor(clip_y["y2"]) if clip_y else H - 1)
         touch = edge_ink(vertical, edge, lo, hi)
         if not touch or len(touch) >= (hi - lo + 1) * 0.6:
             return

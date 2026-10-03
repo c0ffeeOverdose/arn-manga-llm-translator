@@ -12,9 +12,9 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/cloud-detection.mjs', sourcemap: 'inline',
 });
 
-const { bitmapToJpegB64 } = await import(new URL('../.test-build/cloud-detection.mjs', import.meta.url).href);
+const { bitmapToJpegB64, cloudDetect } = await import(new URL('../.test-build/cloud-detection.mjs', import.meta.url).href);
 
-const prev = { OC: globalThis.OffscreenCanvas, FR: globalThis.FileReader };
+const prev = { OC: globalThis.OffscreenCanvas, FR: globalThis.FileReader, chrome: globalThis.chrome };
 
 function stubGlobals(dataUrl) {
   const calls = { arrayBuffer: 0, readAsDataURL: 0, drawImage: 0 };
@@ -48,6 +48,23 @@ function stubGlobals(dataUrl) {
 after(() => {
   if (prev.OC) globalThis.OffscreenCanvas = prev.OC; else delete globalThis.OffscreenCanvas;
   if (prev.FR) globalThis.FileReader = prev.FR; else delete globalThis.FileReader;
+  if (prev.chrome) globalThis.chrome = prev.chrome; else delete globalThis.chrome;
+});
+
+test('cloudDetect preserves and scales split ownership with boxes, texts and patches', async () => {
+  stubGlobals('data:image/jpeg;base64,AAECAwQ=');
+  globalThis.chrome = { runtime: { sendMessage: async () => ({ ok: true, page: {
+    ok: true, boxes: [{ x1: 100, y1: 200, x2: 300, y2: 400, conf: 0.9,
+      clip: { x1: 80, y1: 150, x2: 320, y2: 450 }, cutAxis: 'x' }],
+    texts: ['source'], patches: [{ i: 0, x1: 90, y1: 190, x2: 310, y2: 410, png: 'AAE=' }],
+    splitGen: 5, ms: { detect: 1, ocr: 1, total: 2 },
+  } }) } };
+  const result = await cloudDetect({ width: 1600, height: 2400 }, 'https://cloud.example.test', 'mock',
+    { confThr: 0.35, minSize: 12, quality: 0.85, gray: false });
+  assert.deepEqual(result.boxes[0], { x1: 150, y1: 300, x2: 450, y2: 600, conf: 0.9,
+    clip: { x1: 120, y1: 225, x2: 480, y2: 675 }, cutAxis: 'x' });
+  assert.deepEqual(result.cloudTexts, ['source']);
+  assert.deepEqual([result.cloudPatches[0].i, result.cloudPatches[0].x1, result.cloudPatches[0].y1], [0, 135, 285]);
 });
 
 test('bitmapToJpegB64: reads the canvas blob via FileReader, never arrayBuffer', async () => {

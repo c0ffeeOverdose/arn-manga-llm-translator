@@ -377,6 +377,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     // filtered by the same text-likelihood gate pass 3 uses.
     const textyComps: SplitComp[] = [];
     const boxComps: SplitComp[] = [];
+    const splitIds = new Map<SplitComp, number>();
     for (const c of comps) {
         const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
         // split evidence goes smaller than emitted regions: pass-3 emission keeps
@@ -389,36 +390,29 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         if (c.probSum / c.count < 0.75 && compBoxConf(c) < 0.20) continue;
         const comp = { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 };
         textyComps.push(comp);
+        splitIds.set(comp, c.ids[0]);
         // …and the stricter set the child BOXES are measured from: a texture
         // patch the box head also boxed must not widen a child box into the artwork.
         if (c.probSum / c.count >= 0.75) boxComps.push(comp);
     }
-    // pass 2: merge components whose boxes touch when padded (line spacing)
+    // pass 2: connect original components within the line-spacing gap
     const GAP = 28;
-    let merged = true;
-    while (merged) {
-        merged = false;
-        outer: for (let i = 0; i < comps.length; i++) {
-            for (let j = i + 1; j < comps.length; j++) {
-                const a = comps[i], b = comps[j];
-                const sep = a.x1 - GAP > b.x2 || b.x1 - GAP > a.x2 || a.y1 - GAP > b.y2 || b.y1 - GAP > a.y2;
-                if (!sep) {
-                    comps[i] = {
-                        x1: Math.min(a.x1, b.x1), y1: Math.min(a.y1, b.y1),
-                        x2: Math.max(a.x2, b.x2), y2: Math.max(a.y2, b.y2),
-                        count: a.count + b.count,
-                        probSum: a.probSum + b.probSum,
-                        ids: [...a.ids, ...b.ids],
-                    };
-                    comps.splice(j, 1);
-                    merged = true;
-                    break outer;
-                }
-            }
-        }
-    }
+    // Already-boxed glyphs cannot bridge two unclaimed text groups. Split evidence
+    // above still retains every component for the head boxes themselves.
+    const maskComps = comps.filter(c => !overlap(c));
+    const mergedComps = groupMaskComponents(maskComps, GAP).map(indices => {
+        const members = indices.map(i => maskComps[i]);
+        return {
+            x1: Math.min(...members.map(c => c.x1)), y1: Math.min(...members.map(c => c.y1)),
+            x2: Math.max(...members.map(c => c.x2)), y2: Math.max(...members.map(c => c.y2)),
+            count: members.reduce((n, c) => n + c.count, 0),
+            probSum: members.reduce((n, c) => n + c.probSum, 0),
+            ids: members.flatMap(c => c.ids),
+        };
+    });
     // pass 3: filter + emit
     const maskBoxes: typeof outBoxes = [];
+    const maskCandidates = lowBoxes.map((b, i) => ({ x1: b[0], y1: b[1], x2: b[2], y2: b[3], conf: lowConfs[i] }));
     const pageArea = w * h;
     // recount a split-rescue piece: pixels of the parent comp's labels inside it
     const recount = (ids: number[], x1: number, y1: number, x2: number, y2: number): { count: number; probSum: number } => {
@@ -434,22 +428,19 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     // A merged comp killed ONLY by the overlap gate gets a second chance via
     // split (see rescueSplitComp): pieces outside all boxes survive as their
     // own regions. Comps passing every gate are untouched.
-    const rescueSplitCompW = (c: Comp): typeof outBoxes => rescueSplitComp(
-        c, textyComps, boxComps, GAP, pageArea,
-        (x1, y1, x2, y2) => recount(c.ids, x1, y1, x2, y2),
-        overlap, compBoxConf);
-    for (const c of comps) {
+    const rescueSplitCompW = (c: Comp): typeof outBoxes => {
+        const ids = new Set(c.ids);
+        return rescueSplitComp(
+            c, textyComps.filter(t => ids.has(splitIds.get(t)!)), boxComps.filter(t => ids.has(splitIds.get(t)!)), GAP, pageArea,
+            (x1, y1, x2, y2) => recount(c.ids, x1, y1, x2, y2),
+            overlap, compBoxConf);
+    };
+    for (const c of mergedComps) {
         if (maskBoxes.length >= 16) break;
-        const bw = c.x2 - c.x1, bh = c.y2 - c.y1;
-        const fill = c.count / (bw * bh);
-        // text strokes are sparse-but-present; min bbox side keeps single pixels
-        // out; cap area stops GAP-merges that swallow whole panels.
-        if (bw < 14 || bh < 14 || fill < 0.02 || fill > 0.6) continue;
-        if (bw * bh > 0.2 * pageArea) continue;
-        const maskProb = c.probSum / c.count;
-        if (maskProb < 0.75 && compBoxConf(c) < 0.20) continue; // text-likelihood gate — same definition as the split-input filter
+        if (!maskComponentEligible(c, pageArea, compBoxConf(c))) continue;
         if (!overlap(c)) {
-            maskBoxes.push({ x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, conf: 0.5 });
+            const grown = extendMaskBox(c, maskCandidates, overlap);
+            maskBoxes.push({ x1: Math.max(0, grown.x1), y1: Math.max(0, grown.y1), x2: Math.min(w, grown.x2), y2: Math.min(h, grown.y2), conf: 0.5 });
             continue;
         }
         // sole killer was the overlap gate — second chance via split
@@ -539,7 +530,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
 // scripts; only the language data is downloaded on demand and cached in IDB).
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
-import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
+import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
 import { windowIndex } from '../content/inpaint';
 import { pickInferIndex } from '../content/page-cache';
 import { initDebug, isDebug } from '../debug';
