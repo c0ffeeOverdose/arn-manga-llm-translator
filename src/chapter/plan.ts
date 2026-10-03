@@ -28,5 +28,5 @@ export function nextBatch<T extends { id: string; order: number }>(
 export function nextGroup<T extends { id: string; order: number }>(
     phases: PagePhase[], pages: T[], opts: { size: number; priority: string },
 ): T[] {
-    return orderedDue(phases, pages, opts.priority).slice(0, Math.max(1, Math.min(6, opts.size)));
+    return orderedDue(phases, pages, opts.priority).slice(0, Math.max(1, Math.min(10, opts.size)));
 }

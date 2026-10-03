@@ -134,8 +134,9 @@ test('a rolling group takes up to its size, priority first, and skips waiting pa
     assert.deepEqual(nextGroup(all, pages(6), { size: 2, priority: '' }).map(b => b.order), [0, 1]);
     assert.deepEqual(nextGroup(all, pages(6), { size: 3, priority: 'p4' }).map(b => b.order), [4, 0, 1]);
     assert.deepEqual(nextGroup(['waiting', 'queued', 'queued'], pages(3), { size: 3, priority: '' }).map(b => b.order), [1, 2]);
-    // the planner never asks for more than 6 — slots bound concurrency, not the group size
-    assert.equal(nextGroup(all, pages(6), { size: 99, priority: '' }).length, 6);
+    // the planner never asks for more than 10 — slots bound concurrency, not the group size
+    const many = pages(12).map(() => 'queued');
+    assert.equal(nextGroup(many, pages(12), { size: 99, priority: '' }).length, 10);
 });
 test('rolling groups drain every queued page in reading order', () => {
     const seen = [];

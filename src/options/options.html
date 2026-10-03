@@ -176,6 +176,7 @@
   .combo-list li.active, .combo-list li:hover { background: var(--surface-2); }
   input[type=range] { width: 100%; accent-color: var(--accent); }
   .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .hint.chapter-batch { color: var(--text); }
   .range-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   .range-head label { flex: 1; margin: 0; }
   .range-head .val { color: var(--accent); font-weight: 500; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -749,12 +750,13 @@
           <div class="field">
             <div class="range-head"><label for="parallelLlm">Parallel LLM calls</label><input type="number" id="parallelLlmNum" class="val-input" min="1" max="10" step="1"></div>
             <input type="range" id="parallelLlm" min="1" max="6" step="1">
-            <div class="hint">Only when memory is off. 1 = serial. Chapter translation uses this as how many page groups work at once. Lower it if you hit rate limits.</div>
+            <div class="hint">Lower it if you hit rate limits. While reading, queued pages also translate in parallel when memory is off.</div>
           </div>
           <div class="field">
-            <div class="range-head"><label for="mergePages">Pages per LLM request</label><input type="number" id="mergePagesNum" class="val-input" min="1" max="4" step="1"></div>
-            <input type="range" id="mergePages" min="1" max="4" step="1">
-            <div class="hint">Chapter translation: send this many pages in one request so nearby pages share context. Works with full-page, crop and OCR text sources; the separate OCR model keeps 1.</div>
+            <div class="range-head"><label for="mergePages">Pages per LLM request</label><input type="number" id="mergePagesNum" class="val-input" min="1" max="10" step="1"></div>
+            <input type="range" id="mergePages" min="1" max="10" step="1">
+            <div class="hint chapter-batch" id="chapterBatch" style="margin-top:6px"></div>
+            <div class="hint">Other translations always send one page per request.</div>
           </div>
           <div class="group-label">Translation cache</div>
           <div class="field">

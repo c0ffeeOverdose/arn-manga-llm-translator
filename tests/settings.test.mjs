@@ -303,6 +303,7 @@ test('presets never touch the AI cleanup choice', () => {
 test('mergePages is a batching knob with defensive bounds', () => {
   assert.equal(DEFAULT_PIPELINE_SETTINGS.mergePages, 1);
   assert.equal(loadPipelineSettings({ mergePages: 3 }).mergePages, 3);
+  assert.equal(loadPipelineSettings({ mergePages: 10 }).mergePages, 10);
   assert.equal(loadPipelineSettings({ mergePages: 0 }).mergePages, 1);
   assert.equal(loadPipelineSettings({ mergePages: 99 }).mergePages, 1);
   assert.equal(loadPipelineSettings({ mergePages: 2.6 }).mergePages, 3);

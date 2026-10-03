@@ -97,6 +97,7 @@ export function syncOcrSeparateUI(): void {
     ($('ocrSeparate') as HTMLInputElement).checked = pipeline.useOcrModel;
     ($('ocrPerRegion') as HTMLInputElement).checked = pipeline.ocrPerRegion;
     $('ocrSeparateFields').style.display = pipeline.useOcrModel && pipeline.textSource !== 'ocr' ? '' : 'none';
+    syncChapterBatchHint();
 }
 
 // ---- OCR model manager: download/delete per language, with progress ----
@@ -264,13 +265,28 @@ const RANGE_ABS: Record<string, { min?: number; max?: number }> = {
     fullPageSize: { min: 400, max: 2560 },
     contextPairs: { min: 0, max: 200 },
     parallelLlm: { min: 1, max: 10 },
-    mergePages: { min: 1, max: 4 },
+    mergePages: { min: 1, max: 10 },
     minFont: { min: 1, max: 72 },
     textScale: { min: 0.6, max: 1.6 },
     textStroke: { min: 0, max: 0.5 },
     cacheMax: { min: 10, max: 2000 },
 };
 for (const id of Object.keys(RANGE_ABS)) wireRange(id, id, RANGE_ABS[id]);
+// The two Performance knobs only combine inside a chapter run — say the effective shape in
+// plain words, or "pages per request" and "parallel calls" read as the same number.
+function syncChapterBatchHint(): void {
+    const el = $('chapterBatch');
+    if (!el) return;
+    const per = pipeline.useOcrModel ? 1 : pipeline.mergePages;
+    const slots = pipeline.parallelLlm;
+    el.textContent = `Translate to end of chapter: ${per} page${per === 1 ? '' : 's'} per request · ${slots} request${slots === 1 ? '' : 's'} at a time.`;
+}
+for (const id of ['parallelLlm', 'mergePages'] as const) {
+    for (const el of [$<HTMLInputElement>(id), $<HTMLInputElement>(id + 'Num')]) {
+        el.addEventListener('input', syncChapterBatchHint);
+        el.addEventListener('change', syncChapterBatchHint);
+    }
+}
 for (const [auto, pick, key] of [['textColorAuto', 'textColorPick', 'textColor'], ['strokeColorAuto', 'strokeColorPick', 'strokeColor']] as const) {
     ($<HTMLInputElement>(auto)).onchange = () => {
         (pipeline as any)[key] = ($<HTMLInputElement>(auto)).checked ? 'auto' : ($<HTMLInputElement>(pick)).value;

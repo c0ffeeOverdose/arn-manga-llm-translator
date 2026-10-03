@@ -243,7 +243,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
     if (typeof out.prefetchN !== 'number' || !(out.prefetchN >= 1 && out.prefetchN <= 30)) out.prefetchN = 3;
     else out.prefetchN = Math.round(out.prefetchN);
     // batching knob: 1 = one page per request (the pre-merge behaviour)
-    if (typeof out.mergePages !== 'number' || !(out.mergePages >= 1 && out.mergePages <= 6)) out.mergePages = 1;
+    if (typeof out.mergePages !== 'number' || !(out.mergePages >= 1 && out.mergePages <= 10)) out.mergePages = 1;
     else out.mergePages = Math.round(out.mergePages);
     if (typeof out.cacheEnabled !== 'boolean') out.cacheEnabled = true;
     if (typeof out.cacheMax !== 'number' || !(out.cacheMax >= 10 && out.cacheMax <= 2000)) out.cacheMax = 200;

@@ -467,7 +467,16 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         return;
     }
     let out: TranslateOutcome | null = null;
-    const combined = await combinePages(prepared);
+    // A group too large for one canvas (or a failed combine) must degrade to per-page calls,
+    // never kill the run.
+    const combined = await combinePages(prepared).catch(e => {
+        note(`group ${group.map(p => `p${p.order}`).join(',')} combine ${(e as Error).message}`.slice(0, 160));
+        return null;
+    });
+    if (!combined) {
+        await Promise.all(prepared.map(p => withPageLease(p.page, p.item, valid, live => settlePrepared(p, snapshot, cacheEpoch, live))));
+        return;
+    }
     const attempt = new Attempt({
         timeoutMs: PAGE_LEASE_MS,
         label: () => `group ${group.map(p => `p${p.order}`).join(',')} translating`,
@@ -545,7 +554,7 @@ function pumpCheck(): void {
 // merges by sending every page's annotated image with globally-numbered badges.
 function mergeSize(): number {
     if (config.pipeline.useOcrModel) return 1;
-    return Math.max(1, Math.min(4, config.pipeline.mergePages || 1));
+    return Math.max(1, Math.min(10, config.pipeline.mergePages || 1));
 }
 // Slots bound how many groups work at once — the user's "sets". 6 is a memory guard.
 function slotCount(): number {
