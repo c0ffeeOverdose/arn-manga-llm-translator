@@ -6,7 +6,7 @@ import math
 # ---- box splitting (ported 1:1 from src/content/detection.ts) ----
 # Preserve two JS-isms: Math.round halves UP on positives (use _r) and medians are the UPPER middle (use _med).
 # Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on children); comps are plain rects (no count/psum).
-SPLIT_GEN = 8  # bump when this section's logic changes; /v1/page reports it
+SPLIT_GEN = 9  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
@@ -27,6 +27,9 @@ TWIN_SPAN_FACTOR = 2
 # then passes half of them by a pixel and fakes multi-row text. A real word/line run spans
 # at least this many glyph units horizontally.
 TWIN_WIDE_GLYPHS = 1.5
+# × glyph height — two comps whose row centers sit closer than this share a text
+# line: a cut between them slices the line instead of separating columns/blocks.
+OVERHANG_ROW_ALIGN = 0.1
 
 
 def _median_minor(rs):
@@ -271,6 +274,11 @@ def _split_overhang_columns(box, cs, box_comps):
         return None
     unit = _med([min(c["x2"] - c["x1"], c["y2"] - c["y1"]) for c in ws])
     srt = sorted(cs, key=lambda c: c["x1"] + c["x2"])
+    def cross_row(a, b):
+        min_h = min(a["y2"] - a["y1"], b["y2"] - b["y1"])
+        return (abs((a["y1"] + a["y2"]) / 2 - (b["y1"] + b["y2"]) / 2) <= OVERHANG_ROW_ALIGN * min_h
+                and b["x1"] - a["x2"] <= glyph)
+
     for i in range(1, len(srt)):
         left, right = srt[:i], srt[i:]
         if len(wide(left)) < TWIN_SIDE_MIN or len(wide(right)) < TWIN_SIDE_MIN:
@@ -278,6 +286,8 @@ def _split_overhang_columns(box, cs, box_comps):
         l, r = _bbox(left), _bbox(right)
         gap = r["x1"] - l["x2"]
         if gap < -unit * 0.35 or gap >= TWIN_GUTTER_MIN:
+            continue
+        if any(cross_row(a, b) for a in left for b in right):
             continue
         span = max(TWIN_SPAN_MIN, unit * TWIN_SPAN_FACTOR)
         if l["y2"] - l["y1"] < span or r["y2"] - r["y1"] < span:

@@ -332,6 +332,9 @@ export const TWIN_SPAN_FACTOR = 2; // × median wide-component height
 // then passes half of them by a pixel and fakes multi-row text. A real word/line run spans
 // at least this many glyph units horizontally.
 export const TWIN_WIDE_GLYPHS = 1.5;
+// × glyph height — two comps whose row centers sit closer than this share a text
+// line: a cut between them slices the line instead of separating columns/blocks.
+export const OVERHANG_ROW_ALIGN = 0.1;
 // Median minor extent = one glyph unit.
 function medianMinor(rs: SplitComp[]): number {
     const d = rs.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
@@ -383,6 +386,8 @@ function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Split
 
 // Multi-row columns may overlap by a glyph fringe; a spanning line must still veto
 // the cut. Each side owns its full component extents, including narrow punctuation.
+// A cut is only a boundary when no text row crosses it: comps that share a row and
+// sit within a glyph of each other are neighbouring words of one line.
 function splitOverhangColumns<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
     const glyph = medianMinor(cs);
     const wide = (ss: SplitComp[]) => ss.filter(c => c.x2 - c.x1 > c.y2 - c.y1 && c.x2 - c.x1 >= TWIN_WIDE_GLYPHS * glyph);
@@ -395,12 +400,18 @@ function splitOverhangColumns<T extends DetBox>(box: T, cs: SplitComp[], boxComp
         x1: Math.min(...ss.map(c => c.x1)), y1: Math.min(...ss.map(c => c.y1)),
         x2: Math.max(...ss.map(c => c.x2)), y2: Math.max(...ss.map(c => c.y2)),
     });
+    const crossRow = (a: SplitComp, b: SplitComp) => {
+        const minH = Math.min(a.y2 - a.y1, b.y2 - b.y1);
+        return Math.abs((a.y1 + a.y2) / 2 - (b.y1 + b.y2) / 2) <= OVERHANG_ROW_ALIGN * minH
+            && b.x1 - a.x2 <= glyph;
+    };
     for (let i = 1; i < sorted.length; i++) {
         const left = sorted.slice(0, i), right = sorted.slice(i);
         if (wide(left).length < TWIN_SIDE_MIN || wide(right).length < TWIN_SIDE_MIN) continue;
         const l = bounds(left), r = bounds(right);
         const gap = r.x1 - l.x2;
         if (gap < -unit * 0.35 || gap >= TWIN_GUTTER_MIN) continue;
+        if (left.some(a => right.some(b => crossRow(a, b)))) continue;
         const span = Math.max(TWIN_SPAN_MIN, unit * TWIN_SPAN_FACTOR);
         if (l.y2 - l.y1 < span || r.y2 - r.y1 < span) continue;
         return emitSplit(box, [l, r], 'x', cs, boxComps);

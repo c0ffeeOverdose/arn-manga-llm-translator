@@ -79,6 +79,33 @@ test('multi-row columns tolerate a small glyph overhang but not a spanning headl
   assert.deepEqual(splitMergedBoxes([parent], [...comps, box(20, 70, 260, 95)], GAP), [parent]);
 });
 
+// Live stacked two-line bubble (worker comps verbatim): the word gaps of both lines
+// align into a 1px x-avenue, but some left and right comps share a text row — the cut
+// would slice the line, so overhang leaves the block whole.
+const ALIGNED_WORDS = [[951, 77, 1025, 117], [1038, 77, 1111, 122], [956, 121, 1030, 168], [1031, 125, 1108, 168]];
+
+test('overhang cut ignores word columns of one stacked-line block', () => {
+  const parent = box(952, 75, 1110, 164, 0.37);
+  const comps = ALIGNED_WORDS.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});
+
+// Live reverse-color pair (worker comps verbatim): two touching side-by-side
+// blocks with different row grids — no shared row, so the +3px cut stays.
+const TOUCHING_BLOCKS = [[821, 772, 912, 822], [990, 811, 1054, 842], [834, 828, 911, 880],
+  [991, 843, 1056, 874], [971, 875, 1083, 908], [833, 889, 927, 940], [1003, 909, 1054, 938],
+  [977, 939, 1067, 971], [809, 945, 966, 1004], [1067, 948, 1083, 958], [1014, 969, 1068, 1002],
+  [1067, 970, 1088, 999], [973, 972, 1015, 1003], [821, 1005, 968, 1064], [879, 1070, 919, 1116]];
+
+test('overhang cut separates touching blocks with independent row grids', () => {
+  const parent = box(809, 772, 1091, 1116, 0.5);
+  const comps = TOUCHING_BLOCKS.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [
+    { x1: 809, y1: 772, x2: 969, y2: 1116, conf: 0.5, clip: { x1: 809, y1: 772, x2: 974, y2: 1116 }, cutAxis: 'x' },
+    { x1: 970, y1: 811, x2: 1088, y2: 1003, conf: 0.5, clip: { x1: 966, y1: 772, x2: 1091, y2: 1116 }, cutAxis: 'x' },
+  ]);
+});
+
 test('twin-column extents retain narrow punctuation after the final wide row', () => {
   const parent = box(0, 0, 220, 150);
   const comps = [box(10, 10, 90, 30), box(10, 40, 90, 60), box(10, 70, 90, 90), box(50, 100, 60, 130),

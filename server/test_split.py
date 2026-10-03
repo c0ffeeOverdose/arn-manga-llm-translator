@@ -62,6 +62,31 @@ class ColumnSplits(unittest.TestCase):
         self.assertLessEqual(parts[1]["clip"]["x1"], 154)
         self.assertEqual(split_merged_boxes([parent], comps + [box(20, 70, 260, 95)], GAP), [parent])
 
+    def test_overhang_cut_ignores_word_columns_of_one_stacked_line_block(self):
+        # Live stacked two-line bubble (worker comps verbatim): the word gaps of both
+        # lines align into a 1px x-avenue, but some left and right comps share a text
+        # row — the cut would slice the line, so overhang leaves the block whole.
+        parent = box(952, 75, 1110, 164, 0.37)
+        comps = rects([[951, 77, 1025, 117], [1038, 77, 1111, 122],
+                       [956, 121, 1030, 168], [1031, 125, 1108, 168]])
+        self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [parent])
+
+    def test_overhang_cut_separates_touching_blocks_with_independent_row_grids(self):
+        # Live reverse-color pair (worker comps verbatim): two touching side-by-side
+        # blocks with different row grids; no shared row, so the +3px cut stays.
+        parent = box(809, 772, 1091, 1116, 0.5)
+        comps = rects([[821, 772, 912, 822], [990, 811, 1054, 842], [834, 828, 911, 880],
+                       [991, 843, 1056, 874], [971, 875, 1083, 908], [833, 889, 927, 940],
+                       [1003, 909, 1054, 938], [977, 939, 1067, 971], [809, 945, 966, 1004],
+                       [1067, 948, 1083, 958], [1014, 969, 1068, 1002], [1067, 970, 1088, 999],
+                       [973, 972, 1015, 1003], [821, 1005, 968, 1064], [879, 1070, 919, 1116]])
+        self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [
+            {"x1": 809, "y1": 772, "x2": 969, "y2": 1116, "conf": 0.5,
+             "clip": {"x1": 809, "y1": 772, "x2": 974, "y2": 1116}, "cutAxis": "x"},
+            {"x1": 970, "y1": 811, "x2": 1088, "y2": 1003, "conf": 0.5,
+             "clip": {"x1": 966, "y1": 772, "x2": 1091, "y2": 1116}, "cutAxis": "x"},
+        ])
+
     def test_narrow_punctuation_survives(self):
         comps = rects([[10, 10, 90, 30], [10, 40, 90, 60], [10, 70, 90, 90], [50, 100, 60, 130],
                        [100, 10, 180, 30], [100, 40, 180, 60], [100, 70, 180, 90]])
