@@ -231,6 +231,21 @@ test('text-only vision mode: crops-only images section + no-guess spk rule; extr
   assert.ok(q.includes('<extra'));
 });
 
+test('merged page request: every full page is named, badges stay global, speaker rule follows', () => {
+  const p = all(buildPrompt([{ index: 1, source: '' }, { index: 2, source: '' }], EMPTY_CONTEXT, true, {
+    pageCount: 3, chars: true,
+  }));
+  assert.ok(p.includes('The first 3 images are full pages with red number badges'));
+  assert.ok(p.includes('a badge number is that region\'s number in the list below'));
+  assert.ok(p.includes('use the full pages for context'));
+  assert.ok(p.includes('use the full pages: a balloon tail points at the speaker'));
+  // single-page wording is untouched (cacheable prompt stability)
+  const one = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { chars: true }));
+  assert.ok(one.includes('First image = full page with red number badges'));
+  assert.ok(one.includes('use the full page: a balloon tail'));
+  assert.ok(!one.includes('full pages'));
+});
+
 test('OCR mode: no images section, source text inline, SFX + no-guess rules', () => {
   const p = all(buildPrompt(
     [{ index: 1, source: 'こんにちは、先輩！' }, { index: 2, source: 'ドン' }],

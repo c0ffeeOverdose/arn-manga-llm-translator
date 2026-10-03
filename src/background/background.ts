@@ -23,8 +23,9 @@ interface TranslateMsg {
     vision: boolean;          // false in OCR mode (no images sent)
     textOnly?: boolean;       // crops mode: no full-page image
     ocr?: boolean;            // OCR mode: source text provided per region
-    pageW: number;            // px — for validating VLM-reported extra regions
-    pageH: number;
+    pageW?: number;           // px — for validating VLM-reported extra regions (merged requests omit)
+    pageH?: number;
+    pageCount?: number;       // merged request: number of annotated full pages leading imagesB64
     cacheKey?: string;        // stable per manga — routes provider-side prompt caching
     bookKey?: string;         // the book this context belongs to — scopes user overrides per story
     interim?: boolean;        // caller understands {type:'mt:ocr-texts'} mid-flight messages (new content only — an old listener would read the interim as the final reply and fail the job)
@@ -742,6 +743,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 targetLang: pipeline.targetLang,
                 pageW: msg.pageW,
                 pageH: msg.pageH,
+                pageCount: msg.pageCount,
                 textOnly: split ? true : msg.textOnly,
                 ocr: split ? true : msg.ocr,
                 chars: pipeline.useCharacters,
@@ -775,6 +777,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 const retryPrompt = buildPrompt(missing, ctx, vision2, {
                     stylePrompt: pipeline.stylePrompt,
                     targetLang: pipeline.targetLang,
+                    pageCount: msg.pageCount,
                     textOnly: split ? true : msg.textOnly,
                     ocr: split ? true : msg.ocr,
                     chars: pipeline.useCharacters,
@@ -783,9 +786,14 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
                 if (isDebug()) console.log('[mt:bg] llm prompt (retry missing: ' + missing.map(r => r.index).join(',') + ')', retryPrompt);
-                // crops for the missing regions; page mode prepends the full page ([0]).
+                // Crops for the missing regions; the annotated page prefix is kept (all pages
+                // of a merged request). cropStart is where the crops begin in imagesB64.
+                const cropStart = msg.pageCount && msg.pageCount > 1 ? msg.pageCount : (msg.textOnly ? 0 : 1);
                 const retryImgs = vision2 && msg.imagesB64
-                    ? [...(msg.textOnly ? [] : [msg.imagesB64[0]]), ...missing.map(r => msg.imagesB64![r.index]).filter(Boolean)]
+                    ? [
+                        ...msg.imagesB64.slice(0, cropStart),
+                        ...missing.map(r => msg.imagesB64![cropStart + r.index - 1]).filter((b): b is string => !!b),
+                    ]
                     : undefined;
                 const r2 = await callWithRetry(settings, retryPrompt, retryImgs, undefined, pipeline.temperature, undefined, true);
                 rawAll += '\n--- retry (missing regions) ---\n' + r2.text;
@@ -805,6 +813,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 const fullPrompt = buildPrompt(regions2, ctx, vision2, {
                     stylePrompt: pipeline.stylePrompt,
                     targetLang: pipeline.targetLang,
+                    pageCount: msg.pageCount,
                     textOnly: split ? true : msg.textOnly,
                     ocr: split ? true : msg.ocr,
                     chars: pipeline.useCharacters,

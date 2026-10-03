@@ -226,18 +226,21 @@ function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingConte
 }
 
 // Badge size comes from page-cache's annotFont (pure + unit-tested); draw a
-// numbered badge over each region so the VLM can map them, downscale.
-async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: boolean): Promise<string> {
-    const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
-    const c = new OffscreenCanvas(Math.round(bitmap.width * scale), Math.round(bitmap.height * scale));
+// numbered badge over each region so the VLM can map them, downscale. A segment
+// annotates ONE page of a merged request; `offset` keeps badge numbers global.
+async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: boolean, segment?: { y: number; h: number }, offset = 0): Promise<string> {
+    const srcY = segment?.y ?? 0;
+    const srcH = segment?.h ?? bitmap.height;
+    const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, srcH));
+    const c = new OffscreenCanvas(Math.round(bitmap.width * scale), Math.round(srcH * scale));
     const ctx = c.getContext('2d')!;
     if (grayscale) ctx.filter = 'grayscale(1)';
-    ctx.drawImage(bitmap, 0, 0, c.width, c.height);
+    ctx.drawImage(bitmap, 0, srcY, bitmap.width, srcH, 0, 0, c.width, c.height);
     // canvas filters stick to every later draw: reset, or the badges come out
     // gray whenever the page was grayscale-stripped.
     ctx.filter = 'none';
     const font = annotFont(scale);
-    boxes.forEach((b, i) => drawBadge(ctx, b.x1 * scale, b.y1 * scale, i + 1, font * 0.9, c.width, c.height));
+    boxes.forEach((b, i) => drawBadge(ctx, b.x1 * scale, (b.y1 - srcY) * scale, offset + i + 1, font * 0.9, c.width, c.height));
     return toJpegB64(c, pipeline.jpegQuality);
 }
 
@@ -421,7 +424,7 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[] },
 ): Promise<TranslateOutcome> {
     const cacheEpoch = opts?.cacheEpoch ?? await cacheReady();
     assertCacheCurrent(cacheEpoch);
@@ -456,6 +459,10 @@ export async function translateRegions(
         const vision = !ocr;
         const cropsOnly = vision && pipeline.textSource === 'crops';
         let imagesB64: string[] | undefined;
+        // Page-mode requests carry their annotated full page(s) FIRST; pageImages keeps that
+        // prefix separate so chunked requests can re-send it with a subset of crops.
+        const pageImages: string[] = [];
+        const segs = opts?.pageSegments ?? [];
         let ocrStatus: ('ok' | 'empty')[] | undefined;
         let ocrMs: number | undefined;
         let ocrLockWaitMs: number | undefined;
@@ -507,6 +514,18 @@ export async function translateRegions(
             if (cropsOnly) {
                 imagesB64 = [];
                 for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
+            } else if (segs.length > 1) {
+                // merged page mode: one annotated page per segment, badges numbered globally.
+                // Extras stay off — their coordinates would need one shared page space.
+                let offset = 0;
+                for (const seg of segs) {
+                    const segBoxes = det.boxes.filter(b => b.y1 >= seg.y && b.y1 < seg.y + seg.h);
+                    pageImages.push(await annotateForVLM(bitmap, segBoxes, gs, seg, offset));
+                    offset += segBoxes.length;
+                }
+                annW = 0; annH = 0; badgeR = undefined;
+                imagesB64 = [...pageImages];
+                for (const box of det.boxes) imagesB64.push(await cropRegion(bitmap, box, gs, pageImg));
             } else {
                 const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
                 annW = Math.round(bitmap.width * scale);
@@ -552,16 +571,20 @@ export async function translateRegions(
         // `imagesB64[index]` — so a chunk carrying page-global indices (7..12) asked for
         // "region 7" with its first crop and read crop slot 7, which either missed or
         // mismatched. Chunk-local indices keep prompt, crops and reply aligned.
+        // One flat crop map for all chunks: in page mode the crops sit AFTER the annotated
+        // page prefix (one image per segment in a merged request).
+        const cropOf = new Map<number, string>();
+        if (vision && imagesB64?.length) {
+            for (let i = 0; i < regions.length; i++) {
+                const img = imagesB64[cropsOnly ? i : pageImages.length + i];
+                if (img) cropOf.set(regions[i].index, img);
+            }
+        }
         const chunkPayload = (subset: RegionInput[]): Record<string, unknown> => {
             const local = subset.map((r, i) => ({ ...r, index: i + 1 }));
-            let chunkImages = imagesB64;
-            if (vision && imagesB64?.length) {
-                const cropOf = new Map(regions.map((r, i) => [r.index, imagesB64![cropsOnly ? i : i + 1]]));
-                chunkImages = [
-                    ...(cropsOnly ? [] : [imagesB64[0]]), // the annotated page, if this mode sends one
-                    ...subset.map(r => cropOf.get(r.index)).filter((b): b is string => !!b),
-                ];
-            }
+            const chunkImages = imagesB64
+                ? [...pageImages, ...subset.map(r => cropOf.get(r.index)).filter((b): b is string => !!b)]
+                : imagesB64;
             return { ...payload, imagesB64: chunkImages, regions: local };
         };
         let resp: any;
@@ -569,6 +592,7 @@ export async function translateRegions(
         // mid-translate, the fallback re-sends them so the new worker translates
         // instead of re-transcribing.
         let interimTexts: string[] | null = null;
+        const mergedCount = segs.length > 1 ? segs.length : 0;
         const payload = {
             type: 'mt:translate',
             imagesB64,
@@ -577,8 +601,10 @@ export async function translateRegions(
             vision,
             textOnly: cropsOnly || ocr,
             ocr,
-            pageW: annW,
-            pageH: annH,
+            // extras need ONE page space; a merged request has several, so it opts out
+            pageW: mergedCount ? undefined : annW,
+            pageH: mergedCount ? undefined : annH,
+            pageCount: mergedCount || undefined,
             cacheKey: await resolveMangaId() ?? chapterKey(), // stable per manga → prompt-cache affinity
             bookKey: bookKey(), // scopes user overrides to this story's book
             interim: true, // this version handles the mid-flight transcripts message (see portSend)

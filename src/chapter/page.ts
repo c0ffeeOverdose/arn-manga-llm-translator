@@ -418,17 +418,19 @@ async function workSingle(page: ChapterPage, snapshot: ContextState, generation:
 // Merge a group of prepared pages into one tall bitmap so the existing per-page request
 // pipeline runs ONCE: crops are cut at native pixels, box lists concatenate in page order,
 // and replies map back by box offsets. Page mode never gets here (see mergeSize()).
-async function combinePages(pages: Prepared[]): Promise<{ bitmap: ImageBitmap; det: DetectResult; total: number }> {
+async function combinePages(pages: Prepared[]): Promise<{ bitmap: ImageBitmap; det: DetectResult; total: number; segments: { y: number; h: number }[] }> {
     const width = Math.max(...pages.map(p => p.bitmap.width));
     const height = pages.reduce((a, p) => a + p.bitmap.height, 0);
     const canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext('2d')!;
     const boxes: DetBox[] = [];
     const texts: string[] = [];
+    const segments: { y: number; h: number }[] = [];
     let allTexts = true;
     let y = 0;
     for (const p of pages) {
         ctx.drawImage(p.bitmap, 0, y);
+        segments.push({ y, h: p.bitmap.height });
         for (const b of p.det.boxes) boxes.push({ ...b, y1: b.y1 + y, y2: b.y2 + y });
         if (p.det.cloudTexts) texts.push(...p.det.cloudTexts);
         else allTexts = false;
@@ -436,7 +438,7 @@ async function combinePages(pages: Prepared[]): Promise<{ bitmap: ImageBitmap; d
     }
     const bitmap = await createImageBitmap(canvas);
     const cloudTexts = allTexts && texts.length === boxes.length ? texts : undefined;
-    return { bitmap, det: { ...pages[0].det, boxes, cloudTexts }, total: boxes.length };
+    return { bitmap, det: { ...pages[0].det, boxes, cloudTexts }, total: boxes.length, segments };
 }
 
 // A worker slot with mergePages>1: pages are prepared together, translated in ONE request
@@ -481,6 +483,8 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         const call = translateRegions(combined.bitmap, combined.det, () => {}, {
             fold: false, lo: true, context: snapshot, fresh: prepared.some(p => p.force),
             cacheEpoch, onStarve: starveNotice, regionCap: combined.total, checkpoint: false,
+            // page mode: one annotated image per page, badges numbered globally across the group
+            pageSegments: config.pipeline.textSource === 'page' ? combined.segments : undefined,
         }).then(r => {
             if ('error' in r && r.error) throw Object.assign(new Error(r.error), { kind: r.errorKind });
             return r;
@@ -537,10 +541,10 @@ function pumpCheck(): void {
 }
 // pumpCheck is the only re-entry: pump() must never call itself while `pumping` is true.
 
-// Chapter batching knobs. Merging is ignored in modes whose request needs the page as its
-// first image (page mode) or transcribes per page (split pipeline) — those keep 1.
+// Chapter batching knobs. The split pipeline transcribes per page, so it keeps 1; page mode
+// merges by sending every page's annotated image with globally-numbered badges.
 function mergeSize(): number {
-    if (config.pipeline.textSource === 'page' || config.pipeline.useOcrModel) return 1;
+    if (config.pipeline.useOcrModel) return 1;
     return Math.max(1, Math.min(4, config.pipeline.mergePages || 1));
 }
 // Slots bound how many groups work at once — the user's "sets". 6 is a memory guard.

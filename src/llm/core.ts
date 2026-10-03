@@ -70,6 +70,8 @@ export interface BuildOpts {
     targetLang?: string;    // translation target (default Thai)
     pageW?: number;
     pageH?: number;
+    // merged request: the first `pageCount` images are full pages (badges stay global)
+    pageCount?: number;
     textOnly?: boolean;     // crops mode: crops only, no full-page image
     ocr?: boolean;          // OCR mode: source text provided per region, no images
     chars?: boolean;        // character channel (default true): send known_characters
@@ -156,6 +158,8 @@ The second form (self-closing, keep="true", NO text inside) is ONLY for regions 
     let p = `<task>Translate the numbered manga regions into ${lang}.</task>\n`;
     if (vision && opts.textOnly) {
         p += `<images>Each image is the crop of region 1, 2, … in order — read each region from its own crop. There is no full-page image: you see only the text boxes, not the surrounding artwork.</images>\n`;
+    } else if (vision && (opts.pageCount ?? 1) > 1) {
+        p += `<images>The first ${opts.pageCount} images are full pages with red number badges, in page order — a badge number is that region's number in the list below. The following images are crops of region 1, 2, … in order. Read each region from its crop; use the full pages for context.</images>\n`;
     } else if (vision) {
         p += `<images>First image = full page with red number badges; the following images are crops of region 1, 2, … in order. Read each region from its crop; use the full page for context.</images>\n`;
     }
@@ -191,7 +195,8 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
 ` : ``}</output_format>\n`;
     p += `<rules>\n- ${LANG_RULES[lang] ?? GENERIC_RULE(lang)}\n`;
     if (chars && vision && !opts.textOnly && !opts.ocr) {
-        p += '- Speaker: match each spoken region to a listed id — use the full page: a balloon tail points at the speaker; a thought cloud belongs to the thinker (keep their id); a tail-less box or floating text is narration, an off-panel voice, or SFX — tag a speaker only when the page makes it clear (who reacts, who is addressed, who shares the panel, continuity with earlier pages); otherwise omit spk.\n';
+        const pages = (opts.pageCount ?? 1) > 1 ? 'full pages' : 'full page';
+        p += `- Speaker: match each spoken region to a listed id — use the ${pages}: a balloon tail points at the speaker; a thought cloud belongs to the thinker (keep their id); a tail-less box or floating text is narration, an off-panel voice, or SFX — tag a speaker only when the page makes it clear (who reacts, who is addressed, who shares the panel, continuity with earlier pages); otherwise omit spk.\n`;
     }
     if (chars && vision && opts.textOnly) {
         p += '- You see ONLY text crops, never faces or artwork: identify the speaker from the character book or the dialogue itself. If you cannot tell, omit spk and g rather than guess.\n';
