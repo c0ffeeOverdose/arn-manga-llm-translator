@@ -944,6 +944,61 @@ test('buildPrompt: sourceless pairs render as (previous page)', () => {
   assert.ok(!p.includes('=> prev'), 'no dangling arrow');
 });
 
+// ---- speaker tags on recent lines (2026-10-03) ----
+
+test('updateContext: recent lines carry the resolved speaker id', () => {
+  const { ctx } = updateContext(EMPTY_CONTEXT, [
+    { index: 1, source: 'A', translation: 'หนึ่ง', spk: { desc: 'girl with red ribbon', gender: 'F', name: 'อากิ' } },
+    { index: 2, source: 'B', translation: 'สอง', spk: null },
+  ]);
+  assert.equal(ctx.pairs[0][2], 'c1', 'a row born in this call is tagged');
+  assert.equal(ctx.pairs[1].length, 2, 'narration gets no tag');
+  // a later spk="new" that folds into the same row resolves to the same id
+  const { ctx: next } = updateContext(ctx, [
+    { index: 1, source: 'C', translation: 'สาม', spk: { desc: 'red ribbon girl', gender: 'F' } },
+  ]);
+  assert.equal(next.characters.length, 1, 'the anchors folded');
+  assert.equal(next.pairs.at(-1)[2], 'c1');
+  // an id echoed straight back stays the tag
+  const { ctx: byId } = updateContext(next, [
+    { index: 1, source: 'D', translation: 'สี่', spk: { id: 'c1', desc: '', gender: 'F' } },
+  ]);
+  assert.equal(byId.pairs.at(-1)[2], 'c1');
+});
+
+test('buildPrompt: recent translations tag the speaker id; dead ids and chars-off get none', () => {
+  const characters = [{ id: 'c1', desc: 'girl', gender: 'F', source: 'vlm' }];
+  const p = buildPrompt([{ index: 1, source: '' }],
+    { pairs: [['A', 'หนึ่ง', 'c1'], ['B', 'สอง', 'c9'], ['', 'prev', 'c1']], characters }, true, {});
+  assert.ok(p.user.includes('- [c1] A => หนึ่ง'), 'live id tagged');
+  assert.ok(p.user.includes('- B => สอง'), 'dead id renders untagged');
+  assert.ok(p.user.includes('- [c1] (previous page) prev'), 'sourceless pair keeps its tag');
+  const off = buildPrompt([{ index: 1, source: '' }],
+    { pairs: [['A', 'หนึ่ง', 'c1']], characters }, true, { chars: false });
+  assert.ok(!off.user.includes('[c1]'), 'no tags when the character channel is off');
+});
+
+test('buildPrompt: page mode explains balloon shapes; crops mode stays crops-only', () => {
+  const page = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {}));
+  assert.ok(page.includes('balloon tail points at the speaker'), 'tail rule present');
+  assert.ok(page.includes('thought cloud'), 'thought-cloud rule present');
+  const crops = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true }));
+  assert.ok(crops.includes('You see ONLY text crops'), 'crops mode keeps its own rule');
+  assert.ok(!crops.includes('balloon tail points at the speaker'), 'no page-shape advice without the page');
+});
+
+test('buildPrompt: crops and OCR modes still tag recent lines', () => {
+  // The tag is text, not artwork: it is the only cross-page continuity signal these modes have,
+  // so it must render exactly like in page mode.
+  const characters = [{ id: 'c1', desc: 'girl', gender: 'F', source: 'vlm' }];
+  const pairs = [['A', 'หนึ่ง', 'c1'], ['B', 'สอง']];
+  const crops = buildPrompt([{ index: 1, source: '' }], { pairs, characters }, true, { textOnly: true });
+  assert.ok(crops.user.includes('- [c1] A => หนึ่ง'));
+  assert.ok(crops.user.includes('- B => สอง'));
+  const ocr = buildPrompt([{ index: 1, source: '' }], { pairs, characters }, true, { ocr: true });
+  assert.ok(ocr.user.includes('- [c1] A => หนึ่ง'));
+});
+
 test('maxPairs caps both fold and send', () => {
   const outs = [1, 2, 3].map(i => ({ index: i, source: `s${i}`, translation: `t${i}` }));
   const { ctx } = updateContext(EMPTY_CONTEXT, outs, [], true, 2);

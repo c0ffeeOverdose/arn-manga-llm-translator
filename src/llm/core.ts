@@ -39,8 +39,11 @@ export interface BookOp {
     now?: string;
 }
 
+// source, translation, and the roster id the speaker resolved to (absent for narration/unknown)
+export type PairLine = [string, string, string?];
+
 export interface ContextState {
-    pairs: [string, string][];      // recent lines (source => translation; source is '' in vision modes)
+    pairs: PairLine[];      // recent lines (source => translation; source is '' in vision modes)
     characters: CharacterEntry[];
 }
 
@@ -101,8 +104,11 @@ export function buildPrompt(
 ): BuiltPrompt {
     const lang = opts.targetLang?.trim() || 'Thai';
     const chars = opts.chars !== false;
-    // roster up front: the example below must not reference an id that does not exist yet
-    const roster = chars ? normalizeBook(ctx.characters).slice(0, opts.charLimit ?? MAX_CHARACTERS) : [];
+    // roster up front: the example below must not reference an id that does not exist yet;
+    // the full (uncapped) book also decides which pair speaker tags are safe to show
+    const full = chars ? normalizeBook(ctx.characters) : [];
+    const roster = full.slice(0, opts.charLimit ?? MAX_CHARACTERS);
+    const bookIds = new Set(full.map(c => c.id).filter((id): id is string => typeof id === 'string'));
     // VLM-OCR stage: pure transcription, same <r> shape so caller reuses parseResponse.
     // No book/pairs/style: a read must not be biased.
     if (opts.transcribeOnly) {
@@ -165,7 +171,7 @@ The second form (self-closing, keep="true", NO text inside) is for regions you d
 Never put a description, brackets, or invented dialogue in a keep element. Never leave a translation empty — if there is nothing to translate, it is a keep element.
 ${chars ? `
 Speaker attributes:
-- spk: a character id from <known_characters> (c1, c2, …); if the speaker is NOT listed use spk="new" with desc="short visual anchor" (name="…" only when this page states it).
+- spk: an id from <known_characters> (c1, c2, …); [c2] on a recent line = that speaker; if unlisted use spk="new" desc="short visual anchor" (name="…" only when this page states it).
 - Omit spk/desc/g/name for anything that is not a person speaking (narration, signs, labels, SFX); if you cannot tell who speaks, omit spk rather than guess.
 - name: only when THIS page states the character's name, in ${lang} form; never repeat a name the book already lists.
 <example>
@@ -185,7 +191,7 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
 ` : ``}</output_format>\n`;
     p += `<rules>\n- ${LANG_RULES[lang] ?? GENERIC_RULE(lang)}\n`;
     if (chars && vision && !opts.textOnly && !opts.ocr) {
-        p += '- Speaker: match each spoken region to a listed id — use the full page: bubble tail, who shares the panel, who the line addresses, continuity with earlier pages.\n';
+        p += '- Speaker: match each spoken region to a listed id — use the full page: a balloon tail points at the speaker; a thought cloud belongs to the thinker (keep their id); a tail-less box or floating text is narration, an off-panel voice, or SFX — tag a speaker only when the page makes it clear (who reacts, who is addressed, who shares the panel, continuity with earlier pages); otherwise omit spk.\n';
     }
     if (chars && vision && opts.textOnly) {
         p += '- You see ONLY text crops, never faces or artwork: identify the speaker from the character book or the dialogue itself. If you cannot tell, omit spk and g rather than guess.\n';
@@ -218,8 +224,11 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
     if (ctx.pairs.length) {
         const maxPairs = opts.maxPairs ?? MAX_PAIRS;
         u += '<recent_translations>\n';
-        for (const [s, t] of ctx.pairs.slice(-maxPairs)) {
-            u += s ? `- ${s} => ${t}\n` : `- (previous page) ${t}\n`;
+        // the tag only names rows the model can still find in the roster; a merged/evicted id
+        // would invite an spk reference that no longer exists
+        for (const [s, t, spk] of ctx.pairs.slice(-maxPairs)) {
+            const tag = spk && bookIds.has(spk) ? `[${spk}] ` : '';
+            u += s ? `- ${tag}${s} => ${t}\n` : `- ${tag}(previous page) ${t}\n`;
         }
         u += '</recent_translations>\n';
     }
@@ -614,13 +623,11 @@ export function splitBookRow(book: CharacterEntry[], key: string): CharacterEntr
     return next;
 }
 
-// Merge a new observation into the book. A known id is an exact identity match — no fuzzy
-// guessing; otherwise names/descs fall back to similarity matching. User entries are never
-// overwritten, and an unknown id never becomes an id (a fresh one is assigned instead).
-export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry, maxChars = MAX_CHARACTERS): CharacterEntry[] {
-    const norm = ensureIds(book);
-    const knownId = obs.id ? norm.some(c => c.id === obs.id) : false;
-    const i = knownId ? norm.findIndex(c => c.id === obs.id) : norm.findIndex(c =>
+// Which row an observation belongs to: an exact id wins, otherwise name/desc similarity.
+// mergeCharacter and the pair speaker tag share this so both derive the same identity.
+function matchIndex(book: CharacterEntry[], obs: { id?: string; desc: string; name?: string; fullName?: string }): number {
+    if (obs.id && book.some(c => c.id === obs.id)) return book.findIndex(c => c.id === obs.id);
+    return book.findIndex(c =>
         similar(c.desc, obs.desc) ||
         samePerson(c.name, obs.name) ||
         samePerson(c.fullName, obs.fullName) ||
@@ -629,6 +636,14 @@ export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry, maxC
         // sourceless spk lands with name in desc — match against real names or they fragment
         samePerson(c.name, obs.desc) ||
         samePerson(obs.name, c.desc));
+}
+
+// Merge a new observation into the book. A known id is an exact identity match — no fuzzy
+// guessing; otherwise names/descs fall back to similarity matching. User entries are never
+// overwritten, and an unknown id never becomes an id (a fresh one is assigned instead).
+export function mergeCharacter(book: CharacterEntry[], obs: CharacterEntry, maxChars = MAX_CHARACTERS): CharacterEntry[] {
+    const norm = ensureIds(book);
+    const i = matchIndex(norm, obs);
     if (i === -1) {
         const entry: CharacterEntry = { ...obs, id: undefined };
         return enforceCap(ensureIds([...norm, entry]), maxChars);
@@ -769,10 +784,6 @@ export function updateContext(
     maxPairs = MAX_PAIRS,
     maxChars = MAX_CHARACTERS,
 ): ContextUpdate {
-    const pairs = [...ctx.pairs];
-    for (const o of outputs) {
-        if (o.translation && o.translation !== 'keep') pairs.push([o.source ?? '', o.translation]);
-    }
     let characters = ctx.characters;
     let bookOps: BookOp[] = [];
     if (learn) {
@@ -806,7 +817,30 @@ export function updateContext(
             }, maxChars);
         });
     }
+    // Recent lines carry the resolved speaker id: the next page keeps speaker continuity even
+    // when its balloon has no tail. Resolution runs after learning, so a row born in this call
+    // is tagged too; narration and unknown speakers keep the legacy two-element shape.
+    const pairs = [...ctx.pairs];
+    for (const o of outputs) {
+        if (o.translation && o.translation !== 'keep') {
+            const spk = speakerId(characters, o.spk);
+            pairs.push(spk ? [o.source ?? '', o.translation, spk] : [o.source ?? '', o.translation]);
+        }
+    }
     return { ctx: { pairs: pairs.slice(-maxPairs), characters }, bookOps };
+}
+
+// The book row an output's speaker resolves to, for the speaker tag on recent translations.
+// spk="new" resolves through the same match mergeCharacter used, so the tag names the row the
+// model will see in the roster; a dead id or a non-person speaker resolves to nothing.
+function speakerId(book: CharacterEntry[], spk: RegionOutput['spk']): string | undefined {
+    if (!spk) return undefined;
+    if (spk.id && book.some(c => c.id === spk.id)) return spk.id;
+    const name = usableText(spk.name);
+    const desc = usableText(spk.desc) || name;
+    if (!desc) return undefined;
+    const i = matchIndex(book, { desc, name: name || undefined });
+    return i >= 0 ? book[i].id : undefined;
 }
 
 // A user edit on one roster row (options page / in-page panel). Keys are roster ids

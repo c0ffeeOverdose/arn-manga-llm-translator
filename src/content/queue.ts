@@ -4,7 +4,7 @@
 // NOTE: mutual imports with status-ui/overlays are fine — every cross-module
 // use happens inside function bodies, never at module top level.
 
-import { updateContext, type CharacterEntry } from '../llm/core';
+import { updateContext, type CharacterEntry, type PairLine } from '../llm/core';
 import { cooldownMark, cooldownClear, paintLaneSize, ownedByPath, type FailMark, pageHashFromBitmap } from './page-cache';
 import { isDebug } from '../debug';
 import type { MtStage } from './detection';
@@ -104,7 +104,7 @@ export async function rewindContextBefore(...targets: (PageState | undefined)[])
     }
     // No snapshot (state created before this field existed): rebuild PAIRS only from the
     // accumulated page states and keep characters untouched — a wiped book is unrecoverable.
-    let rebuilt: { pairs: [string, string][]; characters: CharacterEntry[] } = { pairs: [], characters: [] };
+    let rebuilt: { pairs: PairLine[]; characters: CharacterEntry[] } = { pairs: [], characters: [] };
     for (const st of uniquePages()) {
         if (targets.includes(st) || !st.outputs?.length) continue;
         rebuilt = updateContext(rebuilt, st.outputs, [], false, pipeline.contextPairs, pipeline.charLimit).ctx;

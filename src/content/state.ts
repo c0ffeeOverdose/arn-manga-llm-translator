@@ -1,7 +1,7 @@
 // Shared state hub: page registry, context/book, pipeline settings, theme, usage.
 // Every module imports from here; nothing here imports from another content module.
 
-import { EMPTY_CONTEXT, type ContextState, type CharacterEntry, type Mention, type RegionOutput } from '../llm/core';
+import { EMPTY_CONTEXT, type ContextState, type CharacterEntry, type Mention, type RegionOutput, type PairLine } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { fontStackFor, setRenderTuning } from './render';
 import { sessGet } from '../storage-session';
@@ -27,7 +27,7 @@ export interface PageState {
     // book/pairs exactly as they were BEFORE this page folded. rewindContextBefore restores
     // the snapshot on re-translate — exact, and survives a fresh session.
     bookBefore?: CharacterEntry[];
-    pairsBefore?: [string, string][];
+    pairsBefore?: PairLine[];
     hash?: string; // content hash of the ORIGINAL pixels — element-identity fallback
     image?: ImageIdentity;
     paintedImage?: ImageIdentity;
@@ -262,7 +262,7 @@ async function readContext(chapter: string): Promise<void> {
     const bk = bookKey();
     const stored = await sessGet([key, `mtShare:${chapter}`]);
     // pairs (narrative flow) are ALWAYS chapter-scoped — they die with the chapter
-    let pairs: [string, string][] = [];
+    let pairs: PairLine[] = [];
     if (stored[key]) {
         try {
             const v = JSON.parse(stored[key] as string) as { ctx?: ContextState; context?: ContextState };
