@@ -5,6 +5,7 @@ import { inpaintMode, mergePipeline, type PipelineSettings } from '../llm/pipeli
 import { detModelsInstalled, detDownload, inpaintInstalled, inpaintDownload } from '../llm/ocr-models';
 import { $, setDirty, setStatus, dlProgress } from './shell';
 import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI } from './pipeline-section';
+import { hostOriginPatterns, requestHostAccess } from './host-access';
 
 const MODEL_HINTS: Record<string, string> = {
     openai: 'e.g. gpt-5.4-mini, gpt-5.4-nano — or qwen/qwen3.7-flash, z-ai/glm-5.3-flash via OpenRouter',
@@ -85,21 +86,9 @@ export function updateHints() {
     ($('baseHint') as HTMLDivElement).textContent = `Default: ${DEFAULT_BASES[provider as keyof typeof DEFAULT_BASES]}${BASE_HINTS[provider] ?? ''}`;
 }
 
-async function ensureHostPermission(baseUrl: string, provider: string): Promise<void> {
-    const url = baseUrl || DEFAULT_BASES[provider as keyof typeof DEFAULT_BASES];
-    let origin: string;
-    try { origin = new URL(url).origin + '/*'; } catch { return; }
-    let has = false;
-    try {
-        has = await chrome.permissions.contains({ origins: [origin] });
-    } catch { /* pattern with port etc. — try the request below, it reports */ }
-    if (has) return;
-    try {
-        const granted = await chrome.permissions.request({ origins: [origin] });
-        if (!granted) throw new Error('permission denied');
-    } catch (e) {
-        throw new Error(`Needs access to ${origin} — approve the browser prompt (${(e as Error).message})`);
-    }
+// provider endpoint used for host access; an empty override falls back to the default
+function baseUrlOf(baseUrl: string | undefined, provider: LLMSettings['provider']): string {
+    return baseUrl || DEFAULT_BASES[provider];
 }
 
 // model credentials: edit → dirty only. Host permission is asked at
@@ -120,9 +109,12 @@ export async function saveAll(): Promise<void> {
         setStatus('Enter the OCR model and API key first (or untick the separate reader).', 'err');
         return;
     }
+    // one request covers every origin this save touches: Firefox allows it only in
+    // the click's own task, before any await (see host-access.ts)
+    const urls = [baseUrlOf(s.baseUrl, s.provider)];
+    if (o.model || o.apiKey) urls.push(baseUrlOf(o.baseUrl, o.provider));
     try {
-        await ensureHostPermission(s.baseUrl ?? '', s.provider);
-        if (o.model || o.apiKey) await ensureHostPermission(o.baseUrl ?? '', o.provider);
+        await requestHostAccess(hostOriginPatterns(urls));
     } catch (e) {
         setStatus(`Not saved — ${(e as Error).message}`, 'err');
         return;
@@ -157,7 +149,7 @@ export async function testConnection(): Promise<void> {
     }
     setStatus('Testing…', '', 0, el);
     try {
-        await ensureHostPermission(s.baseUrl ?? "", s.provider);
+        await requestHostAccess(hostOriginPatterns([baseUrlOf(s.baseUrl, s.provider)]));
         // text-only check (key + model + reachability); image support is detected at translation time.
         // Thinking rides along for the probe (accepted/rejected).
         const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s, thinking: pipeline.thinkingLevel, temperature: pipeline.temperature });
@@ -191,7 +183,7 @@ export async function testOcr(): Promise<void> {
     // drifting models take a while — show the clock
     const tick = setInterval(() => setStatus(`Testing… ${Math.round((Date.now() - t0) / 1000)}s (reads the test image)`, '', 0, el), 1000);
     try {
-        await ensureHostPermission(s.baseUrl ?? '', s.provider);
+        await requestHostAccess(hostOriginPatterns([baseUrlOf(s.baseUrl, s.provider)]));
         const imageB64 = await ocrTestImageB64();
         const resp = await chrome.runtime.sendMessage({ type: 'mt:test-ocr', settings: s, thinking: pipeline.ocrThinking, temperature: pipeline.ocrTemperature, imageB64, expect: OCR_TEST_EXPECT });
         const secs = ` · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
