@@ -474,6 +474,21 @@ def inpaint_dilate_radius(w, h):
     return min(10, max(4, round(4 * max(w, h) / 1600)))
 
 
+def cleanup_mask(raw, boxes, w, h):
+    """Mirror of aiCleanupMask() in src/content/inpaint.ts: keep the raw CTD mask
+    inside the erase boxes, then dilate it. A tight mask leaves anti-aliased glyph
+    edges and the gaps between strokes outside it, and the model paints ghost
+    glyphs back over the window."""
+    mask = np.zeros_like(raw, dtype=bool)
+    for b in boxes:
+        x1 = max(0, min(w, int(np.floor(b["x1"])))); y1 = max(0, min(h, int(np.floor(b["y1"]))))
+        x2 = max(0, min(w, int(np.ceil(b["x2"])))); y2 = max(0, min(h, int(np.ceil(b["y2"]))))
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = raw[y1:y2, x1:x2]
+    return cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8),
+                      iterations=inpaint_dilate_radius(w, h)) > 0
+
+
 def run_inpaint(pil, boxes, pad_ratio, mask=None):
     """Erase the given boxes with the manga-LaMa model (fp16 weights, 512x512).
 
@@ -481,7 +496,7 @@ def run_inpaint(pil, boxes, pad_ratio, mask=None):
     boxes and dilated — thin glyph strokes and the gaps between them drop out of
     the 512px window resize and the model then paints the leftover white glyphs'
     background over the whole window). Without one the mask is rebuilt from CTD
-    here, restricted to the boxes and dilated with the same recipe. Windows are
+    here with the same recipe. Windows are
     cut from the original image, edge-padded to a square, run at 512x512, and
     composited back only where the mask says text was. Returns per-box PNG
     patches (the same shape the on-device worker produces).
@@ -489,14 +504,7 @@ def run_inpaint(pil, boxes, pad_ratio, mask=None):
     det_ms = 0.0
     if mask is None:
         _, _, _, _, prob, det_ms = infer_once(pil, CONF_THR)
-        raw = prob > MASK_THR
-        mask = np.zeros_like(raw)
-        for b in boxes:
-            x1 = max(0, int(np.floor(b["x1"]))); y1 = max(0, int(np.floor(b["y1"])))
-            x2 = min(pil.width, int(np.ceil(b["x2"]))); y2 = min(pil.height, int(np.ceil(b["y2"])))
-            mask[y1:y2, x1:x2] = raw[y1:y2, x1:x2]
-        mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8),
-                          iterations=inpaint_dilate_radius(pil.width, pil.height)) > 0
+        mask = cleanup_mask(prob > MASK_THR, boxes, pil.width, pil.height)
     rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
     H, W = rgb.shape[:2]
     out = rgb.copy()
@@ -618,7 +626,10 @@ async def page(req: Request,
         patches, windows, inpaint_ms = [], 0, 0.0
         if inpaint_flag:
             try:
-                patches, windows, inpaint_ms, _ = run_inpaint(pil, boxes, pad_ratio, mask_img)
+                # erase with the client's prepared mask recipe (restrict + dilate), not
+                # the raw CTD mask: the thin mask leaves glyph edges behind
+                prepared = cleanup_mask(mask_img, boxes, pil.width, pil.height)
+                patches, windows, inpaint_ms, _ = run_inpaint(pil, boxes, pad_ratio, prepared)
             except Exception as e:
                 print(f"inpaint pass failed: {e}", flush=True)
                 patches, windows, inpaint_ms = [], 0, 0.0

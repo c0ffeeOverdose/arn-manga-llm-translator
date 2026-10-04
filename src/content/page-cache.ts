@@ -172,7 +172,7 @@ export interface CachedPage {
 
 // Bump when the AI-cleanup crop pipeline changes (window geometry, model, mask recipe,
 // composite) — cached patches with a different generation are regenerated.
-export const INPAINT_PATCH_GEN = 3;
+export const INPAINT_PATCH_GEN = 4;
 
 // Bump when the server's box-splitting changes (server/split.py SPLIT_GEN): cloud entries
 // below this hold fused boxes (gen 0), box-filled stand-in masks (gen 1), missed
