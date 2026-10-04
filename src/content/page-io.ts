@@ -27,11 +27,12 @@ export function getPages(): PageRef[] {
     // kept — the sweep picks them up when the reader shows them. Size heuristic only.
     const out: PageRef[] = [];
     for (const img of document.querySelectorAll('img')) {
-        // The EFFECTIVE source decides the scheme: an <img src=https> inside <picture> whose
-        // <source> carries a data: srcset displays the data URL (some readers convert an image
-        // to base64 on save), and that path is both multi-MB and unaddressable — keep it out
-        // of the sweep. currentSrc is '' until resolution; the src attribute covers that.
-        if (!/^(blob:|https?:)/.test(img.currentSrc || img.src)) continue;
+        // The attribute (not currentSrc) decides inclusion: a reader may display a page through
+        // a <picture><source> whose srcset was converted to a data: URL (save guard) while the
+        // attribute still names the CDN file — that element IS a page and must stay in the
+        // sweep. Its multi-MB currentSrc is handled by bounded tokens + scheme-guarded path
+        // comparisons instead of being excluded here.
+        if (!/^(blob:|https?:)/.test(img.src)) continue;
         // promo slots (.link-page): same-size ad images that pass the size floor — never pages.
         if (img.closest('.link-page')) continue;
         if (img.naturalWidth < 400 || img.naturalHeight < 300) continue;
@@ -143,10 +144,18 @@ export function hashReaderManifest(): Promise<{ urls: string[]; alts: string[] }
     const id = hashReaderId(location.pathname);
     if (!id) return Promise.resolve(null);
     if (hashReaderCache?.key === id) return hashReaderCache.task;
-    const shown = getPages().find(r => r.kind === 'img' && /^https?:/.test(refKey(r)));
-    const sample = shown ? (shown.el as HTMLImageElement).currentSrc || (shown.el as HTMLImageElement).src : '';
-    // No decoded page image yet: nothing to learn the scheme from. NOT cached — the next call
-    // (the user's click) must retry once the reader has shown its page.
+    // The displayed rendition may be a data: URL (a reader's save conversion swaps the
+    // <picture><source>), while the element still names its CDN file — any https URL the
+    // element carries teaches the scheme equally well, so take the first one.
+    let sample = '';
+    for (const r of getPages()) {
+        if (r.kind !== 'img') continue;
+        const el = r.el as HTMLImageElement;
+        for (const u of [el.currentSrc, el.src]) if (/^https?:/.test(u)) { sample = u; break; }
+        if (sample) break;
+    }
+    // No addressable page image yet: nothing to learn the scheme from. NOT cached — the next
+    // call (the user's click) must retry once the reader has shown its page.
     if (!sample) return Promise.resolve(null);
     const task = (async () => {
         for (const origin of hashReaderManifestOrigins(sample)) {

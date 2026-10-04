@@ -37,7 +37,7 @@ const applied = new WeakMap<Element, string>();
 const sourceRequests = new Map<string, Promise<string | undefined>>();
 type ProgressPage = ChapterProgress['pages'][number];
 const imageBindings = new WeakMap<Element, { run: string; token: string; page: string; source: string;
-    exact: string; revision?: number; complete: boolean }>();
+    exact: string; revision?: number }>();
 const imageAliases = new Map<string, string>();
 const evidence = new Map<string, Promise<ImageIdentity | undefined>>();
 const sourceImages = new Map<string, Promise<ImageIdentity>>();
@@ -153,7 +153,12 @@ export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): 
     const binding = imageBindings.get(ref.el), state = stateFor(ref);
     const live = ref.kind === 'img' ? ref.el.currentSrc || ref.el.src : '';
     const bound = progress.pages.find(p => p.id === binding?.page);
-    if (ref.kind === 'img' && progress.phase === 'complete' && binding?.complete && binding.run === run
+    // A page we already painted resolves from its binding: the element displays OUR render and
+    // the run/source/identity/revision all agree, so re-reading its pixels only re-decodes an
+    // immutable image — on a data:-backed reader that decode is a whole page, every sweep tick
+    // (the lag users saw). A recycled element showing anything else fails the ownership check
+    // and takes the full pixel path; a retranslate bumps the revision and does the same.
+    if (ref.kind === 'img' && binding?.run === run
         && state?.orig === binding.source && state.image?.exact === binding.exact && bound && bound.revision === binding.revision
         && [state.translated, state.origOwn].includes(live)) {
         imageBindings.set(ref.el, { ...binding, token: viewToken(ref) });
@@ -177,7 +182,7 @@ export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): 
         if (matches.length === 1) {
             const page = matches[0];
             imageBindings.set(ref.el, { run, token: snapshot.token, page: page.id, source: snapshot.source,
-                exact: snapshot.image.exact, revision: page.revision, complete: progress.phase === 'complete' });
+                exact: snapshot.image.exact, revision: page.revision });
             if (ref.kind === 'img') imageAliases.set(snapshot.source, page.id);
             return { ...page, matchedBy: 'image' };
         }

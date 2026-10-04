@@ -9,9 +9,16 @@ export interface PageSnapshot {
     image: ImageIdentity;
     fromNetwork: boolean;
 }
+// Identity token for the element's current view. A reader can display a page THROUGH a
+// multi-MB data: URL (save conversions), and embedding it verbatim makes every token
+// comparison cost milliseconds — collapse long URLs to a bounded fingerprint (length + head +
+// tail) that still changes whenever the displayed image changes. Pure.
+function tokenUrl(u: string): string {
+    return u.length > 4096 ? `${u.length}:${u.slice(0, 40)}:${u.slice(-40)}` : u;
+}
 export function viewToken(ref: PageRef): string {
     return ref.kind === 'img'
-        ? JSON.stringify([ref.el.src, ref.el.currentSrc, ref.el.naturalWidth, ref.el.naturalHeight])
+        ? JSON.stringify([tokenUrl(ref.el.src), tokenUrl(ref.el.currentSrc), ref.el.naturalWidth, ref.el.naturalHeight])
         : JSON.stringify([ref.pageSrc, ref.key, ref.el.width, ref.el.height]);
 }
 export function viewSource(ref: PageRef): string {

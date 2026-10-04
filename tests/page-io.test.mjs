@@ -15,7 +15,7 @@ await build({
       + `\nexport { identifyBitmap } from './src/image-identity.ts';`,
       `export { regPage, pages, retireBlob } from './src/content/state.ts';`,
       `export { cacheGeneration, acceptCacheGeneration } from './src/cache-generation.ts';`,
-      `export { readView } from './src/content/page-identity.ts';`,
+      `export { readView, viewToken } from './src/content/page-identity.ts';`,
     ].join('\n'),
     resolveDir: process.cwd(),
     loader: 'ts',
@@ -27,7 +27,7 @@ await build({
 globalThis.location = { origin: 'https://test.local', pathname: '/chapter/1', search: '', hash: '' };
 
 const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage, healImgBinding, identifyBitmap, setOverlayOn, setDebugOn,
-  regPage, pages, retireBlob, readView, cacheGeneration, acceptCacheGeneration } =
+  regPage, pages, retireBlob, readView, viewToken, cacheGeneration, acceptCacheGeneration } =
   await import(new URL('../.test-build/page-io.mjs', import.meta.url).href);
 
 function fakeState(extra = {}) {
@@ -202,6 +202,19 @@ test('a retired translated view cannot be decoded as an original after Clear', a
         naturalWidth: pixels.width, naturalHeight: pixels.height, pixels };
     await assert.rejects(() => readView({ kind: 'img', el }), /Original image is no longer available/);
     pages.clear();
+});
+
+test('viewToken: a multi-MB data: source collapses to a bounded fingerprint', () => {
+  const huge = 'data:image/png;base64,' + 'A'.repeat(2_000_000);
+  const el = { src: 'https://cdn.test/page.webp', currentSrc: huge, naturalWidth: 2030, naturalHeight: 2880 };
+  const t1 = viewToken({ kind: 'img', el });
+  assert.ok(t1.length < 600, `token must stay bounded, got ${t1.length}`);
+  el.currentSrc = huge.slice(0, -1) + 'B'; // same length, different tail
+  assert.notEqual(viewToken({ kind: 'img', el }), t1, 'a changed source must change the token');
+  el.currentSrc = huge;
+  assert.equal(viewToken({ kind: 'img', el }), t1, 'deterministic for the same view');
+  const short = { ...el, currentSrc: 'blob:https://site.test/x' };
+  assert.ok(viewToken({ kind: 'img', el: short }).includes('blob:https://site.test/x'), 'short URLs stay verbatim');
 });
 
 test('healImgBinding rebinds the same page across a rendition/encoder change', async () => {
