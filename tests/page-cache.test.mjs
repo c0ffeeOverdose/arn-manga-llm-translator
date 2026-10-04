@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, bytesCrops, INPAINT_PATCH_GEN, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -1063,6 +1063,19 @@ test('pageEntryDecision: page identity survives an encoder change, crops do not'
   assert.equal(pageEntryDecision(undefined, 'aaa', fp, W, H).reason, 'no-entry');
   // Unknown current hash (runner could not read the bytes) still uses the entry.
   assert.deepEqual(pageEntryDecision(entry(), '', fp, W, H), { usable: true, dropPatches: true, reason: 'ok' });
+});
+
+test('bytesCrops: identity hits recover crops from the bytes entry for the same pixels', () => {
+  const fp = 'fp1', W = 836, H = 1200;
+  const patches = [{ x1: 1, y1: 2, x2: 3, y2: 4, png: new ArrayBuffer(1) }];
+  const hit = { key: 'ch#aaa', fp, w: W, h: H, atime: 0, boxes: [], panels: [], outputs: [], extras: [],
+    patches, patchesGen: INPAINT_PATCH_GEN };
+  assert.deepEqual(bytesCrops(hit, fp, W, H), { patches, patchesGen: INPAINT_PATCH_GEN });
+  assert.equal(bytesCrops(hit, 'fp2', W, H), null, 'fingerprint change invalidates');
+  assert.equal(bytesCrops(hit, fp, W, H + 1), null, 'dims change invalidates');
+  assert.equal(bytesCrops({ ...hit, patchesGen: INPAINT_PATCH_GEN - 1 }, fp, W, H), null, 'older crop generation invalidates');
+  assert.equal(bytesCrops({ ...hit, patches: [] }, fp, W, H), null);
+  assert.equal(bytesCrops(undefined, fp, W, H), null);
 });
 
 test('pageKey is a page identity, distinct from the bytes key', () => {

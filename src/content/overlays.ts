@@ -4,7 +4,7 @@
 import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
 import { refKey, getPages, readPage, repaintByHash, healImgBinding, writePage } from './page-io';
 import { clearQueue, failMarks, queue, pageKeyOf, paintHas, claimPaint, releasePaint, activeKeyGet, viewportOverlap } from './queue';
-import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap } from './page-cache';
+import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap, bytesCrops } from './page-cache';
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
 import { sweepPageOrder, idlePageOrder, chapterOwnsRequest, resolveChapterRef } from './sweep';
@@ -86,16 +86,29 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         // A live run names the page authoritatively; with no run the reader's own page number
         // is the durable slot the chapter cache was written under.
         const order = sweepPageOrder(refKey(ref)) ?? chapterRef?.order ?? idlePageOrder();
+        const fp = settingsFingerprint(pipeline);
         const identityHit = pipeline.cacheEnabled && order != null ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
-        const decision = pageEntryDecision(identityHit, hash, settingsFingerprint(pipeline), bitmap.width, bitmap.height);
+        const decision = pageEntryDecision(identityHit, hash, fp, bitmap.width, bitmap.height);
+        const byBytes = pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined;
         const hit = decision.usable
             ? { ...identityHit!, ...(decision.dropPatches ? { patches: undefined, patchesGen: undefined } : null) }
-            : (pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined);
+            : byBytes;
+        if (hit && decision.usable && decision.dropPatches) {
+            // The identity entry is rendition-independent and carries no crops; the bytes entry
+            // (fetched under the LIVE hash) holds them for exactly these pixels — reuse them or
+            // the cleanup model re-runs on every reopen of a chapter-translated page.
+            const crops = bytesCrops(byBytes, fp, bitmap.width, bitmap.height);
+            if (crops) { hit.patches = crops.patches; hit.patchesGen = crops.patchesGen; }
+        }
         const det = hit ? detFromCacheEntry(hit, bitmap.width, bitmap.height) : null;
         // Reaching here with a usable `hit` IS the authorization: the entry is durable proof the
         // page was already translated, so painting it spends nothing. Pages with no entry keep
         // the explicit-intent gate below (they would cost a fresh detect + LLM call).
-        if (!det || !hit || stateFor(ref)) { arrivalMiss.set(el, { src, dims, at: Date.now() }); return; }
+        if (!det || !hit || stateFor(ref)) {
+            arrivalMiss.set(el, { src, dims, at: Date.now() });
+            if (isDebug()) console.log('[mt] arrival miss', JSON.stringify({ why: !hit ? 'no-entry' : !det ? 'incomplete' : 'has-state', order, src: src.slice(-24) }));
+            return;
+        }
         if (isDebug()) console.log('[mt] arrival paint (cache):', src.slice(-24));
         assertCacheCurrent(cacheEpoch);
         await renderPage(ref, { srcUrl, bitmap, det, hash, cacheEpoch, cached: hit,

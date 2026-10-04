@@ -267,6 +267,18 @@ export function pageEntryDecision(
     return { usable: true, dropPatches: !sameBytes, reason: 'ok' };
 }
 
+// Crops for an identity hit whose own crops were dropped: the caller fetched the bytes entry
+// under the LIVE content hash, so its crops were made from exactly these pixels — reuse them
+// when the pipeline generation, fingerprint and dims still agree. Without this the cleanup
+// model re-ran on every reopen of a chapter-translated page (identity entries carry no crops).
+// Pure — unit-tested.
+export function bytesCrops(hit: CachedPage | undefined, fp: string, w: number, h: number):
+{ patches: NonNullable<CachedPage['patches']>; patchesGen: number } | null {
+    if (!hit?.patches?.length || hit.patchesGen !== INPAINT_PATCH_GEN) return null;
+    if (hit.fp !== fp || hit.w !== w || hit.h !== h) return null;
+    return { patches: hit.patches, patchesGen: hit.patchesGen };
+}
+
 // rebuild a live DetectResult from a resumable partial — ordered boxes, panels, mask and
 // texts come back as detect produced them (ordering is NOT re-run: it already ran before the
 // checkpoint). Texts ride the cloudTexts slot: translateRegions treats any present texts as
