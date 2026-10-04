@@ -1,13 +1,14 @@
 // Overlay sweeper: re-apply translated/original src to every loaded page element.
 // The reader can swap elements mid-queue — poll every 1s (cheap, self-healing).
 
-import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
+import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, explicitIntentOn, type PageRef } from './state';
 import { refKey, getPages, readPage, repaintByHash, healImgBinding, writePage } from './page-io';
 import { clearQueue, failMarks, queue, pageKeyOf, paintHas, claimPaint, releasePaint, activeKeyGet, viewportOverlap } from './queue';
 import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap, bytesCrops } from './page-cache';
 import { detFromCacheEntry } from './pipeline';
 import { renderPage } from './render-page';
 import { sweepPageOrder, idlePageOrder, chapterOwnsRequest, resolveChapterRef } from './sweep';
+import { autoOn } from './auto';
 import { isDebug } from '../debug';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 
@@ -23,9 +24,13 @@ export function applyOverlays(): void {
         const keyed = pages.get(refKey(ref));
         const st = keyed ?? (ref.kind === 'img' ? elStates.get(ref.el) : undefined);
         if (!st) {
+            // Nothing surfaces without a command: auto-translate, or a translate action the
+            // user already issued in this document. A fresh visit shows originals, cache or
+            // no cache — the queue and chapter-attach paths paint once a command exists.
+            if (!autoOn() && !explicitIntentOn()) continue;
             if (ref.kind === 'img') void repaintByHash(ref.el);
-            // arrival paint: a committed-but-unpainted page the user is looking
-            // at — IDB hit paints with no queue and no LLM; miss stays quiet.
+            // arrival paint: a committed-but-unpainted page the user is looking at —
+            // IDB hit paints with no queue and no LLM; miss stays quiet.
             void arrivalPaint(ref);
             continue;
         }
@@ -49,10 +54,9 @@ function arrivalStuck(el: Element, src: string, dims: string): boolean {
 }
 async function arrivalPaint(ref: PageRef): Promise<void> {
     const el = ref.el;
-    // Explicit intent is NOT required when the page is already in the translation cache: that
-    // entry is durable proof the user already translated this page, so re-showing it spends
-    // nothing. Auto/sweep intent still governs pages with no cache entry (below), so a plain
-    // reopen never starts new work on its own — it only surfaces work already paid for.
+    // Called only when a command exists (auto-translate or explicit intent in this document):
+    // the cache entry is durable proof the page was already paid for, so re-showing it spends
+    // nothing — but showing it still waits for a command.
     if (arrivalBusy.has(el) || document.hidden) return;
     let dims = '';
     if (ref.kind === 'img') {

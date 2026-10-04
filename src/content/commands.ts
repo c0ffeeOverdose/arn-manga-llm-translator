@@ -1,7 +1,7 @@
 // Commands from popup / context menu: element resolution, spread translate,
 // cancel, retranslate, toggles, cache, status poll.
 
-import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, chapterKey, type PageRef } from './state';
+import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareContext, setShareContext, loadContext, saveContext, pipeline, sessionUsage, lastPageUsage, stateFor, chapterKey, markExplicitIntent, type PageRef } from './state';
 import { getPages, refKey } from './page-io';
 import { cacheCount, cacheCountChapter } from './page-cache';
 import { isDebug, setDebug } from '../debug';
@@ -130,6 +130,7 @@ export function installMessageListener(): void {
             return;
         }
         if (msg?.type === 'mt:translate-image') {
+            markExplicitIntent(); // user asked for translation in this document
             const refs = getPages();
             // click-directed (menu pick / srcUrl) vs spread (bare popup press means
             // "everything I'm looking at").
@@ -188,6 +189,7 @@ export function installMessageListener(): void {
             return;
         }
         if (msg?.type === 'mt:retranslate') {
+            markExplicitIntent(); // user asked for translation in this document
             // re-translate only the page the reader is on (with context rewind)
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
             resumeAuto(); // user intent — clears a provider halt (rate limit/auth)

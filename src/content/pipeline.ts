@@ -8,7 +8,7 @@ import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
 import { inpaintMode } from '../llm/pipeline-settings';
-import { pageHashFromBitmap, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, type CachedPage } from './page-cache';
+import { pageHashFromBitmap, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, bytesCrops, type CachedPage } from './page-cache';
 import { sweepPageOrder } from './sweep';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
@@ -233,9 +233,11 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                 cacheMiss = undefined;
                 onStatus('Cache hit…');
                 const det = detFromCacheEntry(byPage, bitmap.width, bitmap.height)!;
-                // crops are erased pixels: keep them only when the bytes match this page
+                // crops are erased pixels: keep them only when they belong to these bytes —
+                // `hit` was fetched under the live hash, so its crops are reusable even though
+                // the identity entry's own were dropped (or the model re-ran on every press).
                 const cached = decision.dropPatches
-                    ? { ...byPage, patches: undefined, patchesGen: undefined }
+                    ? { ...byPage, ...(bytesCrops(hit, fp, bitmap.width, bitmap.height) ?? { patches: undefined, patchesGen: undefined }) }
                     : byPage;
                 return { srcUrl, bitmap, det, hash, cacheEpoch, cached, prepMs: prepMs(),
                     origBytes: ref.kind === 'canvas' ? bytes : undefined };
