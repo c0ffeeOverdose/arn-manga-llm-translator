@@ -1,7 +1,7 @@
 // Page discovery + pixel I/O: getPages/refKey, fetch/read/descramble, write-back,
 // hash-lane repaint + binding healing.
 
-import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, hotlinkRetryable, type EpisodeManifest } from './page-cache';
+import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, hotlinkRetryable, hashReaderId, hashReaderFiles, hashReaderUrls, type EpisodeManifest } from './page-cache';
 import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
 import { identifyBitmap, verifyBitmap } from '../image-identity';
@@ -110,6 +110,53 @@ export async function galleryManifestJson(): Promise<string | null> {
         galleryManifestCache = { key: g[1], json: null };
         return null;
     }
+}
+
+// Hash-listed single-image readers: the chapter is published as a CDN script the reader itself
+// loaded (`<origin>/galleries/<id>.js`), and page art lives on shards of the same CDN family
+// as the displayed image. The origin is taken from the page's own scripts sharing the image
+// host's domain family (tried in order, no host literals); the result is cached per gallery so
+// the 1s sweep never re-fetches it, failures included (the DOM branches take over). Direct
+// fetch is CORS-open on these CDNs. Returns full page URLs + per-page shard alternates.
+let hashReaderCache: { key: string; task: Promise<{ urls: string[]; alts: string[] } | null> } | null = null;
+function hashReaderManifestOrigins(sample: string): string[] {
+    let host: string;
+    try { host = new URL(sample).hostname; } catch { return []; }
+    const parts = host.split('.');
+    if (parts.length < 3) return [];
+    const suffix = parts.slice(1).join('.');
+    const out: string[] = [];
+    for (const el of document.scripts) {
+        try {
+            const u = new URL((el as HTMLScriptElement).src);
+            const family = u.hostname === suffix || u.hostname.endsWith('.' + suffix);
+            if (u.protocol === 'https:' && family && !out.includes(u.origin)) out.push(u.origin);
+        } catch { /* no src */ }
+    }
+    return out;
+}
+export function hashReaderManifest(): Promise<{ urls: string[]; alts: string[] } | null> {
+    const id = hashReaderId(location.pathname);
+    if (!id) return Promise.resolve(null);
+    if (hashReaderCache?.key === id) return hashReaderCache.task;
+    const shown = getPages().find(r => r.kind === 'img' && /^https?:/.test(refKey(r)));
+    const sample = shown ? (shown.el as HTMLImageElement).currentSrc || (shown.el as HTMLImageElement).src : '';
+    // No decoded page image yet: nothing to learn the scheme from. NOT cached — the next call
+    // (the user's click) must retry once the reader has shown its page.
+    if (!sample) return Promise.resolve(null);
+    const task = (async () => {
+        for (const origin of hashReaderManifestOrigins(sample)) {
+            try {
+                const r = await fetch(`${origin}/galleries/${id}.js`, { signal: AbortSignal.timeout(15000) });
+                if (!r.ok) continue;
+                const value = hashReaderUrls(hashReaderFiles(await r.text()), sample);
+                if (value?.urls.length) return value;
+            } catch { /* try the next origin */ }
+        }
+        return null;
+    })();
+    hashReaderCache = { key: id, task };
+    return task;
 }
 
 // Full-chapter enumeration for paged readers that virtualize the DOM (sweeping DOM refs
@@ -263,8 +310,12 @@ export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap
         // A content script knows the reader origin; the offscreen runner does not (its own
         // origin is chrome-extension://), so it lets the background resolve it from the session.
         const origin = /^https?:$/.test(location.protocol) ? location.origin : undefined;
+        // The failed host extends the rule so a CDN the static list never knew still gets the
+        // Referer; a wrong/unparseable URL just falls back to the default set.
+        let imgHost: string | undefined;
+        try { imgHost = new URL(srcUrl).hostname; } catch { /* default set only */ }
         const rule = await Promise.race([
-            chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin }) as
+            chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin, ...(imgHost ? { hosts: [imgHost] } : {}) }) as
                 Promise<{ ok: boolean; error?: string }>,
             new Promise<{ ok: boolean; error?: string }>(res => setTimeout(() => res({ ok: false, error: 'hotlink rule timed out' }), 15_000)),
         ]);

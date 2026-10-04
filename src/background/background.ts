@@ -64,7 +64,7 @@ interface FontGetMsg {
     type: 'mt:font-get';
     id: string;               // font-store id
 }
-type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string } | { type: 'mt:cloud-warm'; endpoint: string; key: string }
+type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string; hosts?: string[] } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string } | { type: 'mt:cloud-warm'; endpoint: string; key: string }
     | { type: 'mt:cloud-inpaint'; endpoint: string; key: string; jpegB64: string; maskB64: string; boxes: { x1: number; y1: number; x2: number; y2: number }[] };
 interface CharBookMsg {
     type: 'mt:char-book';
@@ -447,10 +447,13 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                     : await chapterReaderUrl(sender);
                 const origin = raw ? new URL(raw).origin : '';
                 if (!origin || origin === 'null') { sendResponse({ ok: false, error: 'bad origin' }); return; }
+                // The caller names the hosts of the pages it is about to fetch; the pure builder
+                // turns them into a domain-family alternation (never a stored domain literal).
+                const hosts = Array.isArray(msg.hosts) ? (msg.hosts as unknown[]).filter((h): h is string => typeof h === 'string') : [];
                 const { hotlinkRule, HOTLINK_RULE_ID } = await import('../content/page-cache');
                 await chrome.declarativeNetRequest.updateSessionRules({
                     removeRuleIds: [HOTLINK_RULE_ID],
-                    addRules: [hotlinkRule(origin) as chrome.declarativeNetRequest.Rule],
+                    addRules: [hotlinkRule(origin, hosts) as chrome.declarativeNetRequest.Rule],
                 });
                 sendResponse({ ok: true });
             } catch (e) {

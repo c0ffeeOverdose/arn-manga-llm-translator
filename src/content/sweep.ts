@@ -2,7 +2,7 @@
 import { chapterKey, pipeline, context, loadContext, loadPipeline, bookKey, shareContext, stateFor,
     regPage, unregPage, overlayChoice, setOverlayChoice, setOverlayOn, acceptChapterContext, type PageRef } from './state';
 import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, pagedTierAlternates, galleryManifestJson,
-    collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap, ownOriginalUrl } from './page-io';
+    collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap, ownOriginalUrl, hashReaderManifest } from './page-io';
 import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMask,
     registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cacheKey,
     pageKey, PAGE_KEY_GEN, readerPageNumber } from './page-cache';
@@ -241,10 +241,21 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
         const first = live.find(r => r.kind === 'img' && /^https?:/.test(original(r)));
         if (first) urls = galleryAllUrls(await galleryManifestJson(), original(first)).urls;
     }
+    let altLists: (string[] | undefined)[] = [];
+    if (!urls?.length) {
+        // A hash-paged single-image reader publishes the whole chapter on its CDN; page-io
+        // builds the full URLs from the displayed page + that manifest and returns the
+        // shard-number alternate per page (the manifest cannot name it).
+        const manifest = await hashReaderManifest();
+        if (manifest?.urls.length) {
+            urls = manifest.urls;
+            altLists = manifest.alts.map(a => a ? [a] : []);
+        }
+    }
     if (urls?.length) {
         // A paged reader may ship two encodings of each page; a CDN can evict one, so carry
         // the sibling as a per-page retry (positional — index i is the same page ordinal).
-        const alts = pagedTierAlternates();
+        const alts = altLists.length ? altLists : pagedTierAlternates();
         const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble, ...(alts[order]?.[0] ? { alt: alts[order][0] } : null) }));
         const anchor = await anchorInList(urls, live, current);
         if (anchor >= 0) return { pages, anchor, complete: true };
@@ -414,10 +425,15 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         for (const page of pages) if (!/^https?:/.test(page.url)) page.source = await capture(page);
         if (startCancelled || chapter !== chapterKey()) return { ok: true, cancelled: true };
         assertCacheCurrent(cacheEpoch);
-        // Some image CDNs (MangaDex's network) refuse a referer-less fetch with 403/404; the
-        // session rule carries the reader origin as Referer for the runner's fetches. Install
-        // it before the run starts — the offscreen runner cannot know the reader origin.
-        await chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin: location.origin }).catch(() => {});
+        // Some image CDNs refuse a referer-less fetch with 403/404; the session rule carries the
+        // reader origin as Referer for the runner's fetches. Install it before the run starts —
+        // the offscreen runner cannot know the reader origin — and extend it with the hosts of
+        // this chapter's own page URLs (the rule stores only the Referer value; which hosts get
+        // it must come from the pages we are about to fetch).
+        const hosts = [...new Set(pages.map(p => {
+            try { return new URL(p.url).hostname; } catch { return ''; }
+        }).filter(Boolean))].slice(0, 8);
+        await chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin: location.origin, hosts }).catch(() => {});
         const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-start', data: {
             chapter, cacheEpoch, readerUrl: location.href, pages, completeManifest: found.complete,
             pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,

@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -207,6 +207,68 @@ test('readerPageNumber: the reader URL names the page when its own key folds it'
   // a digit-less stem may use the number AS the story id — refuse
   assert.equal(P('https://site.com/manga/foo/123', 'https://site.com/manga/foo/123'), null);
   assert.equal(P('https://site.com/viewer#5', 'https://site.com/viewer'), null);
+  // hash-paged readers state the page in the fragment; folding it away must land on the chapter
+  assert.equal(P('https://reader.example/reader/123456.html#4', 'https://reader.example/reader/123456.html'), 4);
+  assert.equal(P('https://reader.example/reader/123456.html#4-5', 'https://reader.example/reader/123456.html'), 4);
+  assert.equal(P('https://reader.example/reader/123456.html#0', 'https://reader.example/reader/123456.html'), null);
+  assert.equal(P('https://reader.example/reader/123456.html#4', 'https://reader.example/reader/999999.html'), null, 'another chapter must never answer');
+  assert.equal(P('https://site.com/viewer#5', 'https://site.com/viewer#5'), null, 'a hash story id is not a page number');
+});
+
+test('hashReaderId: the route shape names the manifest id', () => {
+  assert.equal(hashReaderId('/reader/123456.html'), '123456');
+  assert.equal(hashReaderId('/reader/123456'), null);
+  assert.equal(hashReaderId('/reader/123456.html/x'), null);
+  assert.equal(hashReaderId('/manga/some-title-123456.html'), null);
+  assert.equal(hashReaderId('/'), null);
+});
+
+test('hashReaderFiles: one unusable row refuses the whole list', () => {
+  const h0 = '0123456789abcdef'.repeat(4);
+  const js = `var anything = {"id":"123456","files":[{"hash":"${h0}","hasavif":1,"width":1,"height":2,"name":"001.jpg"}]};`;
+  assert.deepEqual(hashReaderFiles(js), [{ hash: h0, avif: true }]);
+  // no hasavif → webp family
+  assert.deepEqual(hashReaderFiles(`var x = {"files":[{"hash":"${h0}"}]};`), [{ hash: h0, avif: false }]);
+  assert.deepEqual(hashReaderFiles(null), []);
+  assert.deepEqual(hashReaderFiles('not json'), []);
+  assert.deepEqual(hashReaderFiles('var x = {"files":[]};'), []);
+  // a row without a usable hash (video/back-matter) must not shift every later page
+  assert.deepEqual(hashReaderFiles(`var x = {"files":[{"hash":"${h0}"},{"name":"extra.jpg"}]};`), []);
+  assert.deepEqual(hashReaderFiles('var x = {"files":[{"hash":"abc"}]};'), []);
+});
+
+test('hashReaderUrls: sample URL teaches the build prefix and shard family', () => {
+  // tails chosen so the computed path slot is checkable by hand: 'def' → 0xfde; '100' → 0x010
+  const h0 = '0123456789abcdef'.repeat(4);            // ends 'cdef'
+  const h1 = 'ffeeddccbbaa99887766554433221100'.repeat(2); // ends '21100'
+  const files = [{ hash: h0, avif: true }, { hash: h1, avif: false }];
+  const sample = `https://a2.img.gallery.example.org/987654321/4062/${h0}.avif`;
+  const built = hashReaderUrls(files, sample);
+  assert.deepEqual(built, {
+    urls: [
+      `https://a2.img.gallery.example.org/987654321/4062/${h0}.avif`,
+      `https://w2.img.gallery.example.org/987654321/16/${h1}.webp`,
+    ],
+    alts: [
+      `https://a1.img.gallery.example.org/987654321/4062/${h0}.avif`,
+      `https://w1.img.gallery.example.org/987654321/16/${h1}.webp`,
+    ],
+  });
+  // the sample's own shard number feeds the alternate; the rest of the shape must match exactly
+  assert.equal(hashReaderUrls(files, `https://a2.img.gallery.example.org/987654321/4062/${h0}.webp`), null,
+    'the sample extension and shard letter must agree');
+  assert.equal(hashReaderUrls(files, `https://c2.img.gallery.example.org/987654321/4062/${h0}.avif`), null);
+  assert.equal(hashReaderUrls(files, `https://a2.img.gallery.example.org/987654321/4062/${h0}.jpg`), null);
+  assert.equal(hashReaderUrls(files, `https://a2.img.gallery.example.org/987654321/${h0}.avif`), null, 'path must carry build + slot + hash');
+  assert.equal(hashReaderUrls(files, `https://a2.hash-example.org/987654321/4062/x/${h0}.avif`), null);
+  assert.equal(hashReaderUrls(files, `https://a2/987654321/4062/${h0}.avif`), null, 'no domain family to hang shards on');
+  assert.equal(hashReaderUrls(files, 'not a url'), null);
+  // a non-default port belongs to the CDN and is preserved in every built URL (local fixtures)
+  const ported = hashReaderUrls([{ hash: h0, avif: true }], `https://a2.img.gallery.example.org:8443/987654321/4062/${h0}.avif`);
+  assert.deepEqual(ported, {
+    urls: [`https://a2.img.gallery.example.org:8443/987654321/4062/${h0}.avif`],
+    alts: [`https://a1.img.gallery.example.org:8443/987654321/4062/${h0}.avif`],
+  });
 });
 
 test('deriveStoryPath: chapter tails strip to a story, ambiguous shapes fail to null', () => {
@@ -449,6 +511,19 @@ test('hotlinkRule: session rule stamping the page origin as Referer on guard CDN
   assert.doesNotMatch('https://strip.example/images/logo.webp', re);
   assert.doesNotMatch('https://imgsrv5.com/x/1.jpg', re);
   assert.deepEqual(rule.condition.resourceTypes, ['xmlhttprequest']); // SW/offscreen fetch only, <img> needs no help
+  // dynamic hosts: the chapter's own page URLs extend the guard set; the leading label is the
+  // edge/shard name, so the rule covers the whole family (unobserved shards included)
+  const dyn = hotlinkRule('https://reader.example', ['a2.cdn.example.org', 'w9.cdn.example.org', 'bad host', '..', 7]);
+  const dre = new RegExp(dyn.condition.regexFilter);
+  assert.match('https://a2.cdn.example.org/1/2/x.avif', dre);
+  assert.match('https://w9.cdn.example.org/1/2/x.webp', dre);
+  assert.match('https://other.cdn.example.org/x', dre, 'the family is covered, not one shard');
+  assert.doesNotMatch('https://cdn.example.org.evil.com/x', dre);
+  assert.doesNotMatch('https://cdnxexample.org/x', dre);
+  assert.equal(dre.source.split('cdn\\.example\\.org').length - 1, 1, 'duplicate families dedupe');
+  assert.match('https://a2.cdn.example.org:8443/x', dre, 'a non-default port still matches');
+  // no hosts → the static guard set decides alone
+  assert.doesNotMatch('https://a2.cdn.example.org/x', new RegExp(hotlinkRule('https://reader.example').condition.regexFilter));
 });
 
 test('hotlinkRetryable: 403 and 404 trigger the referer retry, anything else does not', () => {

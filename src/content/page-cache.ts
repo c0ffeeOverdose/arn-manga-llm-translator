@@ -400,6 +400,15 @@ export function readerPageNumber(origin: string, pathname: string, search: strin
         const n = Number(explicit[1]);
         return n > 0 ? n : null;
     }
+    // A hash-paged reader states its position in the fragment (`#4`, spread `#4-5`). It is a
+    // page turn only when the path itself carries the chapter id AND folding the fragment away
+    // lands exactly on the chapter key — a digit-less stem may be using the hash AS the story
+    // id, so those still refuse (fail direction is a split).
+    const h = /^#(\d+)(?:-\d*)?$/.exec(hash);
+    if (h) {
+        const n = Number(h[1]);
+        if (n > 0 && /\d/.test(pathname) && normalizeChapterKey(origin, pathname, search, hash) === chapter) return n;
+    }
     const segs = pathname.split('/').filter(Boolean);
     if (segs.length < 3) return null;
     const tail = segs[segs.length - 1];
@@ -500,10 +509,25 @@ export function pickStoryScope(origin: string, path: string, search: string, cha
 // ---- hotlink Referer rule: some image CDNs refuse a request without a page Referer — and an
 // MV3 service worker cannot send one (Chrome strips referrer from SW fetch silently), so the
 // SW proxy fails where a plain <img> loads fine. Some answer 403, MangaDex's network answers
-// 404. Fix at the network layer: a declarativeNetRequest session rule sets the header for
-// fetches to these hosts. Pure builder — the background installs it; unit-tested below.
+// 404, and other CDNs require it too. Fix at the network layer: a declarativeNetRequest session
+// rule sets the header for fetches to these hosts. The static list below is the known guard
+// set; `hosts` extends it with the hosts of the chapter's OWN page URLs (their leading label
+// is the shard/edge name, the rule covers the domain family) — no domain literals for new
+// readers, and the caller can only widen which requests get a Referer, never its value.
+// Pure builder — the background installs it; unit-tested below.
 export const HOTLINK_RULE_ID = 1001;
-export function hotlinkRule(origin: string): object {
+function hotlinkDomain(host: unknown): string | null {
+    if (typeof host !== 'string') return null;
+    const h = host.trim().toLowerCase();
+    if (!/^[a-z0-9.-]+$/.test(h) || h.startsWith('.') || h.endsWith('.') || h.includes('..')) return null;
+    const parts = h.split('.');
+    if (parts.length < 2 || parts.some(p => !p.length || p.length > 63)) return null;
+    return parts.length >= 3 ? parts.slice(1).join('.') : h;
+}
+export function hotlinkRule(origin: string, hosts: string[] = []): object {
+    const base = '2xstorage\\.com|waitst\\.com|uploads\\.mangadex\\.org|mangadex\\.network';
+    const extra = [...new Set(hosts.map(hotlinkDomain).filter((d): d is string => !!d))].sort().slice(0, 8)
+        .map(d => d.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
     return {
         id: HOTLINK_RULE_ID,
         priority: 1,
@@ -513,8 +537,9 @@ export function hotlinkRule(origin: string): object {
         },
         condition: {
             // SW/offscreen fetch() surface as xmlhttprequest; <img> loads need no help. The
-            // optional subdomain group covers host rotation (img-r2.2xstorage.com, cmdx….mangadex.network).
-            regexFilter: '^https://([^/]+\\.)?(2xstorage\\.com|waitst\\.com|uploads\\.mangadex\\.org|mangadex\\.network)/',
+            // optional subdomain group covers host rotation (img-r2.2xstorage.com, cmdx….mangadex.network);
+            // the optional port keeps local fixtures (and origin-scoped edges) matchable.
+            regexFilter: `^https://([^/]+\\.)?(${base}${extra.length ? '|' + extra.join('|') : ''})(?::\\d+)?/`,
             resourceTypes: ['xmlhttprequest'],
         },
     };
@@ -678,6 +703,83 @@ export function galleryLookaheadUrls(manifestJson: string | null, origSrc: strin
     const m = origSrc.match(/^(https?:\/\/[^/]+)\/(.+)$/);
     if (!m) return [];
     return galleryAheadUrls(manifestJson, m[1], m[2], max);
+}
+
+// ---- hash-listed single-image readers: one page image on screen, the whole chapter published
+// as a JS assignment (`var <name> = {...}` from the reader's CDN) whose files[] name every page
+// by content hash. Full art sits on numbered CDN shards chosen per file, so the displayed
+// page's own URL teaches the build prefix and shard family; a file's shard NUMBER is not in the
+// manifest and rides as an alternate for the existing one-shot sibling retry. Pure — unit-tested.
+export interface HashReaderFile { hash: string; avif: boolean }
+
+// Reader route shape `/reader/<id>.html` names the id the manifest is fetched by. A route gate
+// only — the manifest must still parse before anything is enumerated.
+export function hashReaderId(pathname: string): string | null {
+    const m = pathname.match(/^\/reader\/(\d+)\.html$/);
+    return m ? m[1] : null;
+}
+
+// files[] out of the CDN's `var <name> = {...};` payload. ONE unusable row refuses the whole
+// list: enumeration indexes parity with the reader's own page numbers, so a skipped row would
+// silently shift every later page. [] keeps the DOM fallback.
+export function hashReaderFiles(manifestJs: string | null): HashReaderFile[] {
+    if (!manifestJs) return [];
+    const from = manifestJs.indexOf('{');
+    const to = manifestJs.lastIndexOf('}');
+    if (from < 0 || to <= from) return [];
+    try {
+        const list = (JSON.parse(manifestJs.slice(from, to + 1)) as { files?: unknown }).files;
+        if (!Array.isArray(list) || !list.length) return [];
+        const out: HashReaderFile[] = [];
+        for (const row of list) {
+            const hash = (row as { hash?: unknown } | null)?.hash;
+            if (typeof hash !== 'string' || !/^[0-9a-f]{16,}$/i.test(hash)) return [];
+            out.push({ hash, avif: !!(row as { hasavif?: unknown }).hasavif });
+        }
+        return out;
+    } catch { return []; }
+}
+
+// Full-size page URLs derived from one DISPLAYED image. The sample path must be
+// `/<build>/<tail-swap>/<hash>.<ext>` on a `<letter><number>.<domain>` host whose letter
+// matches the extension family (avif→a, webp→w): that shape teaches the build prefix and the
+// sample's shard number; each file's URL differs only in hash, its computed path slot and its
+// (unknown) shard number. Returns one primary URL per file plus the number alternate; null on
+// any shape mismatch — the caller keeps the DOM branches rather than fetch invented URLs.
+export function hashReaderUrls(files: HashReaderFile[], sample: string): { urls: string[]; alts: string[] } | null {
+    let u: URL;
+    try { u = new URL(sample); } catch { return null; }
+    if (u.protocol !== 'https:') return null;
+    const segs = u.pathname.split('/').filter(Boolean);
+    if (segs.length !== 3) return null;
+    const build = segs[0];
+    const last = segs[2].match(/^([0-9a-f]{16,})\.(avif|webp)$/i);
+    if (!build || !/^[A-Za-z0-9][A-Za-z0-9._~-]*$/.test(build) || !last) return null;
+    const ext = last[2].toLowerCase();
+    const label = u.hostname.split('.')[0];
+    const suffix = u.hostname.split('.').slice(1).join('.');
+    const shard = /^([aw])([1-9])$/.exec(label);
+    if (!shard || suffix.split('.').length < 2) return null;
+    if ((shard[1] === 'a') !== (ext === 'avif')) return null;
+    const num = Number(shard[2]);
+    const altNum = num === 1 ? 2 : 1;
+    const port = u.port ? ':' + u.port : '';
+    const slot = (hash: string): string | null => {
+        const tail = hash.slice(-3);
+        if (!/^[0-9a-f]{3}$/i.test(tail)) return null;
+        return String(parseInt(tail[2] + tail.slice(0, 2), 16));
+    };
+    const urls: string[] = [], alts: string[] = [];
+    for (const f of files) {
+        const s = slot(f.hash);
+        if (s == null) return null;
+        const letter = f.avif ? 'a' : 'w';
+        const extFor = f.avif ? 'avif' : 'webp';
+        const mk = (n: number): string => `https://${letter}${n}.${suffix}${port}/${build}/${s}/${f.hash}.${extFor}`;
+        urls.push(mk(num));
+        alts.push(mk(altNum));
+    }
+    return { urls, alts };
 }
 
 // ---- episode-manifest canvas readers: the reader draws pages into <canvas> (tainted — no

@@ -19,6 +19,7 @@ const stubs = {
         export const episodeManifestSrcs = () => null; export const fetchPagedUrls = async () => [];
         export const pagedTierAlternates = () => [];
         export const galleryManifestJson = async () => null; export const collectUnloadedUrls = () => [];
+        export const hashReaderManifest = async () => null;
         export const bitmapBlank = async () => false; export const writePage = () => {};`,
     queue: `export const viewportOverlap = () => 1; export const dropAutoQueued = () => {};
         export const resumeAuto = () => {}; export const isBusy = () => false; export const paintBusy = () => false;
