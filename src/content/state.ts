@@ -9,6 +9,7 @@ import { normalizeChapterKey, type EpisodeManifest, pickSeriesLink, pickStorySco
 import type { DetectResult } from './detection';
 import type { ImageIdentity } from '../image-identity';
 import { cacheGeneration, cacheCurrent } from '../cache-generation';
+import { sendToBackground } from '../bg-rpc';
 
 declare const __BUILD_ID__: string; // injected by build.mjs — which build is this?
 
@@ -162,8 +163,9 @@ export async function loadPipeline(): Promise<PipelineSettings> {
     // user-selected render font: fetch bytes from the background, register a FontFace FIRST
     // in the stack — missing glyphs fall through to the per-language default
     if (pipeline.renderFont !== 'default' && pipeline.renderFont !== customFontLoaded) {
-        const resp = await chrome.runtime.sendMessage({ type: 'mt:font-get', id: pipeline.renderFont }) as
-            { ok: boolean; name?: string; b64?: string; error?: string } | null;
+        const resp = await sendToBackground<{ ok: boolean; name?: string; b64?: string; error?: string } | null>(
+            { type: 'mt:font-get', id: pipeline.renderFont }, { timeoutMs: 10_000, retries: 1, label: 'font load' },
+        ).catch(e => { console.warn('[mt] custom font unavailable:', (e as Error).message); return null; });
         if (resp?.ok && resp.b64 && resp.name) {
             try {
                 const bin = atob(resp.b64);
@@ -349,15 +351,24 @@ async function readContext(chapter: string): Promise<void> {
 export async function saveContext(): Promise<void> {
     const chapter = chapterKey();
     const revision = ++contextSaveRevision;
-    const result = await chrome.runtime.sendMessage({ type: 'mt:context-save', chapter,
-        bookKey: bookKey(), before: savedContext, context, share: shareContext });
+    let result: { ok?: boolean; error?: string; context?: ContextState } | undefined;
+    try {
+        result = await sendToBackground({ type: 'mt:context-save', chapter,
+            bookKey: bookKey(), before: savedContext, context, share: shareContext },
+            { timeoutMs: 10_000, retries: 1, label: 'context save' });
+    } catch (e) {
+        // bookkeeping must never hang or fail a page — the next save carries the latest state
+        console.warn('[mt] context save skipped:', (e as Error).message);
+        return;
+    }
     if (!result?.ok) throw new Error(result?.error || 'Could not save character context');
     if (chapterKey() !== chapter || revision !== contextSaveRevision) return;
-    context = result.context;
+    context = result.context!;
     savedContext = structuredClone(context);
     // surface the character book to the options page (with the scope it belongs to)
     if (context.characters.length) {
-        chrome.runtime.sendMessage({ type: 'mt:char-book', book: context.characters, bookKey: bookKey() }).catch(() => {});
+        sendToBackground({ type: 'mt:char-book', book: context.characters, bookKey: bookKey() },
+            { timeoutMs: 10_000, label: 'character book' }).catch(() => {});
     }
 }
 

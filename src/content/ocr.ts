@@ -16,6 +16,7 @@ import { inpaintMode } from '../llm/pipeline-settings';
 import { savedOriginal } from './page-identity';
 import { cacheReady, cacheGeneration, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 import { PageTimer } from '../page-timing';
+import { sendToBackground } from '../bg-rpc';
 
 // Warm-path AI cleanup: compute cleanup patches for a freshly translated page
 // and hand them to the caller's cache entry. Gated on cache-on + local mode;
@@ -682,7 +683,7 @@ export async function translateRegions(
                             const retryPayload = interimTexts
                                 ? { ...one, imagesB64: undefined, regions: withSources(one.regions as RegionInput[], interimTexts), vision: false, textOnly: true, ocr: true }
                                 : one;
-                            resp = await chrome.runtime.sendMessage(retryPayload);
+                            resp = await sendToBackground(retryPayload, { timeoutMs: 260_000, label: 'translate retry' });
                             lastErr = null;
                             break;
                         } catch (e2) {

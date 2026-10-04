@@ -6,6 +6,7 @@ import { isDebug } from '../debug';
 import { fetchWorkerToken } from './worker-token';
 import { canvasJpegB64 } from './encode';
 import type { PageTimer } from '../page-timing';
+import { sendToBackground } from '../bg-rpc';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -1110,9 +1111,9 @@ export async function cloudInpaint(
     const tRequest = performance.now();
     let resp: { ok: boolean; page?: any; error?: string };
     try {
-        resp = await chrome.runtime.sendMessage({
+        resp = await sendToBackground({
             type: 'mt:cloud-inpaint', endpoint: opts.endpoint, key: opts.key, jpegB64, boxes, maskB64,
-        });
+        }, { timeoutMs: 100_000, label: 'cloud inpaint' });
     } finally { opts.timing?.add('cleanupRequest', performance.now() - tRequest); }
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud inpaint failed');
     const j = resp.page;
@@ -1217,7 +1218,8 @@ export async function cloudConfig(): Promise<{ endpoint: string; key: string }> 
 // A sweep pays that ONCE up front instead of letting the first page calls race the boot.
 // /health is auth-exempt and returns only after the models are up.
 export async function cloudWarm(endpoint: string, key: string): Promise<number> {
-    const r = await chrome.runtime.sendMessage({ type: 'mt:cloud-warm', endpoint, key }) as { ok: boolean; ms?: number; error?: string };
+    const r = await sendToBackground<{ ok: boolean; ms?: number; error?: string }>(
+        { type: 'mt:cloud-warm', endpoint, key }, { timeoutMs: 190_000, label: 'cloud warm' });
     if (!r?.ok) throw new Error(r?.error ?? 'cloud warm failed');
     return r.ms ?? 0;
 }
@@ -1239,13 +1241,13 @@ export async function cloudDetect(
     const tUp = performance.now();
     let resp: { ok: boolean; page?: any; error?: string };
     try {
-        resp = await chrome.runtime.sendMessage({
+        resp = await sendToBackground({
             type: 'mt:cloud-page', endpoint, key,
             confThr: opts.confThr, minSize: opts.minSize, jpegB64,
             inpaint: opts.inpaint === true,
             // page/crops modes read the image at the LLM — tell the server to skip its OCR pass
             texts: opts.texts !== false,
-        });
+        }, { timeoutMs: 160_000, label: 'cloud detect' });
     } finally { opts.timing?.add('cloudRequest', performance.now() - tUp); }
     const upMs = Math.round(performance.now() - tUp);
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud failed');

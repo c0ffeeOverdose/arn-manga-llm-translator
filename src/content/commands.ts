@@ -14,6 +14,7 @@ import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
 import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, elementMap, chapterOwnsRequest, resolveChapterRef } from './sweep';
 import { initTranslationReset } from './translation-reset';
 import { acceptCacheGeneration } from '../cache-generation';
+import { sendToBackground } from '../bg-rpc';
 import { lastPageTiming } from '../page-timing';
 
 export function toggleOverlay(): void {
@@ -236,7 +237,8 @@ export function installMessageListener(): void {
             return true;
         }
         if (msg?.type === 'mt:cache-clear') {
-            chrome.runtime.sendMessage({ type: 'mt:translation-cache-clear' }).then(async response => {
+            sendToBackground<{ ok?: boolean; error?: string; generation?: string }>(
+                { type: 'mt:translation-cache-clear' }, { timeoutMs: 120_000, label: 'cache clear' }).then(async response => {
                 if (!response?.ok) { sendResponse({ ok: false, error: response?.error ?? 'Could not clear translations' }); return; }
                 await acceptCacheGeneration(response.generation);
                 sendResponse({ ok: true, count: await cacheCount(), mine: 0, max: pipeline.cacheMax });

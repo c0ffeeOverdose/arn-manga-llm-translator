@@ -3,12 +3,15 @@
 // A service worker caught mid-wake can still miss the read, and the token then stays null —
 // every inference call in the document fails until a manual reload. Ask a few times before
 // treating the handshake as lost. Pure control flow (the asker is injected for tests).
+import { sendToBackground } from '../bg-rpc';
+
 export async function fetchWorkerToken(
     nonce: unknown,
     tries = 3,
     delayMs = 250,
     ask: (nonce: string) => Promise<{ token?: string } | undefined> = n =>
-        chrome.runtime.sendMessage({ type: 'mt:get-worker-token', nonce: n }) as Promise<{ token?: string } | undefined>,
+        sendToBackground<{ token?: string } | undefined>({ type: 'mt:get-worker-token', nonce: n },
+            { timeoutMs: 10_000, label: 'worker token' }),
 ): Promise<string | null> {
     if (typeof nonce !== 'string' || !nonce) return null;
     for (let i = 0; i < Math.max(1, tries); i++) {

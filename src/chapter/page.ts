@@ -19,6 +19,7 @@ import { Attempt } from './lifecycle';
 import { nextDocument, chapterImages, guessNextDocument, sameChapterDocument, discoverEnded } from './discovery';
 import { nextGroup, pagePhase } from './plan';
 import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
+import { sendToBackground } from '../bg-rpc';
 
 let id = '';
 // A page lease must cover the slowest real work (cold model load + a full LLM roundtrip) and
@@ -104,7 +105,8 @@ function publish(): Promise<void> {
     const checkpoint: HostCheckpoint = { config: structuredClone(config), progress: snapshot };
     const next = publishChain.then(async () => {
         await writeRecord(`checkpoint:${id}`, checkpoint);
-        const r = await chrome.runtime.sendMessage({ type: 'mt:chapter-publish', id, status: snapshot });
+        const r = await sendToBackground<{ ok?: boolean; error?: string }>(
+            { type: 'mt:chapter-publish', id, status: snapshot }, { timeoutMs: 15_000, label: 'publish progress' });
         if (!r?.ok) throw new Error(r?.error || 'Could not save chapter progress');
     });
     publishChain = next.catch(() => {});
@@ -150,9 +152,10 @@ function showFatal(e: unknown): void {
 }
 async function contextFor(entries?: Contribution[], beforeOrder?: number): Promise<ContextState> {
     if (!config.shareContext) return { pairs: [], characters: [] };
-    const r = await chrome.runtime.sendMessage({ type: 'mt:chapter-context', id, entries, beforeOrder });
+    const r = await sendToBackground<{ ok?: boolean; error?: string; context?: ContextState }>(
+        { type: 'mt:chapter-context', id, entries, beforeOrder }, { timeoutMs: 15_000, label: 'chapter context' });
     if (!r?.ok) throw new Error(r?.error || 'Could not update character context');
-    return r.context;
+    return r.context!;
 }
 async function source(page: ChapterPage): Promise<ImageBitmap> {
     if (page.source) return createImageBitmap(await (await fetch(page.source)).blob());
@@ -677,9 +680,10 @@ async function attach(runnerId: string): Promise<void> {
     starveNoticeShown = false; // a new session re-arms the one-time notice
     await cacheReady();
     await initDebug();
-    const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-host-init', id });
+    const response = await sendToBackground<{ ok?: boolean; error?: string; config?: HostConfig }>(
+        { type: 'mt:chapter-host-init', id }, { timeoutMs: 12_000, label: 'host init' });
     if (!response?.ok) throw new Error(response?.error || 'Chapter session expired');
-    config = response.config;
+    config = response.config!;
     assertCacheCurrent(config.cacheEpoch ?? '');
     // A session with no status record is indistinguishable from a dead one. Publish a
     // placeholder BEFORE the slow setup (fonts, checkpoint) so a start that fails later still
@@ -711,8 +715,8 @@ async function attach(runnerId: string): Promise<void> {
 // and Firefox's background iframe load page.html, which calls it on load. Safe to call twice.
 export async function attachChapterRunner(): Promise<void> {
     if (id) return;
-    const reply = await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-boot' }) as
-        { ok?: boolean; id?: string } | undefined;
+    const reply = await sendToBackground<{ ok?: boolean; id?: string }>(
+        { type: 'mt:chapter-runner-boot' }, { timeoutMs: 10_000, label: 'runner boot' });
     if (reply?.id) await attach(reply.id);
 }
 

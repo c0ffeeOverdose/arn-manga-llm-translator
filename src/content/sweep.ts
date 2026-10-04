@@ -20,6 +20,7 @@ import { isDebug } from '../debug';
 import { ensurePageDebugViews } from './ocr';
 import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 import { cloudConfig, cloudWarm } from './detection';
+import { sendToBackground } from '../bg-rpc';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
@@ -139,7 +140,9 @@ async function pageEvidence(page: ProgressPage): Promise<ImageIdentity | undefin
     const key = `${run}:${page.id}:${page.revision ?? 0}`;
     let task = evidence.get(key);
     if (!task) {
-        task = chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter: chapterKey(), page: page.id, evidenceOnly: true })
+        task = sendToBackground<{ result?: { signature?: string; identity?: ImageIdentity } }>(
+            { type: 'mt:chapter-result', chapter: chapterKey(), page: page.id, evidenceOnly: true },
+            { timeoutMs: 30_000, label: 'chapter evidence' })
             .then(r => r?.result?.signature === chapterSignature(pipeline) ? r.result.identity : undefined)
             .catch(() => undefined);
         evidence.set(key, task!);
@@ -216,7 +219,8 @@ export function sweepHas(url: string): boolean {
     return !!owned(url) && sweepActive();
 }
 async function control(command: string, extra: Record<string, unknown> = {}): Promise<any> {
-    return chrome.runtime.sendMessage({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra });
+    return sendToBackground({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra },
+        { timeoutMs: 15_000, label: 'chapter control' });
 }
 
 // Manual/auto requests join the chapter owner, including explicit retranslation.
@@ -451,14 +455,15 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         const hosts = [...new Set(pages.map(p => {
             try { return new URL(p.url).hostname; } catch { return ''; }
         }).filter(Boolean))].slice(0, 8);
-        await chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin: location.origin, hosts }).catch(() => {});
-        const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-start', data: {
+        await sendToBackground({ type: 'mt:hotlink-rule', origin: location.origin, hosts },
+            { timeoutMs: 10_000, label: 'hotlink rule' }).catch(() => {});
+        const response = await sendToBackground<{ ok?: boolean; error?: string; id: string; status?: ChapterProgress }>({ type: 'mt:chapter-start', data: {
             chapter, cacheEpoch, readerUrl: location.href, pages, completeManifest: found.complete,
             pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,
             nextDocument: found.complete ? undefined : nextDocument(document, location.href, chapter)
                 ?? guessNextDocument(location.href, chapter),
             imageFilter: readerImageFilter(),
-        } });
+        } }, { timeoutMs: 90_000, label: 'chapter start' });
         assertCacheCurrent(cacheEpoch);
         if (!response?.ok) throw new Error(response?.error || 'Could not start chapter translation');
         if (startCancelled) { await control('stop'); return { ok: true, cancelled: true }; }
@@ -581,7 +586,8 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         const w = snapshot?.bitmap.width ?? img!.naturalWidth;
         const h = snapshot?.bitmap.height ?? img!.naturalHeight;
         const src = snapshot?.source ?? viewSource(ref);
-        const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-result', chapter, page: page.id });
+        const response = await sendToBackground<{ result?: any; error?: string }>(
+            { type: 'mt:chapter-result', chapter, page: page.id }, { timeoutMs: 30_000, label: 'chapter result' });
         mark('result'); // background roundtrip incl. the artifact transfer
         const result = response?.result;
         if (!result) { bail(`no-result:${response?.error ?? 'empty'}`); return; }
@@ -731,7 +737,8 @@ async function refresh(): Promise<void> {
             observedChapter = chapter; progress = null; refs.clear(); imageAliases.clear(); evidence.clear(); sourceImages.clear();
             removeActivity('sweep');
         }
-        const response = await chrome.runtime.sendMessage({ type: 'mt:chapter-status', chapter });
+        const response = await sendToBackground<{ status?: ChapterProgress }>(
+            { type: 'mt:chapter-status', chapter }, { timeoutMs: 10_000, retries: 1, label: 'chapter status' });
         if (!cacheCurrent(token) || chapterKey() !== chapter) return;
         if (response?.status) {
             if (progress?.id !== response.status.id) { imageAliases.clear(); evidence.clear(); }
