@@ -447,9 +447,27 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         // lone corroborated component is never enough to strip the rest (corroboratedCore).
         const core = corroboratedCore(members, members.map(m => compBoxConf(m) > 0), GAP,
             p => maskComponentEligible(p, pageArea, compBoxConf(p)));
-        for (const piece of core ?? [c]) {
+        // A tall effect stroke touching a bubble carries the group's bbox over the artwork;
+        // the line's glyph means can sit below the eligibility gate, so pure structure
+        // (lineOutlierSplit) emits the line without re-gating — the group itself passed.
+        let pieces = core;
+        let structural = false;
+        if (!pieces) {
+            const split = lineOutlierSplit(members);
+            if (split) {
+                pieces = [{
+                    x1: Math.min(...split.line.map(s => s.x1)), y1: Math.min(...split.line.map(s => s.y1)),
+                    x2: Math.max(...split.line.map(s => s.x2)), y2: Math.max(...split.line.map(s => s.y2)),
+                    count: split.line.reduce((n, s) => n + s.count, 0),
+                    probSum: split.line.reduce((n, s) => n + s.probSum, 0),
+                    ids: split.line.flatMap(s => s.ids),
+                }];
+                structural = true;
+            }
+        }
+        for (const piece of pieces ?? [c]) {
             if (maskBoxes.length >= 16) break;
-            if (!maskComponentEligible(piece, pageArea, compBoxConf(piece))) continue;
+            if (!structural && !maskComponentEligible(piece, pageArea, compBoxConf(piece))) continue;
             if (!overlap(piece)) {
                 const grown = extendMaskBox(piece, maskCandidates, overlap);
                 maskBoxes.push({ x1: Math.max(0, grown.x1), y1: Math.max(0, grown.y1), x2: Math.min(w, grown.x2), y2: Math.min(h, grown.y2), conf: 0.5 });
@@ -543,7 +561,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
 // scripts; only the language data is downloaded on demand and cached in IDB).
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
-import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
+import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, lineOutlierSplit, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
 import { windowIndex } from '../content/inpaint';
 import { pickInferIndex } from '../content/page-cache';
 import { initDebug, isDebug } from '../debug';

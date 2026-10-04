@@ -245,6 +245,38 @@ export function corroboratedCore(
     return core;
 }
 
+// A stray tall effect stroke drawn against a bubble merges its bbox into the group; the
+// region then crops/erases/paints over the artwork and the translation overflows. When a
+// group's members contain a text line (>=3 similarly sized comps whose stacking spans
+// overlap) plus at least one much taller member, that line is the text. Pure — unit tested.
+export const LINE_FAMILY_RATIO = 1.5;   // heights within this × are one line's glyphs
+export const LINE_OUTLIER_FACTOR = 1.6; // outlier height ≥ this × the line's tallest glyph
+export function lineOutlierSplit<T extends SplitComp>(members: T[]): { line: T[]; rest: T[] } | null {
+    if (members.length < 4) return null;
+    const h = (c: T) => c.y2 - c.y1 + 1;
+    const idx = members.map((_, i) => i).sort((a, b) => h(members[a]) - h(members[b]));
+    let best: number[] = [];
+    for (let a = 0; a < idx.length; a++) {
+        for (let b = a; b < idx.length; b++) {
+            if (h(members[idx[b]]) > LINE_FAMILY_RATIO * h(members[idx[a]])) break;
+            if (b - a + 1 > best.length) best = idx.slice(a, b + 1);
+        }
+    }
+    if (best.length < 3) return null;
+    const line = best.map(i => members[i]);
+    const sorted = [...line].sort((a, b) => a.y1 - b.y1);
+    let reach = sorted[0].y2;
+    for (const c of sorted.slice(1)) {
+        if (c.y1 > reach) return null; // stacked lines of similar size, not one line
+        reach = Math.max(reach, c.y2);
+    }
+    const rest = members.filter((_c, i) => !best.includes(i));
+    if (!rest.length) return null;
+    const tallest = Math.max(...line.map(h));
+    if (!rest.some(c => h(c) >= LINE_OUTLIER_FACTOR * tallest)) return null;
+    return { line, rest };
+}
+
 export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number, boxComps: SplitComp[] = comps): T[] {
     if (comps.length < 2) return [...boxes];
     const out: T[] = [];

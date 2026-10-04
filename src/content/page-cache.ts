@@ -1124,11 +1124,11 @@ export interface FingerprintOpts {
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
-    // trailing detector-generation tag (currently tile23): entries from older split/render/OCR
+    // trailing detector-generation tag (currently tile24): entries from older split/render/OCR
     // pipeline versions miss once and heal on overwrite — bump it whenever touching the
     // split, layout, or mask recipe, or old entries keep rendering stale regions.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile23'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile24'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

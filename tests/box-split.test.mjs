@@ -11,7 +11,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/box-split-detection.mjs', sourcemap: 'inline',
 });
 
-const { splitMergedBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, shiftDetectionBoxY } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
+const { splitMergedBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, lineOutlierSplit, shiftDetectionBoxY } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
 
 const box = (x1, y1, x2, y2, conf = 0.9) => ({ x1, y1, x2, y2, conf });
 const GAP = 28;
@@ -326,6 +326,29 @@ test('lane 2: a stray murmur does not veto the lobe cut (live double balloon)', 
     [1875, 2364, 1990, 2698],
   ]);
   assert.ok(parts.every(p => p.cutAxis === 'x'));
+});
+
+// Live mask group: a tall hand-drawn effect stroke leaning on a bubble merged its bbox into
+// the group; the region painted/erased the artwork and the text overflowed. The glyph line
+// (four similar comps sharing a row band) is the text; the stroke is the outlier.
+const LINE_EFFECT = [
+  [455, 1072, 505, 1188], [491, 1115, 524, 1148], [533, 1123, 572, 1160],
+  [573, 1123, 599, 1156], [601, 1123, 609, 1159], [470, 1194, 494, 1217],
+].map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+
+test('lineOutlierSplit finds the glyph line under a tall touching effect stroke', () => {
+  const split = lineOutlierSplit(LINE_EFFECT);
+  assert.ok(split);
+  const bbox = ss => [Math.min(...ss.map(c => c.x1)), Math.min(...ss.map(c => c.y1)),
+    Math.max(...ss.map(c => c.x2)), Math.max(...ss.map(c => c.y2))];
+  assert.deepEqual(bbox(split.line), [491, 1115, 609, 1160]);
+  assert.deepEqual(bbox(split.rest), [455, 1072, 505, 1217]);
+  // stacked lines of one size are not a line + outlier
+  const stacked = [box(10, 10, 120, 40), box(10, 50, 120, 80), box(10, 90, 120, 120), box(10, 130, 120, 160)];
+  assert.equal(lineOutlierSplit(stacked), null);
+  // glyphs plus the small tick only (no tall outlier): untouched
+  const flat = LINE_EFFECT.slice(1);
+  assert.equal(lineOutlierSplit(flat), null);
 });
 
 test('lane 2: nested single line under its block stays fused', () => {
