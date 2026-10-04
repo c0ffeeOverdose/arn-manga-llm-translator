@@ -968,6 +968,13 @@ test('samePagePath: exact always, cross-host by path, same-host strict', () => {
   assert.equal(samePagePath('http://img-a.gallery.example.org/galleries/999001/5.webp', b), false); // non-https never fuzzy
   assert.equal(samePagePath('not a url', b), false);
   assert.equal(samePagePath('https://a.example/', 'https://b.example/'), false); // bare roots never match
+  // a reader's save-conversion hands us a whole page as a data: URL — the scheme must be
+  // rejected before the parser (a multi-MB new URL() per comparison froze the sweep)
+  const huge = 'data:image/png;base64,' + 'A'.repeat(1 << 20);
+  assert.equal(samePagePath(huge, b), false);
+  assert.equal(samePagePath(b, huge), false);
+  assert.equal(samePagePath(huge, 'data:image/png;base64,BBBB'), false);
+  assert.equal(samePagePath('blob:https://site.example/aaaaaaaa-1111', b), false);
 });
 
 test('handoffRead: earliest fresh stamp across exact + host-volatile twins', () => {

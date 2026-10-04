@@ -1257,6 +1257,11 @@ export async function cacheCountChapter(chapter: string): Promise<number> {
 // Pure — unit-tested below.
 export function samePagePath(a: string, b: string): boolean {
     if (a === b) return true;
+    // Only https URLs can be cross-host twins, and the SCHEME check must come before the
+    // parser: readers can hand us a data: URL holding a whole page image (multi-MB base64),
+    // and one `new URL(data:)` costs ~20ms — a sweep comparing it against every chapter page
+    // froze the reader's main thread. Rejecting the scheme up front is exact and free.
+    if (!a.startsWith('https:') || !b.startsWith('https:')) return false;
     try {
         const ua = new URL(a), ub = new URL(b);
         if (ua.protocol !== 'https:' || ub.protocol !== 'https:') return false;

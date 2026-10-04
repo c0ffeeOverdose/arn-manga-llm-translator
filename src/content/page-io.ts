@@ -27,7 +27,11 @@ export function getPages(): PageRef[] {
     // kept — the sweep picks them up when the reader shows them. Size heuristic only.
     const out: PageRef[] = [];
     for (const img of document.querySelectorAll('img')) {
-        if (!/^(blob:|https?:)/.test(img.src)) continue;
+        // The EFFECTIVE source decides the scheme: an <img src=https> inside <picture> whose
+        // <source> carries a data: srcset displays the data URL (some readers convert an image
+        // to base64 on save), and that path is both multi-MB and unaddressable — keep it out
+        // of the sweep. currentSrc is '' until resolution; the src attribute covers that.
+        if (!/^(blob:|https?:)/.test(img.currentSrc || img.src)) continue;
         // promo slots (.link-page): same-size ad images that pass the size floor — never pages.
         if (img.closest('.link-page')) continue;
         if (img.naturalWidth < 400 || img.naturalHeight < 300) continue;
