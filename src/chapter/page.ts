@@ -707,35 +707,15 @@ async function attach(runnerId: string): Promise<void> {
     pumpCheck();
 }
 
-// Entry point for a context that hosts this runner. Chromium's offscreen document calls it
-// on load; Firefox's background page calls it through chapter/boot.ts. Safe to call twice.
+// Entry point for a context that hosts this runner. Both Chromium's offscreen document
+// and Firefox's background iframe load page.html, which calls it on load. Safe to call twice.
 export async function attachChapterRunner(): Promise<void> {
     if (id) return;
     const reply = await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-boot' }) as
         { ok?: boolean; id?: string } | undefined;
     if (reply?.id) await attach(reply.id);
 }
-chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-    if (sender.id !== chrome.runtime.id) return;
-    // Firefox starts a run by telling the background page (which IS the runner) to attach.
-    if (msg?.type === 'mt:chapter-runner-attach') {
-        if (id) { respond({ ok: true, already: true }); return; }
-        attach(String(msg.id)).then(() => respond({ ok: true }), e => { showFatal(e); respond({ ok: false }); });
-        return true;
-    }
-    if (msg?.type === 'mt:chapter-runner-stop') {
-        (async () => {
-            if (status) stop();
-            while (pumping) await new Promise(r => setTimeout(r, 20));
-            await publishChain;
-            id = '';
-            respond({ ok: true });
-        })();
-        return true;
-    }
-});
 
-// A page loaded directly (offscreen document, or a developer opening page.html) attaches
-// itself. Firefox reaches the same code through boot.ts, where the module also evaluates —
-// attaching twice is a no-op because `status` is already set.
+// A page loaded directly (offscreen document, background iframe, or a developer opening
+// page.html) attaches itself; attaching twice is a no-op because `status` is already set.
 void attachChapterRunner().catch(showFatal);

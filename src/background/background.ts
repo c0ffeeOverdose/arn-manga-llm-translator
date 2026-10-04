@@ -5,7 +5,6 @@ import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError
 import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type CharOverride, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl } from './chapter-broker';
-import { bootChapterRunner } from '../chapter/boot';
 import { cacheReady, cacheCurrent, onCacheReset } from '../cache-generation';
 import { initDebug, isDebug } from '../debug';
 
@@ -912,8 +911,3 @@ chrome.contextMenus?.onClicked.addListener((info, tab) => {
     if (info.menuItemId !== 'mt-translate-image' || !tab?.id) return;
     chrome.tabs.sendMessage(tab.id, { type: 'mt:translate-image', srcUrl: info.srcUrl }).catch(() => {});
 });
-
-// Firefox has no offscreen API: its MV3 background is an event page with a DOM, so the
-// chapter runner lives in this very context. Chromium's offscreen document boots itself
-// and this call is a no-op there.
-bootChapterRunner().catch(() => {});

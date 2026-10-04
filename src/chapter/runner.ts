@@ -3,7 +3,9 @@ import type { ChapterProgress } from './model';
 // WHERE a chapter run executes. Neither place is a tab, so the run survives the reader
 // navigating and the user never sees a new tab appear.
 //   Chromium: an offscreen document (no lifetime cap for our reasons).
-//   Firefox:  the background event page itself, which has a DOM.
+//   Firefox:  a hidden iframe inside the background event page. The broker shares that
+//             page, and runtime.sendMessage is never delivered to the sender's own
+//             frame, so broker and runner must be separate frames to talk at all.
 // This module is the only place that knows the difference.
 export interface ChapterRunner {
     readonly kind: RunnerKind;
@@ -44,14 +46,20 @@ export function createRunner(): ChapterRunner {
             },
         };
     }
-    // Firefox: the background page is the runner. Its own boot hook starts it, and a
-    // restart re-attaches to the stored session, so `ensure` has nothing to create.
+    // Firefox: the runner is a hidden iframe in this (background) page; its own boot hook
+    // attaches it (see chapter/page.ts) and broker messages now cross frames.
+    let frame: HTMLIFrameElement | null = null;
     return {
         kind: 'background',
-        async ensure(id) {
-            await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-attach', id }).catch(() => {});
+        async ensure() {
+            if (frame?.isConnected) return;
+            frame?.remove();
+            frame = document.createElement('iframe');
+            frame.src = runnerUrl();
+            frame.style.display = 'none';
+            document.documentElement.appendChild(frame);
         },
-        async stop() { await chrome.runtime.sendMessage({ type: 'mt:chapter-runner-stop' }).catch(() => {}); },
-        async live() { return true; },
+        async stop() { frame?.remove(); frame = null; },
+        async live() { return !!frame?.isConnected; },
     };
 }
