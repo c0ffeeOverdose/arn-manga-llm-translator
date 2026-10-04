@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, bytesCrops, INPAINT_PATCH_GEN, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, detFromCacheEntry, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, bytesCrops, INPAINT_PATCH_GEN, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -759,6 +759,28 @@ test('detFromPartial: rebuilds detect output verbatim, texts ride cloudTexts', (
   assert.equal(bare.cloudTexts, undefined);
   // maskless entry refuses (callers check isResumable first)
   assert.equal(detFromPartial(partialFixture({ mask: undefined }), 4, 4), null);
+});
+
+test('detFromCacheEntry: the one full-entry gate, and splitGen rides along', () => {
+  const full = partialFixture({ partial: undefined, ep: 'cloud', splitGen: CLOUD_SPLIT_GEN });
+  const det = detFromCacheEntry(full, RESUME_FP, 4, 4, true);
+  assert.ok(det);
+  assert.equal(det.ep, 'cache');
+  assert.deepEqual(det.boxes, full.boxes);
+  assert.equal(new Uint8Array(det.mask.data)[5], 255);
+  // The generation survives: a cache-hit render re-persists its crops by writing det.splitGen
+  // back, so dropping it here downgraded the entry to gen 0 (unusable on the next visit).
+  assert.equal(det.splitGen, CLOUD_SPLIT_GEN);
+  // A stale generation refuses — callers must fall through to re-detect, never force a det.
+  assert.equal(detFromCacheEntry({ ...full, splitGen: CLOUD_SPLIT_GEN - 1 }, RESUME_FP, 4, 4, true), null);
+  // Local mode ignores splitGen (the tile fingerprint owns freshness).
+  assert.ok(detFromCacheEntry({ ...full, splitGen: 0 }, RESUME_FP, 4, 4, false));
+  // partial / absent / fp / dims / mask all refuse.
+  assert.equal(detFromCacheEntry(partialFixture(), RESUME_FP, 4, 4, false), null);
+  assert.equal(detFromCacheEntry(undefined, RESUME_FP, 4, 4, false), null);
+  assert.equal(detFromCacheEntry(full, 'other', 4, 4, false), null);
+  assert.equal(detFromCacheEntry(full, RESUME_FP, 8, 4, false), null);
+  assert.equal(detFromCacheEntry({ ...full, mask: undefined }, RESUME_FP, 4, 4, false), null);
 });
 
 test('cloudSplitFresh: the gate only bites in cloud mode', () => {

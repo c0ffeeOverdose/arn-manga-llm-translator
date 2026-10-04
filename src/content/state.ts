@@ -139,13 +139,6 @@ export function setDebugOn(v: boolean): void { debugOn = v; }
 // originals — jobs finishing later must NOT flip it back
 export let overlayChoice: 'auto' | 'original' = 'auto';
 export function setOverlayChoice(v: 'auto' | 'original'): void { overlayChoice = v; }
-// Explicit translate intent for THIS document. Set by any user translate action (this page /
-// chapter / retranslate); auto-translate is a separate always-on signal (autoOn()). Cached
-// translations must never surface without one of them: a fresh visit shows originals until
-// the user asks, cache or no cache.
-let explicitIntent = false;
-export function markExplicitIntent(): void { explicitIntent = true; }
-export function explicitIntentOn(): boolean { return explicitIntent; }
 export let ui: HTMLDivElement | null = null;
 export function setUi(v: HTMLDivElement | null): void { ui = v; }
 

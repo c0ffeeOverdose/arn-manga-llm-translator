@@ -1,9 +1,9 @@
 import { configureChapterHost, loadPipeline, setShareContext } from '../content/state';
 import { fetchBitmap, unscrambleTiles } from '../content/page-io';
-import { resolveHeadlessDet, detFromCacheEntry } from '../content/pipeline';
+import { resolveHeadlessDet } from '../content/pipeline';
 import { translateRegions, abortLiveRpcs } from '../content/ocr';
 import { renderPage } from '../content/render-page';
-import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial } from '../content/page-cache';
+import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial, detFromCacheEntry } from '../content/page-cache';
 import { keepaliveOpen } from '../content/queue';
 import { initDebug, isDebug } from '../debug';
 import { chapterMessage, providerMessage, fetchSourceWithAlternate, type ChapterPage, type ChapterProgress, type Contribution, type PagePhase } from './model';
@@ -286,7 +286,7 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
             bitmap.close();
             return 'done';
         }
-        const det = resolved.det ?? (cached && detFromCacheEntry(cached, bitmap.width, bitmap.height));
+        const det = resolved.det ?? (cached && detFromCacheEntry(cached, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud'));
         if (!det) throw new Error('Saved page data is incomplete');
         // The request pipeline caps a page at 150 regions. Cap before a group call so the
         // merged box list and the renderer see exactly what the single-page path would.

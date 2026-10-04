@@ -1,11 +1,10 @@
 // Overlay sweeper: re-apply translated/original src to every loaded page element.
 // The reader can swap elements mid-queue — poll every 1s (cheap, self-healing).
 
-import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, explicitIntentOn, type PageRef } from './state';
+import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
 import { refKey, getPages, readPage, repaintByHash, healImgBinding, writePage } from './page-io';
 import { clearQueue, failMarks, queue, pageKeyOf, paintHas, claimPaint, releasePaint, activeKeyGet, viewportOverlap } from './queue';
-import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap, bytesCrops } from './page-cache';
-import { detFromCacheEntry } from './pipeline';
+import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap, bytesCrops, detFromCacheEntry } from './page-cache';
 import { renderPage } from './render-page';
 import { sweepPageOrder, idlePageOrder, chapterOwnsRequest, resolveChapterRef } from './sweep';
 import { autoOn } from './auto';
@@ -24,14 +23,14 @@ export function applyOverlays(): void {
         const keyed = pages.get(refKey(ref));
         const st = keyed ?? (ref.kind === 'img' ? elStates.get(ref.el) : undefined);
         if (!st) {
-            // Nothing surfaces without a command: auto-translate, or a translate action the
-            // user already issued in this document. A fresh visit shows originals, cache or
-            // no cache — the queue and chapter-attach paths paint once a command exists.
-            if (!autoOn() && !explicitIntentOn()) continue;
+            // In-memory healing only: it matches pages already painted in THIS document (a
+            // command happened), so it cannot surface un-commanded work. Keeps a translated
+            // page translated across reader redraws and element recycling.
             if (ref.kind === 'img') void repaintByHash(ref.el);
-            // arrival paint: a committed-but-unpainted page the user is looking at —
-            // IDB hit paints with no queue and no LLM; miss stays quiet.
-            void arrivalPaint(ref);
+            // Cache surfacing (a cached page never painted here) follows auto-translate only.
+            // Manual and chapter commands surface their own pages through the queue and the
+            // chapter attach path — one page's command must not reveal the chapter's cache.
+            if (autoOn()) void arrivalPaint(ref);
             continue;
         }
         // bound element showing an unknown URL: verify by content hash, never paint blind.
@@ -54,9 +53,9 @@ function arrivalStuck(el: Element, src: string, dims: string): boolean {
 }
 async function arrivalPaint(ref: PageRef): Promise<void> {
     const el = ref.el;
-    // Called only when a command exists (auto-translate or explicit intent in this document):
-    // the cache entry is durable proof the page was already paid for, so re-showing it spends
-    // nothing — but showing it still waits for a command.
+    // Called only while auto-translate owns surfacing: the cache entry is durable proof the
+    // page was already paid for, so re-showing it spends nothing. Manual/chapter pages arrive
+    // through their own command paths (queue render / chapter attach), never this lane.
     if (arrivalBusy.has(el) || document.hidden) return;
     let dims = '';
     if (ref.kind === 'img') {
@@ -104,10 +103,9 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
             const crops = bytesCrops(byBytes, fp, bitmap.width, bitmap.height);
             if (crops) { hit.patches = crops.patches; hit.patchesGen = crops.patchesGen; }
         }
-        const det = hit ? detFromCacheEntry(hit, bitmap.width, bitmap.height) : null;
-        // Reaching here with a usable `hit` IS the authorization: the entry is durable proof the
-        // page was already translated, so painting it spends nothing. Pages with no entry keep
-        // the explicit-intent gate below (they would cost a fresh detect + LLM call).
+        const det = hit ? detFromCacheEntry(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud') : null;
+        // A usable entry IS the authorization: the cache is durable proof the page was already
+        // paid for. A miss stays a miss — a fresh detect + LLM call is not this lane's job.
         if (!det || !hit || stateFor(ref)) {
             arrivalMiss.set(el, { src, dims, at: Date.now() });
             if (isDebug()) console.log('[mt] arrival miss', JSON.stringify({ why: !hit ? 'no-entry' : !det ? 'incomplete' : 'has-state', order, src: src.slice(-24) }));

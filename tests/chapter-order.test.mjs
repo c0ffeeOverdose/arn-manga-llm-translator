@@ -11,7 +11,6 @@ const stubs = {
         export const bookKey = () => 'book'; export const loadContext = async () => {}; export const loadPipeline = async () => {};
         export const regPage = state => globalThis.fixture.paints.push(state);
         export const unregPage = () => {}; export const setOverlayChoice = () => {}; export const setOverlayOn = () => {};
-        export const markExplicitIntent = () => {}; export const explicitIntentOn = () => false;
         export const acceptChapterContext = () => {};`,
     'page-io': `export const getPages = () => globalThis.fixture.live;
         export const refKey = ref => ref.el.currentSrc || ref.el.src || ref.key;

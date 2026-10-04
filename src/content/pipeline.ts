@@ -8,7 +8,7 @@ import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
 import { inpaintMode } from '../llm/pipeline-settings';
-import { pageHashFromBitmap, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, cacheGet, cachePut, unpackMask, dropContainedBoxes, isResumable, detFromPartial, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, bytesCrops, type CachedPage } from './page-cache';
+import { pageHashFromBitmap, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, cacheGet, cachePut, dropContainedBoxes, isResumable, detFromPartial, detFromCacheEntry, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, bytesCrops, type CachedPage } from './page-cache';
 import { sweepPageOrder } from './sweep';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
@@ -16,17 +16,6 @@ import { pageIsGrayscale } from './ocr';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 
 export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cacheEpoch?: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
-
-// cached entry → render-ready det (shared by preparePage and arrival paint).
-// Null unless: full entry + fp + dims + mask (partials never render as Done).
-export function detFromCacheEntry(hit: CachedPage, w: number, h: number): DetectResult | null {
-    if (!hit || hit.partial || hit.fp !== settingsFingerprint(pipeline) || hit.w !== w || hit.h !== h || !hit.mask || !cloudSplitFresh(hit, pipeline.inferEngine === 'cloud')) return null;
-    return {
-        boxes: hit.boxes, panels: hit.panels,
-        mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
-        inferMs: 0, ep: 'cache', dropped: [], panelDropped: [],
-    };
-}
 
 // Headless detect resolve — shared by lookahead prefetch and chapter sweep (DOM jobs use
 // preparePage instead). Full hit → {det:null}; resumable partial → rebuilt det; else fresh
@@ -212,11 +201,15 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         const hit = await cacheGet(cacheKey(chapterKey(), hash));
         // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite.
         // Partial entries never render as Done — they resume below.
-        if (pipeline.cacheEnabled && hit && !hit.partial && hit.fp === fp && hit.w === bitmap.width && hit.h === bitmap.height && hit.mask) {
+        // The shared predicate IS the gate (fingerprint, dims, mask, split generation): a
+        // weaker test here let a splitGen-stale entry through and the forced non-null det
+        // crashed the renderer instead of falling through to re-detect.
+        const hitDet = pipeline.cacheEnabled
+            ? detFromCacheEntry(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud') : null;
+        if (hitDet) {
             cacheMiss = undefined;
             onStatus('Cache hit…');
-            const det = detFromCacheEntry(hit, bitmap.width, bitmap.height)!;
-            return { srcUrl, bitmap, det, hash, cacheEpoch, cached: hit, prepMs: prepMs(),
+            return { srcUrl, bitmap, det: hitDet, hash, cacheEpoch, cached: hit, prepMs: prepMs(),
                 // canvas cache hit still needs the original bytes (re-translate reads the stash)
                 origBytes: ref.kind === 'canvas' ? bytes : undefined };
         }
@@ -228,19 +221,22 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         if (pipeline.cacheEnabled) {
             const order = sweepPageOrder(srcUrl);
             const byPage = order != null ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
-            const decision = pageEntryDecision(byPage, hash, fp, bitmap.width, bitmap.height);
-            if (decision.usable && byPage?.mask) {
-                cacheMiss = undefined;
-                onStatus('Cache hit…');
-                const det = detFromCacheEntry(byPage, bitmap.width, bitmap.height)!;
-                // crops are erased pixels: keep them only when they belong to these bytes —
-                // `hit` was fetched under the live hash, so its crops are reusable even though
-                // the identity entry's own were dropped (or the model re-ran on every press).
-                const cached = decision.dropPatches
-                    ? { ...byPage, ...(bytesCrops(hit, fp, bitmap.width, bitmap.height) ?? { patches: undefined, patchesGen: undefined }) }
-                    : byPage;
-                return { srcUrl, bitmap, det, hash, cacheEpoch, cached, prepMs: prepMs(),
-                    origBytes: ref.kind === 'canvas' ? bytes : undefined };
+            if (byPage) {
+                const decision = pageEntryDecision(byPage, hash, fp, bitmap.width, bitmap.height);
+                const pageDet = decision.usable
+                    ? detFromCacheEntry(byPage, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud') : null;
+                if (pageDet) {
+                    cacheMiss = undefined;
+                    onStatus('Cache hit…');
+                    // crops are erased pixels: keep them only when they belong to these bytes —
+                    // `hit` was fetched under the live hash, so its crops are reusable even though
+                    // the identity entry's own were dropped (or the model re-ran on every press).
+                    const cached = decision.dropPatches
+                        ? { ...byPage, ...(bytesCrops(hit, fp, bitmap.width, bitmap.height) ?? { patches: undefined, patchesGen: undefined }) }
+                        : byPage;
+                    return { srcUrl, bitmap, det: pageDet, hash, cacheEpoch, cached, prepMs: prepMs(),
+                        origBytes: ref.kind === 'canvas' ? bytes : undefined };
+                }
             }
         }
         // detect checkpoint resume: the previous load finished detect but died before

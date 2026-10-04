@@ -297,6 +297,25 @@ export function detFromPartial(hit: CachedPage, w: number, h: number): DetectRes
     };
 }
 
+// cached full entry → render-ready det (shared by preparePage, arrival paint and the chapter
+// runner).
+// Null unless: full entry + fingerprint + dims + mask + split generation — the ONE gate for
+// "this entry renders as-is"; callers must not re-derive it with a weaker test (a splitGen-
+// stale entry that passed a weaker guard handed a null det to the renderer).
+export function detFromCacheEntry(
+    hit: CachedPage | undefined, fp: string, w: number, h: number, isCloud: boolean,
+): DetectResult | null {
+    if (!hit || hit.partial || hit.fp !== fp || hit.w !== w || hit.h !== h || !hit.mask || !cloudSplitFresh(hit, isCloud)) return null;
+    return {
+        boxes: hit.boxes, panels: hit.panels,
+        mask: { width: w, height: h, data: unpackMask(hit.mask, w, h) },
+        inferMs: 0, ep: 'cache', dropped: [], panelDropped: [],
+        // the entry's generation rides along: a cache-hit render re-persists the crops, and
+        // dropping this downgraded the entry to gen 0 (unusable on the next visit).
+        ...(hit.splitGen != null ? { splitGen: hit.splitGen } : null),
+    };
+}
+
 // split-pipeline fallback: the transcribe already ran when the channel died — stamp its texts
 // onto the regions so the re-sent call is a text-only translate instead of a second (billed)
 // transcription. Short lists keep the caller's own source. Pure.

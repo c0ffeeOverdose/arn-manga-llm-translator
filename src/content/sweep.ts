@@ -1,6 +1,6 @@
 // Reader-side chapter controller. Execution and rendered artifacts live in the extension host.
 import { chapterKey, pipeline, context, loadContext, loadPipeline, bookKey, shareContext, stateFor,
-    regPage, unregPage, overlayChoice, setOverlayChoice, setOverlayOn, acceptChapterContext, markExplicitIntent, type PageRef } from './state';
+    regPage, unregPage, overlayChoice, setOverlayChoice, setOverlayOn, acceptChapterContext, type PageRef } from './state';
 import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, pagedTierAlternates, galleryManifestJson,
     collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap, ownOriginalUrl, hashReaderManifest } from './page-io';
 import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMask,
@@ -380,7 +380,6 @@ function reportError(e: unknown): void {
     void logError(text, undefined, 'chapter');
 }
 export async function startSweep(): Promise<{ ok: boolean; total?: number; error?: string; starting?: boolean; cancelled?: boolean }> {
-    markExplicitIntent(); // the user asked for this chapter's translation
     if (starting) return { ok: true, starting: true };
     if (sweepActive()) return { ok: true, total: progress?.total };
     starting = true;

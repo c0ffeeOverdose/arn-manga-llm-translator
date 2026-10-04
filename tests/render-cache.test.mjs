@@ -19,6 +19,18 @@ test('a warm-generated crop set is persisted, not only a freshly computed one', 
         'the branch must write the crops it just produced');
 });
 
+test('the full-hit gate is the shared predicate, never a weaker guard with a forced det', () => {
+    // A splitGen-stale entry passed the old raw guard, detFromCacheEntry returned null, and
+    // the `!` handed that null to the renderer ("Cannot read properties of null (reading
+    // 'boxes')"). The gate must be the predicate itself; a stale entry falls through to
+    // re-detect.
+    const pipe = readFileSync(new URL('../src/content/pipeline.ts', import.meta.url), 'utf8');
+    assert.ok(!/detFromCacheEntry\([^)]*\)!/.test(pipe),
+        'a forced non-null cached det can crash the renderer on a stale entry');
+    assert.match(pipe, /detFromCacheEntry\(hit, fp, bitmap\.width, bitmap\.height, pipeline\.inferEngine === 'cloud'\)/,
+        'the bytes entry must be gated by the shared predicate');
+});
+
 test('the diagnostic distinguishes "reused from cache" from "produced in warm"', () => {
     // cached:true must mean the crops came from the stored entry — if a warm-produced set
     // also reports cached:true, a real miss looks like a hit in the dump.
