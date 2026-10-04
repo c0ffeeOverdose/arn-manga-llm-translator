@@ -678,9 +678,46 @@ export function sortReadingOrder(boxes: DetBox[], dir: 'rtl' | 'ltr', page?: { w
     return sortReadingOrderBy(boxes, b => b, dir, page, defer);
 }
 
+// Landscape content with a wide, central empty corridor reads as two side-by-side page/column groups
+// (reading-start group first) — a stitched spread and side-by-side vertical text columns otherwise
+// interleave rows. Two gates: page-like proportions (any box shape) or all-tall boxes (vertical text).
+// No split when a box crosses the corridor, so spanning headlines and wide art keep banding. Pure.
+function corridorSplit<T>(items: T[], rect: (t: T) => DetBox, dir: 'rtl' | 'ltr'): [T[], T[]] | null {
+    if (items.length < 2) return null;
+    const boxes = items.map(rect);
+    const x1 = Math.min(...boxes.map(b => b.x1)), x2 = Math.max(...boxes.map(b => b.x2));
+    const y1 = Math.min(...boxes.map(b => b.y1)), y2 = Math.max(...boxes.map(b => b.y2));
+    const w = x2 - x1, h = y2 - y1;
+    if (w <= 0 || h <= 0) return null;
+    const widths = boxes.map(b => b.x2 - b.x1).sort((a, b) => a - b);
+    const medW = widths[Math.floor(widths.length / 2)];
+    const tall = boxes.every(b => b.y2 - b.y1 >= 1.2 * (b.x2 - b.x1));
+    const pageLike = w >= 1.8 * h && w >= 3 * medW;
+    const columns = tall && w >= 2.5 * medW;
+    if (!pageLike && !columns) return null;
+    const edges = [...new Set(boxes.flatMap(b => [b.x1, b.x2]))].sort((a, b) => a - b);
+    let best: { L: T[]; R: T[] } | null = null, bestGap = 0;
+    for (let i = 0; i + 1 < edges.length; i++) {
+        const x = (edges[i] + edges[i + 1]) / 2;
+        if (x < x1 + 0.3 * w || x > x1 + 0.7 * w) continue;
+        const L = items.filter(t => rect(t).x2 <= x), R = items.filter(t => rect(t).x1 >= x);
+        if (L.length < 2 || R.length < 2 || L.length + R.length !== items.length) continue;
+        // each box must have a y-overlapping partner across the corridor: real side-by-side columns
+        // share bands; a stray box far above/below the other group is not a column and must stay in flow
+        const yOverlap = (a: T, b: T) => Math.min(rect(a).y2, rect(b).y2) > Math.max(rect(a).y1, rect(b).y1);
+        if (!L.every(a => R.some(b => yOverlap(a, b))) || !R.every(a => L.some(b => yOverlap(a, b)))) continue;
+        const gap = Math.min(x - Math.max(...L.map(t => rect(t).x2)), Math.min(...R.map(t => rect(t).x1)) - x);
+        if (gap >= Math.max(0.5 * medW, 0.02 * w) && gap > bestGap) { bestGap = gap; best = { L, R }; }
+    }
+    if (!best) return null;
+    return dir === 'rtl' ? [best.R, best.L] : [best.L, best.R]; // reading-start group first
+}
+
 // Generic core so panel rects order with the same rules as text boxes.
 export function sortReadingOrderBy<T>(items: T[], rect: (t: T) => DetBox, dir: 'rtl' | 'ltr', page?: { w: number; h: number }, defer = true): T[] {
     if (items.length < 2) return [...items];
+    const split = corridorSplit(items, rect, dir);
+    if (split) return [...sortReadingOrderBy(split[0], rect, dir, page, defer), ...sortReadingOrderBy(split[1], rect, dir, page, defer)];
     const cy = (t: T) => (rect(t).y1 + rect(t).y2) / 2;
     const hs = items.map(t => { const r = rect(t); return r.y2 - r.y1; }).sort((a, b) => a - b);
     const gap = Math.max(1, hs[Math.floor(hs.length / 2)] * 0.5);
@@ -799,18 +836,55 @@ export function panelsUsable(panels: DetBox[], pageW: number, pageH: number): bo
     return biggest >= 0.1 * area;
 }
 
+// Panels mostly inside another (>=70% area) read at their position INSIDE the parent's flow instead
+// of as a peer group after it: YOLO merges/nests rects on real pages, and the peer model then pushes
+// a nested panel's dialogue past the parent's whole group. A leaf may sink a small label cluster only
+// when every cluster box is smaller than every main box; on SFX-heavy pages dialogue bubbles are not,
+// so the sink that used to reorder speech after SFX is suppressed. Containers never sink (their own
+// boxes interleave with child panels by position). Pure — unit tested.
+const PANEL_CONTAIN_FRAC = 0.7; // of the child's area inside the candidate parent
 export function orderByPanels(boxes: DetBox[], panels: DetBox[], dir: 'rtl' | 'ltr', page?: { w: number; h: number }, defer = true): DetBox[] {
     // no page dims → can't judge usability, keep the old trust-panels behavior
     if (!panels.length || (page && !panelsUsable(panels, page.w, page.h))) return sortReadingOrder(boxes, dir, page, defer);
+    const area = (p: DetBox) => (p.x2 - p.x1) * (p.y2 - p.y1);
+    const inter = (a: DetBox, b: DetBox) => Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
+        * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+    const parent = panels.map(() => -1);
+    panels.forEach((c, ci) => {
+        let best = -1, bestArea = Infinity;
+        panels.forEach((p, pi) => {
+            if (pi === ci || inter(c, p) < PANEL_CONTAIN_FRAC * area(c)) return;
+            // a container is strictly larger (ties break to the earlier index): near-duplicate YOLO
+            // rects otherwise contain each other and vanish from the tree.
+            const pa = area(p), ca = area(c);
+            if (!(pa > ca || (pa === ca && pi < ci))) return;
+            if (pa < bestArea) { bestArea = pa; best = pi; }
+        });
+        parent[ci] = best;
+    });
+    const children: number[][] = panels.map(() => []);
+    const roots: number[] = [];
+    panels.forEach((_, i) => (parent[i] < 0 ? roots : children[parent[i]]).push(i));
     const groups: DetBox[][] = panels.map(() => []);
     for (const b of boxes) groups[nearestPanel(b, panels)].push(b);
-    return panelReadingOrder(panels, dir).filter(i => groups[i].length)
-        .flatMap(i => {
-            // whole-group deferral (labels can sit bands above the dialogue)
-            if (!page || !defer) return sortReadingOrder(groups[i], dir);
-            const { main, deferred } = splitDeferred(groups[i], page.w, page.h);
-            return [...sortReadingOrder(main, dir, page, defer), ...sortReadingOrder(deferred, dir, page, defer)];
-        });
+    type OrderItem = { rect: DetBox; box?: DetBox; child?: number };
+    const expand = (order: OrderItem[]): DetBox[] => order.flatMap(t => t.box ? [t.box] : orderNode(t.child!));
+    const orderNode = (i: number): DetBox[] => {
+        const items: OrderItem[] = groups[i].map(b => ({ rect: b, box: b }));
+        for (const c of children[i]) items.push({ rect: panels[c], child: c });
+        let sink: { main: DetBox[]; deferred: DetBox[] } | null = null;
+        if (page && defer && !children[i].length) {
+            const split = splitDeferred(groups[i], page.w, page.h);
+            if (split.deferred.length && Math.max(...split.deferred.map(area)) < Math.min(...split.main.map(area))) sink = split;
+        }
+        if (sink) {
+            const mainSet = new Set(sink.main);
+            return [...expand(sortReadingOrderBy(items.filter(t => !t.box || mainSet.has(t.box)), t => t.rect, dir, page, true)),
+                ...expand(sortReadingOrderBy(items.filter(t => t.box && !mainSet.has(t.box)), t => t.rect, dir, page, true))];
+        }
+        return expand(sortReadingOrderBy(items, t => t.rect, dir, page, false));
+    };
+    return panelReadingOrder(roots.map(i => panels[i]), dir).map(k => roots[k]).flatMap(orderNode);
 }
 
 // panel indices in reading order — shared by translation ordering + debug numbers

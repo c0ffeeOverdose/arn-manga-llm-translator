@@ -56,16 +56,65 @@ test('user screenshot replica: row-major across three panel rows', () => {
   assert.deepEqual(orderByPanels(scrambled, panels, 'rtl'), [...r1, ...r2, ...r3]);
 });
 
-test('inset panel wins over host (smallest containing)', () => {
+test('inset panel is read at its position inside the host flow', () => {
   const host = P(0, 0, 1000, 1000);
   const inset = P(400, 100, 600, 300);
   const inside = box(450, 150, 550, 250);
   const outside = box(100, 500, 200, 600);
-  // inset orders before host (banding on panel tops: 100 < 0? no — host top 0 first,
-  // but host group has [outside], inset group has [inside] → host panel first)
+  // inset is contained (>=70%) → a unit in the host's flow; the unit sits above `outside`
   const out = orderByPanels([inside, outside], [host, inset], 'rtl');
-  assert.deepEqual(out, [outside, inside]);
+  assert.deepEqual(out, [inside, outside]);
   assert.ok(out.includes(inside) && out.includes(outside));
+});
+
+test('nested panel is read at its position inside the parent flow', () => {
+  // YOLO merged a mega panel + a nested right-mid panel: top-left block first, then the nested
+  // panel's dialogue at its position, then the parent's remaining boxes
+  const mega = P(0, 0, 1000, 2000);
+  const child = P(600, 500, 950, 900);
+  const a = box(100, 50, 300, 150);    // top-left
+  const b = box(400, 50, 600, 150);    // top-center (right of a)
+  const c = box(0, 700, 200, 900);     // big left block
+  const d = box(650, 600, 900, 800);   // inside the nested panel
+  const e = box(100, 1100, 300, 1300); // bottom
+  const out = orderByPanels([e, d, c, b, a], [mega, child], 'rtl', { w: 1000, h: 2000 });
+  assert.deepEqual(out, [b, a, d, c, e]);
+});
+
+test('a label cluster sinks only when it is smaller than every main box', () => {
+  const page = { w: 1000, h: 1600 };
+  const panel = P(0, 0, 1000, 1600);
+  const A = box(100, 100, 400, 300);  // 60k main
+  const B = box(100, 500, 400, 700);  // 60k main
+  const l1 = box(600, 100, 660, 200); // 6k cluster
+  const l2 = box(600, 220, 660, 320); // 6k cluster
+  assert.deepEqual(orderByPanels([B, A, l2, l1], [panel], 'rtl', page), [A, B, l1, l2]);
+  // a main box smaller than the cluster suppresses the sink: labels stay in flow
+  const S = box(100, 900, 180, 960);  // 4.8k main, isolated
+  assert.deepEqual(orderByPanels([B, A, S, l2, l1], [panel], 'rtl', page), [l1, A, l2, B, S]);
+});
+
+test('a container never sinks its own boxes past child panels', () => {
+  const page = { w: 1000, h: 2000 };
+  const mega = P(0, 0, 1000, 2000);
+  const child = P(100, 800, 400, 1200);
+  const t1 = box(600, 50, 660, 110);
+  const t2 = box(600, 130, 660, 190);
+  const bottom = box(600, 1500, 800, 1700);
+  const d = box(150, 900, 350, 1100);
+  const out = orderByPanels([d, bottom, t2, t1], [mega, child], 'rtl', page);
+  assert.deepEqual(out, [t1, t2, d, bottom]);
+});
+
+test('near-duplicate panels keep every box (no containment cycle)', () => {
+  const page = { w: 1000, h: 1000 };
+  const p1 = P(0, 0, 600, 600);
+  const p2 = P(2, 2, 598, 598); // near-duplicate YOLO rect
+  const a = box(100, 100, 300, 300);
+  const b = box(700, 700, 900, 900); // outside both → nearest
+  const out = orderByPanels([b, a], [p1, p2], 'rtl', page);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out, [a, b]);
 });
 
 test('box outside every panel joins the nearest one', () => {

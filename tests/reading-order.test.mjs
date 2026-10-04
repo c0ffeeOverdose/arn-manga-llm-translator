@@ -80,3 +80,31 @@ test('tall spanner gets its own band, neighbors stay ordered', () => {
   const bottom = box(200, 850, 290, 950);
   assert.deepEqual(sortReadingOrder([bottom, tall, top], 'rtl'), [top, tall, bottom]);
 });
+
+test('a landscape spread reads page by page, not band by band', () => {
+  const R1 = box(1500, 100, 1800, 300);
+  const R2 = box(1500, 400, 1800, 600);
+  const L1 = box(500, 100, 800, 300);
+  const L2 = box(500, 400, 800, 600);
+  const page = { w: 2000, h: 1000 };
+  assert.deepEqual(sortReadingOrder([L1, R2, R1, L2], 'rtl', page), [R1, R2, L1, L2]);
+  assert.deepEqual(sortReadingOrder([L1, R2, R1, L2], 'ltr', page), [L1, L2, R1, R2]);
+});
+
+test('two tall vertical-text columns read column by column', () => {
+  const R1 = box(600, 50, 660, 210);
+  const R2 = box(600, 240, 660, 400);
+  const L1 = box(200, 50, 260, 210);
+  const L2 = box(200, 240, 260, 400);
+  assert.deepEqual(sortReadingOrder([L1, R2, R1, L2], 'rtl', { w: 800, h: 500 }), [R1, R2, L1, L2]);
+});
+
+test('a tall box far above the other group does not form a column', () => {
+  const top = box(1765, 240, 1869, 458);
+  const a = box(794, 207, 958, 568);
+  const b = box(890, 830, 1009, 1055);
+  const c = box(715, 879, 889, 1208);
+  const low = box(1625, 1644, 1794, 1910);
+  // `low` shares no row with the left group, so the corridor split must not fire
+  assert.deepEqual(sortReadingOrder([low, c, b, top, a], 'rtl', { w: 2030, h: 2880 }), [top, a, b, c, low]);
+});
