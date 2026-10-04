@@ -214,9 +214,12 @@ export interface GroupComp extends SplitComp { count: number; probSum: number; i
 
 // A merged mask group can chain an uncorroborated tail (SFX strokes, artwork marks) onto
 // model-corroborated text. When every uncorroborated cluster fails eligibility on its own
-// and at least one corroborated cluster passes, the corroborated clusters are the real text —
-// emit them and drop the tail. Any other mixture keeps the whole group, so a genuine second
-// text mass is never split away. Pure — unit tested.
+// and the corroborated clusters pass, the corroborated clusters are the real text — emit them
+// and drop the tail. Any other mixture keeps the whole group, so a genuine second text mass
+// is never split away. A LONE corroborated component never strands the rest of its group:
+// stripping a pair of sound effects down to one would delete a real translation (fail-safe:
+// keep the group whole unless the corroborated core is itself a text mass of ≥2 components).
+// Pure — unit tested.
 export function corroboratedCore(
     members: GroupComp[],
     corr: boolean[],
@@ -235,8 +238,11 @@ export function corroboratedCore(
     const clusters = (ss: GroupComp[]) =>
         groupMaskComponents(ss, gap).map(idx => aggregate(idx.map(i => ss[i])));
     if (clusters(uncorrMembers).some(eligible)) return null;
-    const core = clusters(corrMembers).filter(eligible);
-    return core.length ? core : null;
+    const corrIdx = groupMaskComponents(corrMembers, gap);
+    const core = corrIdx.filter(idx => eligible(aggregate(idx.map(i => corrMembers[i])))).map(idx => aggregate(idx.map(i => corrMembers[i])));
+    if (!core.length) return null;
+    if (corrIdx.reduce((n, idx) => n + idx.length, 0) < 2) return null;
+    return core;
 }
 
 export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number, boxComps: SplitComp[] = comps): T[] {
@@ -344,7 +350,7 @@ function emitSplit<T extends DetBox>(box: T, groups: SplitGroup[], axis: 'x' | '
 // a child is never re-split.
 function splitBox<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: number, boxComps: SplitComp[]): T[] | null {
     if (cs.length < 2) return null;
-    return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps) ?? splitTwinCut(box, cs, boxComps) ?? splitOverhangColumns(box, cs, boxComps);
+    return splitBoxLane1(box, cs, sameBlockGap, boxComps) ?? splitBoxLane2(box, cs, boxComps, sameBlockGap) ?? splitTwinCut(box, cs, boxComps) ?? splitOverhangColumns(box, cs, boxComps);
 }
 
 // Twin-balloon cut: a straight ink-free avenue across the box with wide multi-row text on
@@ -500,7 +506,7 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
 // a paragraph's separated last line fused while the caption-block case passes. Same-span lines
 // of one block merge through the overlap ratio. Cross spans come from the strict text core plus
 // its glyph leash, so a weak comp cannot fake the nesting. Pure — unit tested.
-function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
+function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[], strayGap: number): T[] | null {
     if (cs.length < 2) return null;
     const unit = medianMinor(cs);
     const floor = Math.max(SPLIT2_FLOOR_MIN, Math.round(SPLIT2_FLOOR_RATIO * unit));
@@ -513,7 +519,21 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
         const inBox = (c: SplitComp) =>
             (c.x1 + c.x2) / 2 >= g.x1 && (c.x1 + c.x2) / 2 <= g.x2 &&
             (c.y1 + c.y2) / 2 >= g.y1 && (c.y1 + c.y2) / 2 <= g.y2;
-        const own = boxComps.filter(inBox);
+        let own = boxComps.filter(inBox);
+        // A stray strict comp far from the group's text block (a murmur on the skin, a detached
+        // label) must not stretch the cross span and veto a real cut through overlap. The span
+        // reads the group's largest strict cluster at the same gap the mask grouping uses;
+        // in-block line spacing sits far below that gap, so a block never fragments.
+        if (own.length > 1) {
+            const clusters = groupMaskComponents(own, Math.max(floor, strayGap));
+            let best: SplitComp[] = own, bestArea = -1;
+            for (const idx of clusters) {
+                const part = idx.map(i => own[i]);
+                const area = part.reduce((n, c) => n + (c.x2 - c.x1) * (c.y2 - c.y1), 0);
+                if (area > bestArea) { bestArea = area; best = part; }
+            }
+            own = best;
+        }
         let ss: SplitComp[] = own;
         if (own.length) {
             const core = {
@@ -757,8 +777,39 @@ export function orderByPanels(boxes: DetBox[], panels: DetBox[], dir: 'rtl' | 'l
 }
 
 // panel indices in reading order — shared by translation ordering + debug numbers
+// Panel rects are approximate: side-by-side panels overlap by a sliver of x, and a tall
+// panel spans several text rows. Reading order is built for panels, not text boxes:
+// vertical-overlap clusters form rows; within a row, substantially-x-overlapping panels
+// form columns, right-to-left (rtl), then top-to-bottom. Pure — unit tested.
+export const PANEL_ROW_OVERLAP = 0.25; // × the shorter panel's height — a row member
+export const PANEL_COL_OVERLAP = 0.5;  // × the narrower panel's width — a column member
 export function panelReadingOrder(panels: DetBox[], dir: 'rtl' | 'ltr'): number[] {
-    return sortReadingOrderBy(panels.map((_, i) => i), i => panels[i], dir);
+    if (panels.length < 2) return panels.map((_, i) => i);
+    const w = (p: DetBox) => p.x2 - p.x1, h = (p: DetBox) => p.y2 - p.y1;
+    const overlap = (a1: number, a2: number, b1: number, b2: number) => Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
+    const cluster = (n: number, near: (i: number, j: number) => boolean): number[][] => {
+        const parent = Array.from({ length: n }, (_, i) => i);
+        const find = (i: number): number => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+        for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (near(i, j)) parent[find(j)] = find(i);
+        const groups = new Map<number, number[]>();
+        for (let i = 0; i < n; i++) { const k = find(i); const g = groups.get(k); if (g) g.push(i); else groups.set(k, [i]); }
+        return [...groups.values()];
+    };
+    const rows = cluster(panels.length, (i, j) => {
+        const a = panels[i], b = panels[j];
+        return overlap(a.y1, a.y2, b.y1, b.y2) >= PANEL_ROW_OVERLAP * Math.min(h(a), h(b));
+    });
+    const columnsOf = (row: number[]) => cluster(row.length, (i, j) => {
+        const a = panels[row[i]], b = panels[row[j]];
+        return overlap(a.x1, a.x2, b.x1, b.x2) >= PANEL_COL_OVERLAP * Math.min(w(a), w(b));
+    }).map(g => g.map(i => row[i]));
+    const top = (g: number[]) => Math.min(...g.map(i => panels[i].y1));
+    const right = (g: number[]) => Math.max(...g.map(i => panels[i].x2));
+    const left = (g: number[]) => Math.min(...g.map(i => panels[i].x1));
+    return rows
+        .map(g => (dir === 'rtl' ? columnsOf(g).sort((a, b) => right(b) - right(a)) : columnsOf(g).sort((a, b) => left(a) - left(b))))
+        .sort((a, b) => top(a.flat()) - top(b.flat()))
+        .flatMap(cols => cols.flatMap(col => col.sort((i, j) => panels[i].y1 - panels[j].y1)));
 }
 
 let iframe: HTMLIFrameElement | null = null;

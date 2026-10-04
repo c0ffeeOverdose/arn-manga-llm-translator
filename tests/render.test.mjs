@@ -14,6 +14,7 @@ await build({
 const {
   bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, isLight, layoutText, horizontalFits,
   widthProfile, surfaceProfile, sourceBoxForLayout, runInterval, sourcePitch, sizeCapFrom, layoutTextFit, boxIsVertical, setRenderTuning, renderTuning, ENCLOSED_MIN,
+  smoothRowPinches,
   clampRunEnd, RUN_JUMP,
   clipArea,
   dividerClips, growDarkArea, expandCropToInk,
@@ -455,6 +456,33 @@ test('widthProfile: vertical profile measures columns (transposed axes)', () => 
   assert.ok(mid && edge && mid[1] - mid[0] > edge[1] - edge[0], 'middle column taller than the edge column');
 });
 
+test('smoothRowPinches: a one-row halftone pinch is restored from its neighbours', () => {
+  const i1 = Int32Array.from([10, 10, 10, 10]);
+  const i2 = Int32Array.from([90, 90, 30, 90]);
+  smoothRowPinches(i1, i2);
+  assert.deepEqual([...i2], [90, 90, 90, 90]);
+  // a two-row pinch (a speck spans two rows) restores both
+  const j1 = Int32Array.from([10, 10, 10, 10, 10]);
+  const j2 = Int32Array.from([90, 90, 30, 30, 90]);
+  smoothRowPinches(j1, j2);
+  assert.deepEqual([...j2], [90, 90, 90, 90, 90]);
+  // a four-row pinch chain restores from the wide rows around it
+  const c1 = Int32Array.from([10, 10, 10, 10, 10, 10, 10]);
+  const c2 = Int32Array.from([90, 90, 40, 35, 45, 90, 90]);
+  smoothRowPinches(c1, c2);
+  for (let k = 2; k <= 4; k++) assert.ok(c2[k] - c1[k] >= 60, `chain row ${k} restored, got ${c2[k] - c1[k]}`);
+  // a genuine curve keeps shrinking: wide -> narrow -> narrower
+  const grad1 = Int32Array.from([10, 20, 30, 40]);
+  const grad2 = Int32Array.from([90, 80, 70, 60]);
+  smoothRowPinches(grad1, grad2);
+  assert.deepEqual([...grad1], [10, 20, 30, 40], 'a gradual curve is not a pinch');
+  // a dead row stays dead
+  const hole1 = Int32Array.from([10, 50, 10]);
+  const hole2 = Int32Array.from([90, 40, 90]);
+  smoothRowPinches(hole1, hole2);
+  assert.ok(hole2[1] < hole1[1], 'a dead row stays dead');
+});
+
 test('runInterval: min-over-band narrows to the tightest row; a hole nulls it', () => {
   const mk = (i1, i2) => ({ vertical: false, p0: 0, p1: i1.length - 1, i1: Int32Array.from(i1), i2: Int32Array.from(i2), enclosed: 1 });
   const prof = mk([10, 10, 10, 10, 10, 10, 10, 10], [90, 90, 50, 90, 90, 90, 90, 90]);
@@ -463,6 +491,21 @@ test('runInterval: min-over-band narrows to the tightest row; a hole nulls it', 
   const hole = mk([10, 10, 10], [90, 0, 90]);
   assert.equal(runInterval(hole, 0, 3), null, 'a row with no run rejects the whole band');
   assert.deepEqual(runInterval(hole, 0, 1), [10, 90], 'band without the hole is fine');
+});
+
+test('sourcePitch: intra-glyph stroke rows do not drag the glyph height down', () => {
+  const W = 200, H = 200;
+  // one glyph line striped into short stroke runs (14/13/4/4) plus a 44px dominant run —
+  // a median over every run reads 13px; the dominant-scale median must not
+  const img = page(W, H);
+  barsInto(img, W, 60, 30, [60], 14);
+  barsInto(img, W, 60, 30, [76], 13);
+  barsInto(img, W, 60, 30, [92], 4);
+  barsInto(img, W, 60, 30, [98], 4);
+  barsInto(img, W, 60, 30, [104], 44);
+  barsInto(img, W, 60, 30, [150], 5);
+  const p = sourcePitch(img, { x1: 60, y1: 55, x2: 140, y2: 156, conf: 0.9 }, false);
+  assert.ok(p && p.glyph >= 30, `glyph reflects the dominant run scale, got ${p && p.glyph}`);
 });
 
 test('sourcePitch: two glyph lines give the line pitch; noisy boxes bail', () => {

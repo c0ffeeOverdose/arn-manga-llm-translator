@@ -443,7 +443,9 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         const members = mergedMembers[gi];
         // A corroborated text cluster with an uncorroborated tail (SFX strokes) emits the
         // cluster alone; removal of a real second mass never happens (see corroboratedCore).
-        const core = corroboratedCore(members, members.map(m => compBoxConf(m) >= 0.20), GAP,
+        // Any head-box overlap is corroboration — these pages' heads barely reach 0.2 — but a
+        // lone corroborated component is never enough to strip the rest (corroboratedCore).
+        const core = corroboratedCore(members, members.map(m => compBoxConf(m) > 0), GAP,
             p => maskComponentEligible(p, pageArea, compBoxConf(p)));
         for (const piece of core ?? [c]) {
             if (maskBoxes.length >= 16) break;
@@ -507,7 +509,7 @@ async function ensurePanelSession(): Promise<boolean> {
         panelCreating = (async () => {
             // no latch on failure: bundle-absent is normal (HF mirror), and a
             // transient download failure must retry next page, not stay dead.
-            const buf = await loadModelFile('panel', 'models/panel-yolo26n.onnx', 'panel-yolo26n.onnx', 'panel model (~10MB)');
+            const { buf } = await loadModelFile('panel', 'models/panel-yolo26n.onnx', 'panel-yolo26n.onnx', 'panel model (~10MB)');
             // ponytail: wasm-only — ~40ms on CPU for this nano model, no webgpu dance.
             panelSession = await withInferLock(() => ort.InferenceSession.create(buf, { executionProviders: ['wasm'] }));
         })().finally(() => { panelCreating = null; });

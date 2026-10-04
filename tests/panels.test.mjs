@@ -10,7 +10,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/panel-detection.mjs', sourcemap: 'inline',
 });
 
-const { parsePanelOutput, orderByPanels, sortReadingOrder, splitDeferred, panelsUsable, splitTiles, mergeTileBoxes, PANEL_CONF_THR } =
+const { parsePanelOutput, orderByPanels, sortReadingOrder, splitDeferred, panelsUsable, splitTiles, mergeTileBoxes, PANEL_CONF_THR, panelReadingOrder } =
   await import(new URL('../.test-build/panel-detection.mjs', import.meta.url).href);
 
 const box = (x1, y1, x2, y2, conf = 0.9) => ({ x1, y1, x2, y2, conf });
@@ -90,6 +90,34 @@ test('live page with P5: user-expected order (dialogue before labels, THEREFORE 
   const panels = [P(1021, 1, 1698, 997), P(861, 1023, 1698, 1761), P(857, 1791, 1700, 2399), P(149, 8, 1013, 994), P(143, 1018, 848, 2391)];
   const out = orderByPanels(boxes, panels, 'rtl', { w: 1700, h: 2400 });
   assert.deepEqual(out.map(b => boxes.indexOf(b) + 1), [1, 2, 3, 4, 5, 9, 6, 7, 8, 11, 12, 14, 15, 10, 13, 16]);
+});
+
+test('panel reading order: side-by-side panels order right-to-left despite a sliver of x overlap', () => {
+  const left = P(4, 0, 1108, 492);
+  const right = P(1086, 0, 1700, 500);
+  assert.deepEqual(panelReadingOrder([left, right], 'rtl'), [1, 0]);
+  assert.deepEqual(panelReadingOrder([left, right], 'ltr'), [0, 1]);
+});
+
+test('panel reading order: a sloppy mid row keeps right before left', () => {
+  const left = P(0, 722, 971, 1462);
+  const right = P(809, 749, 1690, 1258);
+  assert.deepEqual(panelReadingOrder([left, right], 'rtl'), [1, 0]);
+});
+
+test('panel reading order: tall right panel, then the stacked left column top-to-bottom', () => {
+  const top = P(193, 0, 1700, 994);
+  const right = P(566, 1040, 1699, 2454);
+  const leftMid = P(3, 1023, 743, 1760);
+  const leftBottom = P(0, 1690, 948, 2456);
+  assert.deepEqual(panelReadingOrder([right, leftBottom, top, leftMid], 'rtl'), [2, 0, 3, 1]);
+});
+
+test('panel reading order: live sloppy panel set reads right to left, row by row', () => {
+  // panels verbatim from a page probe: top row TR/TM/TL, mid-right before mid-left, then bottom
+  const panels = [P(13, 1455, 1684, 2456), P(0, 722, 971, 1462), P(809, 749, 1690, 1258),
+    P(1, 0, 631, 696), P(584, 0, 1198, 711), P(1152, 0, 1693, 730)];
+  assert.deepEqual(panelReadingOrder(panels, 'rtl'), [5, 4, 3, 2, 1, 0]);
 });
 
 test('splitDeferred: small clustered labels sink, isolated small boxes stay', () => {

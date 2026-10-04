@@ -17,7 +17,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 31;
+export const RENDER_GEN = 33;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -704,6 +704,39 @@ export function sourceBoxForLayout(img: ImageData, box: DetBox, vertical: boolea
     return { ...box, x1, y1, x2: x2 + 1, y2: y2 + 1 };
 }
 
+// A halftone speck inside a bubble can truncate a few rows' runs while their neighbours stay
+// wide; a line band's strict min-over-rows then wraps to a single word and the block comes out
+// as a staircase. Restore pinched rows from the widest row in a small window (intersected with
+// the recovery row when it is also wide). A genuine curved edge keeps shrinking — the far side
+// never recovers — so it is untouched. Pure — unit tested.
+export const PINCH_WIDTH_RATIO = 0.75; // row narrower than this × the widest row in the window is a pinch
+export const PINCH_WINDOW = 4; // rows — a pinch never spans more than this
+export function smoothRowPinches(i1: Int32Array, i2: Int32Array): void {
+    const n = i1.length;
+    const w = (k: number) => i2[k] - i1[k];
+    for (let pass = 0; pass < 2; pass++) {
+        for (let k = 1; k < n - 1; k++) {
+            const wk = w(k);
+            if (wk <= 0) continue; // dead row: not a pinch, a real gap
+            let jW = -1, bw = -1;
+            for (let j = Math.max(0, k - PINCH_WINDOW); j <= Math.min(n - 1, k + PINCH_WINDOW); j++) {
+                if (j === k) continue;
+                const wj = w(j);
+                if (wj > bw) { bw = wj; jW = j; }
+            }
+            if (jW < 0 || wk >= PINCH_WIDTH_RATIO * bw) continue;
+            const jO = k + (jW < k ? 1 : -1); // the far side of the pinch, away from the wide row
+            if (jO < 0 || jO >= n || w(jO) < wk) continue; // a curve keeps shrinking: not a pinpoint
+            const otherWide = w(jO) >= PINCH_WIDTH_RATIO * bw;
+            const lo = otherWide ? Math.max(i1[jW], i1[jO]) : i1[jW];
+            const hi = otherWide ? Math.min(i2[jW], i2[jO]) : i2[jW];
+            if (hi - lo <= wk) continue; // nothing to gain
+            i1[k] = lo;
+            i2[k] = hi;
+        }
+    }
+}
+
 // Restrict a rectangular fallback to its measured surface without authorizing
 // any extra growth. Text-mask pixels bridge glyphs; open fields stay rectangular.
 export function surfaceProfile(img: ImageData, box: DetBox, area: Area, vertical: boolean, mask?: TextMask): RunProfile | null {
@@ -757,6 +790,7 @@ export function surfaceProfile(img: ImageData, box: DetBox, area: Area, vertical
         if (r2 <= r1) continue;
         i1[p - p0] = r1; i2[p - p0] = r2; rows++;
     }
+    smoothRowPinches(i1, i2);
     if (!rows || bounded < rows * 0.25) return null;
     const anchor = Math.round(vertical ? (box.x1 + box.x2) / 2 : (box.y1 + box.y2) / 2) - p0;
     const valid = (k: number) => k >= 0 && k < i1.length && i2[k] > i1[k];
@@ -975,10 +1009,18 @@ export function sourcePitch(img: ImageData, box: DetBox, vertical: boolean): Sou
     }
     if (runFirst >= 0) bands.push([runFirst, runLast]);
     if (!bands.length || bands.length > 8) return null;
+    // glyph = median of the runs at the dominant scale: stroke rows of one glyph are much
+    // shorter than its line run and must not drag the median down (a Korean line measured
+    // 13px while its glyphs were ~43px). A dominant run spanning >half the box is several
+    // merged lines, not one glyph — keep the plain median for that shape.
     const heights = bands.map(([a, b]) => b - a + 1).sort((a, b) => a - b);
+    const span = bands[bands.length - 1][1] - bands[0][0] + 1;
+    const dominant = heights[heights.length - 1] < span * 0.5
+        ? heights.filter(h => h >= heights[heights.length - 1] / 3) : [];
+    const glyph = dominant.length ? dominant[dominant.length >> 1] : heights[heights.length >> 1];
     return {
         pitch: (bands[bands.length - 1][1] - bands[0][0] + 1) / bands.length,
-        glyph: heights[heights.length >> 1], // median band height
+        glyph,
     };
 }
 

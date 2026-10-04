@@ -81,6 +81,17 @@ test('corroboratedCore drops an uncorroborated SFX tail, keeps its text cluster'
   // homogeneous groups are untouched
   assert.equal(corroboratedCore(SPEECH_SFX, SPEECH_SFX.map(() => true), GAP, meanEligible), null);
   assert.equal(corroboratedCore(SPEECH_SFX, SPEECH_SFX.map(() => false), GAP, meanEligible), null);
+  // a LONE corroborated component never strands the rest of its group (two sound
+  // effects merged into one group must not lose one translation to a speck)
+  const lone = [
+    gc(100, 100, 140, 140, 1600, 1360, 0),   // corroborated single blob
+    gc(100, 180, 130, 210, 900, 450, 1),     // uncorroborated pair below (mean 0.5)
+    gc(140, 180, 170, 210, 900, 450, 2),
+  ];
+  assert.equal(corroboratedCore(lone, [true, false, false], GAP, meanEligible), null);
+  const pair = [lone[0], gc(150, 100, 190, 140, 1600, 1360, 3), lone[1], lone[2]];
+  assert.deepEqual(corroboratedCore(pair, [true, true, false, false], GAP, meanEligible),
+    [{ x1: 100, y1: 100, x2: 190, y2: 140, count: 3200, probSum: 2720, ids: [0, 3] }]);
 });
 test('short lateral lobe separates from a non-nested multi-line block', () => {
   const parent = box(0, 0, 250, 200);
@@ -294,6 +305,27 @@ test('lane 2: a same-span caption block stays whole', () => {
     [1181, 1598, 1308, 1622], [1149, 1624, 1333, 1648]];
   const parent = box(1149, 1439, 1334, 1653, 0.9);
   assert.deepEqual(splitMergedBoxes([parent], midComps.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 })), GAP), [parent]);
+});
+
+// Live double-lobe balloon (worker comps verbatim): a murmur on the skin below
+// the right lobe used to inflate that group's cross span and veto the x cut
+// through overlap — two balloon lobes shipped as one crop and one translation.
+// The span now reads the group's largest strict cluster, so the lobe boundary
+// cuts even though the murmur keeps the union bbox tall.
+const LOBE_COMPS = [[1940, 2363, 1986, 2408], [1887, 2364, 1929, 2408], [1945, 2409, 1986, 2451],
+  [1892, 2410, 1918, 2450], [1914, 2413, 1932, 2445], [1887, 2453, 1929, 2498],
+  [1827, 2486, 1863, 2706], [1794, 2489, 1806, 2524], [1783, 2528, 1819, 2597],
+  [1951, 2607, 1996, 2667], [1945, 2675, 1960, 2698]];
+
+test('lane 2: a stray murmur does not veto the lobe cut (live double balloon)', () => {
+  const parent = box(1785, 2364, 1990, 2702, 0.96);
+  const comps = LOBE_COMPS.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
+  const parts = splitMergedBoxes([parent], comps, GAP, comps);
+  assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
+    [1785, 2486, 1875, 2702],
+    [1875, 2364, 1990, 2698],
+  ]);
+  assert.ok(parts.every(p => p.cutAxis === 'x'));
 });
 
 test('lane 2: nested single line under its block stays fused', () => {
