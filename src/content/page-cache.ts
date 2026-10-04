@@ -984,6 +984,25 @@ export function seamInkLinked(upper: SeamMask, lower: SeamMask): boolean {
     return ov >= 60 && ov >= narrow * 0.3;
 }
 
+// Owner-side seam suspicion, evaluated BEFORE any neighbor prep is pulled: every pull costs
+// a full page read + detect (a billed cloud roundtrip). Real cut evidence is text-mask ink
+// inside the 16px edge band — seamTruncated's ≥8-row run implies ≥3 such rows, and
+// seamInkLinked needs them on this side too. A box merely NEAR an edge is common on normal
+// pages and alone is not worth a pull; the fail-safe direction is the split. Pure — unit-tested.
+export function seamEdgeSuspect(mask: SeamMask | null | undefined, H: number): boolean {
+    if (!mask || mask.height !== H || mask.data.byteLength < mask.width * H) return false;
+    const d = new Uint8Array(mask.data);
+    const W = mask.width;
+    const rowsWithInk = (y0: number, y1: number): number => {
+        let rows = 0;
+        for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+            for (let x = 0; x < W; x++) if (d[y * W + x] > 127) { rows++; break; }
+        }
+        return rows;
+    };
+    return rowsWithInk(H - 16, H) >= 3 || rowsWithInk(0, 16) >= 3; // seamInkLinked's BAND
+}
+
 // Containment of two boxes (intersection over the SMALLER area): catches a near-threshold
 // fragment inside a real box that IoU lets through. Pure.
 export function boxContained(a: SeamBox, b: SeamBox): number {
@@ -1163,6 +1182,24 @@ function req<T>(q: IDBRequest<T>): Promise<T> {
 
 let purgedGeneration: string | undefined;
 let purgeWork: Promise<void> = Promise.resolve();
+// Persisted per origin: the generation sweep walks every stored row (megabytes on a
+// phone — seconds), and reloads used to pay it again every document. Stale rows cannot
+// be served regardless (reads filter by cacheEpoch); the sweep only reclaims space.
+function purgeMarkerKey(): string { return `mtPurged:${location.origin}`; }
+async function purgeStaleRows(d: IDBDatabase, token: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+        const tx = d.transaction('pages', 'readwrite');
+        const cursor = tx.objectStore('pages').openCursor();
+        cursor.onsuccess = () => {
+            const row = cursor.result;
+            if (!row) return;
+            if ((row.value.cacheEpoch ?? '') !== token) row.delete();
+            row.continue();
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = tx.onabort = () => reject(tx.error ?? new Error('Could not invalidate translation cache'));
+    });
+}
 async function freshDb(): Promise<IDBDatabase | null> {
     await cacheReady();
     const d = await db();
@@ -1170,18 +1207,12 @@ async function freshDb(): Promise<IDBDatabase | null> {
     const token = cacheGeneration();
     purgeWork = purgeWork.catch(() => {}).then(async () => {
         if (purgedGeneration === token) return;
-        await new Promise<void>((resolve, reject) => {
-            const tx = d.transaction('pages', 'readwrite');
-            const cursor = tx.objectStore('pages').openCursor();
-            cursor.onsuccess = () => {
-                const row = cursor.result;
-                if (!row) return;
-                if ((row.value.cacheEpoch ?? '') !== token) row.delete();
-                row.continue();
-            };
-            tx.oncomplete = () => resolve();
-            tx.onerror = tx.onabort = () => reject(tx.error ?? new Error('Could not invalidate translation cache'));
-        });
+        const key = purgeMarkerKey();
+        let swept: unknown;
+        try { swept = (await chrome.storage.local.get(key))[key]; } catch { /* walk below */ }
+        if (swept === token) { purgedGeneration = token; return; }
+        await purgeStaleRows(d, token);
+        try { await chrome.storage.local.set({ [key]: token }); } catch { /* sweep repeats next document */ }
         purgedGeneration = token;
     });
     await purgeWork;

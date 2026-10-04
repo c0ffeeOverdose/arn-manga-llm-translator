@@ -4,6 +4,8 @@
 import { unpackMask } from './page-cache';
 import { isDebug } from '../debug';
 import { fetchWorkerToken } from './worker-token';
+import { canvasJpegB64 } from './encode';
+import type { PageTimer } from '../page-timing';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -30,7 +32,7 @@ export interface DetectResult {
     cloudTexts?: string[]; // cloud path: OCR texts aligned 1:1 with boxes (raw — caller trims)
     // cloud path: server-side breakdown — detect/ocr are server inference, total is the
     // server wall clock; enc/net are client-side (JPEG encode, roundtrip minus server total)
-    cloudMs?: { detect: number; ocr: number; enc?: number; net?: number; total?: number };
+    cloudMs?: { detect: number; ocr: number; inpaint?: number; enc?: number; net?: number; total?: number };
     // cloud path: cleanup patches computed server-side in the same /v1/page call (inpaint=1) —
     // one patch per box (full-res coords), filtered to the erase plan at render
     cloudPatches?: InpaintPatch[];
@@ -1097,13 +1099,21 @@ export async function inpaintPage(
 // the SW (content-script fetch is CORS-gated on the page origin).
 export async function cloudInpaint(
     bitmap: ImageBitmap, boxes: { x1: number; y1: number; x2: number; y2: number }[],
-    opts: { quality: number; gray: boolean; endpoint: string; key: string; mask: { width: number; height: number; data: Uint8Array } },
+    opts: { quality: number; gray: boolean; endpoint: string; key: string; mask: { width: number; height: number; data: Uint8Array }; timing?: PageTimer },
 ): Promise<{ patches: InpaintPatch[]; windows: number; ms: number }> {
-    const jpegB64 = await bitmapToJpegB64(bitmap, opts.quality, opts.gray);
-    const maskB64 = await maskToPngB64(opts.mask);
-    const resp = await chrome.runtime.sendMessage({
-        type: 'mt:cloud-inpaint', endpoint: opts.endpoint, key: opts.key, jpegB64, boxes, maskB64,
-    }) as { ok: boolean; page?: any; error?: string };
+    const tEnc = performance.now();
+    let jpegB64: string, maskB64: string;
+    try {
+        jpegB64 = await bitmapToJpegB64(bitmap, opts.quality, opts.gray);
+        maskB64 = await maskToPngB64(opts.mask);
+    } finally { opts.timing?.add('cleanupEncode', performance.now() - tEnc); }
+    const tRequest = performance.now();
+    let resp: { ok: boolean; page?: any; error?: string };
+    try {
+        resp = await chrome.runtime.sendMessage({
+            type: 'mt:cloud-inpaint', endpoint: opts.endpoint, key: opts.key, jpegB64, boxes, maskB64,
+        });
+    } finally { opts.timing?.add('cleanupRequest', performance.now() - tRequest); }
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud inpaint failed');
     const j = resp.page;
     if (!j?.ok) throw new Error(String(j?.error ?? 'cloud inpaint failed'));
@@ -1118,32 +1128,28 @@ export async function cloudInpaint(
 // boxes (inpaint + cache work; mask-only SFX recovery is local-only).
 
 // Binary erase mask -> base64 PNG for the cloud call (PNG squeezes 1 byte/px to tens of KB,
-// where raw base64 would be ~2.4MB). FileReader, not blob.arrayBuffer() — Firefox Xray trap.
+// where raw base64 would be ~2.4MB). Sync toDataURL — the blob path stalls on Android.
 async function maskToPngB64(mask: { width: number; height: number; data: Uint8Array }): Promise<string> {
     return withEncodeLock(async () => {
-        const c = new OffscreenCanvas(mask.width, mask.height);
-        const ctx = c.getContext('2d')!;
+        const c = document.createElement('canvas');
+        c.width = mask.width;
+        c.height = mask.height;
+        const ctx = c.getContext('2d', { willReadFrequently: true })!;
         const img = ctx.createImageData(mask.width, mask.height);
         for (let i = 0, p = 0; i < mask.data.length; i++, p += 4) {
             const v = mask.data[i] > 127 ? 255 : 0;
             img.data[p] = v; img.data[p + 1] = v; img.data[p + 2] = v; img.data[p + 3] = 255;
         }
         ctx.putImageData(img, 0, 0);
-        const blob = await c.convertToBlob({ type: 'image/png' });
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-            const fr = new FileReader();
-            fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
-            fr.onload = () => resolve(fr.result as string);
-            fr.readAsDataURL(blob);
-        });
+        const dataUrl = c.toDataURL('image/png');
         const comma = dataUrl.indexOf(',');
         return comma < 0 ? '' : dataUrl.slice(comma + 1);
     });
 }
 
-// JPEG encode + data-URL read, shared by both cloud upload encoders. FileReader, not
-// blob.arrayBuffer() — Firefox Xray trap on canvas blobs. Returns the payload after the comma.
-async function jpegDataUrl(c: OffscreenCanvas, quality: number, gray: boolean): Promise<string> {
+// JPEG payload after the comma, shared by both cloud upload encoders. Sync
+// toDataURL (see encode.ts) — the async blob path stalls on Android.
+function jpegDataUrl(c: HTMLCanvasElement, quality: number, gray: boolean): string {
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
     if (gray) {
         const img = ctx.getImageData(0, 0, c.width, c.height);
@@ -1154,20 +1160,14 @@ async function jpegDataUrl(c: OffscreenCanvas, quality: number, gray: boolean): 
         }
         ctx.putImageData(img, 0, 0);
     }
-    const blob = await c.convertToBlob({ type: 'image/jpeg', quality });
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-        const fr = new FileReader();
-        fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
-        fr.onload = () => resolve(fr.result as string);
-        fr.readAsDataURL(blob);
-    });
-    const comma = dataUrl.indexOf(',');
-    return comma < 0 ? '' : dataUrl.slice(comma + 1);
+    return canvasJpegB64(c, quality);
 }
 
 export async function bitmapToJpegB64(bitmap: ImageBitmap, quality: number, gray: boolean): Promise<string> {
     return withEncodeLock(async () => {
-        const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const c = document.createElement('canvas');
+        c.width = bitmap.width;
+        c.height = bitmap.height;
         c.getContext('2d', { willReadFrequently: true })!.drawImage(bitmap, 0, 0);
         return jpegDataUrl(c, quality, gray);
     });
@@ -1184,17 +1184,21 @@ export async function bitmapToJpegB64Capped(
     return withEncodeLock(async () => {
         const long = Math.max(bitmap.width, bitmap.height);
         if (maxSide <= 0 || long <= maxSide) {
-            const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+            const c = document.createElement('canvas');
+            c.width = bitmap.width;
+            c.height = bitmap.height;
             c.getContext('2d', { willReadFrequently: true })!.drawImage(bitmap, 0, 0);
-            return { b64: await jpegDataUrl(c, quality, gray), scale: 1 };
+            return { b64: jpegDataUrl(c, quality, gray), scale: 1 };
         }
         const scale = long / maxSide;
         const w = Math.round(bitmap.width / scale), h = Math.round(bitmap.height / scale);
-        const c = new OffscreenCanvas(w, h);
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
         const ctx = c.getContext('2d', { willReadFrequently: true })!;
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(bitmap, 0, 0, w, h);
-        return { b64: await jpegDataUrl(c, quality, gray), scale };
+        return { b64: jpegDataUrl(c, quality, gray), scale };
     });
 }
 
@@ -1221,7 +1225,7 @@ export async function cloudWarm(endpoint: string, key: string): Promise<number> 
 export async function cloudDetect(
     bitmap: ImageBitmap,
     endpoint: string, key: string,
-    opts: { confThr: number; minSize: number; quality: number; gray: boolean; inpaint?: boolean },
+    opts: { confThr: number; minSize: number; quality: number; gray: boolean; inpaint?: boolean; texts?: boolean; timing?: PageTimer },
 ): Promise<DetectResult> {
     // capped upload (mobile uplink): CTD/Baberu inputs are resize-invariant, so anything above
     // CLOUD_MAX_SIDE is pure wire cost — response coords come back in sent space and are mapped
@@ -1229,17 +1233,24 @@ export async function cloudDetect(
     const tEnc = performance.now();
     const { b64: jpegB64, scale } = await bitmapToJpegB64Capped(bitmap, opts.quality, opts.gray, CLOUD_MAX_SIDE);
     const encMs = Math.round(performance.now() - tEnc);
+    opts.timing?.add('cloudEncode', encMs);
     // via the SW: content-script fetch is CORS-gated on the page origin. The channel
     // JSON-serializes, so the JPEG rides as base64 (an ArrayBuffer arrives as {}).
     const tUp = performance.now();
-    const resp = await chrome.runtime.sendMessage({
-        type: 'mt:cloud-page', endpoint, key,
-        confThr: opts.confThr, minSize: opts.minSize, jpegB64,
-        inpaint: opts.inpaint === true,
-    }) as { ok: boolean; page?: any; error?: string };
+    let resp: { ok: boolean; page?: any; error?: string };
+    try {
+        resp = await chrome.runtime.sendMessage({
+            type: 'mt:cloud-page', endpoint, key,
+            confThr: opts.confThr, minSize: opts.minSize, jpegB64,
+            inpaint: opts.inpaint === true,
+            // page/crops modes read the image at the LLM — tell the server to skip its OCR pass
+            texts: opts.texts !== false,
+        });
+    } finally { opts.timing?.add('cloudRequest', performance.now() - tUp); }
     const upMs = Math.round(performance.now() - tUp);
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud failed');
     {
+        const tDecode = performance.now();
         const j = resp.page;
         if (!j?.ok) throw new Error(String(j?.error ?? 'cloud failed'));
         // response coords are in SENT-image space (capped upload) — scale everything back to
@@ -1284,6 +1295,10 @@ export async function cloudDetect(
             x2: Math.round(+p.x2 * scale), y2: Math.round(+p.y2 * scale),
             png: b64buf(String(p.png ?? '')),
         }));
+        opts.timing?.add('cloudDecode', performance.now() - tDecode);
+        if (opts.timing) opts.timing.meta.cloud = {
+            detect: j.ms?.detect, ocr: j.ms?.ocr, inpaint: j.ms?.inpaint, total: j.ms?.total, body: j.ms?.body,
+        };
         return {
             boxes,
             mask: { width: w, height: h, data: maskData },
@@ -1293,6 +1308,7 @@ export async function cloudDetect(
             cloudTexts: (j.texts ?? []).map((t: unknown) => String(t ?? '').replace(/\s+/g, ' ').trim()),
             cloudMs: {
                 detect: Math.round(j.ms?.detect ?? 0), ocr: Math.round(j.ms?.ocr ?? 0),
+                ...(typeof j.ms?.inpaint === 'number' ? { inpaint: Math.round(j.ms.inpaint) } : null),
                 enc: encMs, net: Math.max(0, upMs - serverTotal), total: serverTotal,
             },
             cloudPatches: cloudPatches.length ? cloudPatches : undefined,

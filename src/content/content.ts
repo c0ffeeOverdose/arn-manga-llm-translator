@@ -9,6 +9,7 @@ import { installMessageListener } from './commands';
 import { initAuto } from './auto';
 import { initSweep } from './sweep';
 import { onThemeChanged } from './chars-ui';
+import { ensureFont } from './render';
 import { cacheReady } from '../cache-generation';
 
 declare const __BUILD_ID__: string; // injected by build.mjs — which build is this?
@@ -34,6 +35,8 @@ async function main() {
     await loadTheme();
     await loadDebug();
     await loadPipeline();
+    // first-page cost: load the bundled font during boot instead of inside the first render
+    void ensureFont().catch(() => { /* first render retries (fontReady resets on failure) */ });
     await ensureDetector().catch(e => console.error('[mt] detector init failed:', e));
     const t = setInterval(() => {
         if (document.body && !ui) {

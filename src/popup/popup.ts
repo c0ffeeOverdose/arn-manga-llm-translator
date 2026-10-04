@@ -2,6 +2,7 @@
 import { loadPipelineSettings, isAutoSite, autoSiteOf, autoSiteList, autoSiteAdd, autoSiteRemove } from '../llm/pipeline-settings';
 import { sweepCountMessage, type SweepCountReason } from '../chapter/model';
 import { sessGet } from '../storage-session';
+import { TIMING_LABELS, formatPageTiming, timingSeconds, type PageTimingReport, type TimingName } from '../page-timing';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const btn = $<HTMLButtonElement>('translate');
@@ -23,6 +24,46 @@ const statusSection = $<HTMLDetailsElement>('statusSection');
 const stateDot = $<HTMLElement>('stateDot');
 const errBanner = $<HTMLElement>('errBanner');
 const usageWrap = $<HTMLDetailsElement>('usageWrap');
+const timingWrap = $<HTMLDetailsElement>('timingWrap');
+const timingCopy = $<HTMLButtonElement>('timingCopy');
+const timingText = $<HTMLTextAreaElement>('timingText');
+let timingReport: PageTimingReport | null = null;
+
+function renderTiming(report: PageTimingReport | null): void {
+    timingReport = report;
+    timingWrap.style.display = report ? '' : 'none';
+    if (!report) return;
+    const { meta } = report;
+    const lines = [
+        `${report.state === 'running' ? 'In progress' : report.state === 'failed' ? 'Stopped' : 'Finished'} · ${timingSeconds(report.elapsedMs)}`,
+        `${meta.page ?? '?'} · ${meta.boxes ?? '?'} text regions · ${meta.cached ? 'saved page' : meta.textSource ?? '?'}`,
+        `Build ${report.build}`,
+    ];
+    for (const [key, label] of Object.entries(TIMING_LABELS)) {
+        const ms = report.ms[key as TimingName];
+        if (ms != null) lines.push(`${label}: ${timingSeconds(ms)}`);
+    }
+    if (meta.apiMs != null) lines.push(`API calls: ${meta.calls ?? '?'} · ${timingSeconds(meta.apiMs)}`);
+    if (meta.cloud?.total != null) lines.push(`Cloud server: ${timingSeconds(meta.cloud.total)}`);
+    lines.push('Some timings overlap; they do not add up to the total.');
+    $('timingBody').textContent = lines.join('\n');
+}
+
+timingCopy.onclick = async () => {
+    if (!timingReport) return;
+    const text = formatPageTiming(timingReport);
+    try {
+        await navigator.clipboard.writeText(text);
+        $('timingNote').textContent = 'Copied — paste the report with your test results.';
+        timingText.hidden = true;
+    } catch {
+        timingText.value = text;
+        timingText.hidden = false;
+        timingText.focus();
+        timingText.select();
+        $('timingNote').textContent = 'Automatic copy is unavailable. Long-press the selected report to copy it.';
+    }
+};
 
 async function activeTab(): Promise<number | null> {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -81,6 +122,7 @@ let sweepRunning = false; // mirrored from mt:status each poll — the button to
 async function refreshStatus(): Promise<void> {
     const resp = await send({ type: 'mt:status' });
     if (resp?.ok) {
+        renderTiming(resp.pageTiming ?? null);
         const counts = resp.translated && resp.loaded ? ` · ${resp.translated}/${resp.loaded} pages` : '';
         const raw = resp.status || (resp.translated ? `${resp.translated} page(s) translated` : '');
         // A finished page can fail to reach the reader; without this the button just looked
@@ -135,7 +177,15 @@ async function refreshStatus(): Promise<void> {
         charsBtn.textContent = resp.charsOpen ? 'Hide characters' : 'Characters';
         lastChars = resp.charsOpen;
         // Chapter execution continues independently of reader navigation.
-        const sw = resp.sweep as { active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean; done: number; total: number; errors: number } | null;
+        const sw = resp.sweep as { active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean; done: number; total: number; errors: number; diagnostics?: string } | null;
+        const sweepInfo = $<HTMLElement>('sweepDetails');
+        if (sw && (sw.diagnostics || sw.errors > 0)) {
+            sweepInfo.style.display = '';
+            sweepInfo.textContent = `${sw.errors > 0 ? `${sw.errors} failed — ` : ''}${sw.diagnostics ?? ''}`.trim();
+        } else {
+            sweepInfo.style.display = 'none';
+            sweepInfo.textContent = '';
+        }
         sweepRunning = !!sw?.active;
         if (sw?.stopping) {
             sweepBtn.textContent = `Stopping… (${sw.done}/${sw.total})`;
@@ -174,6 +224,7 @@ async function refreshStatus(): Promise<void> {
         const cc = await send({ type: 'mt:cache-count' });
         cacheLabel.textContent = cc?.ok ? `Cached pages (${cc.mine ?? cc.count} here · ${cc.count} total)` : 'Cached pages';
     } else {
+        renderTiming(null);
         statusEl.textContent = 'Open a manga page to translate.';
         btn.disabled = redoBtn.disabled = true;
     }

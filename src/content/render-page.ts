@@ -6,6 +6,7 @@ import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type 
 import { isDebug } from '../debug';
 import { cacheKey, pageKey, PAGE_KEY_GEN, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN } from './page-cache';
 import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus, type DetectResult } from './detection';
+import { canvasPngBlob } from './encode';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
 import { stateFor } from './state';
 import { paintRegions, paintExtras, type Prep, type PaintPatch } from './pipeline';
@@ -20,6 +21,7 @@ import { starveNotice } from './status-ui';
 import { saveContext } from './state';
 import { identifyBitmap } from '../image-identity';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
+import { PageTimer } from '../page-timing';
 
 // Dump-only twin of the paint's area resolution (see the `areas` entry below).
 function dumpAreas(
@@ -61,6 +63,9 @@ function dumpAreas(
 // harmless). The book snapshot is skipped too (context is mid-chapter at paint time).
 export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean,
     opts: { paintOnly?: boolean; detached?: boolean } = {}): Promise<PageState> {
+    const timing = prep.timing ?? new PageTimer();
+    const notify = onStatus;
+    onStatus = (s, stage) => { timing.setStage(s); notify(s, stage); };
     const cacheEpoch = prep.cacheEpoch ?? await cacheReady();
     assertCacheCurrent(cacheEpoch);
     const paintOnly = opts.paintOnly === true;
@@ -109,6 +114,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled,
                 fresh: force,
                 cacheEpoch,
+                timing,
                 onStarve: starveNotice,
                 // AI cleanup warm: starts the moment OCR ends (the infer lock
                 // is about to go idle) and runs through the LLM's network
@@ -126,14 +132,18 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         bookAdd(prep.hash); // folded above (translateRegions) — arrivals skip refold
     }
 
+    const tBase = performance.now();
     const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     ctx.drawImage(bitmap, 0, 0);
+    timing.add('renderBase', performance.now() - tBase);
 
     // AI text cleanup: patches from the cache when valid, otherwise generated
     // once from the original bitmap. Any failure falls back to the built-in
     // fill — a page must never fail here.
     const aiMode = inpaintMode(pipeline);
+    const tCleanup = performance.now();
+    timing.meta.cleanupSource = 'fill';
     let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
     let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiPre = false, aiError: string | undefined;
     let aiMaskMs = 0, aiLockWaitMs = 0, aiEncodeMs = 0;
@@ -141,7 +151,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     if (aiMode !== 'fill') {
         const cached = prep.cached?.patches?.length && prep.cached.patchesGen === INPAINT_PATCH_GEN
             ? prep.cached.patches : null;
-        if (cached) aiPatches = cached;
+        if (cached) { aiPatches = cached; timing.meta.cleanupSource = 'cache'; }
         else {
             const plan = erasePlan(det, outputs);
             if (plan.boxesToErase.length) {
@@ -163,6 +173,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                     try {
                         if (!r) r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes);
                         if (r) {
+                            timing.meta.cleanupSource = aiWarmUsed ? 'local-warm' : 'local';
                             aiPatches = r.patches; aiGenerated = true;
                             aiMs = r.ms; aiWindows = r.windows; aiMaskMs = r.maskMs;
                             aiLockWaitMs = r.lockWaitMs; aiEncodeMs = r.encodeMs;
@@ -182,21 +193,27 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                         const pre = det.cloudPatches.filter(p => idx.has(p.i ?? -1));
                         // full coverage only — paintRegions skips the fill when ANY
                         // patches exist, so a partial set would strand boxes.
-                        if (pre.length && pre.length === plan.boxesToErase.length) { aiPatches = pre; aiWindows = pre.length; aiPre = true; }
+                        if (pre.length && pre.length === plan.boxesToErase.length) {
+                            aiPatches = pre; aiWindows = pre.length; aiPre = true;
+                            timing.meta.cleanupSource = 'cloud-detect';
+                        }
                     }
                     if (!aiPatches) {
                         // the same client-side mask rides along, so local and cloud
                         // erase the same pixels.
-                        const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes);
+                        const { boxes, mask, maskMs } = timing.measure('cleanupMask', () => eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes));
                         aiMaskMs = maskMs;
                         const cfg = await cloudConfig();
                         if (cfg.endpoint && cfg.key) {
                             try {
                                 const r = await cloudInpaint(
                                     bitmap, boxes,
-                                    { quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw, endpoint: cfg.endpoint, key: cfg.key, mask },
+                                    { quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw, endpoint: cfg.endpoint, key: cfg.key, mask, timing },
                                 );
-                                if (r.patches.length) { aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows; }
+                                if (r.patches.length) {
+                                    aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows;
+                                    timing.meta.cleanupSource = 'cloud-request';
+                                }
                             } catch (e) {
                                 aiError = String((e as Error)?.message ?? e).slice(0, 120);
                                 if (isDebug()) console.log('[mt] cloud AI cleanup unavailable — using built-in fill:', aiError);
@@ -209,25 +226,42 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             }
         }
     }
-    let paintPatches: PaintPatch[] | null = null;
+    timing.add('cleanup', performance.now() - tCleanup);
+    let paintPatches: (PaintPatch & { url: string })[] | null = null;
     if (aiPatches?.length) {
-        paintPatches = await Promise.all(aiPatches.map(async p =>
-            ({ x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2, bmp: await createImageBitmap(new Blob([p.png], { type: 'image/png' })) })));
+        // img.decode() rides the standard image pipeline; createImageBitmap(Blob) stalls
+        // ~0.1-0.3s per patch on some Android builds (see LESSONS.md). Fallback keeps the
+        // old path for engines/CSP where a blob: image cannot load.
+        paintPatches = await timing.measureAsync('patchDecode', () => Promise.all(aiPatches!.map(async p => {
+            const url = URL.createObjectURL(new Blob([p.png], { type: 'image/png' }));
+            const box = { x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2 };
+            // img.decode() rides the standard image pipeline; createImageBitmap(Blob) stalls
+            // ~0.1-0.3s per patch on some Android builds (see LESSONS.md). The decode is
+            // raced: a decode that never settles must not hold a page (no other timeout
+            // covers this await in the offscreen chapter runner).
+            const decoded = await Promise.race([
+                (async () => { const img = new Image(); img.src = url; await img.decode(); return img; })().catch(() => null),
+                new Promise<null>(r => setTimeout(() => r(null), 2000)),
+            ]);
+            if (decoded) return { ...box, bmp: decoded as CanvasImageSource, url };
+            const bmp = await createImageBitmap(new Blob([p.png], { type: 'image/png' }));
+            return { ...box, bmp, url };
+        })));
     }
 
-    await ensureFont();
-    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    await timing.measureAsync('font', () => ensureFont());
+    const frame = timing.measure('renderRead', () => ctx.getImageData(0, 0, canvas.width, canvas.height));
 
     onStatus('Rendering…', 'render');
     const tRender0 = performance.now();
-    const layouts = paintRegions(canvas, frame, det, outputs, paintPatches);
-    for (const p of paintPatches ?? []) p.bmp.close();
+    const layouts = timing.measure('paint', () => paintRegions(canvas, frame, det, outputs, paintPatches));
+    for (const p of paintPatches ?? []) URL.revokeObjectURL(p.url);
 
-    paintExtras(canvas, frame, det, extras);
+    timing.measure('paint', () => paintExtras(canvas, frame, det, extras));
     const renderMs = Math.round(performance.now() - tRender0); // paint only (excludes PNG encode + overlays)
 
     // single debug dump: everything needed to diagnose a bad page render
-    if (isDebug()) console.log('[mt] page result', JSON.stringify({
+    if (isDebug()) timing.measure('debug', () => console.log('[mt] page result', JSON.stringify({
         page: `${bitmap.width}x${bitmap.height}`,
         ann: `${annWCache}x${annHCache}`,
         ...(badgeR != null ? { badgeR } : null), // drawn region-badge radius (ann px): a mis-mapping report shows the mark size without decoding the JPEG
@@ -274,10 +308,14 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         outputs: outputs.map(o => ({ i: o.index, t: o.translation, s: o.source || null, spk: o.spk ? { d: o.spk.desc || o.spk.id || '', g: o.spk.gender, n: o.spk.name ?? null } : null })),
         extras,
         ...(bookOps?.length ? { bookOps } : null),
-    }));
+    })));
     if (rawLLM == null) console.warn('[mt] llm raw unavailable — stale service worker? reload the extension');
     assertCacheCurrent(cacheEpoch);
-    const blob = await withEncodeLock(() => canvas.convertToBlob({ type: 'image/png' }));
+    const tPngQueue = performance.now();
+    const blob = await withEncodeLock(() => {
+        timing.add('pngWait', performance.now() - tPngQueue);
+        return timing.measureAsync('png', () => canvasPngBlob(canvas));
+    });
     assertCacheCurrent(cacheEpoch);
     const state: PageState = {
         cacheEpoch,
@@ -289,7 +327,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         bookBefore,
         pairsBefore,
         hash: prep.hash,
-        image: identifyBitmap(bitmap, det.boxes),
+        image: timing.measure('identity', () => identifyBitmap(bitmap, det.boxes)),
         // canvas pages have no URL to re-read — carry the original bytes forward
         // (and a decoded translated bitmap for write-back) with the state
         origBytes: prep.origBytes ?? existing?.origBytes,
@@ -300,7 +338,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // blob-origin readers: keep an extension-owned copy now — once we swap in
     // the translated blob the reader's URL may be dead (see ownOriginalUrl).
     if (ownCopyNeeded(srcUrl, bitmap.width, bitmap.height)) {
-        state.origOwn = await ownOriginalUrl(bitmap);
+        state.origOwn = await timing.measureAsync('originalCopy', () => ownOriginalUrl(bitmap));
         if (isDebug() && state.origOwn) console.log('[mt] orig copy', JSON.stringify({ src: srcUrl.slice(-14), px: bitmap.width * bitmap.height }));
     }
     // debug views ride along only when debug is on — zero cost otherwise.
@@ -309,7 +347,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         // canvas pages reuse the kept translated bitmap (transfer is one-shot);
         // img pages transfer here as before — the canvas is dead after this
         const bmp = state.translatedBmp ?? canvas.transferToImageBitmap();
-        await ensurePageDebugViews(state, bitmap, bmp);
+        await timing.measureAsync('debug', () => ensurePageDebugViews(state, bitmap, bmp));
         if (!state.translatedBmp) bmp.close();
     }
     assertCacheCurrent(cacheEpoch);

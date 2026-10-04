@@ -2,6 +2,7 @@
 // overlay views, and the LLM translate RPC (translateRegions).
 
 import { ocrInWorker, ocrLangsInstalled, baberuOcr, baberuInstalled, panelReadingOrder, type DetectResult, type DetBox, type MtOnStatus } from './detection';
+import { canvasJpegB64 } from './encode';
 import { EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, bookKey, uniquePages, pages } from './state';
@@ -14,6 +15,7 @@ import { type InpaintPatch } from './detection';
 import { inpaintMode } from '../llm/pipeline-settings';
 import { savedOriginal } from './page-identity';
 import { cacheReady, cacheGeneration, cacheCurrent, assertCacheCurrent } from '../cache-generation';
+import { PageTimer } from '../page-timing';
 
 // Warm-path AI cleanup: compute cleanup patches for a freshly translated page
 // and hand them to the caller's cache entry. Gated on cache-on + local mode;
@@ -177,20 +179,6 @@ export async function baberuOcrAll(bitmap: ImageBitmap, boxes: DetBox[], pageImg
     return { texts: results, lockWaitMs };
 }
 
-// JPEG base64 helper. Grayscale strips ~2/3 of the payload on B&W pages.
-// FileReader (not arrayBuffer + btoa): canvas-blob bytes through JS TypedArrays
-// throw on Firefox — the data URL hands back a plain string instead.
-async function toJpegB64(canvas: OffscreenCanvas, quality: number): Promise<string> {
-    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
-    const dataUrl: string = await new Promise((resolve, reject) => {
-        const fr = new FileReader();
-        fr.onerror = () => reject(fr.error ?? new Error('readAsDataURL failed'));
-        fr.onload = () => resolve(fr.result as string);
-        fr.readAsDataURL(blob);
-    });
-    return dataUrl.slice(dataUrl.indexOf(',') + 1);
-}
-
 // mean saturation of the page — decides grayscale stripping
 export function pageIsGrayscale(bitmap: ImageBitmap): boolean {
     const c = new OffscreenCanvas(64, 64);
@@ -232,8 +220,10 @@ async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: b
     const srcY = segment?.y ?? 0;
     const srcH = segment?.h ?? bitmap.height;
     const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, srcH));
-    const c = new OffscreenCanvas(Math.round(bitmap.width * scale), Math.round(srcH * scale));
-    const ctx = c.getContext('2d')!;
+    const c = document.createElement('canvas');
+    c.width = Math.round(bitmap.width * scale);
+    c.height = Math.round(srcH * scale);
+    const ctx = c.getContext('2d', { willReadFrequently: true })!;
     if (grayscale) ctx.filter = 'grayscale(1)';
     ctx.drawImage(bitmap, 0, srcY, bitmap.width, srcH, 0, 0, c.width, c.height);
     // canvas filters stick to every later draw: reset, or the badges come out
@@ -241,7 +231,7 @@ async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: b
     ctx.filter = 'none';
     const font = annotFont(scale);
     boxes.forEach((b, i) => drawBadge(ctx, b.x1 * scale, (b.y1 - srcY) * scale, offset + i + 1, font * 0.9, c.width, c.height));
-    return toJpegB64(c, pipeline.jpegQuality);
+    return canvasJpegB64(c, pipeline.jpegQuality);
 }
 
 // dark pill with exact conf in threshold units — answers "what threshold catches this box?"
@@ -372,23 +362,30 @@ export async function ensurePageDebugViews(state: PageState, original?: ImageBit
 }
 
 // Zoomed crop per region (upscaled so small narration text is readable).
-async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, pageImg: ImageData): Promise<string> {
+// One reused canvas per document: per-crop canvas churn buys nothing, and the
+// sync encode path (see encode.ts) is what avoids the Android blob-encoder stall.
+let cropCanvas: HTMLCanvasElement | null = null;
+async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, pageImg: ImageData, timing: PageTimer): Promise<string> {
     const pad = Math.max(8, (box.y2 - box.y1) * 0.12);
-    const r = expandCropToInk(pageImg, box, {
+    const r = timing.measure('cropExpand', () => expandCropToInk(pageImg, box, {
         x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
         w: Math.ceil(box.x2 - box.x1 + 2 * pad), h: Math.ceil(box.y2 - box.y1 + 2 * pad),
-    });
+    }));
     const x = Math.max(0, Math.floor(r.x));
     const y = Math.max(0, Math.floor(r.y));
     const w = Math.min(bitmap.width - x, Math.ceil(r.w));
     const h = Math.min(bitmap.height - y, Math.ceil(r.h));
     const scale = Math.min(3, Math.max(1, pipeline.cropSize / Math.max(w, h)));
-    const c = new OffscreenCanvas(Math.round(w * scale), Math.round(h * scale));
-    const ctx = c.getContext('2d')!;
-    ctx.imageSmoothingQuality = 'high';
-    if (grayscale) ctx.filter = 'grayscale(1)';
-    ctx.drawImage(bitmap, x, y, w, h, 0, 0, c.width, c.height);
-    return toJpegB64(c, Math.min(0.95, pipeline.jpegQuality + 0.05));
+    const cw = Math.round(w * scale), ch = Math.round(h * scale);
+    if (!cropCanvas) cropCanvas = document.createElement('canvas');
+    if (cropCanvas.width !== cw || cropCanvas.height !== ch) { cropCanvas.width = cw; cropCanvas.height = ch; }
+    const ctx = cropCanvas.getContext('2d', { willReadFrequently: true })!;
+    timing.measure('cropDraw', () => {
+        ctx.imageSmoothingQuality = 'high';
+        ctx.filter = grayscale ? 'grayscale(1)' : 'none';
+        ctx.drawImage(bitmap, x, y, w, h, 0, 0, cw, ch);
+    });
+    return timing.measure('cropEncode', () => canvasJpegB64(cropCanvas!, Math.min(0.95, pipeline.jpegQuality + 0.05)));
 }
 
 export interface TranslateOutcome {
@@ -424,8 +421,11 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[] },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer },
 ): Promise<TranslateOutcome> {
+    const timing = opts?.timing ?? new PageTimer();
+    const notify = onStatus;
+    onStatus = (s, stage) => { timing.setStage(s); notify(s, stage); };
     const cacheEpoch = opts?.cacheEpoch ?? await cacheReady();
     assertCacheCurrent(cacheEpoch);
     // A fresh user intent (Re-translate) re-probes the whole page — one-off starvation must not
@@ -438,6 +438,7 @@ export async function translateRegions(
     if (det.boxes.length > regionCap) det.boxes = det.boxes.slice(0, regionCap);
     await loadContext();
     onStatus('Translating…');
+    const tPrep = performance.now();
     const regions: RegionInput[] = det.boxes.map((b, i) => ({
         index: i + 1,
         source: '',           // vision mode: the model reads from the annotated image
@@ -471,7 +472,7 @@ export async function translateRegions(
         let annW = bitmap.width, annH = bitmap.height;
         let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
         // OCR crops grow past edge-cut glyphs — one shared readback, not one per region.
-        const pageImg = await pageImageData(bitmap);
+        const pageImg = await timing.measureAsync('pixelRead', () => pageImageData(bitmap));
         if (ocr) {
             const tOcr = performance.now();
             onStatus('OCR…', 'ocr');
@@ -512,14 +513,14 @@ export async function translateRegions(
         } else {
             const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
             const crops: string[] = [];
-            for (const box of det.boxes) crops.push(await cropRegion(bitmap, box, gs, pageImg));
+            for (const box of det.boxes) crops.push(await cropRegion(bitmap, box, gs, pageImg, timing));
             if (!cropsOnly && segs.length > 1) {
                 // merged page mode: one annotated page per segment, badges numbered globally.
                 // Extras stay off — their coordinates would need one shared page space.
                 let offset = 0;
                 for (const seg of segs) {
                     const segBoxes = det.boxes.filter(b => b.y1 >= seg.y && b.y1 < seg.y + seg.h);
-                    pageImages.push(await annotateForVLM(bitmap, segBoxes, gs, seg, offset));
+                    pageImages.push(await timing.measureAsync('annotate', () => annotateForVLM(bitmap, segBoxes, gs, seg, offset)));
                     offset += segBoxes.length;
                 }
                 annW = 0; annH = 0; badgeR = undefined;
@@ -528,10 +529,13 @@ export async function translateRegions(
                 annW = Math.round(bitmap.width * scale);
                 annH = Math.round(bitmap.height * scale);
                 badgeR = Math.round(annotFont(scale) * 0.9);
-                pageImages.push(await annotateForVLM(bitmap, det.boxes, gs));
+                pageImages.push(await timing.measureAsync('annotate', () => annotateForVLM(bitmap, det.boxes, gs)));
             }
             imagesB64 = requestImages({ mode: cropsOnly ? 'crops' : 'page', pages: pageImages, crops });
         }
+        timing.add('translationPrep', performance.now() - tPrep);
+        timing.meta.images = imagesB64?.length ?? 0;
+        timing.meta.imageChars = imagesB64?.reduce((n, image) => n + image.length, 0) ?? 0;
         // build what we send: shareContext off = standalone page (ablation);
         // toggles strip pairs / characters independently (also ablation arms)
         let ctxToSend: ContextState;
@@ -545,6 +549,7 @@ export async function translateRegions(
         // live status during the LLM call — it can take tens of seconds and the
         // previous status would otherwise look stuck.
         onStatus('LLM translating…', 'llm');
+        const tLlm = performance.now();
         let llmSeconds = 0;
         const t0local = Date.now();
         if (opts?.progressKey) writeProgressT0(opts.progressKey, t0local);
@@ -715,13 +720,20 @@ export async function translateRegions(
                 for (const [k, v] of Object.entries(resp.usage ?? {})) merged.usage[k] = (merged.usage[k] ?? 0) + Number(v ?? 0);
                 merged.calls += resp.llmCalls ?? 0;
                 merged.ms += resp.llmMs ?? 0;
+                if (typeof resp.provider === 'string') timing.meta.provider = resp.provider;
+                if (typeof resp.model === 'string') timing.meta.model = resp.model;
                 // The book context is the last chunk's own view; every chunk ran against the
                 // same snapshot, so the final one is as correct as any single-request run.
                 if (resp.context) merged.context = resp.context as ContextState;
             }
         } finally {
             clearInterval(llmTick);
+            timing.add('llm', performance.now() - tLlm);
         }
+        timing.meta.calls = merged.calls;
+        timing.meta.apiMs = merged.ms;
+        timing.meta.inTok = merged.usage.inTok;
+        timing.meta.outTok = merged.usage.outTok;
         resp = { ok: true, outputs: merged.outputs, extras: merged.extras, mentions: merged.mentions,
             bookOps: merged.bookOps, raw: merged.raw, usage: merged.usage, llmCalls: merged.calls,
             llmMs: merged.ms, context: merged.context };

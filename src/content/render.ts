@@ -17,7 +17,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 33;
+export const RENDER_GEN = 34;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -53,7 +53,7 @@ export function ensureFont(): Promise<void> {
             const face = new FontFace(FONT, `url(${chrome.runtime.getURL('fonts/Sriracha-Regular.ttf')})`);
             await face.load();
             document.fonts.add(face);
-        })();
+        })().catch((e) => { fontReady = null; throw e; }); // a failed warm must not poison the first render
     }
     return fontReady;
 }
@@ -432,17 +432,25 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
         }
         return best;
     };
-    const visited = new Uint8Array(W * H);
+    let visited = new Uint8Array(0);
+    let visitX = 0, visitY = 0, visitW = 0, visitH = 0;
     const mk = maskView(mask, W, H);
     type Win = ReturnType<typeof window4>;
     const fillFrom = (seed: [number, number, number], win: Win, at?: number) => {
-        visited.fill(0);
         // A seed sampled just outside the box starts there: re-homing it lands the flood in a glyph-gap pocket.
         // The pocket loses the largest-flood vote, collapsing the fill to the glyph column.
         const start = at != null && seedLike(data, at * 4, seed) ? at : startFor(seed);
         const sx = start % W, sy = (start / W) | 0;
+        // A clipped window may exclude its seed. Include that pixel in scratch storage;
+        // neighbour traversal still obeys the original window and page coordinates.
+        const vx = Math.min(win.loX, sx), vy = Math.min(win.loY, sy);
+        const vw = Math.max(win.hiX, sx) - vx + 1, vh = Math.max(win.hiY, sy) - vy + 1;
+        if (vx !== visitX || vy !== visitY || vw !== visitW || vh !== visitH) {
+            visited = new Uint8Array(vw * vh);
+            visitX = vx; visitY = vy; visitW = vw; visitH = vh;
+        } else visited.fill(0);
         const queue = [start];
-        visited[start] = 1;
+        visited[(sy - visitY) * visitW + sx - visitX] = 1;
         let minX = sx, maxX = sx, minY = sy, maxY = sy, count = 0;
         while (queue.length) {
             const p = queue.pop()!;
@@ -454,9 +462,10 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
                 const nx = x + dx, ny = y + dy;
                 if (nx < win.loX || ny < win.loY || nx > win.hiX || ny > win.hiY) continue;
                 const np = ny * W + nx;
-                if (visited[np]) continue;
+                const vi = (ny - visitY) * visitW + nx - visitX;
+                if (visited[vi]) continue;
                 if (seedLike(data, np * 4, seed) || (mk != null && mk[np] > 127)) {
-                    visited[np] = 1;
+                    visited[vi] = 1;
                     queue.push(np);
                 }
             }
@@ -1083,16 +1092,19 @@ export function expandCropToInk(img: ImageData, box: DetBox, rect: CropRect): Cr
         const loY = Math.max(0, y1 - cap), hiY = Math.min(H - 1, y2 + cap);
         const ix1 = Math.ceil(box.x1) + 2, iy1 = Math.ceil(box.y1) + 2;
         const ix2 = Math.floor(box.x2) - 2, iy2 = Math.floor(box.y2) - 2;
-        const seen = new Uint8Array(W * H);
-        const dist = new Int16Array(W * H).fill(-1);
+        const rw = hiX - loX + 1, rh = hiY - loY + 1;
+        const seen = new Uint8Array(rw * rh);
+        const dist = new Int16Array(rw * rh).fill(-1);
         // FIFO queue (index pointer, no shift): distances must be SHORTEST-path.
         // A LIFO stack inflates first-visit distances and strangles the flood.
         const queue: number[] = [];
         for (const q of pts) {
             const x = vertical ? at : q, y = vertical ? q : at;
-            if (x < loX || x > hiX || y < loY || y > hiY || seen[y * W + x]) continue;
-            seen[y * W + x] = 1;
-            dist[y * W + x] = 0;
+            if (x < loX || x > hiX || y < loY || y > hiY) continue;
+            const k = (y - loY) * rw + x - loX;
+            if (seen[k]) continue;
+            seen[k] = 1;
+            dist[k] = 0;
             queue.push(x + y * W);
         }
         let reached = false;
@@ -1101,17 +1113,18 @@ export function expandCropToInk(img: ImageData, box: DetBox, rect: CropRect): Cr
             const p = queue[head];
             const x = p % W, y = (p / W) | 0;
             if (!inkAt(x, y)) continue;
-            const d = dist[p];
+            const k = (y - loY) * rw + x - loX;
+            const d = dist[k];
             if (x < bx1) bx1 = x;
             if (y < by1) by1 = y;
             if (x > bx2) bx2 = x;
             if (y > by2) by2 = y;
             if (x >= ix1 && x <= ix2 && y >= iy1 && y <= iy2) reached = true;
             if (d + 1 > cap) continue;
-            if (x - 1 >= loX && !seen[p - 1]) { seen[p - 1] = 1; dist[p - 1] = d + 1; queue.push(p - 1); }
-            if (x + 1 <= hiX && !seen[p + 1]) { seen[p + 1] = 1; dist[p + 1] = d + 1; queue.push(p + 1); }
-            if (y - 1 >= loY && !seen[p - W]) { seen[p - W] = 1; dist[p - W] = d + 1; queue.push(p - W); }
-            if (y + 1 <= hiY && !seen[p + W]) { seen[p + W] = 1; dist[p + W] = d + 1; queue.push(p + W); }
+            if (x - 1 >= loX && !seen[k - 1]) { seen[k - 1] = 1; dist[k - 1] = d + 1; queue.push(p - 1); }
+            if (x + 1 <= hiX && !seen[k + 1]) { seen[k + 1] = 1; dist[k + 1] = d + 1; queue.push(p + 1); }
+            if (y - 1 >= loY && !seen[k - rw]) { seen[k - rw] = 1; dist[k - rw] = d + 1; queue.push(p - W); }
+            if (y + 1 <= hiY && !seen[k + rw]) { seen[k + rw] = 1; dist[k + rw] = d + 1; queue.push(p + W); }
         }
         return reached && bx2 >= bx1 ? { x1: bx1, y1: by1, x2: bx2, y2: by2 } : null;
     };

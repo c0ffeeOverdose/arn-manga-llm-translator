@@ -19,6 +19,7 @@ import { nextDocument, guessNextDocument, hasNextPage } from '../chapter/discove
 import { isDebug } from '../debug';
 import { ensurePageDebugViews } from './ocr';
 import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
+import { cloudConfig, cloudWarm } from './detection';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
@@ -91,13 +92,15 @@ export function sweepActive(): boolean {
 export interface SweepStatus {
     active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean;
     done: number; total: number; errors: number; skipped: number; inflight: number;
+    diagnostics?: string; // runner breadcrumbs (stuck labels etc.) — shown in the popup for support
 }
 export function sweepStatus(): SweepStatus | null {
     if (starting) return { active: true, phase: 'starting', stopping: false, done: 0, total: 0, errors: 0, skipped: 0, inflight: 0 };
     if (!progress || progress.chapter !== chapterKey()) return null;
     return { active: sweepActive(), phase: progress.phase === 'stopping' ? 'stopping' : 'running',
         stopping: progress.phase === 'stopping', done: progress.done, total: progress.total,
-        errors: progress.errors, skipped: 0, inflight: progress.inflight };
+        errors: progress.errors, skipped: 0, inflight: progress.inflight,
+        ...(progress.diagnostics ? { diagnostics: progress.diagnostics } : null) };
 }
 function original(ref: PageRef): string {
     return viewSource(ref);
@@ -401,6 +404,16 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         }
         await loadPipeline();
         await loadContext();
+        // Cloud engine: pay the container wake ONCE here — otherwise the first pages race a
+        // cold boot inside their own request caps (worst on mobile uplinks). A failed warm is
+        // not a failed run: the page calls still try.
+        if (pipeline.inferEngine === 'cloud') {
+            const cfg = await cloudConfig();
+            if (cfg.endpoint && cfg.key) {
+                setActivity('sweep', 'Waking the cloud server…', 'sweep', 'detect');
+                await cloudWarm(cfg.endpoint, cfg.key).catch(() => { /* page calls retry the wake */ });
+            }
+        }
         setActivity('sweep', 'Finding the remaining pages in this chapter…', 'sweep', 'read');
         const found = await enumerate();
         const pages = remainingPages(found.pages, found.anchor);

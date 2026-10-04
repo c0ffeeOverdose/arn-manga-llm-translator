@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, detFromCacheEntry, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, bytesCrops, INPAINT_PATCH_GEN, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, seamEdgeSuspect, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, detFromCacheEntry, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, bytesCrops, INPAINT_PATCH_GEN, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -446,6 +446,27 @@ test('seamRowsMatch: identical rows pass, webp-ringing passes, scenes fail', () 
   assert.equal(seamRowsMatch(black, row((x) => x < 20 ? [0, 0, 0] : [180, 10, 10]), W), false);
   // short buffers → fail closed
   assert.equal(seamRowsMatch(new Uint8ClampedArray(10), black, W), false);
+});
+
+test('seamEdgeSuspect: only real cut ink at the edge earns a neighbor pull', () => {
+  const W = 200, H = 1000;
+  const mask = (inkRows) => {
+    const d = new Uint8Array(W * H);
+    for (const [y0, y1, x0, x1] of inkRows)
+      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) d[y * W + x] = 255;
+    return { width: W, height: H, data: d.buffer };
+  };
+  // ≥3 ink rows inside an edge band = a cut glyph run → suspect
+  assert.equal(seamEdgeSuspect(mask([[H - 3, H, 40, 160]]), H), true);
+  assert.equal(seamEdgeSuspect(mask([[0, 3, 40, 160]]), H), true);
+  // 1-2 rows is a speck/curve, not a run → no pull
+  assert.equal(seamEdgeSuspect(mask([[H - 2, H, 40, 160]]), H), false);
+  assert.equal(seamEdgeSuspect(mask([[H - 1, H, 40, 160]]), H), false);
+  // ink away from the edges → clean page (boxes alone never pull)
+  assert.equal(seamEdgeSuspect(mask([[300, 700, 40, 160]]), H), false);
+  assert.equal(seamEdgeSuspect(mask([]), H), false);
+  assert.equal(seamEdgeSuspect(null, H), false);
+  assert.equal(seamEdgeSuspect({ width: W, height: H, data: new ArrayBuffer(10) }, H), false);
 });
 
 test('bandSpan: only a box crossing the band seam confirms the cut', () => {

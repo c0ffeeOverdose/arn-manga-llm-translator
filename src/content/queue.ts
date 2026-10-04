@@ -16,6 +16,7 @@ import { renderPage } from './render-page';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logError, pillUnDismiss, setStatus } from './status-ui';
 import { applyOverlays } from './overlays';
 import { bookHas, chapterOwnsRequest } from './sweep';
+import type { PageTimer } from '../page-timing';
 
 export const queue: Job[] = [];
 let running = false;
@@ -202,10 +203,15 @@ function pumpPaint(): void {
         claimPaint(job.key); // shared with out-of-band painters (the arrival sweep)
         const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
         void (async () => {
+            let timing: PageTimer | undefined;
+            let painted = false;
             try {
                 const prep = await job.prep;
                 if (!prep) { removeActivity(job.key); renderStatus(); return; } // painted while queued
+                timing = prep.timing;
+                timing?.activate();
                 await renderPage(job.ref, prep, st, job.force);
+                painted = true;
                 cooldownClear(failMarks, job.key);
                 removeActivity(job.key);
                 renderStatus();
@@ -221,7 +227,9 @@ function pumpPaint(): void {
                 paintActive.delete(job.key);
                 releasePaint(job.key);
                 paintRunning--;
-                applyOverlays();
+                if (timing) timing.measure('display', () => applyOverlays());
+                else applyOverlays();
+                timing?.finish(painted ? 'done' : 'failed');
                 pumpPaint();
             }
         })();
@@ -278,6 +286,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     activePrep = job.prep;
     const endKeepalive = keepaliveOpen();
     const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
+    let timing: PageTimer | undefined;
     try {
         let prep;
         try {
@@ -293,9 +302,12 @@ export async function runJob(allowSeam: boolean): Promise<void> {
             if (isDebug()) console.log('[mt] job dropped (already translated):', job.key.slice(-14));
             removeActivity(job.key); lastMsgSet(null); renderStatus(); return;
         }
+        timing = prep.timing;
+        timing?.activate();
         // ghost-drop BEFORE any LLM call (auto only — manual intent always wins). A 2.5s pill
         // flash (not silence): the only trace that a page-turn orphaned the job.
         if (job.auto && (await ghostDropped(job, prep))) {
+            timing?.finish('done');
             if (isDebug()) console.log('[mt] job dropped (ghost):', job.key.slice(-14));
             removeActivity(job.key); lastMsgSet(null); setStatus('Skipped (page changed)', 'idle'); renderStatus(); return;
         }
@@ -307,12 +319,16 @@ export async function runJob(allowSeam: boolean): Promise<void> {
             pumpPaint();
             return;
         }
-        const state = (allowSeam && job.ref.kind === 'img' && !prep.cached)
-            ? (await trySeam(job, prep, st).catch(e => {
+        let joined: PageState | null = null;
+        if (allowSeam && job.ref.kind === 'img' && !prep.cached) {
+            const join = () => trySeam(job, prep, st).catch(e => {
                 console.warn('[mt] seam failed, solo fallback:', (e as Error)?.message ?? e);
                 return null;
-            }) ?? await renderPage(job.ref, prep, st, job.force))
-            : await renderPage(job.ref, prep, st, job.force);
+            });
+            joined = timing ? await timing.measureAsync('joined', join) : await join();
+            if (joined && timing) timing.meta.joined = true;
+        }
+        const state = joined ?? await renderPage(job.ref, prep, st, job.force);
         if (state.det && state.det.boxes.length) {
             // auto-show only when the user hasn't pinned "Show original" mid-run
             if (overlayChoice === 'auto') setOverlayOn(true);
@@ -330,9 +346,12 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         }
         // sweep instead of pointing at the (possibly replaced) element —
         // picks up fresh reader elements for THIS page and any earlier ones
-        applyOverlays();
+        if (timing) timing.measure('display', () => applyOverlays());
+        else applyOverlays();
         cooldownClear(failMarks, job.key);
+        timing?.finish('done');
     } catch (e) {
+        timing?.finish('failed');
         if ((e as Error)?.name === 'AbortError') return;
         const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         cooldownMark(failMarks, job.key, Date.now());

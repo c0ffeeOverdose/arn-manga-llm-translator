@@ -14,8 +14,9 @@ import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter,
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
+import { PageTimer } from '../page-timing';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cacheEpoch?: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cacheEpoch?: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer; timing?: PageTimer }
 
 // Headless detect resolve — shared by lookahead prefetch and chapter sweep (DOM jobs use
 // preparePage instead). Full hit → {det:null}; resumable partial → rebuilt det; else fresh
@@ -50,7 +51,7 @@ export async function resolveHeadlessDet(
 }
 
 // Detection for one bitmap (local or cloud), no ordering — shared by preparePage and the seam path.
-export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts?: { lo?: boolean }): Promise<DetectResult> {
+export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts?: { lo?: boolean; timing?: PageTimer }): Promise<DetectResult> {
     // cloud engine: one POST returns boxes+texts. No silent fallback — a cloud failure is an
     // error, and cloud mode without endpoint/key is a config error, not a cue to go local.
     const { mtSettings } = await chrome.storage.local.get('mtSettings');
@@ -64,6 +65,9 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
             );
         }
         onStatus('Cloud detecting…', 'detect');
+        // page/crops modes feed the image to the LLM, so the server OCR pass would be paid
+        // for and discarded; only OCR-text mode (or the split reader) needs those texts
+        const needsTexts = pipeline.textSource === 'ocr' || pipeline.useOcrModel;
         try {
             return await cloudDetect(bitmap, endpoint, key, {
                 confThr: pipeline.detConf, minSize: pipeline.detMinSize,
@@ -71,6 +75,8 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
                 // merge AI cleanup into the same roundtrip — the server already has the CTD
                 // mask; a second /v1/inpaint POST re-uploads the page
                 inpaint: inpaintMode(pipeline) !== 'fill',
+                texts: needsTexts,
+                timing: opts?.timing,
             });
         } catch (e) {
             throw Object.assign(
@@ -142,6 +148,27 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
 // waitSweep=false for user-driven jobs: an explicit Translate press must not sit behind a
 // slow sweep's claim (auto prefetch still waits — it would duplicate the sweep).
 export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false, waitSweep = true): Promise<Prep | null> {
+    const timing = new PageTimer();
+    timing.activate();
+    try {
+        const prep = await prepareMeasuredPage(ref, force, (s, stage) => {
+            timing.setStage(s);
+            onStatus(s, stage);
+        }, fromSweep, waitSweep, timing);
+        if (!prep) { timing.finish('done'); return null; }
+        Object.assign(timing.meta, {
+            page: `${prep.bitmap.width}x${prep.bitmap.height}`, boxes: prep.det.boxes.length,
+            engine: pipeline.inferEngine, textSource: pipeline.textSource,
+            thinking: pipeline.thinkingLevel, debug: isDebug(), cached: !!prep.cached,
+        });
+        return { ...prep, timing };
+    } catch (e) {
+        timing.finish('failed');
+        throw e;
+    }
+}
+
+async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep: boolean, waitSweep: boolean, timing: PageTimer): Promise<Prep | null> {
     const cacheEpoch = await cacheReady();
     const existing = stateFor(ref);
     if (existing?.det && !force) return null;
@@ -154,21 +181,24 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
     const srcUrl = existing ? existing.orig : refKey(ref);
     resetContextIfNewChapter();
     await loadPipeline();
+    Object.assign(timing.meta, { engine: pipeline.inferEngine, textSource: pipeline.textSource,
+        thinking: pipeline.thinkingLevel, debug: isDebug() });
     onStatus('Reading page…', 'read');
     // sliding-window canvas readers keep BLANK placeholder canvases outside the render window —
     // translating one poisons the page, so skip (no state, no cache). The verdict is cached per
     // element+SIZE (readers resize on draw, so an unchanged size means still blank). A canvas
     // that becomes VISIBLE re-checks regardless.
     let bitmap: ImageBitmap, bytes: ArrayBuffer | undefined;
+    const readSource = (originalBytes?: ArrayBuffer) => timing.measureAsync('read', () => readPage(ref, srcUrl, originalBytes));
     if (ref.kind === 'canvas') {
         const el = ref.el;
         const size = `${el.width}x${el.height}`;
         const r = el.getBoundingClientRect();
         const visible = r.width > 0 && r.right > 0 && r.left < innerWidth && r.bottom > 0 && r.top < innerHeight;
         if (blankVerdicts.get(el) === size && !visible) return null;
-        ({ bitmap, bytes } = await readPage(ref, srcUrl, existing?.origBytes));
+        ({ bitmap, bytes } = await readSource(existing?.origBytes));
         if (await bitmapBlank(bitmap)) {
-            if (existing?.origBytes) ({ bitmap, bytes } = await readPage(ref, srcUrl));
+            if (existing?.origBytes) ({ bitmap, bytes } = await readSource());
             if (await bitmapBlank(bitmap)) {
                 blankVerdicts.set(el, size);
                 if (isDebug()) console.log('[mt] canvas blank — reader has not drawn it yet:', refKey(ref).slice(-12));
@@ -177,28 +207,31 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         }
         blankVerdicts.delete(el);
     } else {
-        ({ bitmap, bytes } = await readPage(ref, srcUrl, existing?.origBytes));
+        ({ bitmap, bytes } = await readSource(existing?.origBytes));
     }
+    timing.meta.page = `${bitmap.width}x${bitmap.height}`;
+    const tCache = performance.now();
+    const cacheDone = () => timing.add('cache', performance.now() - tCache);
     // persistent cache: same image bytes + same settings → skip detect + LLM.
     // force (re-translate) always misses and overwrites below.
     // A previous document may have died mid-job on this exact page (full-load readers kill
     // in-memory state per page-turn) — leave a trace so the next load can name the restart.
     // Read BEFORE our own write below, else every visit self-matches.
-    const prevWarming = readWarming();
-    writeWarming(refKey(ref));
+    const prevWarming = timing.measure('cacheWarm', () => readWarming());
+    timing.measure('cacheWarm', () => writeWarming(refKey(ref)));
     // chapter sweep owns this page right now — wait for its commit instead of paying a
     // duplicate detect + LLM (falls through on cancel/timeout)
     if (waitSweep && !force && !fromSweep && pipeline.cacheEnabled) {
         await Promise.race([sweepWait(refKey(ref), onStatus), new Promise(r => setTimeout(r, 150000))]);
     }
-    const hash = pageHashFromBitmap(bitmap);
+    const hash = timing.measure('cacheHash', () => pageHashFromBitmap(bitmap));
     assertCacheCurrent(cacheEpoch);
     // miss-reason instrument: a revisit that SHOULD hit but misses needs a verdict in one
     // dump (absent | fp | dims | splitgen | mask | disabled)
     let cacheMiss: string | undefined = pipeline.cacheEnabled ? 'absent' : 'disabled';
     if (!force) {
         const fp = settingsFingerprint(pipeline);
-        const hit = await cacheGet(cacheKey(chapterKey(), hash));
+        const hit = await timing.measureAsync('cacheIdb', () => cacheGet(cacheKey(chapterKey(), hash)));
         // hit.mask gate: pre-mask entries miss once, re-detect, and heal on overwrite.
         // Partial entries never render as Done — they resume below.
         // The shared predicate IS the gate (fingerprint, dims, mask, split generation): a
@@ -207,6 +240,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         const hitDet = pipeline.cacheEnabled
             ? detFromCacheEntry(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud') : null;
         if (hitDet) {
+            cacheDone();
             cacheMiss = undefined;
             onStatus('Cache hit…');
             return { srcUrl, bitmap, det: hitDet, hash, cacheEpoch, cached: hit, prepMs: prepMs(),
@@ -220,7 +254,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         // translated again (and billed again) on "Translate this page".
         if (pipeline.cacheEnabled) {
             const order = sweepPageOrder(srcUrl);
-            const byPage = order != null ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
+            const byPage = order != null ? await timing.measureAsync('cacheIdb', () => cacheGet(pageKey(chapterKey(), order))) : undefined;
             if (byPage) {
                 const decision = pageEntryDecision(byPage, hash, fp, bitmap.width, bitmap.height);
                 const pageDet = decision.usable
@@ -234,6 +268,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
                     const cached = decision.dropPatches
                         ? { ...byPage, ...(bytesCrops(hit, fp, bitmap.width, bitmap.height) ?? { patches: undefined, patchesGen: undefined }) }
                         : byPage;
+                    cacheDone();
                     return { srcUrl, bitmap, det: pageDet, hash, cacheEpoch, cached, prepMs: prepMs(),
                         origBytes: ref.kind === 'canvas' ? bytes : undefined };
                 }
@@ -242,6 +277,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
         // detect checkpoint resume: the previous load finished detect but died before
         // translating — continue at translateRegions, skipping detect entirely.
         if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
+            cacheDone();
             cacheMiss = undefined;
             onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
             return { srcUrl, bitmap, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, cacheEpoch, resumed: true as const,
@@ -255,8 +291,9 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
             if (w && samePagePath(w.key, refKey(ref)) && warmingFresh(w.ts)) onStatus('Warming was interrupted — restarting…', 'read');
         }
     }
-    const det = await detectPage(bitmap, onStatus, { lo: fromSweep });
-    await orderDetection(det, bitmap);
+    cacheDone();
+    const det = await timing.measureAsync('detect', () => detectPage(bitmap, onStatus, { lo: fromSweep, timing }));
+    await timing.measureAsync('order', () => orderDetection(det, bitmap));
     assertCacheCurrent(cacheEpoch);
     // detect checkpoint: a page-turn kills this document mid-job — the next load resumes
     // from this entry (same key the full entry overwrites). Zero-box pages skip it.
@@ -272,7 +309,7 @@ export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnSt
 // Paint translated regions onto a canvas (inpaint source text, draw the translation per
 // box) — shared by the solo path and the seam path (which paints the whole stitch, then
 // slices). `patches` (AI cleanup output) replace the built-in fill when present.
-export interface PaintPatch { x1: number; y1: number; x2: number; y2: number; bmp: ImageBitmap }
+export interface PaintPatch { x1: number; y1: number; x2: number; y2: number; bmp: CanvasImageSource }
 
 export function paintRegions(
     canvas: OffscreenCanvas, frame: ImageData, det: DetectResult, outputs: RegionOutput[],

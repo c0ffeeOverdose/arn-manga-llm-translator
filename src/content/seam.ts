@@ -3,7 +3,7 @@
 // on the stitch, paint whole, slice write-back. Serial-only; any failure →
 // null → the caller falls back to the solo path.
 
-import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, seamLinked, seamInkLinked, seamTruncated, boxIoU, bandSpan, seamRowsMatch } from './page-cache';
+import { pageHashFromBitmap, cacheKey, settingsFingerprint, cachePut, cacheDelete, packMask, seamLinked, seamInkLinked, seamTruncated, seamEdgeSuspect, boxIoU, bandSpan, seamRowsMatch } from './page-cache';
 import { ensureFont, renderTuning, RENDER_GEN } from './render';
 import { updateContext, type Mention, type RegionOutput } from '../llm/core';
 import { isDebug } from '../debug';
@@ -96,6 +96,9 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             run.push(r);
         }
         if (run.length < 2) { trace('lone-width', { run: run.length }); return null; }
+        // No pull until THIS page shows real cut ink at an edge: a pulled neighbor costs a
+        // full read + detect (cloud bills it), and the fail-safe direction is the split.
+        if (!seamEdgeSuspect(prep.det.mask, prep.bitmap.height)) { trace('no-edge-ink'); return null; }
         // resolve pixels + solo boxes per member: queued/active preps first (no
         // re-detect), rendered states next, auto-pulled enqueue last (manual never
         // expands scope — no surprise LLM spend). Unresolvable members become

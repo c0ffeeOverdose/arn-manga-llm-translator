@@ -14,6 +14,7 @@ import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
 import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, elementMap, chapterOwnsRequest, resolveChapterRef } from './sweep';
 import { initTranslationReset } from './translation-reset';
 import { acceptCacheGeneration } from '../cache-generation';
+import { lastPageTiming } from '../page-timing';
 
 export function toggleOverlay(): void {
     setOverlayOn(!overlayOn);
@@ -273,6 +274,7 @@ export function installMessageListener(): void {
                 charsOpen: charsPanelOpen(),
                 usage: sessionUsage,
                 lastUsage: lastPageUsage,
+                pageTiming: lastPageTiming(),
                 // viewed-page state for the popup's main button (keyed by page —
                 // the reader swaps elements, so element identity lies).
                 viewedTranslated: viewed ? !!stateFor(viewed)?.det : false,

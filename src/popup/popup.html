@@ -118,6 +118,14 @@
     details.usage-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 11px; color: var(--muted); }
     details.usage-wrap summary { cursor: pointer; font-size: 11px; }
     details.usage-wrap summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #timingWrap { font-size: 12px; }
+    #timingWrap summary { min-height: 28px; display: list-item; line-height: 28px; font-size: 12px; }
+    #timingBody { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.6; }
+    #timingCopy { width: 100%; min-height: 44px; margin-top: 8px; }
+    #timingNote { margin-top: 6px; overflow-wrap: anywhere; }
+    #timingText { width: 100%; margin-top: 8px; padding: 8px; background: var(--surface-2); color: var(--text);
+                  border: 1px solid var(--border-strong); border-radius: 6px; font: 12px/1.5 monospace; resize: vertical; }
+    #timingText:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .linkrow { display: flex; gap: 12px; justify-content: center; }
     .linkrow button { background: none; border: 0; padding: 6px 4px; color: var(--text); font: inherit; font-size: 12px; cursor: pointer; min-height: 24px; }
     .linkrow button:hover { color: var(--text); text-decoration: underline; }
@@ -190,10 +198,18 @@
     <details id="statusSection" style="display:none">
     <summary class="group-label"><span id="stateDot"></span>Status</summary>
     <div class="status" id="status"></div>
+    <div class="status" id="sweepDetails" style="display:none;margin-top:4px"></div>
     <button id="cancelAll" class="btn ghost slim" style="display:none;width:100%;margin-top:6px">Cancel all</button>
     </details>
     <div id="errBanner"></div>
     <details class="usage-wrap" id="usageWrap" style="display:none"><summary>Token usage</summary><div id="usageBox" class="usage" style="border:0;padding:4px 0 0"></div></details>
+    <details class="usage-wrap" id="timingWrap" style="display:none">
+      <summary>Last page timing</summary>
+      <div id="timingBody"></div>
+      <button id="timingCopy" class="btn ghost">Copy timing report</button>
+      <div id="timingNote" role="status">Includes device/browser and model name, but no keys, page text or images. Copy before reloading the reader.</div>
+      <textarea id="timingText" rows="8" readonly hidden aria-label="Timing report for manual copying"></textarea>
+    </details>
     <div id="errlog" class="errlog"></div>
     <a href="#" id="errors"></a>
   </div>
