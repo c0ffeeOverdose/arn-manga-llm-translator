@@ -45,3 +45,22 @@ class DetectionResponse(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("clip", wire["boxes"][1])
         self.assertEqual(wire["texts"], ["first source", "second source"])
         self.assertEqual(wire["splitGen"], SPLIT_GEN)
+
+    async def test_texts_flag_zero_skips_ocr(self):
+        source = io.BytesIO()
+        Image.new("RGB", (100, 100), "white").save(source, format="PNG")
+
+        class Request:
+            async def body(self):
+                return source.getvalue()
+
+        boxes = [{"x1": 10, "y1": 20, "x2": 30, "y2": 60, "conf": 0.9}]
+        mask = {"w": 1, "h": 1, "b64": "AA=="}
+        with patch.object(app, "run_detect", return_value=(boxes, 1, mask, np.zeros((100, 100), bool))), \
+                patch.object(app, "run_baberu") as baberu:
+            response = await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=0,
+                                      texts_flag=0, pad_ratio=0.5)
+        baberu.assert_not_called()
+        wire = json.loads(json.dumps(response))
+        self.assertEqual(wire["texts"], [])
+        self.assertEqual(wire["ms"]["ocr"], 0.0)

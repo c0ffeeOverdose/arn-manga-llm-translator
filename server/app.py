@@ -591,6 +591,7 @@ async def inpaint_page(req: Request, pad_ratio: float = Query(INPAINT_PAD_RATIO)
 async def page(req: Request,
                conf_thr: float = Query(CONF_THR), min_size: int = Query(MIN_SIZE),
                inpaint_flag: int = Query(0, alias="inpaint"),
+               texts_flag: int = Query(1, alias="texts"),
                pad_ratio: float = Query(INPAINT_PAD_RATIO)):
     t0 = time.perf_counter()
     raw = await req.body()
@@ -601,15 +602,18 @@ async def page(req: Request,
         return JSONResponse({"ok": False, "error": f"bad image: {e} (got {len(raw)} bytes head={raw[:8].hex()})"}, 400)
     async with lock:
         boxes, det_ms, mask, mask_img = run_detect(pil, conf_thr, min_size)
-        rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
+        # texts=0 (client's page/crops modes): the LLM reads the image itself, so this
+        # OCR pass — the slowest step — is skipped. Older clients omit the flag (OCR runs).
         texts, ocr_ms = [], 0.0
-        for b in boxes:
-            try:
-                t, ms = run_baberu(baberu_crop(pil, rgb, b))
-            except Exception:
-                t, ms = "", 0.0
-            texts.append(t)
-            ocr_ms += ms
+        if texts_flag:
+            rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
+            for b in boxes:
+                try:
+                    t, ms = run_baberu(baberu_crop(pil, rgb, b))
+                except Exception:
+                    t, ms = "", 0.0
+                texts.append(t)
+                ocr_ms += ms
         # merged cleanup pass: patches in the same roundtrip (saves an upload + lock wait). One patch per box (i = index).
         patches, windows, inpaint_ms = [], 0, 0.0
         if inpaint_flag:
