@@ -6,6 +6,7 @@
 
 import type { DetBox, DetectResult, InpaintPatch, MtOnStatus } from './detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
+import type { ImageSignature } from '../image-identity';
 import { cacheReady, cacheGeneration, cacheCurrent } from '../cache-generation';
 
 // ORT inference-queue picker (worker-side, pure): first hi-priority task (0), else the
@@ -168,6 +169,12 @@ export interface CachedPage {
     // matched by page-identity lookups.
     order?: number;
     keyGen?: number;
+    // page-level pixel evidence for an IDLE page-identity hit (no live chapter run): the
+    // reader's own /N names the slot, but a slot + dims cannot reject a wrong page, so the
+    // idle lookup must prove these pixels against the stored identity before it renders.
+    // Absent on bytes rows, old rows (miss once and heal) and non-attach producers.
+    idSig?: ImageSignature;
+    idGray?: string;
 }
 
 // Bump when the AI-cleanup crop pipeline changes (window geometry, model, mask recipe,

@@ -126,6 +126,14 @@
     #timingText { width: 100%; margin-top: 8px; padding: 8px; background: var(--surface-2); color: var(--text);
                   border: 1px solid var(--border-strong); border-radius: 6px; font: 12px/1.5 monospace; resize: vertical; }
     #timingText:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #chapterLogWrap { font-size: 12px; }
+    #chapterLogWrap summary { min-height: 44px; display: list-item; line-height: 1.5; padding: 12px 0; font-size: 12px; }
+    #chapterLogBody { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.6; }
+    #chapterLogCopy { width: 100%; min-height: 44px; margin-top: 8px; }
+    #chapterLogNote { margin-top: 8px; overflow-wrap: anywhere; }
+    #chapterLogText { width: 100%; margin-top: 8px; padding: 8px; background: var(--surface-2); color: var(--text);
+                      border: 1px solid var(--border-strong); border-radius: 6px; font: 12px/1.5 monospace; resize: vertical; }
+    #chapterLogText:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .linkrow { display: flex; gap: 12px; justify-content: center; }
     .linkrow button { background: none; border: 0; padding: 6px 4px; color: var(--text); font: inherit; font-size: 12px; cursor: pointer; min-height: 24px; }
     .linkrow button:hover { color: var(--text); text-decoration: underline; }
@@ -165,6 +173,13 @@
     <button id="translate" class="btn">Translate this page</button>
     <button id="sweep" class="btn ghost slim" style="width:100%">Translate to end of chapter</button>
     <div id="sweepWhy" class="hint" hidden></div>
+    <details class="usage-wrap" id="chapterLogWrap" hidden>
+      <summary>Latest chapter translation log</summary>
+      <div id="chapterLogBody"></div>
+      <button id="chapterLogCopy" class="btn ghost">Copy chapter log</button>
+      <div id="chapterLogNote" role="status">Saved across reader reloads. No keys, URLs, page text or images.</div>
+      <textarea id="chapterLogText" rows="8" readonly hidden aria-label="Chapter translation log for manual copying"></textarea>
+    </details>
     <div class="grid">
       <button id="showOriginal" class="btn ghost">Show original</button>
       <button id="retranslate" class="btn ghost">Re-translate</button>

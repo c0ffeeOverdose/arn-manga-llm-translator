@@ -168,3 +168,44 @@ test('a different aspect ratio never matches one page of a composite', async () 
     const ref = imageRef('blob:spread', bitmap(grayPage(2), { width: 1200, height: 800 }));
     assert.equal(await resolveChapterRef(ref), undefined);
 });
+// The owner's report: a chapter run translated page 2, but the reader's rendition of that page
+// could not be decoded (the runner's own fetch of the same page failed too and used the sibling
+// tier). The pixel probe threw and the old shared catch skipped the position fallback, so the
+// page stayed unmatched and never painted though its slot was known from the manifest.
+test('an unreadable rendition still resolves by the manifest page number, never by guesswork', async () => {
+    globalThis.location = { origin: 'https://reader.test', pathname: '/chapter/uuid/6', search: '', hash: '', href: 'https://reader.test/chapter/uuid/6' };
+    const pages = [1, 2, 3, 4, 5, 6].map(order => {
+        const identity = identifyBitmap(bitmap(grayPage(order)), [{ x1: 10, y1: 10, x2: 200, y2: 200 }]);
+        fixture.artifacts.set(`p${order}`, { identity, signature: 'test:signature' });
+        return { id: `p${order}`, url: `https://cdn.test/${order}.png`, order, phase: 'ready', revision: 1, image: signatureOf(identity) };
+    });
+    const createImageBitmap = globalThis.createImageBitmap;
+    globalThis.createImageBitmap = async () => { throw new Error("The ImageBitmap could not be allocated."); };
+    try {
+        testProgress({ id: 'broken', chapter: 'chapter:test', phase: 'running', completeManifest: true, pages });
+        const page = await resolveChapterRef(imageRef('blob:broken-page', bitmap(grayPage(6))));
+        assert.equal(page?.matchedBy, 'url', 'position resolves when pixels are unreadable');
+        assert.equal(page?.order, 5, 'the URL page number names the slot');
+        // No manifest → the same unreadable page must resolve nothing: a guessed slot must never
+        // authorize a lookup.
+        testProgress({ id: 'broken2', chapter: 'chapter:test', phase: 'running', pages: pages.map(p => ({ ...p })) });
+        assert.equal(await resolveChapterRef(imageRef('blob:broken-page', bitmap(grayPage(6)))), undefined);
+    } finally { globalThis.createImageBitmap = createImageBitmap; }
+});
+test('a run that changes mid-probe must never position-guess from the stale one', async () => {
+    globalThis.location = { origin: 'https://reader.test', pathname: '/chapter/uuid/6', search: '', hash: '', href: 'https://reader.test/chapter/uuid/6' };
+    const pages = [1, 2, 3, 4, 5, 6].map(order => {
+        const identity = identifyBitmap(bitmap(grayPage(order)), [{ x1: 10, y1: 10, x2: 200, y2: 200 }]);
+        fixture.artifacts.set(`p${order}`, { identity, signature: 'test:signature' });
+        return { id: `p${order}`, url: `https://cdn.test/${order}.png`, order, phase: 'ready', revision: 1, image: signatureOf(identity) };
+    });
+    testProgress({ id: 'run-A', chapter: 'chapter:test', phase: 'running', completeManifest: true, pages });
+    // The broker roundtrip for evidence is where a new run can replace this one; the stale run's
+    // page number must not authorize a paint afterwards (the readable pixels make the probe
+    // reach that await).
+    fixture.onResult = async () => {
+        fixture.onResult = undefined;
+        testProgress({ id: 'run-B', chapter: 'chapter:test', phase: 'running', completeManifest: true, pages: pages.map(p => ({ ...p })) });
+    };
+    assert.equal(await resolveChapterRef(imageRef('blob:stale', bitmap(grayPage(6)))), undefined);
+});

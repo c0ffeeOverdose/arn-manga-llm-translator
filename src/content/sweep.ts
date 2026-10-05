@@ -21,6 +21,7 @@ import { ensurePageDebugViews } from './ocr';
 import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 import { cloudConfig, cloudWarm } from './detection';
 import { sendToBackground } from '../bg-rpc';
+import { chapterLogError, type ChapterLogInput } from '../chapter/log';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
@@ -32,6 +33,7 @@ let notified = '';
 let foldedChapter = '';
 let attachWhy = ''; // why the last attach attempt refused — a page translated but not painted
 let noticeLogged = ''; // last runner notice copied into the popup log (dedupe across publishes)
+let prioritized = '';
 const folded = new Set<string>();
 const refs = new Map<string, PageRef>();
 const attaching = new WeakSet<Element>();
@@ -53,7 +55,7 @@ export function bookDrop(hash: string): void { syncBook(); folded.delete(hash); 
 export function forgetSweep(): void {
     startCancelled = true;
     progress = null; refs.clear(); evidence.clear(); imageAliases.clear(); sourceImages.clear(); sourceRequests.clear();
-    folded.clear(); notified = ''; attachWhy = '';
+    folded.clear(); notified = ''; attachWhy = ''; prioritized = '';
     removeActivity('sweep');
 }
 export function sweepArrivable(): boolean { return !!progress && progress.chapter === chapterKey(); }
@@ -93,6 +95,8 @@ export function sweepActive(): boolean {
 export interface SweepStatus {
     active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean;
     done: number; total: number; errors: number; skipped: number; inflight: number;
+    // Why the run stopped (runner message) — the halt line is a CTA, not a diagnosis.
+    message?: string;
     diagnostics?: string; // runner breadcrumbs (stuck labels etc.) — shown in the popup for support
 }
 export function sweepStatus(): SweepStatus | null {
@@ -101,6 +105,7 @@ export function sweepStatus(): SweepStatus | null {
     return { active: sweepActive(), phase: progress.phase === 'stopping' ? 'stopping' : 'running',
         stopping: progress.phase === 'stopping', done: progress.done, total: progress.total,
         errors: progress.errors, skipped: 0, inflight: progress.inflight,
+        ...(progress.message ? { message: progress.message } : null),
         ...(progress.diagnostics ? { diagnostics: progress.diagnostics } : null) };
 }
 function original(ref: PageRef): string {
@@ -171,19 +176,26 @@ export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): 
         return { ...bound, matchedBy: 'image' };
     }
     let snapshot = supplied;
+    let candidates = 0;
+    // Pixel evidence first: unique verified pixels are the strongest binding. The probe owns its
+    // own try/catch — a rendition the browser cannot decode (a partially corrupt file the reader
+    // still paints) must not skip the positional fallback below, which is why the old shared
+    // catch left such a page unmatched forever.
     try {
         snapshot ??= await readView(ref);
         const matches: ProgressPage[] = [];
-        for (const page of imageCandidates(snapshot.image, progress.pages)) {
+        const list = imageCandidates(snapshot.image, progress.pages);
+        candidates = list.length;
+        for (const page of list) {
             const identity = await pageEvidence(page);
-            if (!cacheCurrent(token) || progress?.id !== run || chapterKey() !== chapter || viewToken(ref) !== snapshot.token) return;
+            if (!cacheCurrent(token) || progress?.id !== run || chapterKey() !== chapter || viewToken(ref) !== snapshot.token) break;
             // A page still being worked on has no artifact to verify against yet: SKIP it, do
             // not abort the whole resolve. Aborting here meant the visible, already-finished
             // page stayed unmatched whenever a pending neighbour happened to be a close
             // pixel candidate — it then never attached and its paid translation was stranded.
             if (!identity) continue;
             if (verifyBitmap(snapshot.bitmap, identity)) matches.push(page);
-            if (matches.length > 1) return;
+            if (matches.length > 1) break;
         }
         if (matches.length === 1) {
             const page = matches[0];
@@ -192,28 +204,30 @@ export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): 
             if (ref.kind === 'img') imageAliases.set(snapshot.source, page.id);
             return { ...page, matchedBy: 'image' };
         }
-        if (matches.length > 1) return;
-        // Pixel evidence resolved nothing: for a reader that ships an authoritative chapter
-        // manifest, the URL's own page number is a reliable position. A paged reader shows one
-        // page per /N, and the run enumerated the chapter in order from the reader's API, so
-        // index N-1 is that page. This is a POSITION hint, not a paint authorization on its
-        // own: attach still re-reads the view and verifies the artifact's pixels before
-        // painting, so a mismatch is refused there rather than painting a neighbour.
-        // Only for a complete, reader-authored manifest — the case where order IS the page
-        // number. An incomplete/DOM-discovered run must never be position-guessed.
-        const hint = progress.completeManifest ? urlPageNumber() : null;
-        if (hint != null) {
-            // page.order is the ABSOLUTE chapter slot (0-based), so it survives a run that
-            // started mid-chapter — a positional index would not.
-            const byOrder = progress.pages.find(p => p.order === hint - 1);
-            if (byOrder) {
-                refs.set(byOrder.id, ref);
-                return { ...byOrder, matchedBy: 'url' };
-            }
+    } catch (e) {
+        if (isDebug()) console.log('[mt] resolve pixel probe failed', String((e as Error)?.message ?? e).slice(0, 140));
+    } finally { if (!supplied) snapshot?.bitmap.close(); }
+    if (!cacheCurrent(token) || progress?.id !== run || chapterKey() !== chapter) return;
+    // Pixel evidence resolved nothing (or was impossible): for a reader that ships an
+    // authoritative chapter manifest, the URL's own page number is a reliable position. A paged
+    // reader shows one page per /N, and the run enumerated the chapter in order from the
+    // reader's API, so index N-1 is that page. Position authorizes the identity; attach paints
+    // from the artifact (its pixel check is deferred, or refused for non-manifest pages).
+    // Only for a complete, reader-authored manifest — the case where order IS the page number.
+    // An incomplete/DOM-discovered run must never be position-guessed.
+    const hint = progress.completeManifest ? urlPageNumber() : null;
+    if (hint != null) {
+        // page.order is the ABSOLUTE chapter slot (0-based), so it survives a run that
+        // started mid-chapter — a positional index would not.
+        const byOrder = progress.pages.find(p => p.order === hint - 1);
+        if (byOrder) {
+            refs.set(byOrder.id, ref);
+            return { ...byOrder, matchedBy: 'url' };
         }
-        return;
-    } catch { return; }
-    finally { if (!supplied) snapshot?.bitmap.close(); }
+    }
+    if (isDebug()) console.log('[mt] resolve failed', JSON.stringify({ url: refKey(ref).slice(-14),
+        completeManifest: progress.completeManifest, hint, candidates }));
+    return;
 }
 export function sweepHas(url: string): boolean {
     return !!owned(url) && sweepActive();
@@ -221,6 +235,17 @@ export function sweepHas(url: string): boolean {
 async function control(command: string, extra: Record<string, unknown> = {}): Promise<any> {
     return sendToBackground({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra },
         { timeoutMs: 15_000, label: 'chapter control' });
+}
+
+function prioritize(page: ProgressPage): void {
+    if (!sweepActive() || page.phase !== 'queued') return;
+    const key = `${progress?.id}:${page.id}`;
+    if (prioritized === key) return;
+    prioritized = key;
+    void control('prioritize', { page: page.id }).catch(e => {
+        if (prioritized === key) prioritized = '';
+        reportError(e);
+    });
 }
 
 // Manual/auto requests join the chapter owner, including explicit retranslation.
@@ -233,9 +258,10 @@ export function chapterOwnsRequest(ref: PageRef, force: boolean): boolean {
         // Keep the old state until replacement: it owns the original pixels behind a
         // revoked reader blob. The new revision replaces its paint and context together.
         applied.delete(ref.el);
+        prioritized = '';
         void control('retry', { page: page.id }).catch(reportError);
     } else {
-        void control('prioritize', { page: page.id }).catch(reportError);
+        prioritize(page);
         if (page.phase === 'ready') void attach(ref, page);
     }
     return true;
@@ -392,7 +418,16 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
     starting = true;
     startCancelled = false;
     const chapter = chapterKey();
+    let logId = '';
+    const log = (event: ChapterLogInput): void => {
+        if (logId) void sendToBackground({ type: 'mt:chapter-log-event', logId, chapter, readerUrl: location.href, event },
+            { timeoutMs: 10_000, label: 'chapter log' }).catch(() => {});
+    };
     try {
+        const began = await sendToBackground<{ logId?: string }>({ type: 'mt:chapter-log-begin', chapter, readerUrl: location.href },
+            { timeoutMs: 10_000, label: 'chapter log start' }).catch(() => undefined);
+        logId = began?.logId ?? '';
+        log({ kind: 'stage', stage: 'preparing' });
         const cacheEpoch = await cacheReady();
         pillUnDismiss();
         setOverlayChoice('auto');
@@ -400,12 +435,14 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         dropAutoQueued();
         resumeAuto();
         setActivity('sweep', 'Preparing chapter translation…', 'sweep', 'read');
+        if (isBusy() || paintBusy() || lookaheadActive()) log({ kind: 'stage', stage: 'current' });
         // Existing manual work owns its pixels and context until it settles.
         while (isBusy() || paintBusy() || lookaheadActive()) {
-            if (startCancelled || chapter !== chapterKey()) return { ok: true, cancelled: true };
+            if (startCancelled || chapter !== chapterKey()) { log({ kind: 'cancel' }); return { ok: true, cancelled: true }; }
             setActivity('sweep', 'Finishing the current page before starting the chapter…', 'sweep', 'llm');
             await new Promise(r => setTimeout(r, 200));
         }
+        log({ kind: 'stage', stage: 'settings' });
         await loadPipeline();
         await loadContext();
         // Cloud engine: pay the container wake ONCE here — otherwise the first pages race a
@@ -415,10 +452,12 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
             const cfg = await cloudConfig();
             if (cfg.endpoint && cfg.key) {
                 setActivity('sweep', 'Waking the cloud server…', 'sweep', 'detect');
-                await cloudWarm(cfg.endpoint, cfg.key).catch(() => { /* page calls retry the wake */ });
+                log({ kind: 'stage', stage: 'warm' });
+                await cloudWarm(cfg.endpoint, cfg.key, logId ? { logId } : undefined).catch(e => { log({ kind: 'retry', ...chapterLogError(e) }); });
             }
         }
         setActivity('sweep', 'Finding the remaining pages in this chapter…', 'sweep', 'read');
+        log({ kind: 'stage', stage: 'enumerate' });
         const found = await enumerate();
         const pages = remainingPages(found.pages, found.anchor);
         if (!pages.length) {
@@ -429,6 +468,7 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
                 : 'No page images found on this reader — scroll to a page and try again');
         }
         const seeds: NonNullable<ChapterStart['seeds']> = [];
+        log({ kind: 'stage', stage: 'capture', total: pages.length });
         for (const page of pages) {
             const ref = getPages().find(r => original(r) === page.url);
             const state = ref && stateFor(ref);
@@ -444,8 +484,11 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
             page.inBaseContext = bookHas(state.hash);
         }
         // Capture readable opaque pixels before the reader can destroy their document.
-        for (const page of pages) if (!/^https?:/.test(page.url)) page.source = await capture(page);
-        if (startCancelled || chapter !== chapterKey()) return { ok: true, cancelled: true };
+        for (const page of pages) if (!/^https?:/.test(page.url)) {
+            log({ kind: 'stage', stage: 'capture', pages: [page.order + 1] });
+            page.source = await capture(page);
+        }
+        if (startCancelled || chapter !== chapterKey()) { log({ kind: 'cancel' }); return { ok: true, cancelled: true }; }
         assertCacheCurrent(cacheEpoch);
         // Some image CDNs refuse a referer-less fetch with 403/404; the session rule carries the
         // reader origin as Referer for the runner's fetches. Install it before the run starts —
@@ -457,8 +500,9 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         }).filter(Boolean))].slice(0, 8);
         await sendToBackground({ type: 'mt:hotlink-rule', origin: location.origin, hosts },
             { timeoutMs: 10_000, label: 'hotlink rule' }).catch(() => {});
+        log({ kind: 'stage', stage: 'start' });
         const response = await sendToBackground<{ ok?: boolean; error?: string; id: string; status?: ChapterProgress }>({ type: 'mt:chapter-start', data: {
-            chapter, cacheEpoch, readerUrl: location.href, pages, completeManifest: found.complete,
+            logId, chapter, cacheEpoch, readerUrl: location.href, pages, completeManifest: found.complete,
             pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,
             nextDocument: found.complete ? undefined : nextDocument(document, location.href, chapter)
                 ?? guessNextDocument(location.href, chapter),
@@ -473,6 +517,7 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         showProgress();
         return { ok: true, total: pages.length };
     } catch (e) {
+        log({ kind: 'failure', ...chapterLogError(e) });
         reportError(e);
         return { ok: false, error: (e as Error).message };
     } finally { starting = false; if (!sweepActive()) removeActivity('sweep'); }
@@ -674,7 +719,11 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
             const row = { ...entry, order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN };
             void cachePut({ ...row, key: cacheKey(chapter, result.hash) }, pipeline.cacheMax, cacheEpoch);
             if (hash) void cachePut({ ...row, key: cacheKey(chapter, hash) }, pipeline.cacheMax, cacheEpoch);
-            if (page.order != null) void cachePut({ ...row, key: pageKey(chapter, page.order) }, pipeline.cacheMax, cacheEpoch);
+            // The page-slot row carries pixel evidence for an idle reopen: with no live run the
+            // reader's own /N is the only identity left, and a slot alone cannot reject a wrong
+            // page. signatureOf()+gray let the prep gate verify before reusing.
+            if (page.order != null) void cachePut({ ...row, key: pageKey(chapter, page.order),
+                idSig: signatureOf(result.identity), idGray: result.identity.gray }, pipeline.cacheMax, cacheEpoch);
         }
         if (page.hash) bookAdd(page.hash);
         applied.set(ref.el, stamp);
@@ -755,7 +804,7 @@ async function refresh(): Promise<void> {
                 const source = await capture(page);
                 if (source) await control('append', { pages: [{ id: page.id, url: page.url, order: page.order ?? 0, descramble: false, source }] });
             }
-            else if (sweepActive()) void control('prioritize', { page: page.id }).catch(() => {});
+            else prioritize(page);
         }
         if (sweepActive() && !progress.completeManifest && Date.now() - discoverAt > 5000) {
             discoverAt = Date.now();
@@ -788,5 +837,7 @@ export function initSweep(): void {
         }
     });
     setInterval(() => void refresh(), 1000);
+    void sendToBackground({ type: 'mt:chapter-log-reader', chapter: chapterKey(), readerUrl: location.href },
+        { timeoutMs: 10_000, label: 'chapter log reader' }).catch(() => {});
     void refresh();
 }

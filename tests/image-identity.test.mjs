@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { bitmap, grayPage, installCanvas } from './helpers/image-fixture.mjs';
 
 await build({ entryPoints: ['src/image-identity.ts'], bundle: true, format: 'esm', outfile: '.test-build/image-identity.mjs' });
-const { identifyBitmap, imageCandidates, verifyBitmap, grayAgreement, hashDistance, signatureOf } = await import('../.test-build/image-identity.mjs');
+const { identifyBitmap, imageCandidates, verifyBitmap, grayAgreement, hashDistance, signatureOf, verifyGrayIdentity } = await import('../.test-build/image-identity.mjs');
 installCanvas();
 const box = { x1: 100, y1: 200, x2: 500, y2: 300 };
 
@@ -33,6 +33,16 @@ test('matching whole-page hashes cannot hide changed text in a region', () => {
     assert.equal(identifyBitmap(differentText).exact, expected.exact);
     assert.equal(imageCandidates(identifyBitmap(differentText), [{ image: expected }]).length, 1);
     assert.equal(verifyBitmap(differentText, expected), false);
+});
+test('a stored page-gray identity authorizes idle reuse and rejects another page', () => {
+    const source = bitmap();
+    const expected = identifyBitmap(source, [box]);
+    const drift = a => Uint8Array.from(a, (v, i) => Math.min(255, Math.max(0, v + (i % 3) - 1)));
+    const variant = bitmap(drift(source.gray), { width: 300, height: 400, region: drift(source.region) });
+    assert.equal(verifyGrayIdentity(variant, signatureOf(expected), expected.gray), true, 'encoder noise keeps the page');
+    assert.equal(verifyGrayIdentity(bitmap(grayPage(4)), signatureOf(expected), expected.gray), false, 'another page must not reuse the slot');
+    assert.equal(verifyGrayIdentity(bitmap(), signatureOf(expected), ''), false, 'a row without stored evidence must not be trusted');
+    assert.equal(verifyGrayIdentity(bitmap(), { ...signatureOf(expected), gen: 0 }, expected.gray), false, 'wrong generation fails closed');
 });
 test('a composite/spread is not accepted as one single page', () => {
     const expected = identifyBitmap(bitmap());

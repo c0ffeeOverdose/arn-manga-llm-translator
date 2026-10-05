@@ -146,10 +146,13 @@ export function setUi(v: HTMLDivElement | null): void { ui = v; }
 export let pipeline: PipelineSettings = { ...DEFAULT_PIPELINE_SETTINGS };
 let customFontLoaded = ''; // font-store id whose FontFace is already on document.fonts
 
-export async function loadPipeline(): Promise<PipelineSettings> {
+export async function loadPipeline(settings?: PipelineSettings): Promise<PipelineSettings> {
     if (hostIdentity) return pipeline;
-    const { mtPipeline } = await chrome.storage.local.get('mtPipeline');
-    pipeline = loadPipelineSettings(mtPipeline);
+    if (settings) pipeline = settings;
+    else {
+        const { mtPipeline } = await chrome.storage.local.get('mtPipeline');
+        pipeline = loadPipelineSettings(mtPipeline);
+    }
     setRenderTuning({
         minFont: pipeline.minFont,
         letterSpacing: pipeline.letterSpacing,

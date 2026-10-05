@@ -4,9 +4,13 @@
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
 import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type CharOverride, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
-import { chapterReaderUrl } from './chapter-broker';
+import { chapterReaderUrl, isChapterRunnerSender } from './chapter-broker';
 import { cacheReady, cacheCurrent, onCacheReset } from '../cache-generation';
 import { initDebug, isDebug } from '../debug';
+import { recordChapterLog, recordChapterWorkerWake } from '../chapter/log-store';
+import { chapterLogError, type ChapterTrace } from '../chapter/log';
+
+void recordChapterWorkerWake().catch(() => {});
 
 // content scripts can't touch storage.session by default — open it up.
 // ?. chain: setAccessLevel doesn't exist on older Firefox, and a sync throw
@@ -30,6 +34,7 @@ interface TranslateMsg {
     interim?: boolean;        // caller understands {type:'mt:ocr-texts'} mid-flight messages (new content only — an old listener would read the interim as the final reply and fail the job)
     requestNonce?: string;    // fresh user intent; transport retries reuse the same nonce
     cacheEpoch?: string;
+    chapterTrace?: ChapterTrace;
 }
 interface TestLlmMsg {
     type: 'mt:test-llm';
@@ -59,12 +64,13 @@ interface CloudPageMsg {
     jpegB64: string; // base64 JPEG (raw bytes don't survive MV3 messaging)
     inpaint?: boolean; // ask the server to merge cleanup patches into the response
     texts?: boolean; // false = skip the server OCR pass (the LLM reads the image instead)
+    chapterTrace?: ChapterTrace;
 }
 interface FontGetMsg {
     type: 'mt:font-get';
     id: string;               // font-store id
 }
-type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string; hosts?: string[] } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string } | { type: 'mt:cloud-warm'; endpoint: string; key: string }
+type BgMsg = TranslateMsg | TestLlmMsg | TestOcrMsg | TestCloudMsg | CloudPageMsg | CharBookMsg | FontGetMsg | { type: 'ping' } | { type: 'mt:screenshot' } | { type: 'mt:hotlink-rule'; origin: string; hosts?: string[] } | { type: 'mt:fetch-image'; url: string } | { type: 'mt:worker-token'; nonce: string; token: string } | { type: 'mt:get-worker-token'; nonce: string } | { type: 'mt:cloud-warm'; endpoint: string; key: string; chapterTrace?: ChapterTrace }
     | { type: 'mt:cloud-inpaint'; endpoint: string; key: string; jpegB64: string; maskB64: string; boxes: { x1: number; y1: number; x2: number; y2: number }[] };
 interface CharBookMsg {
     type: 'mt:char-book';
@@ -323,16 +329,22 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         // scale-to-zero boot can outlive the per-page 90s cap: warming gets its
         // own longer one, and the reply carries the boot ms back for the pill.
         (async () => {
+            const trace = sender.frameId === 0 || isChapterRunnerSender(sender) ? msg.chapterTrace : undefined;
+            recordChapterLog(trace, { kind: 'cloud-received' });
             const ctrl = new AbortController();
             const to = setTimeout(() => ctrl.abort(), 180000);
             const t0 = Date.now();
             try {
                 const base = String(msg.endpoint ?? '').replace(/\/$/, '');
                 if (!/^https?:\/\//.test(base)) { sendResponse({ ok: false, error: 'Endpoint URL must start with http(s)://' }); return; }
+                recordChapterLog(trace, { kind: 'cloud-http-start', deadlineMs: 180_000 });
                 const r = await fetch(`${base}/health`, { signal: ctrl.signal });
-                if (!r.ok) { sendResponse({ ok: false, error: `cloud warm HTTP ${r.status}` }); return; }
+                recordChapterLog(trace, { kind: 'cloud-http-reply', status: r.status });
+                if (!r.ok) { recordChapterLog(trace, { kind: 'cloud-response', status: r.status, reason: 'http' }); sendResponse({ ok: false, error: `cloud warm HTTP ${r.status}` }); return; }
+                recordChapterLog(trace, { kind: 'cloud-response', status: r.status });
                 sendResponse({ ok: true, ms: Date.now() - t0 });
             } catch (e) {
+                recordChapterLog(trace, { kind: 'cloud-response', ...chapterLogError(e) });
                 const m = e instanceof Error && e.name === 'AbortError' ? 'cloud warm timed out after 180s' : String((e as Error)?.message ?? e);
                 sendResponse({ ok: false, error: m });
             } finally {
@@ -371,6 +383,8 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         // content-script fetch is CORS-gated on the page origin, so the /v1/page
         // POST rides through here. 90s cap (150s with inpaint).
         (async () => {
+            const trace = isChapterRunnerSender(sender) ? msg.chapterTrace : undefined;
+            recordChapterLog(trace, { kind: 'cloud-received' });
             const capMs = msg.inpaint ? 150000 : 90000;
             const ctrl = new AbortController();
             const to = setTimeout(() => ctrl.abort(), capMs);
@@ -380,12 +394,17 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 const bin = atob(msg.jpegB64 ?? '');
                 const bytes = new Uint8Array(bin.length);
                 for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                recordChapterLog(trace, { kind: 'cloud-http-start', deadlineMs: capMs });
                 const r = await fetch(
                     `${base}/v1/page?conf_thr=${msg.confThr}&min_size=${msg.minSize}${msg.inpaint ? '&inpaint=1' : ''}${msg.texts === false ? '&texts=0' : ''}`,
                     { method: 'POST', headers: { Authorization: `Bearer ${msg.key}`, 'Content-Type': 'image/jpeg' }, body: bytes, signal: ctrl.signal });
-                if (!r.ok) { const t = await r.text().catch(() => ''); sendResponse({ ok: false, error: `cloud HTTP ${r.status}: ${t.slice(0, 160)}` }); return; }
-                sendResponse({ ok: true, page: await r.json() });
+                recordChapterLog(trace, { kind: 'cloud-http-reply', status: r.status });
+                if (!r.ok) { const t = await r.text().catch(() => ''); recordChapterLog(trace, { kind: 'cloud-response', status: r.status, reason: 'http' }); sendResponse({ ok: false, error: `cloud HTTP ${r.status}: ${t.slice(0, 160)}` }); return; }
+                const page = await r.json();
+                recordChapterLog(trace, { kind: 'cloud-response', status: r.status });
+                sendResponse({ ok: true, page });
             } catch (e) {
+                recordChapterLog(trace, { kind: 'cloud-response', ...chapterLogError(e) });
                 const m = e instanceof Error && e.name === 'AbortError' ? `cloud timed out after ${Math.round(capMs / 1000)}s` : String((e as Error)?.message ?? e);
                 sendResponse({ ok: false, error: m });
             } finally {
@@ -520,7 +539,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
     }
     if (msg?.type !== 'mt:translate') return;
 
-    runTranslate(msg, sendResponse);
+    runTranslate(msg, sendResponse, undefined, sender);
     return true; // async response
 });
 
@@ -551,7 +570,14 @@ function flightRecentPut(id: string, resp: unknown): void {
     if (flightRecent.size > FLIGHT_RECENT_MAX) flightRecent.delete(flightRecent.keys().next().value!);
 }
 
-function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (r: unknown) => void) {
+function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: (r: unknown) => void, sender?: chrome.runtime.MessageSender) {
+    const trace = sender && isChapterRunnerSender(sender) ? msg.chapterTrace : undefined;
+    recordChapterLog(trace, { kind: 'llm-received' });
+    const send = (result: unknown): void => {
+        const r = result as { ok?: boolean; kind?: string };
+        recordChapterLog(trace, { kind: 'llm-response', ...(r?.ok ? {} : chapterLogError(r)) });
+        reply(result);
+    };
     // settles waiters when assigned (post-adoption); pre-adoption failures
     // answer the caller directly — nothing was claimed.
     let settle: ((resp: unknown) => void) | null = null;
@@ -609,9 +635,11 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 for (;;) {
                     calls++;
                     const tAttempt = Date.now();
+                    recordChapterLog(trace, { kind: 'llm-provider-start', calls });
                     if (isDebug()) console.log(`[mt:trace] ${traceTag} attempt#${calls} send (${Date.now() - tCall}ms in)`);
                     try {
                         const r = await callLLM(s, p, imgs, thinking ?? pipeline.thinkingLevel, session, temperature, maxTokens);
+                        recordChapterLog(trace, { kind: 'llm-provider-reply', ms: r.ms, calls });
                         ms += r.ms;
                         addUsage(r.usage);
                         if (r.tempDropped) tempDropped = true;
@@ -620,6 +648,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                         if (isDebug()) console.log(`[mt:trace] ${traceTag} attempt#${calls} OK in ${Date.now() - tAttempt}ms, text.len=${r.text.trim().length}`);
                         if (retryEmpty && !emptyRetried && !r.text.trim()) {
                             emptyRetried = true;
+                            recordChapterLog(trace, { kind: 'retry', reason: 'empty-reply' });
                             // Name the failure: model/finish/usage separate reasoning starvation
                             // (finish=length/max_tokens, reasonTok near outTok) from a gateway
                             // that answered 200 with no usable body at all.
@@ -631,6 +660,8 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                     } catch (e) {
                         const m = toMtError(e);
                         const retryable = m.kind === 'server' || m.kind === 'network';
+                        recordChapterLog(trace, { kind: retryable && errAttempt < 2 ? 'retry' : 'llm-provider-failed',
+                            ...chapterLogError(m), ms: Date.now() - tAttempt });
                         console.warn(`[mt:trace] ${traceTag} attempt#${calls} FAIL in ${Date.now() - tAttempt}ms kind=${m.kind} retryable=${retryable}: ${m.message.slice(0, 120)}`);
                         if (!retryable || errAttempt >= 2) throw m;
                         await new Promise(r => setTimeout(r, errAttempt === 0 ? 1000 : 4000));
@@ -665,6 +696,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
             if (recent && (recent as { ok?: unknown })?.ok) {
                 // the twin call finished moments ago — serve without spending.
                 flightStats.recentHits++;
+                recordChapterLog(trace, { kind: 'cache-hit', reason: 'cached-reply' });
                 if (isDebug()) console.log('[mt:bg] flight recent-hit', reqId.slice(0, 12));
                 send(recent);
                 return;
@@ -674,6 +706,7 @@ function runTranslate(msg: TranslateMsg, send: (r: unknown) => void, interim?: (
                 // the twin call is still running — wait for its outcome instead
                 // of paying a duplicate.
                 flightStats.adopted++;
+                recordChapterLog(trace, { kind: 'cache-hit', reason: 'shared-request' });
                 if (isDebug()) console.log('[mt:bg] flight adopted', reqId.slice(0, 12));
                 send(await new Promise<unknown>(res => inflight.push(res)));
                 return;
@@ -891,7 +924,7 @@ chrome.runtime.onConnect.addListener((port) => {
                 // split-pipeline interim (transcripts) — same channel, filtered
                 // by the content script before it settles its promise
                 try { port.postMessage(r); } catch { /* peer gone */ }
-            });
+            }, port.sender);
         });
     }
 });

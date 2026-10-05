@@ -7,6 +7,8 @@ import { fetchWorkerToken } from './worker-token';
 import { canvasJpegB64 } from './encode';
 import type { PageTimer } from '../page-timing';
 import { sendToBackground } from '../bg-rpc';
+import { recordChapterLog } from '../chapter/log-store';
+import { chapterLogError, type ChapterTrace } from '../chapter/log';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -1217,9 +1219,11 @@ export async function cloudConfig(): Promise<{ endpoint: string; key: string }> 
 // Modal scales to zero: the first request after idle pays the container boot + model load.
 // A sweep pays that ONCE up front instead of letting the first page calls race the boot.
 // /health is auth-exempt and returns only after the models are up.
-export async function cloudWarm(endpoint: string, key: string): Promise<number> {
+export async function cloudWarm(endpoint: string, key: string, chapterTrace?: ChapterTrace): Promise<number> {
+    const trace = chapterTrace ? { ...chapterTrace, request: crypto.randomUUID() } : undefined;
+    recordChapterLog(trace, { kind: 'cloud-sent', stage: 'warm', deadlineMs: 190_000 });
     const r = await sendToBackground<{ ok: boolean; ms?: number; error?: string }>(
-        { type: 'mt:cloud-warm', endpoint, key }, { timeoutMs: 190_000, label: 'cloud warm' });
+        { type: 'mt:cloud-warm', endpoint, key, ...(trace ? { chapterTrace: trace } : {}) }, { timeoutMs: 190_000, label: 'cloud warm' });
     if (!r?.ok) throw new Error(r?.error ?? 'cloud warm failed');
     return r.ms ?? 0;
 }
@@ -1227,15 +1231,18 @@ export async function cloudWarm(endpoint: string, key: string): Promise<number> 
 export async function cloudDetect(
     bitmap: ImageBitmap,
     endpoint: string, key: string,
-    opts: { confThr: number; minSize: number; quality: number; gray: boolean; inpaint?: boolean; texts?: boolean; timing?: PageTimer },
+    opts: { confThr: number; minSize: number; quality: number; gray: boolean; inpaint?: boolean; texts?: boolean; timing?: PageTimer; chapterTrace?: ChapterTrace },
 ): Promise<DetectResult> {
     // capped upload (mobile uplink): CTD/Baberu inputs are resize-invariant, so anything above
     // CLOUD_MAX_SIDE is pure wire cost — response coords come back in sent space and are mapped
     // back with `scale` below
     const tEnc = performance.now();
+    const trace = opts.chapterTrace ? { ...opts.chapterTrace, request: crypto.randomUUID() } : undefined;
+    recordChapterLog(trace, { kind: 'stage', stage: 'cloudEncode' });
     const { b64: jpegB64, scale } = await bitmapToJpegB64Capped(bitmap, opts.quality, opts.gray, CLOUD_MAX_SIDE);
     const encMs = Math.round(performance.now() - tEnc);
     opts.timing?.add('cloudEncode', encMs);
+    recordChapterLog(trace, { kind: 'cloud-sent', stage: 'cloudWait', ms: encMs, bytes: Math.round(jpegB64.length * 0.75), deadlineMs: 160_000 });
     // via the SW: content-script fetch is CORS-gated on the page origin. The channel
     // JSON-serializes, so the JPEG rides as base64 (an ArrayBuffer arrives as {}).
     const tUp = performance.now();
@@ -1247,10 +1254,15 @@ export async function cloudDetect(
             inpaint: opts.inpaint === true,
             // page/crops modes read the image at the LLM — tell the server to skip its OCR pass
             texts: opts.texts !== false,
+            ...(trace ? { chapterTrace: trace } : {}),
         }, { timeoutMs: 160_000, label: 'cloud detect' });
+    } catch (e) {
+        recordChapterLog(trace, { kind: 'cloud-response', ...chapterLogError(e) });
+        throw e;
     } finally { opts.timing?.add('cloudRequest', performance.now() - tUp); }
     const upMs = Math.round(performance.now() - tUp);
     if (!resp?.ok) throw new Error(resp?.error ?? 'cloud failed');
+    recordChapterLog(trace, { kind: 'stage', stage: 'detect', ms: upMs });
     {
         const tDecode = performance.now();
         const j = resp.page;

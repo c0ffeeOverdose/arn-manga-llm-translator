@@ -63,7 +63,7 @@ await Promise.all([
     minify: true,
     sourcemap: process.argv.includes('--watch') ? 'inline' : false,
     outfile: join(dist, 'background.js'),
-    define: { 'process.env.NODE_ENV': '"production"' },
+    define: { 'process.env.NODE_ENV': '"production"', '__BUILD_ID__': JSON.stringify(buildId) },
     loader: { '.ts': 'ts' },
   }),
   esbuild.build({

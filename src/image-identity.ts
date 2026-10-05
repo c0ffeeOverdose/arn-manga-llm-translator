@@ -170,3 +170,18 @@ export function verifyBitmap(bitmap: ImageBitmap | HTMLCanvasElement, expected: 
     }
     return true;
 }
+
+// Page-level verification for a stored page identity (`idSig` + `idGray` on a cache row):
+// proves the pixels are this page before an idle slot is trusted. Dims and fingerprints
+// cannot reject a wrong page of equal size; the page-wide gray comparison can. Text-region
+// evidence is not stored with cache rows, so a changed digit inside one page is not detected
+// here — callers must use full verifyBitmap where region evidence exists.
+export function verifyGrayIdentity(bitmap: ImageBitmap | HTMLCanvasElement, expected: ImageSignature, grayB64: string): boolean {
+    if (!expected || typeof grayB64 !== 'string' || !grayB64) return false;
+    const gray = sampleGray(bitmap, PAGE_SAMPLE);
+    const signature = imageSignature(gray, bitmap.width, bitmap.height);
+    if (!sameGeometry(signature, expected)) return false;
+    if (signature.contrast < 3 && signature.exact !== expected.exact) return false;
+    const original = decodeGray(grayB64, PAGE_SAMPLE);
+    return !!original && grayAgreement(gray, original, PAGE_SAMPLE);
+}

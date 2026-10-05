@@ -1,6 +1,5 @@
-// A start whose runner never attaches is invisible: the broker would hold a session the reader
-// can never see progress for. This watch records the runner's host-config request and lets
-// start() bound its wait before retrying or reporting an honest failure.
+// A start is acknowledged only after its runner finishes setup, never on config delivery.
+// The broker bounds this wait before recreating the context or reporting failure.
 export class AttachWatch {
     private hitIds = new Set<string>();
     private waiters = new Map<string, Set<(ok: boolean) => void>>();

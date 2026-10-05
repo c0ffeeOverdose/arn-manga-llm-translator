@@ -88,6 +88,46 @@ test('Chromium: offscreen document path unchanged', async () => {
   }
 });
 
+test('Chromium without hasDocument uses exact context presence for reuse and crash recovery', async () => {
+    const calls = [], filters = [];
+    let contexts = [];
+    const url = 'chrome-extension://test/chapter/page.html';
+    globalThis.chrome = {
+        runtime: { getURL: p => `chrome-extension://test/${p}`, getContexts: async filter => { filters.push(filter); return contexts; } },
+        offscreen: {
+            createDocument: async opts => { calls.push(opts); contexts = [{ contextType: 'OFFSCREEN_DOCUMENT', documentUrl: url }]; },
+            closeDocument: async () => { contexts = []; },
+        },
+    };
+    try {
+        const runner = createRunner();
+        assert.equal(await runner.live('s'), false, 'an unavailable API is not evidence of a living runner');
+        await runner.ensure('s');
+        await runner.ensure('s');
+        assert.equal(calls.length, 1, 'getContexts must prevent duplicate offscreen creation');
+        assert.equal(await runner.live('s'), true);
+        assert.deepEqual(filters[0], { contextTypes: ['OFFSCREEN_DOCUMENT'], documentUrls: [url] });
+        contexts = [];
+        assert.equal(await runner.live('s'), false, 'a crashed runner must release its running status');
+    } finally { delete globalThis.chrome; }
+});
+
+test('older Chromium uses window clients and never treats an unrelated extension page as the runner', async () => {
+    let clients = [{ url: 'chrome-extension://test/options/options.html' }];
+    globalThis.clients = { matchAll: async () => clients };
+    globalThis.chrome = { runtime: { getURL: p => `chrome-extension://test/${p}` }, offscreen: {} };
+    try {
+        const runner = createRunner();
+        assert.equal(await runner.live('s'), false);
+        clients.push({ url: 'chrome-extension://test/chapter/page.html' });
+        assert.equal(await runner.live('s'), true);
+        clients = [];
+        assert.equal(await runner.live('s'), false);
+        delete globalThis.clients;
+        assert.equal(await runner.live('s'), false, 'no presence API must fail closed');
+    } finally { delete globalThis.clients; delete globalThis.chrome; }
+});
+
 test('the background bundle no longer loads the runner into its own context', () => {
   assert.equal(existsSync(new URL('../src/chapter/boot.ts', import.meta.url)), false, 'boot.ts is gone');
   const bg = readFileSync(new URL('../src/background/background.ts', import.meta.url), 'utf8');

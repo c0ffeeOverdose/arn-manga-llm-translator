@@ -3,6 +3,8 @@ import { loadPipelineSettings, isAutoSite, autoSiteOf, autoSiteList, autoSiteAdd
 import { sweepCountMessage, type SweepCountReason } from '../chapter/model';
 import { sessGet } from '../storage-session';
 import { TIMING_LABELS, formatPageTiming, timingSeconds, type PageTimingReport, type TimingName } from '../page-timing';
+import { latestChapterLogHead, readChapterLog } from '../chapter/log-store';
+import { chapterLogSummary, formatChapterLog, type ChapterLogHead, type ChapterLogReport } from '../chapter/log';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const btn = $<HTMLButtonElement>('translate');
@@ -28,6 +30,52 @@ const timingWrap = $<HTMLDetailsElement>('timingWrap');
 const timingCopy = $<HTMLButtonElement>('timingCopy');
 const timingText = $<HTMLTextAreaElement>('timingText');
 let timingReport: PageTimingReport | null = null;
+const chapterLogWrap = $<HTMLDetailsElement>('chapterLogWrap');
+const chapterLogCopy = $<HTMLButtonElement>('chapterLogCopy');
+const chapterLogText = $<HTMLTextAreaElement>('chapterLogText');
+let chapterHead: ChapterLogHead | undefined;
+let chapterReport: ChapterLogReport | undefined;
+let chapterLogBusy = false;
+
+async function refreshChapterLog(): Promise<void> {
+    if (chapterLogBusy) return;
+    chapterLogBusy = true;
+    try {
+        const head = await latestChapterLogHead();
+        chapterHead = head;
+        chapterLogWrap.hidden = !head;
+        if (!head) { chapterReport = undefined; return; }
+        if (chapterLogWrap.open) {
+            chapterReport = await readChapterLog(head.id);
+            if (chapterReport) $('chapterLogBody').textContent = chapterLogSummary(chapterReport);
+        }
+    } catch {
+        if (!chapterLogWrap.hidden) $('chapterLogBody').textContent = 'Could not read the saved chapter log — try opening it again.';
+    } finally { chapterLogBusy = false; }
+}
+chapterLogWrap.ontoggle = () => { if (chapterLogWrap.open) void refreshChapterLog(); };
+chapterLogCopy.onclick = async () => {
+    if (!chapterHead) return;
+    chapterLogCopy.disabled = true;
+    try {
+        const report = await readChapterLog(chapterHead.id);
+        if (!report) throw new Error('No saved chapter log');
+        chapterReport = report;
+        const text = formatChapterLog(report);
+        try {
+            await navigator.clipboard.writeText(text);
+            chapterLogText.hidden = true;
+            $('chapterLogNote').textContent = 'Copied — paste the chapter log with your test results.';
+        } catch {
+            chapterLogText.value = text;
+            chapterLogText.hidden = false;
+            chapterLogText.focus(); chapterLogText.select();
+            $('chapterLogNote').textContent = 'Automatic copy is unavailable. Long-press the selected log to copy it.';
+        }
+    } catch {
+        $('chapterLogNote').textContent = 'Could not read the saved chapter log — try again.';
+    } finally { chapterLogCopy.disabled = false; }
+};
 
 function renderTiming(report: PageTimingReport | null): void {
     timingReport = report;
@@ -177,11 +225,12 @@ async function refreshStatus(): Promise<void> {
         charsBtn.textContent = resp.charsOpen ? 'Hide characters' : 'Characters';
         lastChars = resp.charsOpen;
         // Chapter execution continues independently of reader navigation.
-        const sw = resp.sweep as { active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean; done: number; total: number; errors: number; diagnostics?: string } | null;
+        const sw = resp.sweep as { active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean; done: number; total: number; errors: number; message?: string; diagnostics?: string } | null;
         const sweepInfo = $<HTMLElement>('sweepDetails');
-        if (sw && (sw.diagnostics || sw.errors > 0)) {
+        const sweepParts = sw ? [sw.errors > 0 ? `${sw.errors} failed` : '', sw.message ?? '', sw.diagnostics ?? ''].filter(Boolean) : [];
+        if (sweepParts.length) {
             sweepInfo.style.display = '';
-            sweepInfo.textContent = `${sw.errors > 0 ? `${sw.errors} failed — ` : ''}${sw.diagnostics ?? ''}`.trim();
+            sweepInfo.textContent = sweepParts.join(' · ');
         } else {
             sweepInfo.style.display = 'none';
             sweepInfo.textContent = '';
@@ -231,7 +280,9 @@ async function refreshStatus(): Promise<void> {
 }
 refreshStatus();
 const poll = setInterval(refreshStatus, 1000);
-window.addEventListener('unload', () => clearInterval(poll));
+void refreshChapterLog();
+const chapterPoll = setInterval(() => void refreshChapterLog(), 2000);
+window.addEventListener('unload', () => { clearInterval(poll); clearInterval(chapterPoll); });
 
 btn.onclick = async () => {
     const resp = await send({ type: 'mt:translate-image' });

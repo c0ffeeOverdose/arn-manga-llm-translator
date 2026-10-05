@@ -17,6 +17,8 @@ import { savedOriginal } from './page-identity';
 import { cacheReady, cacheGeneration, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 import { PageTimer } from '../page-timing';
 import { sendToBackground } from '../bg-rpc';
+import { recordChapterLog } from '../chapter/log-store';
+import type { ChapterTrace } from '../chapter/log';
 
 // Warm-path AI cleanup: compute cleanup patches for a freshly translated page
 // and hand them to the caller's cache entry. Gated on cache-on + local mode;
@@ -422,7 +424,7 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer; chapterTrace?: ChapterTrace },
 ): Promise<TranslateOutcome> {
     const timing = opts?.timing ?? new PageTimer();
     const notify = onStatus;
@@ -613,7 +615,10 @@ export async function translateRegions(
             interim: true, // this version handles the mid-flight transcripts message (see portSend)
             requestNonce: opts?.fresh ? crypto.randomUUID() : undefined,
             cacheEpoch,
+            ...(opts?.chapterTrace ? { chapterTrace: { ...opts.chapterTrace, request: crypto.randomUUID() } } : {}),
         };
+        recordChapterLog(payload.chapterTrace, { kind: 'llm-sent', stage: 'llmWait', boxes: regions.length,
+            bytes: Math.round((timing.meta.imageChars ?? 0) * 0.75), deadlineMs: 260_000 });
         // suspend-proof channel: an open runtime port pins the background page
         // alive AND its replies always arrive (a pending sendResponse can be
         // dropped when the page suspends). Falls back to plain sendMessage.

@@ -9,12 +9,15 @@ import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
 import { inpaintMode } from '../llm/pipeline-settings';
 import { pageHashFromBitmap, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, cacheGet, cachePut, dropContainedBoxes, isResumable, detFromPartial, detFromCacheEntry, partialEntry, readWarming, warmingFresh, writeWarming, sweepWait, samePagePath, cloudSplitFresh, bytesCrops, type CachedPage } from './page-cache';
-import { sweepPageOrder } from './sweep';
+import { sweepPageOrder, idlePageOrder } from './sweep';
+import { verifyGrayIdentity } from '../image-identity';
 import { stateFor, pipeline, loadPipeline, chapterKey, resetContextIfNewChapter, type PageRef } from './state';
 import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { PageTimer } from '../page-timing';
+import { recordChapterLog } from '../chapter/log-store';
+import type { ChapterTrace } from '../chapter/log';
 
 export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; cacheEpoch?: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer; timing?: PageTimer }
 
@@ -24,6 +27,7 @@ export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; 
 export async function resolveHeadlessDet(
     bitmap: ImageBitmap, hash: string, onStatus: MtOnStatus,
     token?: string,
+    chapterTrace?: ChapterTrace,
 ): Promise<{ det: DetectResult | null; resumed: boolean }> {
     token ??= await cacheReady();
     assertCacheCurrent(token);
@@ -41,7 +45,8 @@ export async function resolveHeadlessDet(
             return { det: detFromPartial(hit, bitmap.width, bitmap.height)!, resumed: true };
         }
     }
-    const det = await detectPage(bitmap, onStatus, { lo: true }); // lookahead/sweep headless — background
+    const det = await detectPage(bitmap, onStatus, { lo: true, chapterTrace }); // lookahead/sweep headless — background
+    recordChapterLog(chapterTrace, { kind: 'stage', stage: 'order' });
     await orderDetection(det, bitmap);
     assertCacheCurrent(token);
     if (det.boxes.length) {
@@ -51,13 +56,15 @@ export async function resolveHeadlessDet(
 }
 
 // Detection for one bitmap (local or cloud), no ordering — shared by preparePage and the seam path.
-export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts?: { lo?: boolean; timing?: PageTimer }): Promise<DetectResult> {
+export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts?: { lo?: boolean; timing?: PageTimer; chapterTrace?: ChapterTrace }): Promise<DetectResult> {
     // cloud engine: one POST returns boxes+texts. No silent fallback — a cloud failure is an
     // error, and cloud mode without endpoint/key is a config error, not a cue to go local.
+    recordChapterLog(opts?.chapterTrace, { kind: 'stage', stage: 'settings' });
     const { mtSettings } = await chrome.storage.local.get('mtSettings');
     const endpoint = String((mtSettings as LLMSettings | undefined)?.cloudEndpoint ?? '').trim();
     const key = String((mtSettings as LLMSettings | undefined)?.cloudKey ?? '').trim();
     if (pipeline.inferEngine === 'cloud') {
+        recordChapterLog(opts?.chapterTrace, { kind: 'stage', stage: 'detect', execution: 'cloud' });
         if (!endpoint || !key) {
             throw Object.assign(
                 new Error('Cloud engine selected but endpoint/key missing'),
@@ -77,6 +84,7 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
                 inpaint: inpaintMode(pipeline) !== 'fill',
                 texts: needsTexts,
                 timing: opts?.timing,
+                chapterTrace: opts?.chapterTrace,
             });
         } catch (e) {
             throw Object.assign(
@@ -85,6 +93,7 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
             );
         }
     }
+    recordChapterLog(opts?.chapterTrace, { kind: 'stage', stage: 'detect', execution: 'local' });
     return detect(bitmap, onStatus, { confThr: pipeline.detConf, minSize: pipeline.detMinSize, forceWasm: pipeline.detEp === 'wasm', lo: opts?.lo === true });
 }
 
@@ -227,7 +236,7 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
     const hash = timing.measure('cacheHash', () => pageHashFromBitmap(bitmap));
     assertCacheCurrent(cacheEpoch);
     // miss-reason instrument: a revisit that SHOULD hit but misses needs a verdict in one
-    // dump (absent | fp | dims | splitgen | mask | disabled)
+    // dump (absent | fp | dims | splitgen | mask | identity | disabled)
     let cacheMiss: string | undefined = pipeline.cacheEnabled ? 'absent' : 'disabled';
     if (!force) {
         const fp = settingsFingerprint(pipeline);
@@ -253,13 +262,20 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
         // showing differ from what the runner fetched. Without this the same page was
         // translated again (and billed again) on "Translate this page".
         if (pipeline.cacheEnabled) {
-            const order = sweepPageOrder(srcUrl);
+            // A live run trusts its own slot (it enumerated this reader). With no run — a plain
+            // reopen — the reader's own /N is the durable slot the chapter wrote, but a slot plus
+            // matching dims cannot reject a wrong page, so an IDLE hit must prove these pixels
+            // against the row's stored identity before it renders.
+            const liveOrder = sweepPageOrder(srcUrl);
+            const order = liveOrder ?? idlePageOrder();
             const byPage = order != null ? await timing.measureAsync('cacheIdb', () => cacheGet(pageKey(chapterKey(), order))) : undefined;
             if (byPage) {
                 const decision = pageEntryDecision(byPage, hash, fp, bitmap.width, bitmap.height);
                 const pageDet = decision.usable
                     ? detFromCacheEntry(byPage, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud') : null;
-                if (pageDet) {
+                const verified = liveOrder != null
+                    || (!!byPage.idSig && !!byPage.idGray && verifyGrayIdentity(bitmap, byPage.idSig, byPage.idGray));
+                if (pageDet && verified) {
                     cacheMiss = undefined;
                     onStatus('Cache hit…');
                     // crops are erased pixels: keep them only when they belong to these bytes —
@@ -272,6 +288,9 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
                     return { srcUrl, bitmap, det: pageDet, hash, cacheEpoch, cached, prepMs: prepMs(),
                         origBytes: ref.kind === 'canvas' ? bytes : undefined };
                 }
+                // Idle entry that could render but failed (or lacks) pixel proof: miss once and
+                // heal — the fresh render stores identity evidence for the next reopen.
+                if (pageDet && !verified && liveOrder == null) cacheMiss = 'identity';
             }
         }
         // detect checkpoint resume: the previous load finished detect but died before

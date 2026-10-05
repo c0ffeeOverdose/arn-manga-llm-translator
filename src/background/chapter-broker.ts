@@ -8,17 +8,19 @@ import { AttachWatch } from '../chapter/attach-watch';
 import { readerStartAllowed } from '../chapter/reader';
 import { cacheClear } from '../content/page-cache';
 import { CACHE_GENERATION_KEY, cacheReady, cacheGeneration, acceptCacheGeneration, assertCacheCurrent } from '../cache-generation';
+import { createChapterLog, appendChapterLog, recordChapterLog, latestChapterLogHead, chapterLogOwned } from '../chapter/log-store';
+
+declare const __BUILD_ID__: string;
 
 interface Binding { id: string; kind: 'offscreen' | 'background'; chapter: string }
 const bindingKey = (tab: number) => `mtChapterTab:${tab}`;
 const starts = new Map<number, Promise<unknown>>();
-// How long a freshly created runner context gets to ask for its host config before the start
-// is treated as failed. Generous enough for a cold document load, short enough that a user who
-// clicks start is never left without an answer.
-const ATTACH_TIMEOUT_MS = 15_000;
+// Readiness includes settings and font setup, not merely obtaining the host config.
+const ATTACH_TIMEOUT_MS = 30_000;
 const attachWatch = new AttachWatch();
 let runner: ChapterRunner = createRunner();
 let liveId = '';
+let liveLogId = '';
 let clearing: Promise<unknown> | undefined;
 async function binding(tab: number): Promise<Binding | undefined> {
     return (await sessGet(bindingKey(tab)))[bindingKey(tab)] as Binding | undefined;
@@ -67,7 +69,13 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
     }
     assertCacheCurrent(token);
     const id = crypto.randomUUID();
-    const config: HostConfig = { ...data, cacheEpoch: token, id, readerTab: tab, kind: runnerKind() };
+    const logId = data.logId && await chapterLogOwned(data.logId, tab, data.chapter).catch(() => false) ? data.logId
+        : await createChapterLog(tab, data.chapter, typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'development', navigator.userAgent).catch(() => '');
+    const config: HostConfig = { ...data, logId, cacheEpoch: token, id, readerTab: tab, kind: runnerKind() };
+    recordChapterLog({ logId }, { kind: 'stage', stage: 'start', phase: 'preparing', total: data.pages.length,
+        engine: data.pipeline.inferEngine, textSource: data.pipeline.textSource, parallelLlm: data.pipeline.parallelLlm, mergePages: data.pipeline.mergePages,
+        runnerKind: config.kind, hasOffscreenApi: !!chrome.offscreen,
+        hasContextsApi: typeof (chrome.runtime as unknown as { getContexts?: unknown }).getContexts === 'function', hasSessionStorage: !!chrome.storage.session });
     for (const seed of data.seeds ?? []) {
         const entry = { ...seed.entry, mask: seed.entry.mask ? { ...seed.entry.mask,
             data: Uint8Array.from(atob(seed.maskData), c => c.charCodeAt(0)).buffer } : undefined };
@@ -79,6 +87,7 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
     assertCacheCurrent(token);
     await writeRecord(`host:${id}`, config);
     liveId = id;
+    liveLogId = logId;
     await sessSet({ [bindingKey(tab)]: { id, kind: config.kind, chapter: data.chapter } });
     await runner.ensure(id);
     // A created runner context can still fail to attach (a stale document no-ops, or its module
@@ -88,6 +97,7 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
         await runner.stop(id);
         await runner.ensure(id);
         if (!await attachWatch.wait(id, ATTACH_TIMEOUT_MS)) {
+            recordChapterLog({ logId }, { kind: 'failure', reason: 'timeout' });
             return { ok: false, error: 'The translator background task did not start — reload the extension and try again' };
         }
     }
@@ -122,21 +132,51 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         return true;
     }
     if (!msg.type.startsWith('mt:chapter-')) return;
+    if (msg.type === 'mt:chapter-log-begin' || msg.type === 'mt:chapter-log-event' || msg.type === 'mt:chapter-log-reader') {
+        const work = async () => {
+            const tab = sender.tab?.id;
+            if (tab === undefined || sender.frameId !== 0) return { ok: false };
+            const current = await chrome.tabs.get(tab);
+            const origin = sender.origin ?? (sender.url ? new URL(sender.url).origin : '');
+            if (!readerStartAllowed(msg.readerUrl, msg.chapter, current.url ?? '', origin)) return { ok: false };
+            if (msg.type === 'mt:chapter-log-begin') {
+                const logId = await createChapterLog(tab, msg.chapter, typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'development', navigator.userAgent);
+                return { ok: true, logId };
+            }
+            if (msg.type === 'mt:chapter-log-reader') {
+                const head = await latestChapterLogHead(tab);
+                if (head && await chapterLogOwned(head.id, tab, msg.chapter)) {
+                    const b = await binding(tab);
+                    await appendChapterLog(head.id, { kind: 'reader-reloaded', reason: b?.chapter === msg.chapter ? 'binding-present' : 'binding-missing' });
+                }
+                return { ok: true };
+            }
+            if (typeof msg.logId !== 'string' || !await chapterLogOwned(msg.logId, tab, msg.chapter)) return { ok: false };
+            await appendChapterLog(msg.logId, msg.event);
+            return { ok: true };
+        };
+        work().then(respond, () => respond({ ok: false }));
+        return true;
+    }
     // The runner asks which session it owns; the answer is also what starts it pumping.
     if (msg.type === 'mt:chapter-runner-boot') {
         if (!isRunnerSender(sender)) return;
-        respond({ ok: true, id: liveId || undefined });
+        respond({ ok: true, id: liveId || undefined, logId: liveLogId || undefined });
         return true;
     }
     if (msg.type === 'mt:chapter-command') return;
     const work = async () => {
-        if (msg.type === 'mt:chapter-host-init' || msg.type === 'mt:chapter-publish' || msg.type === 'mt:chapter-context') {
+        if (msg.type === 'mt:chapter-host-init' || msg.type === 'mt:chapter-runner-ready'
+            || msg.type === 'mt:chapter-publish' || msg.type === 'mt:chapter-context') {
             const config = await authenticatedRunner(sender, msg);
             if (!config) return { ok: false, error: 'Unknown chapter session' };
-            if (msg.type === 'mt:chapter-host-init') { attachWatch.hit(config.id); return { ok: true, config }; }
+            if (msg.type === 'mt:chapter-host-init') return { ok: true, config };
+            if (msg.type === 'mt:chapter-runner-ready') { attachWatch.hit(config.id); return { ok: true }; }
             if (msg.type === 'mt:chapter-context') {
+                recordChapterLog(config.logId ? { logId: config.logId } : undefined, { kind: 'context-received' });
                 const context = await chapterContext(config.chapter, config.bookKey, config.pipeline.useCharacters,
                     config.pipeline.contextPairs, config.pipeline.charLimit, msg.entries, msg.beforeOrder);
+                recordChapterLog(config.logId ? { logId: config.logId } : undefined, { kind: 'context-response' });
                 if (msg.entries) void chrome.tabs.sendMessage(config.readerTab, { type: 'mt:chapter-context-updated', chapter: config.chapter, context }).catch(() => {});
                 return { ok: true, context };
             }
@@ -189,6 +229,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                 }
             }
             if (status && ['running', 'waiting', 'stopping'].includes(status.phase) && !(await runner.live(b.id))) {
+                const cfg = await readRecord<HostConfig>(`host:${b.id}`);
+                recordChapterLog(cfg?.logId ? { logId: cfg.logId } : undefined, { kind: 'runner-lost', reason: 'disconnected' });
                 status.phase = 'error';
                 status.message = 'Translation paused — the background task stopped; start again to continue';
                 status.inflight = 0;
@@ -224,6 +266,8 @@ chrome.tabs.onRemoved.addListener(tab => {
     void (async () => {
         const b = await binding(tab);
         if (b) {
+            const cfg = await readRecord<HostConfig>(`host:${b.id}`);
+            recordChapterLog(cfg?.logId ? { logId: cfg.logId } : undefined, { kind: 'reader-closed' });
             await runner.stop(b.id);
             await sessRemove(bindingKey(tab));
         }

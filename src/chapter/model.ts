@@ -17,6 +17,7 @@ export interface ChapterPage {
 export type PagePhase = 'queued' | 'reading' | 'detecting' | 'translating' | 'rendering' | 'ready' | 'failed' | 'waiting';
 export interface ChapterProgress {
     id: string;
+    logId?: string;
     chapter: string;
     phase: 'running' | 'stopping' | 'stopped' | 'complete' | 'waiting' | 'error';
     done: number;
@@ -35,6 +36,7 @@ export interface ChapterProgress {
     diagnostics?: string;
 }
 export interface ChapterStart {
+    logId?: string;
     cacheEpoch?: string;
     chapter: string;
     readerUrl: string;

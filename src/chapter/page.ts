@@ -3,7 +3,7 @@ import { fetchBitmap, unscrambleTiles } from '../content/page-io';
 import { resolveHeadlessDet } from '../content/pipeline';
 import { translateRegions, abortLiveRpcs } from '../content/ocr';
 import { renderPage } from '../content/render-page';
-import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial, detFromCacheEntry } from '../content/page-cache';
+import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial, detFromCacheEntry, cloudSplitFresh } from '../content/page-cache';
 import { keepaliveOpen } from '../content/queue';
 import { initDebug, isDebug } from '../debug';
 import { chapterMessage, providerMessage, fetchSourceWithAlternate, type ChapterPage, type ChapterProgress, type Contribution, type PagePhase } from './model';
@@ -20,8 +20,21 @@ import { nextDocument, chapterImages, guessNextDocument, sameChapterDocument, di
 import { nextGroup, pagePhase } from './plan';
 import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generation';
 import { sendToBackground } from '../bg-rpc';
+import { recordChapterLog } from './log-store';
+import { chapterLogError, type ChapterLogStage, type ChapterTrace } from './log';
 
 let id = '';
+let logId = '';
+function trace(pages?: number[]): ChapterTrace | undefined { return logId ? { logId, pages } : undefined; }
+function step(stage: ChapterLogStage, pages?: number[]): void { recordChapterLog(trace(pages), { kind: 'stage', stage }); }
+function pageStatus(pages: number[], valid: () => boolean = () => true): (text: string, stage?: string) => void {
+    let last = '';
+    return (_text, stage) => {
+        const key = stage === 'ocr' ? 'ocr' : stage === 'llm' ? 'llmWait' : stage === 'render' ? 'render' : undefined;
+        if (!valid() || !key || key === last) return;
+        last = key; step(key, pages);
+    };
+}
 // A page lease must cover the slowest real work (cold model load + a full LLM roundtrip) and
 // still be short enough that one stuck page cannot freeze the chapter. Expiry costs that page
 // only — the run carries on with the rest.
@@ -37,6 +50,7 @@ let config: HostConfig;
 let status: ChapterProgress;
 let epoch = 0;
 let pumping = false;
+let initialized = false;
 let priority = '';
 let publishChain: Promise<unknown> = Promise.resolve();
 const pendingForce = new Set<string>();
@@ -48,6 +62,7 @@ async function discover(generation: number): Promise<boolean> {
     if (!url) return false;
     if (visitedDocuments.has(url)) throw new Error('Reader pagination repeats a page');
     if (!sameChapterDocument(url, config.readerUrl, config.chapter)) return false;
+    step('discovery');
     const response = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(30000) });
     if (!response.ok) {
         // Past the last page the reader answers the guessed next URL with 404/410 — the
@@ -99,6 +114,8 @@ function publish(): Promise<void> {
     // The runner has no console a user (or a harness) can open — the last few breadcrumbs
     // ride along for diagnosis. Never the user-facing `message`: the pill reads that.
     status.diagnostics = diagnostics.length ? diagnostics.slice(-6).join(' | ').slice(0, 900) : undefined;
+    recordChapterLog(trace(), { kind: 'progress', phase: status.phase, done: status.done, total: status.total,
+        errors: status.errors, inflight: status.inflight });
     const statusEl = statusElement();
     if (statusEl) statusEl.textContent = chapterMessage(status);
     const snapshot = structuredClone(status);
@@ -113,6 +130,7 @@ function publish(): Promise<void> {
     return next;
 }
 function stop(message?: string): void {
+    recordChapterLog(trace(), { kind: message ? 'failure' : 'stop' });
     epoch++;
     for (const attempt of attempts) attempt.cancel();
     abortLiveRpcs();
@@ -127,6 +145,7 @@ let starveNoticeShown = false;
 function starveNotice(): void {
     if (starveNoticeShown || !status) return;
     starveNoticeShown = true;
+    recordChapterLog(trace(), { kind: 'retry', reason: 'smaller-batches' });
     status.notice = 'Retrying some pages with smaller batches';
     void publish().catch(() => {});
     setTimeout(() => {
@@ -134,6 +153,7 @@ function starveNotice(): void {
     }, 8000);
 }
 function showFatal(e: unknown): void {
+    recordChapterLog(trace(), { kind: 'failure', ...chapterLogError(e) });
     const msg = `Translation paused — ${(e as Error).message || String(e)}`;
     const el = statusElement();
     if (el) el.textContent = msg;
@@ -152,6 +172,7 @@ function showFatal(e: unknown): void {
 }
 async function contextFor(entries?: Contribution[], beforeOrder?: number): Promise<ContextState> {
     if (!config.shareContext) return { pairs: [], characters: [] };
+    step(entries ? 'contextWrite' : 'context', entries?.map(e => e.order + 1));
     const r = await sendToBackground<{ ok?: boolean; error?: string; context?: ContextState }>(
         { type: 'mt:chapter-context', id, entries, beforeOrder }, { timeoutMs: 15_000, label: 'chapter context' });
     if (!r?.ok) throw new Error(r?.error || 'Could not update character context');
@@ -163,7 +184,8 @@ async function source(page: ChapterPage): Promise<ImageBitmap> {
         // The preferred encoding may be evicted on this CDN edge; the sibling tier of the SAME
         // page is a separate file, so try it once before failing the page.
         const f = await fetchSourceWithAlternate(page.url, page.alt, fetchBitmap,
-            why => note(`source p${page.order} primary failed (${why}); trying sibling encoding`));
+            why => { note(`source p${page.order} primary failed (${why}); trying sibling encoding`);
+                recordChapterLog(trace([page.order + 1]), { kind: 'source-alternate' }); });
         if (!page.descramble) return f.bitmap;
         try {
             const fixed = await unscrambleTiles(f.bitmap);
@@ -189,6 +211,7 @@ async function markFailed(page: ChapterPage, item: ProgressItem, e: unknown, val
     note(`work p${page.order} FAIL ${(e as Error).name}: ${(e as Error).message}`.slice(0, 200));
     if (!valid()) return;
     const err = e as Error & { kind?: string };
+    recordChapterLog(trace([page.order + 1]), { kind: err.kind === 'source' ? 'page-waiting' : 'page-failed', ...chapterLogError(e) });
     // A page that already reached 'ready' in this run is done; a late publish failure must
     // not demote it and re-queue an infinite retry.
     if (item.phase !== 'ready') item.phase = err.kind === 'source' ? 'waiting' : 'failed';
@@ -227,10 +250,12 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
     let bitmap: ImageBitmap | undefined;
     try {
         stage(item, valid, 'reading');
+        step('artifact', [page.order + 1]);
         const previous = await readRecord<ChapterArtifact>(artifactKey(id, page.id));
         const force = config.force?.has(page.id) === true;
         if (!valid()) return 'skip';
         if (!force && previous?.identity && previous.hash && previous.signature === signature()) {
+            recordChapterLog(trace([page.order + 1]), { kind: 'cache-hit', reason: 'artifact', cached: true });
             const hash = previous.hash;
             item.hash = hash;
             item.image = signatureOf(previous.identity);
@@ -238,12 +263,16 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
             if (!page.inBaseContext) await contextFor([contribution]);
             if (!valid()) return 'skip';
             item.phase = 'ready';
+            recordChapterLog(trace([page.order + 1]), { kind: 'page-ready' });
             await publish();
             return 'done';
         }
+        step('image', [page.order + 1]);
         bitmap = await source(page).catch(e => { note(`source p${page.order} ${(e as Error).message}`); throw e; });
         if (!valid()) { bitmap.close(); return 'skip'; }
+        step('hash', [page.order + 1]);
         const hash = pageHashFromBitmap(bitmap);
+        recordChapterLog(trace([page.order + 1]), { kind: 'stage', stage: 'cache', w: bitmap.width, h: bitmap.height });
         item.hash = hash;
         item.image = signatureOf(identifyBitmap(bitmap));
         if (bitmap.width < 400 || bitmap.height < 300) throw new Error('Image is too small to be a manga page');
@@ -266,9 +295,16 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
             // and it is what carries cloud OCR texts into the translate stage.
             const hit = await cacheGet(bytesKey);
             if (!force && isResumable(hit, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud')) {
+                recordChapterLog(trace([page.order + 1]), { kind: 'cache-hit', reason: 'checkpoint', cached: true, splitGen: hit.splitGen });
                 resolved = { det: detFromPartial(hit!, bitmap.width, bitmap.height), resumed: true };
             } else {
-                resolved = await resolveHeadlessDet(bitmap, hash, () => {}, cacheEpoch);
+                const fp = settingsFingerprint(config.pipeline);
+                const reason = !config.pipeline.cacheEnabled ? 'disabled' : !hit ? 'absent' : hit.fp !== fp ? 'fingerprint'
+                    : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : !hit.mask ? 'mask'
+                    : !cloudSplitFresh(hit, config.pipeline.inferEngine === 'cloud') ? 'splitgen' : hit.partial ? 'partial' : undefined;
+                if (reason) recordChapterLog(trace([page.order + 1]), { kind: 'cache-miss', reason, splitGen: hit?.splitGen, cached: false });
+                step('detect', [page.order + 1]);
+                resolved = await resolveHeadlessDet(bitmap, hash, pageStatus([page.order + 1], valid), cacheEpoch, trace([page.order + 1]));
             }
         } catch (e) {
             note(`detect p${page.order} ${(e as Error).message}`.slice(0, 160));
@@ -285,12 +321,15 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
         if (!boxes) {
             item.phase = 'ready';
             item.revision = (item.revision ?? 0) + 1;
+            recordChapterLog(trace([page.order + 1]), { kind: 'page-ready', reason: 'no-text', boxes: 0 });
             await publish();
             bitmap.close();
             return 'done';
         }
         const det = resolved.det ?? (cached && detFromCacheEntry(cached, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud'));
         if (!det) throw new Error('Saved page data is incomplete');
+        recordChapterLog(trace([page.order + 1]), { kind: cached ? 'cache-hit' : 'stage', stage: 'translationPrep',
+            ...(cached ? { reason: 'full-cache' as const } : {}), boxes: det.boxes.length, splitGen: det.splitGen, cached: !!cached });
         // The request pipeline caps a page at 150 regions. Cap before a group call so the
         // merged box list and the renderer see exactly what the single-page path would.
         if (!cached && det.boxes.length > 150) det.boxes = det.boxes.slice(0, 150);
@@ -314,8 +353,10 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
 
 async function translateOrThrow(p: Prepared, snapshot: ContextState, cacheEpoch: string): Promise<TranslateOutcome> {
     try {
-        const out = await translateRegions(p.bitmap, p.det, () => {}, {
+        step('translationPrep', [p.page.order + 1]);
+        const out = await translateRegions(p.bitmap, p.det, pageStatus([p.page.order + 1]), {
             fold: false, lo: true, context: snapshot, fresh: p.force, cacheEpoch, onStarve: starveNotice,
+            chapterTrace: trace([p.page.order + 1]),
         });
         if ('error' in out && out.error) throw Object.assign(new Error(out.error), { kind: out.errorKind });
         return out;
@@ -331,10 +372,11 @@ async function commitPage(p: Prepared, out: TranslationResult, valid: () => bool
     const { page, item, bitmap, det, hash, bytesKey, identityKey } = p;
     const cacheEpoch = config.cacheEpoch ?? await cacheReady();
     stage(item, valid, 'rendering');
+    step('render', [page.order + 1]);
     const rendered = await renderPage({ kind: 'img', el: document.createElement('img') },
         { srcUrl: page.url, bitmap, det, hash, cacheEpoch,
             cached: { ...out, patches: p.patches, ...(p.patches?.length ? { patchesGen: p.patchesGen } : null) } },
-        () => {}, false, { paintOnly: true, detached: true });
+        pageStatus([page.order + 1], valid), false, { paintOnly: true, detached: true });
     let blob: Blob;
     try { blob = await (await fetch(rendered.translated)).blob(); }
     finally { URL.revokeObjectURL(rendered.translated); }
@@ -349,9 +391,11 @@ async function commitPage(p: Prepared, out: TranslationResult, valid: () => bool
         order: page.order, keyGen: PAGE_KEY_GEN };
     // Bytes entry: the resume checkpoint's full form, home of the crops.
     const bytesEntry: ChapterArtifact['entry'] = { ...entry, key: bytesKey };
+    step('result', [page.order + 1]);
     await writeRecord(artifactKey(id, page.id), { blob, entry, identity: p.identity, hash, at: Date.now(), signature: signature() } satisfies ChapterArtifact);
     if (!valid()) return;
     if (config.pipeline.cacheEnabled) {
+        step('cacheWrite', [page.order + 1]);
         await cachePut(entry, config.pipeline.cacheMax, cacheEpoch);
         await cachePut(bytesEntry, config.pipeline.cacheMax, cacheEpoch);
     }
@@ -362,6 +406,7 @@ async function commitPage(p: Prepared, out: TranslationResult, valid: () => bool
     config.force?.delete(page.id);
     item.revision = (item.revision ?? 0) + 1;
     item.phase = 'ready';
+    recordChapterLog(trace([page.order + 1]), { kind: 'page-ready' });
     await publish();
 }
 
@@ -376,6 +421,7 @@ async function withPageLease<T>(page: ChapterPage, item: ProgressItem, valid: ()
             void label;
             const phase = item.phase;
             item.phase = 'failed';
+            recordChapterLog(trace([page.order + 1]), { kind: 'page-failed', reason: 'timeout' });
             const stuck = `p${page.order} stuck in ${phase} for ${Math.round(elapsedMs / 1000)}s`;
             note(stuck);
             if (isDebug()) console.warn('[mt] chapter', stuck);
@@ -472,6 +518,7 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
     let out: TranslateOutcome | null = null;
     // A group too large for one canvas (or a failed combine) must degrade to per-page calls,
     // never kill the run.
+    step('merge', prepared.map(p => p.page.order + 1));
     const combined = await combinePages(prepared).catch(e => {
         note(`group ${group.map(p => `p${p.order}`).join(',')} combine ${(e as Error).message}`.slice(0, 160));
         return null;
@@ -486,15 +533,19 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         onExpire: ({ label, elapsedMs }) => {
             if (!valid()) return;
             const stuck = `${label} exceeded ${Math.round(elapsedMs / 1000)}s — trying per-page`;
+            recordChapterLog(trace(group.map(p => p.order + 1)), { kind: 'retry', reason: 'per-page-fallback' });
             note(stuck);
             if (isDebug()) console.warn('[mt] chapter', stuck);
         },
     });
     attempts.add(attempt);
     try {
-        const call = translateRegions(combined.bitmap, combined.det, () => {}, {
+        const groupPages = prepared.map(p => p.page.order + 1);
+        step('translationPrep', groupPages);
+        const call = translateRegions(combined.bitmap, combined.det, pageStatus(groupPages, valid), {
             fold: false, lo: true, context: snapshot, fresh: prepared.some(p => p.force),
             cacheEpoch, onStarve: starveNotice, regionCap: combined.total, checkpoint: false,
+            chapterTrace: trace(groupPages),
             // page mode: one annotated image per page, badges numbered globally across the group
             pageSegments: config.pipeline.textSource === 'page' ? combined.segments : undefined,
         }).then(r => {
@@ -540,6 +591,7 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
 // snapshot is taken when the slot starts, so an earlier slot that already folded is included
 // — slots roll by completion, not by waves.
 async function runSlot(group: ChapterPage[], generation: number): Promise<void> {
+    step('context', group.map(p => p.order + 1));
     const cacheEpoch = config.cacheEpoch ?? await cacheReady();
     const order = Math.min(...group.map(p => p.order));
     const snapshot = await contextFor(undefined, order);
@@ -549,7 +601,7 @@ async function runSlot(group: ChapterPage[], generation: number): Promise<void> 
 }
 
 function pumpCheck(): void {
-    if (!pumping) void pump();
+    if (initialized && !pumping) void pump();
 }
 // pumpCheck is the only re-entry: pump() must never call itself while `pumping` is true.
 
@@ -565,7 +617,7 @@ function slotCount(): number {
 }
 
 async function pump(): Promise<void> {
-    if (pumping || !['running', 'waiting'].includes(status.phase)) return;
+    if (!initialized || pumping || !['running', 'waiting'].includes(status.phase)) return;
     pumping = true;
     const generation = epoch;
     const release = keepaliveOpen();
@@ -632,26 +684,32 @@ async function pump(): Promise<void> {
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (sender.id !== chrome.runtime.id || msg?.type !== 'mt:chapter-command' || msg.id !== id || !status) return;
-    if (msg.command === 'stop') stop();
-    if (msg.command === 'prioritize' || msg.command === 'retry') {
+    // Priority is a scheduling hint, not a progress update. It may arrive during setup,
+    // but must neither start unconfigured work nor echo a status back to the reader.
+    if (msg.command === 'prioritize') {
         priority = String(msg.page);
-        if (msg.command === 'retry') {
-            const page = status.pages.find(p => p.id === priority);
-            if (page) {
-                config.force ??= new Set();
-                config.force.add(page.id);
-                // Revoke the active generation before resetting its phases, so a late
-                // answer cannot replace the user's newer retranslation intent.
-                if (['reading', 'detecting', 'translating', 'rendering'].includes(page.phase)) {
-                    epoch++;
-                    for (const attempt of attempts) attempt.cancel();
-                    abortLiveRpcs();
-                    for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
-                }
-                page.phase = 'queued';
-                status.phase = 'running';
-                status.message = undefined;
+        pumpCheck();
+        respond({ ok: true });
+        return;
+    }
+    if (msg.command === 'stop') stop();
+    if (msg.command === 'retry') {
+        priority = String(msg.page);
+        const page = status.pages.find(p => p.id === priority);
+        if (page) {
+            config.force ??= new Set();
+            config.force.add(page.id);
+            // Revoke the active generation before resetting its phases, so a late
+            // answer cannot replace the user's newer retranslation intent.
+            if (['reading', 'detecting', 'translating', 'rendering'].includes(page.phase)) {
+                epoch++;
+                for (const attempt of attempts) attempt.cancel();
+                abortLiveRpcs();
+                for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
             }
+            page.phase = 'queued';
+            status.phase = 'running';
+            status.message = undefined;
         }
     }
     if (msg.command === 'append' && Array.isArray(msg.pages)) {
@@ -678,29 +736,33 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 async function attach(runnerId: string): Promise<void> {
     id = runnerId;
     starveNoticeShown = false; // a new session re-arms the one-time notice
+    step('generation');
     await cacheReady();
+    step('debug');
     await initDebug();
+    step('config');
     const response = await sendToBackground<{ ok?: boolean; error?: string; config?: HostConfig }>(
         { type: 'mt:chapter-host-init', id }, { timeoutMs: 12_000, label: 'host init' });
     if (!response?.ok) throw new Error(response?.error || 'Chapter session expired');
     config = response.config!;
+    logId = config.logId ?? logId;
     assertCacheCurrent(config.cacheEpoch ?? '');
-    // A session with no status record is indistinguishable from a dead one. Publish a
-    // placeholder BEFORE the slow setup (fonts, checkpoint) so a start that fails later still
-    // lands as a visible session with an honest error instead of silent nothing.
-    status = { id, chapter: config.chapter, phase: 'running', done: 0, total: config.pages.length,
-        inflight: 0, errors: 0, completeManifest: config.completeManifest,
-        pages: config.pages.map(p => ({ id: p.id, url: p.url, order: p.order, phase: 'queued' })) };
-    await publish();
-    // Load custom fonts before pinning the execution session's settings.
-    await loadPipeline();
-    configureChapterHost(config.chapter, config.bookKey, config.pipeline, config.context);
-    setShareContext(config.shareContext);
+    step('checkpoint');
     const checkpoint = await readRecord<HostCheckpoint>(`checkpoint:${id}`);
     if (checkpoint) config = { ...config, ...checkpoint.config };
-    if (checkpoint?.progress) status = checkpoint.progress;
-    status.notice = undefined; // transient — never resurrect a stale banner from a checkpoint
+    assertCacheCurrent(config.cacheEpoch ?? '');
+    // Restore before the first write; setup progress must not overwrite completed work.
+    status = checkpoint?.progress ?? { id, logId, chapter: config.chapter, phase: 'running', done: 0, total: config.pages.length,
+        inflight: 0, errors: 0, completeManifest: config.completeManifest,
+        pages: config.pages.map(p => ({ id: p.id, url: p.url, order: p.order, phase: 'queued' })) };
+    status.notice = undefined;
     for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
+    await publish();
+    // The run uses the reader's captured settings; only fonts need asynchronous setup.
+    step('fonts');
+    await loadPipeline(config.pipeline);
+    configureChapterHost(config.chapter, config.bookKey, config.pipeline, config.context);
+    setShareContext(config.shareContext);
     // Storage-change events are optional: an offscreen document is given only the runtime
     // API, and the shim may not cover every area this build talks to. A missing event must
     // not take the whole run down.
@@ -708,6 +770,11 @@ async function attach(runnerId: string): Promise<void> {
         if (area === 'local' && (changes.mtPipeline || changes.mtSettings || changes.mtOcrSettings)) stop('Translation paused — settings changed; start again to use them');
     });
     await publish();
+    initialized = true;
+    recordChapterLog(trace(), { kind: 'setup-ready' });
+    const ready = await sendToBackground<{ ok?: boolean; error?: string }>(
+        { type: 'mt:chapter-runner-ready', id }, { timeoutMs: 12_000, label: 'runner ready' });
+    if (!ready?.ok) throw new Error(ready?.error || 'Chapter session expired');
     pumpCheck();
 }
 
@@ -715,9 +782,13 @@ async function attach(runnerId: string): Promise<void> {
 // and Firefox's background iframe load page.html, which calls it on load. Safe to call twice.
 export async function attachChapterRunner(): Promise<void> {
     if (id) return;
-    const reply = await sendToBackground<{ ok?: boolean; id?: string }>(
+    const reply = await sendToBackground<{ ok?: boolean; id?: string; logId?: string }>(
         { type: 'mt:chapter-runner-boot' }, { timeoutMs: 10_000, label: 'runner boot' });
-    if (reply?.id) await attach(reply.id);
+    if (reply?.id) {
+        logId = reply.logId ?? '';
+        step('boot');
+        await attach(reply.id);
+    }
 }
 
 // A page loaded directly (offscreen document, background iframe, or a developer opening

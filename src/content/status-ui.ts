@@ -65,7 +65,16 @@ export function pageCounts(): { loaded: number; translated: number; queued: numb
 export function idleStatus(): string {
     // a provider/cache halt outranks the counts: nothing else runs until the user acts (see haltAuto)
     const halted = autoHalted();
-    if (halted) return haltMessage(halted);
+    if (halted) {
+        // A chapter halt keeps the runner's own message (why it stopped) instead of only the
+        // call-to-action: "start chapter translation to continue" alone reads as "the button
+        // is broken" and hides the real failure.
+        if (halted.kind === 'chapter') {
+            const last = sweepStatus()?.message;
+            if (last) return last;
+        }
+        return haltMessage(halted);
+    }
     const { loaded, translated, queued } = pageCounts();
     // pages parked after errors — shown only while auto is on. Counts loaded pages only.
     let parked = 0;
