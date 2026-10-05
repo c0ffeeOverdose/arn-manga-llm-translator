@@ -186,10 +186,10 @@ export const INPAINT_PATCH_GEN = 4;
 // overlap-swallowed text (gen 2), fused stacked groups (gen 3), splits vetoed by weak
 // comps (gen 5), single vertical-text balloons split by square glyph comps (gen 6), diagonal masses
 // left fused by a sub-floor gap (gen 7), a cut slicing one shared text row (gen 8),
-// or an SFX tail merged into speech (gen 9) — all
-// re-detect instead of rendering from cache. Local entries never carry splitGen (their tile
+// an SFX tail merged into speech (gen 9), or a silence-dot cluster swallowed into a region (gen 10)
+// — all re-detect instead of rendering from cache. Local entries never carry splitGen (their tile
 // fingerprint already forces re-detect) — isCloud scopes the gate to cloud mode.
-export const CLOUD_SPLIT_GEN = 10;
+export const CLOUD_SPLIT_GEN = 11;
 export function cloudSplitFresh(hit: { ep?: string; splitGen?: number } | undefined, isCloud: boolean): boolean {
     return !isCloud || (hit?.splitGen ?? 0) >= CLOUD_SPLIT_GEN;
 }
@@ -1150,11 +1150,11 @@ export interface FingerprintOpts {
 }
 
 export function settingsFingerprint(o: FingerprintOpts): string {
-    // trailing detector-generation tag (currently tile24): entries from older split/render/OCR
+    // trailing detector-generation tag (currently tile25): entries from older split/render/OCR
     // pipeline versions miss once and heal on overwrite — bump it whenever touching the
     // split, layout, or mask recipe, or old entries keep rendering stale regions.
     return [o.targetLang, o.textSource, o.ocrEngine, o.readingDir,
-        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile24'].join('|');
+        o.detConf, o.panelConf, o.deferLabels ? 1 : 0, o.transcribeSrc ? 1 : 0, o.useOcrModel ? 1 : 0, o.ocrPerRegion ? 1 : 0, o.temperature ?? 'd', o.ocrTemperature ?? 'd', 'tile25'].join('|');
 }
 
 // ---- IndexedDB (separate DB from mt-models — no version coordination) ----

@@ -11,7 +11,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/box-split-detection.mjs', sourcemap: 'inline',
 });
 
-const { splitMergedBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, lineOutlierSplit, shiftDetectionBoxY } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
+const { splitMergedBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, lineOutlierSplit, shiftDetectionBoxY, splitSpeckCluster, SPECK_MIN_GAP } = await import(new URL('../.test-build/box-split-detection.mjs', import.meta.url).href);
 
 const box = (x1, y1, x2, y2, conf = 0.9) => ({ x1, y1, x2, y2, conf });
 const GAP = 28;
@@ -349,6 +349,25 @@ test('lineOutlierSplit finds the glyph line under a tall touching effect stroke'
   // glyphs plus the small tick only (no tall outlier): untouched
   const flat = LINE_EFFECT.slice(1);
   assert.equal(lineOutlierSplit(flat), null);
+});
+
+test('wide rest members rejoin the line: merged multi-line text is not an effect stroke', () => {
+  // Live page 22 group: the height window caught five fragments (heights 26-39) and dropped the
+  // balloon's second line (41px) and its merged three-line block (81px) as "outliers" — both are
+  // wide text, not strokes. The emitted line must cover them so the region keeps the text; the
+  // portrait hand/stroke stay out.
+  const members = [
+    box(788, 379, 800, 405), box(635, 388, 675, 414), box(620, 414, 645, 441),
+    box(890, 384, 928, 421), box(801, 383, 880, 422),
+    box(801, 423, 913, 464), box(645, 387, 764, 468),
+    box(754, 325, 810, 399), box(934, 462, 991, 540),
+  ];
+  const split = lineOutlierSplit(members);
+  assert.ok(split);
+  const bbox = ss => [Math.min(...ss.map(c => c.x1)), Math.min(...ss.map(c => c.y1)),
+    Math.max(...ss.map(c => c.x2)), Math.max(...ss.map(c => c.y2))];
+  assert.deepEqual(bbox(split.line), [620, 379, 928, 468]);
+  assert.deepEqual(bbox(split.rest), [754, 325, 991, 540]);
 });
 
 test('lane 2: nested single line under its block stays fused', () => {
@@ -700,4 +719,73 @@ test('same-balloon columns with sub-floor gutters stay fused', () => {
     for (let row = 0; row < 6; row++)
       comps.push(box(10 + col * 36, 10 + row * 34, 34 + col * 36, 38 + row * 34));
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [parent]);
+});
+
+// ---- leading speck cluster split (live page: one CTD box over the silence-dots bubble and
+// the speech balloon. The specks are ~7x8px mask blobs below the comp floor, so no split
+// lane can cut them; the single region's crop, layout and erase covered the "……" and the
+// cleanup deleted them. Worker tiny-blob collection feeds this cut; specks y 126-180, text
+// 253+.) The specks region rides the normal keep path: a kept or unanswered region is never
+// erased, so the worst case is a visible translation, never a silently deleted bubble.
+test('a speck cluster far above the text becomes its own region', () => {
+  const parent = { ...box(132, 112, 299, 394, 0.91), clip: { x1: 132, y1: 112, x2: 299, y2: 394 }, cutAxis: 'y' };
+  const comps = [box(135, 253, 282, 278), box(136, 281, 282, 307), box(136, 309, 282, 334)];
+  const specks = [box(242, 126, 249, 134), box(242, 144, 249, 152), box(284, 135, 291, 143),
+    box(284, 162, 291, 171), box(242, 172, 249, 180)];
+  const parts = splitSpeckCluster(parent, comps, specks);
+  assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
+    [242, 126, 291, 217], // the speck cluster, cut at the mid-gap (216.5 → 217)
+    [132, 217, 299, 394], // the text keeps the rest of the parent box
+  ]);
+  assert.deepEqual(parts.map(p => p.clip), [
+    { x1: 132, y1: 112, x2: 299, y2: 229 }, // leash toward the sibling capped at SPLIT_CLIP_SLACK
+    { x1: 132, y1: 205, x2: 299, y2: 394 },
+  ]);
+  assert.ok(parts.every(p => p.cutAxis === 'y' && p.conf === 0.91));
+  assert.equal(parent.y1, 112, `source box untouched (${SPECK_MIN_GAP}px floor)`);
+});
+
+test('glyph-sized specks just above a large letter block never split (fragment guard)', () => {
+  // Live noisily-fragmented lettering: the top of the first glyph sheds sub-comp specks
+  // ~1 glyph height above the main mass. The gap gate scales with the block's glyph height,
+  // so these fragments are never treated as a separate specks cluster (they are the letter).
+  const parent = box(104, 504, 381, 1011, 0.5);
+  const comps = [box(280, 583, 352, 664), box(185, 669, 308, 756), box(104, 755, 283, 840), box(292, 766, 381, 853)];
+  const specks = [box(283, 515, 295, 522), box(258, 522, 262, 527), box(281, 523, 285, 527)];
+  assert.equal(splitSpeckCluster(parent, comps, specks), null);
+});
+
+test('split needs a far cluster: near, lone, below-text or absent specks never split', () => {
+  const parent = box(132, 112, 299, 394, 0.91);
+  const comps = [box(135, 253, 282, 278), box(136, 281, 282, 305)];
+  const speck = (y1, y2) => box(242, y1, 249, y2);
+  assert.equal(splitSpeckCluster(parent, comps, [speck(126, 134), speck(220, 228)]), null,
+    'the lowest speck sits within line spacing of the text: it belongs to the block');
+  assert.equal(splitSpeckCluster(parent, comps, [speck(300, 308), speck(320, 328)]), null, 'below the text');
+  assert.equal(splitSpeckCluster(parent, comps, [speck(126, 134)]), null, 'a lone speck is dust');
+  assert.equal(splitSpeckCluster(parent, comps, []), null, 'no speck evidence at all');
+  assert.equal(splitSpeckCluster(parent, [], [speck(126, 134), speck(140, 148)]), null, 'no text comps');
+});
+
+// Live page 22: one mask box over two side-by-side balloons ("JUST BECAUSE WE'RE CHILDHOOD
+// FRIENDS..." + "THAT'S IM-POSSIBLE...") 24px apart. Bold text on tone fragments into
+// multi-line comps (119x81), which used to inflate the lane-2 unit (37 -> floor 19 -> strong
+// gate 28.5 > 24) and kept the pair fused; the lower-half median reads the line height (25)
+// and the pair splits with the existing thresholds. Worker comps verbatim.
+test('live page 22: fragmented side-by-side balloons split (line-height unit)', () => {
+  const parent = box(620, 379, 928, 441, 0.5);
+  const comps = [
+    box(788, 379, 800, 405), box(801, 383, 880, 422), box(890, 384, 928, 421),
+    box(645, 387, 764, 468), box(635, 388, 675, 414), box(620, 414, 645, 441),
+  ];
+  const parts = splitMergedBoxes([parent], comps, GAP, comps);
+  assert.deepEqual(parts.map(p => [p.x1, p.y1, p.x2, p.y2]), [
+    [620, 387, 776, 441], // left balloon text, cut in the 764-788 gutter
+    [776, 379, 928, 422], // right balloon text
+  ]);
+  assert.deepEqual(parts.map(p => p.clip), [
+    { x1: 620, y1: 379, x2: 788, y2: 441 },
+    { x1: 764, y1: 379, x2: 928, y2: 441 },
+  ]);
+  assert.ok(parts.every(p => p.cutAxis === 'x'));
 });

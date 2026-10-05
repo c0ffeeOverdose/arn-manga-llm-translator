@@ -351,6 +351,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         return boxConf;
     };
     const comps: Comp[] = [];
+    const tinyBlobs: SplitComp[] = []; // sub-8px mask specks — leading-cluster trim evidence
     const seen = new Uint8Array(packed.length);
     const compId = new Int32Array(packed.length); // label per pixel, for split-rescue recounts below
     let nextCompId = 0;
@@ -372,6 +373,7 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
             if (y < h - 1 && packed[q + w] && !seen[q + w]) { seen[q + w] = 1; stack.push(q + w); }
         }
         if (maxX - minX + 1 >= 8 && maxY - minY + 1 >= 8) comps.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1, count, probSum, ids: [id] });
+        else if (count >= 6 && tinyBlobs.length < 300) tinyBlobs.push({ x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1 });
     }
     // Split-input comps: raw text clusters snapshotted BEFORE pass 2 merges and
     // filtered by the same text-likelihood gate pass 3 uses.
@@ -487,7 +489,10 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
         // split AFTER the mask-only pass: a merged box's coverage must still
         // suppress mask clusters it swallowed, and only then does each balloon
         // become its own box.
-        boxes: splitMergedBoxes([...outBoxes, ...maskBoxes], textyComps, GAP, boxComps),
+        // speck clusters split after the balloon split: a box that swallowed a silence-dot
+        // cluster above its text becomes two regions (the specks ride the keep path)
+        boxes: splitMergedBoxes([...outBoxes, ...maskBoxes], textyComps, GAP, boxComps)
+            .flatMap(b => splitSpeckCluster(b, textyComps, tinyBlobs) ?? [b]),
         dropped: nearMisses(lowBoxes, lowConfs, outBoxes, confThr, minSize, w, h),
         mask: { width: w, height: h, data: packed.buffer },
         inferMs,
@@ -561,7 +566,7 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
 // scripts; only the language data is downloaded on demand and cached in IDB).
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
-import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, lineOutlierSplit, splitMergedBoxes, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
+import { parsePanelOutput, PANEL_CONF_THR, splitTiles, mergeTileBoxes, groupMaskComponents, maskComponentEligible, extendMaskBox, corroboratedCore, lineOutlierSplit, splitMergedBoxes, splitSpeckCluster, rescueSplitComp, type SplitComp, type Tile } from '../content/detection';
 import { windowIndex } from '../content/inpaint';
 import { pickInferIndex } from '../content/page-cache';
 import { initDebug, isDebug } from '../debug';

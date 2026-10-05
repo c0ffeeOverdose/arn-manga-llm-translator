@@ -187,7 +187,8 @@ def merge_tile_boxes(tiled):
 
 
 from split import (SPLIT_GEN, corroborated_core, expand_crop_to_ink, extend_mask_box, group_mask_components,
-                   mask_component_eligible, pack_mask, rescue_split_comp, split_merged_boxes)
+                   mask_component_eligible, pack_mask, rescue_split_comp, split_merged_boxes,
+                   split_speck_cluster)
 def infer_once(pil, conf_thr):
     w, h = pil.size
     s = CTD_INPUT / max(w, h)
@@ -300,12 +301,15 @@ def run_detect(pil, conf_thr, min_size):
     n, labels, stats, _ = cv2.connectedComponentsWithStats(packed, connectivity=4)
     prob_sum = np.bincount(labels.ravel(), weights=prob.ravel(), minlength=n)
     comps = []
+    tiny_blobs = []
     for lab in range(1, min(n, 401)):
         x, y, bw, bh, area = (int(stats[lab, i]) for i in range(5))
         if bw >= 8 and bh >= 8:
             comps.append({"x1": x, "y1": y, "x2": x + bw, "y2": y + bh,
                           "count": int(area), "psum": float(prob_sum[lab]),
                           "labs": {lab}})
+        elif area >= 6 and len(tiny_blobs) < 300:
+            tiny_blobs.append({"x1": x, "y1": y, "x2": x + bw, "y2": y + bh})
     # Split-input comps: raw clusters BEFORE merge (merged bbox hides balloon gaps), same text-likelihood gate + 10px floor.
     texty_comps, box_comps = [], []
     split_labs = {}
@@ -387,6 +391,10 @@ def run_detect(pil, conf_thr, min_size):
                                    "conf": 0.5})
     # split AFTER the mask-only pass: merged coverage still suppresses swallowed clusters, then each balloon splits.
     boxes = split_merged_boxes(out_boxes + mask_boxes, texty_comps, COMP_GAP, box_comps)
+    # speck clusters split after the balloon split: a box that swallowed a silence-dot cluster
+    # above its text becomes two regions (the specks ride the keep path)
+    boxes = [piece for b in boxes
+             for piece in (split_speck_cluster(b, texty_comps, tiny_blobs) or [b])]
     # packed is 0/1 — packMask mirrors the client byte mask; the bool mask rides along for the merged inpaint pass
     mask_img = packed.astype(bool)
     mw, mh, mbytes = pack_mask(w, h, (packed * 255).ravel())

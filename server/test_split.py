@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from split import expand_crop_to_ink, extend_mask_box, group_mask_components, mask_component_eligible, split_merged_boxes
+from split import expand_crop_to_ink, extend_mask_box, group_mask_components, mask_component_eligible, split_merged_boxes, split_speck_cluster
 
 GAP = 28
 
@@ -201,6 +201,21 @@ class SplitTest(unittest.TestCase):
         self.assertEqual([p["clip"] for p in parts],
                          [{"x1": 594, "y1": 118, "x2": 758, "y2": 362},
                           {"x1": 734, "y1": 118, "x2": 887, "y2": 362}])
+
+    def test_lane2_fragmented_pair_splits_with_line_unit(self):
+        # Live page 22: bold text fragments into multi-line comps (119x81) that used to inflate
+        # the lane-2 unit (37 -> floor 19 -> strong gate 28.5 > 24); the lower-half median reads
+        # the line height (25) and the two side-by-side balloons split.
+        parent = box(620, 379, 928, 441, 0.5)
+        comps = rects([[788, 379, 800, 405], [801, 383, 880, 422], [890, 384, 928, 421],
+                       [645, 387, 764, 468], [635, 388, 675, 414], [620, 414, 645, 441]])
+        parts = split_merged_boxes([parent], comps, GAP, comps)
+        self.assertEqual([[p["x1"], p["y1"], p["x2"], p["y2"]] for p in parts],
+                         [[620, 387, 776, 441], [776, 379, 928, 422]])
+        self.assertEqual([p["clip"] for p in parts],
+                         [{"x1": 620, "y1": 379, "x2": 788, "y2": 441},
+                          {"x1": 764, "y1": 379, "x2": 928, "y2": 441}])
+        self.assertTrue(all(p["cutAxis"] == "x" for p in parts))
 
     def test_lane2_15px_overlap_72px(self):
         parent = box(968, 843, 1274, 1113, 0.88)
@@ -527,3 +542,42 @@ class FirstPairTest(unittest.TestCase):
         parent = {"x1": 42, "y1": 700, "x2": 200, "y2": 940, "conf": 0.8}
         cs = self.comps([[48, 710, 150, 750], [48, 758, 150, 790], [80, 910, 120, 928]])
         self.assertEqual(self.split([parent], cs, GAP, cs), [parent])
+
+
+class SplitSpeckCluster(unittest.TestCase):
+    # Mirror of the speck-split cases in tests/box-split.test.mjs: a CTD box over a
+    # silence-dots bubble plus its speech balloon becomes two regions.
+    def test_speck_cluster_far_above_text_becomes_its_own_region(self):
+        parent = dict(box(132, 112, 299, 394, 0.91),
+                      clip={"x1": 132, "y1": 112, "x2": 299, "y2": 394}, cutAxis="y")
+        comps = rects([[135, 253, 282, 278], [136, 281, 282, 307], [136, 309, 282, 334]])
+        specks = rects([[242, 126, 249, 134], [242, 144, 249, 152], [284, 135, 291, 143],
+                        [284, 162, 291, 171], [242, 172, 249, 180]])
+        parts = split_speck_cluster(parent, comps, specks)
+        self.assertEqual([[p["x1"], p["y1"], p["x2"], p["y2"]] for p in parts],
+                         [[242, 126, 291, 217], [132, 217, 299, 394]])
+        self.assertEqual([p["clip"] for p in parts],
+                         [{"x1": 132, "y1": 112, "x2": 299, "y2": 229},
+                          {"x1": 132, "y1": 205, "x2": 299, "y2": 394}])
+        self.assertTrue(all(p["cutAxis"] == "y" and p["conf"] == 0.91 for p in parts))
+        self.assertEqual(parent["y1"], 112)
+
+    def test_glyph_sized_specks_on_large_lettering_never_split(self):
+        # fragments of the first large glyph sit ~1 glyph above the main mass, not a dots cluster
+        parent = box(104, 504, 381, 1011, 0.5)
+        comps = rects([[280, 583, 352, 664], [185, 669, 308, 756],
+                       [104, 755, 283, 840], [292, 766, 381, 853]])
+        specks = rects([[283, 515, 295, 522], [258, 522, 262, 527], [281, 523, 285, 527]])
+        self.assertIsNone(split_speck_cluster(parent, comps, specks))
+
+    def test_near_lone_below_or_absent_specks_never_split(self):
+        parent = box(132, 112, 299, 394, 0.91)
+        comps = rects([[135, 253, 282, 278], [136, 281, 282, 305]])
+
+        def speck(y1, y2):
+            return box(242, y1, 249, y2)
+        self.assertIsNone(split_speck_cluster(parent, comps, [speck(126, 134), speck(220, 228)]))
+        self.assertIsNone(split_speck_cluster(parent, comps, [speck(300, 308), speck(320, 328)]))
+        self.assertIsNone(split_speck_cluster(parent, comps, [speck(126, 134)]))
+        self.assertIsNone(split_speck_cluster(parent, comps, []))
+        self.assertIsNone(split_speck_cluster(parent, [], [speck(126, 134), speck(140, 148)]))

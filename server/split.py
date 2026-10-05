@@ -6,7 +6,7 @@ import math
 # ---- box splitting (ported 1:1 from src/content/detection.ts) ----
 # Preserve two JS-isms: Math.round halves UP on positives (use _r) and medians are the UPPER middle (use _med).
 # Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on children); comps are plain rects (no count/psum).
-SPLIT_GEN = 10  # bump when this section's logic changes; /v1/page reports it
+SPLIT_GEN = 11  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
@@ -35,6 +35,14 @@ OVERHANG_ROW_ALIGN = 0.1
 def _median_minor(rs):
     # median minor extent = one glyph unit
     return _med([min(r["x2"] - r["x1"], r["y2"] - r["y1"]) for r in rs])
+
+
+def _line_unit(rs):
+    # Lane-2 unit for fragmented text: a comp that merged several text lines must not inflate
+    # the cut floor; read the median of the smaller half of the minor extents.
+    d = sorted(min(r["x2"] - r["x1"], r["y2"] - r["y1"]) for r in rs)
+    lower = d[:max(1, len(d) // 2)]
+    return lower[len(lower) // 2]
 
 
 def _r(x):
@@ -150,6 +158,49 @@ def split_merged_boxes(boxes, comps, same_block_gap, box_comps=None):
         parts = _split_box(b, cs, same_block_gap, bs)
         out.extend(parts if parts is not None else [b])
     return out
+
+
+# Mirror of splitSpeckCluster (src/content/detection.ts): a box that swallowed a cluster of
+# sub-component specks (silence dots, dust) far above its text is cut into two regions — the
+# speck cluster and the text. The gate scales with the block's glyph height so large-lettering
+# fragments never qualify.
+SPECK_MIN_GAP = 40
+SPECK_GLYPH_MULT = 2
+
+
+def split_speck_cluster(box, comps, tiny):
+    if not comps or len(tiny) < 2:
+        return None
+
+    def inside(r):
+        cx = (r["x1"] + r["x2"]) / 2
+        cy = (r["y1"] + r["y2"]) / 2
+        return box["x1"] <= cx <= box["x2"] and box["y1"] <= cy <= box["y2"]
+
+    own = [c for c in comps if inside(c)]
+    if not own:
+        return None
+    first_top = min(c["y1"] for c in own)
+    heights = sorted(c["y2"] - c["y1"] for c in own)
+    gate = max(SPECK_MIN_GAP, SPECK_GLYPH_MULT * heights[len(heights) // 2])
+    cluster = [b for b in tiny if inside(b) and b["y2"] <= first_top - gate]
+    if len(cluster) < 2:
+        return None
+    lowest = max(b["y2"] for b in cluster)
+    cut = _r((lowest + first_top) / 2)
+    if cut <= box["y1"] + 4 or cut >= box["y2"] - 4:
+        return None
+    slack = min(SPLIT_CLIP_SLACK, max(4, (first_top - lowest) // 2))
+    base = box.get("clip") or {"x1": box["x1"], "y1": box["y1"], "x2": box["x2"], "y2": box["y2"]}
+    speck = dict(box,
+                 x1=max(box["x1"], min(b["x1"] for b in cluster)),
+                 x2=min(box["x2"], max(b["x2"] for b in cluster)),
+                 y1=max(box["y1"], min(b["y1"] for b in cluster)),
+                 y2=cut,
+                 clip=dict(base, y2=cut + slack),
+                 cutAxis="y")
+    text = dict(box, y1=cut, clip=dict(base, y1=cut - slack), cutAxis="y")
+    return [speck, text]
 
 
 def _emit_split(box, groups, axis, loose, box_comps):
@@ -366,7 +417,7 @@ def _split_box_lane1(box, cs, same_block_gap, box_comps):
 def _split_box_lane2(box, cs, box_comps):
     if len(cs) < 2:
         return None
-    unit = _median_minor(cs)
+    unit = _line_unit(cs)
     floor = max(SPLIT2_FLOOR_MIN, _r(SPLIT2_FLOOR_RATIO * unit))
     # Cross-axis evidence reads the strict text core plus loose comps within the
     # same glyph leash _emit_split gives child boxes: a weak comp (corroborated

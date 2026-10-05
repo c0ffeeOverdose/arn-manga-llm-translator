@@ -256,6 +256,7 @@ export function corroboratedCore(
 // overlap) plus at least one much taller member, that line is the text. Pure — unit tested.
 export const LINE_FAMILY_RATIO = 1.5;   // heights within this × are one line's glyphs
 export const LINE_OUTLIER_FACTOR = 1.6; // outlier height ≥ this × the line's tallest glyph
+export const LINE_TEXT_ASPECT = 1.2;    // × height — wider rest members are text, not strokes
 export function lineOutlierSplit<T extends SplitComp>(members: T[]): { line: T[]; rest: T[] } | null {
     if (members.length < 4) return null;
     const h = (c: T) => c.y2 - c.y1 + 1;
@@ -277,9 +278,20 @@ export function lineOutlierSplit<T extends SplitComp>(members: T[]): { line: T[]
     }
     const rest = members.filter((_c, i) => !best.includes(i));
     if (!rest.length) return null;
+    // The outlier reference is the height-window line (pre-rejoin): the strokes must be much
+    // taller than the text line, not than a merged multi-line block that rejoins below.
     const tallest = Math.max(...line.map(h));
-    if (!rest.some(c => h(c) >= LINE_OUTLIER_FACTOR * tallest)) return null;
-    return { line, rest };
+    // A rest member wider than tall is a text fragment the height window missed — the balloon's
+    // next line, or a merged multi-line block — not an effect stroke: rejoin the emitted line so
+    // the region still covers it. Portrait strokes/hands stay in rest.
+    const strokes: T[] = [];
+    for (const c of rest) {
+        if (c.x2 - c.x1 >= LINE_TEXT_ASPECT * (c.y2 - c.y1)) line.push(c);
+        else strokes.push(c);
+    }
+    if (!strokes.length) return null;
+    if (!strokes.some(c => h(c) >= LINE_OUTLIER_FACTOR * tallest)) return null;
+    return { line, rest: strokes };
 }
 
 export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number, boxComps: SplitComp[] = comps): T[] {
@@ -298,6 +310,49 @@ export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[
         out.push(...(parts ?? [b]));
     }
     return out;
+}
+
+// A box can swallow a cluster of sub-component mask specks (silence dots, dust) sitting far
+// above its text: the split lanes see no evidence (specks are below the comp floor), so the
+// single region crop, layout and erase would cover them and the cleanup deletes them. When ≥2
+// specks end at least a glyph-scaled gap above the first text comp inside the box, cut the box
+// at the gap into two regions — the speck cluster and the text. The specks region rides the
+// normal keep path (the LLM marks no-readable-text regions keep; an unanswered or missed region
+// is never erased either). The gap gate scales with the block's glyph height so fragments of
+// large lettering — which sit ~1 glyph above the main mass — are never treated as a cluster.
+// Pure — unit tested.
+export const SPECK_MIN_GAP = 40; // px — absolute floor on the speck-to-text gap
+export const SPECK_GLYPH_MULT = 2; // × median comp height — a same-glyph fragment sits nearer
+export function splitSpeckCluster<T extends DetBox>(box: T, comps: SplitComp[], tiny: SplitComp[]): T[] | null {
+    if (!comps.length || tiny.length < 2) return null;
+    const inside = (r: SplitComp): boolean => {
+        const cx = (r.x1 + r.x2) / 2, cy = (r.y1 + r.y2) / 2;
+        return cx >= box.x1 && cx <= box.x2 && cy >= box.y1 && cy <= box.y2;
+    };
+    const own = comps.filter(inside);
+    if (!own.length) return null;
+    const firstTop = Math.min(...own.map(c => c.y1));
+    const heights = own.map(c => c.y2 - c.y1).sort((a, b) => a - b);
+    const gate = Math.max(SPECK_MIN_GAP, SPECK_GLYPH_MULT * heights[Math.floor(heights.length / 2)]);
+    const cluster = tiny.filter(b => inside(b) && b.y2 <= firstTop - gate);
+    if (cluster.length < 2) return null;
+    const lowest = Math.max(...cluster.map(b => b.y2));
+    const cut = Math.round((lowest + firstTop) / 2);
+    if (cut <= box.y1 + 4 || cut >= box.y2 - 4) return null; // no room for two regions
+    const slack = Math.min(SPLIT_CLIP_SLACK, Math.max(4, Math.floor((firstTop - lowest) / 2)));
+    const base = box.clip ?? { x1: box.x1, y1: box.y1, x2: box.x2, y2: box.y2 };
+    // children never cross the cut; clips keep the sibling-side leash for the render
+    const speck = {
+        ...box,
+        x1: Math.max(box.x1, Math.min(...cluster.map(b => b.x1))),
+        x2: Math.min(box.x2, Math.max(...cluster.map(b => b.x2))),
+        y1: Math.max(box.y1, Math.min(...cluster.map(b => b.y1))),
+        y2: cut,
+        clip: { ...base, y2: cut + slack },
+        cutAxis: 'y' as const,
+    };
+    const text = { ...box, y1: cut, clip: { ...base, y1: cut - slack }, cutAxis: 'y' as const };
+    return [speck, text];
 }
 
 type SplitGroup = { x1: number; y1: number; x2: number; y2: number };
@@ -412,6 +467,16 @@ export const OVERHANG_ROW_ALIGN = 0.1;
 function medianMinor(rs: SplitComp[]): number {
     const d = rs.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
     return d[Math.floor(d.length / 2)];
+}
+// Lane-2 glyph unit for fragmented text: a comp that merged several text lines has a minor
+// extent above one line height, and the plain median lets such merges inflate the cut floor
+// (bold text on tone fragments into big multi-line comps). Reading the median of the smaller
+// half keeps the estimate on single-line fragments. Falls back to the median for tiny sets.
+// Pure — unit tested.
+function lineUnit(rs: SplitComp[]): number {
+    const d = rs.map(c => Math.min(c.x2 - c.x1, c.y2 - c.y1)).sort((a, b) => a - b);
+    const lower = d.slice(0, Math.max(1, Math.floor(d.length / 2)));
+    return lower[Math.floor(lower.length / 2)];
 }
 function splitTwinCut<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[]): T[] | null {
     const unit = medianMinor(cs);
@@ -538,14 +603,15 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
 // Lane 2: same two-balloon problem on tightly packed pages — clusters sit ~15–40px apart
 // (under lane 1's gap floor) and side-by-side balloons share cross-axis space, so lane 1's
 // disjointness guard rejects them too. Cut on cluster evidence: the floor gap scales with the
-// box's glyph size (median cluster minor extent) and a cut needs EITHER strongly disjoint cross
-// spans OR 1.5 times the floor with the cross spans not nested in each other. The nested guard keeps
+// box's glyph size (the lower-half median minor extent — a comp that merged several text lines
+// must not inflate the floor) and a cut needs EITHER strongly disjoint cross spans OR 1.5 times
+// the floor with the cross spans not nested in each other. The nested guard keeps
 // a paragraph's separated last line fused while the caption-block case passes. Same-span lines
 // of one block merge through the overlap ratio. Cross spans come from the strict text core plus
 // its glyph leash, so a weak comp cannot fake the nesting. Pure — unit tested.
 function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: SplitComp[], strayGap: number): T[] | null {
     if (cs.length < 2) return null;
-    const unit = medianMinor(cs);
+    const unit = lineUnit(cs);
     const floor = Math.max(SPLIT2_FLOOR_MIN, Math.round(SPLIT2_FLOOR_RATIO * unit));
     // Cross-axis evidence reads the strict text core plus loose comps within the
     // same glyph leash emitSplit gives child boxes: a weak comp (corroborated texture,
