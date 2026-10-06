@@ -141,6 +141,17 @@ test('live page with P5: user-expected order (dialogue before labels, THEREFORE 
   assert.deepEqual(out.map(b => boxes.indexOf(b) + 1), [1, 2, 3, 4, 5, 9, 6, 7, 8, 11, 12, 14, 15, 10, 13, 16]);
 });
 
+test('panel reading order: a full-width banner does not chain the lower row (live case, S04 p66)', () => {
+  // The top banner overlaps the bottom row's top edge; chaining it made the single row
+  // sort columns by y and read the row left-first (1,2,3,4,5). With page dims the
+  // banner is held to level starts, so the row orders right-to-left per panel.
+  const page = { w: 2000, h: 2872 };
+  const panels = [P(0, 0, 2000, 2144), P(1117, 1670, 2068, 2872), P(1124, 1676, 2067, 2874), P(66, 1653, 721, 2876), P(743, 1680, 1249, 2728)];
+  const boxes = [box(51, 2109, 246, 2293), box(588, 2220, 670, 2553), box(1655, 1749, 1979, 2618), box(1179, 2157, 1503, 2644), box(923, 1714, 1207, 1983)];
+  const out = orderByPanels(boxes, panels, 'rtl', page);
+  assert.deepEqual(out.map(b => boxes.indexOf(b) + 1), [3, 4, 5, 1, 2]);
+});
+
 test('panel reading order: side-by-side panels order right-to-left despite a sliver of x overlap', () => {
   const left = P(4, 0, 1108, 492);
   const right = P(1086, 0, 1700, 500);

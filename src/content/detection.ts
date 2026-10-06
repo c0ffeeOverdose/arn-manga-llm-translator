@@ -941,6 +941,10 @@ export function orderByPanels(boxes: DetBox[], panels: DetBox[], dir: 'rtl' | 'l
         let sink: { main: DetBox[]; deferred: DetBox[] } | null = null;
         if (page && defer && !children[i].length) {
             const split = splitDeferred(groups[i], page.w, page.h);
+            // OPEN (2026-10-06): two live cases (S02 p26, S05 p21) sink a small cluster that
+            // is arguably real reading order; every counter-rule tried so far (ratio cap,
+            // split-child guard) moved owner-verified cases (live-page-p5 / real-hard-23),
+            // so the sink stays as-is pending an owner decision. Numbers in the task record.
             if (split.deferred.length && Math.max(...split.deferred.map(area)) < Math.min(...split.main.map(area))) sink = split;
         }
         if (sink) {
@@ -950,7 +954,7 @@ export function orderByPanels(boxes: DetBox[], panels: DetBox[], dir: 'rtl' | 'l
         }
         return expand(sortReadingOrderBy(items, t => t.rect, dir, page, false));
     };
-    return panelReadingOrder(roots.map(i => panels[i]), dir).map(k => roots[k]).flatMap(orderNode);
+    return panelReadingOrder(roots.map(i => panels[i]), dir, page).map(k => roots[k]).flatMap(orderNode);
 }
 
 // panel indices in reading order — shared by translation ordering + debug numbers
@@ -958,9 +962,9 @@ export function orderByPanels(boxes: DetBox[], panels: DetBox[], dir: 'rtl' | 'l
 // panel spans several text rows. Reading order is built for panels, not text boxes:
 // vertical-overlap clusters form rows; within a row, substantially-x-overlapping panels
 // form columns, right-to-left (rtl), then top-to-bottom. Pure — unit tested.
-export const PANEL_ROW_OVERLAP = 0.25; // × the shorter panel's height — a row member
+export const PANEL_ROW_OVERLAP = 0.25; // × either panel's height — a row member
 export const PANEL_COL_OVERLAP = 0.5;  // × the narrower panel's width — a column member
-export function panelReadingOrder(panels: DetBox[], dir: 'rtl' | 'ltr'): number[] {
+export function panelReadingOrder(panels: DetBox[], dir: 'rtl' | 'ltr', page?: { w: number; h: number }): number[] {
     if (panels.length < 2) return panels.map((_, i) => i);
     const w = (p: DetBox) => p.x2 - p.x1, h = (p: DetBox) => p.y2 - p.y1;
     const overlap = (a1: number, a2: number, b1: number, b2: number) => Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
@@ -972,9 +976,18 @@ export function panelReadingOrder(panels: DetBox[], dir: 'rtl' | 'ltr'): number[
         for (let i = 0; i < n; i++) { const k = find(i); const g = groups.get(k); if (g) g.push(i); else groups.set(k, [i]); }
         return [...groups.values()];
     };
+    // A full-width banner's bottom edge overlaps the top of the next row; chaining it in
+    // made the fallback sort that row's columns by y (S04 p66 read left-first). Banner
+    // pairs additionally need to start at the same level. Normal tall side panels keep
+    // chaining their stacked neighbours (owner-verified live page P5). Page dims are
+    // optional: without them this stays the legacy rule.
+    const banner = (p: DetBox) => page != null && w(p) >= 0.9 * page.w;
     const rows = cluster(panels.length, (i, j) => {
         const a = panels[i], b = panels[j];
-        return overlap(a.y1, a.y2, b.y1, b.y2) >= PANEL_ROW_OVERLAP * Math.min(h(a), h(b));
+        const minH = Math.min(h(a), h(b));
+        if (overlap(a.y1, a.y2, b.y1, b.y2) < PANEL_ROW_OVERLAP * minH) return false;
+        if ((banner(a) || banner(b)) && Math.abs(a.y1 - b.y1) > PANEL_ROW_OVERLAP * minH) return false;
+        return true;
     });
     const columnsOf = (row: number[]) => cluster(row.length, (i, j) => {
         const a = panels[row[i]], b = panels[row[j]];
