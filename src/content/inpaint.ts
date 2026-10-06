@@ -2,7 +2,7 @@
 // leaves anti-aliased glyph edges). Fill = per-box median background from a ring outside the box.
 import type { DetBox, DetectResult } from './detection';
 import { inpaintPage, type InpaintPatch } from './detection';
-import { dropContainedBoxes } from './page-cache';
+import { dropContainedBoxes, dropDuplicateBoxes } from './page-cache';
 import type { RegionOutput } from '../llm/core';
 
 const DILATE_PASSES = 3; // 3 x 3x3 box dilation ≈ 6-7px — kills anti-aliased glyph edges
@@ -393,11 +393,18 @@ export function erasePlan(det: DetectResult, outputs: RegionOutput[]): {
     const translatedIdx = new Set(
         outputs.filter(o => o.translation && o.translation !== 'keep').map(o => o.index),
     );
-    // contained-duplicate guard: the lower-conf box is treated as keep.
-    const keptBoxes = new Set(dropContainedBoxes(det.boxes));
-    const dupIdx = new Set(det.boxes.map((b, i) => keptBoxes.has(b) ? -1 : i + 1).filter(i => i > 0));
-    const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && !dupIdx.has(i + 1));
-    const keepBoxes = det.boxes.filter((_, i) => keepIdx.has(i + 1) || dupIdx.has(i + 1));
+    // duplicate guards: the lower-conf copy of a double detection is never painted.
+    // Contained losers keep their pixels (the winner's own erase window covers them);
+    // near-identical losers are ERASED but not painted — their offset area can stick
+    // out of the winner and would otherwise leave the source text behind (live S16 p11).
+    const keptContained = dropContainedBoxes(det.boxes);
+    const containedSet = new Set(keptContained);
+    const keptAll = new Set(dropDuplicateBoxes(keptContained));
+    const containedDup = new Set(det.boxes.map((b, i) => !containedSet.has(b) ? i + 1 : -1).filter(i => i > 0));
+    const dupOverlap = new Set(det.boxes.map((b, i) => (containedSet.has(b) && !keptAll.has(b)) ? i + 1 : -1).filter(i => i > 0));
+    const dupIdx = new Set([...containedDup, ...dupOverlap]);
+    const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && (!dupIdx.has(i + 1) || dupOverlap.has(i + 1)));
+    const keepBoxes = det.boxes.filter((_, i) => keepIdx.has(i + 1) || containedDup.has(i + 1));
     const missedIdx = det.boxes.map((_, i) => i + 1).filter(i => !translatedIdx.has(i) && !keepIdx.has(i));
     return { boxesToErase, keepBoxes, keepIdx, dupIdx, missedIdx };
 }

@@ -16,7 +16,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/page-cache-adapters.mjs', sourcemap: 'inline',
 });
 
-const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, seamEdgeSuspect, boxIoU, boxContained, dropContainedBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, detFromCacheEntry, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, bytesCrops, INPAINT_PATCH_GEN, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
+const { hashPixels, cacheKey, settingsFingerprint, CACHE_MAX, packMask, unpackMask, cropPixels, overlapOfRect, normalizeChapterKey, readerPageNumber, deriveStoryPath, pickSeriesLink, pickStoryScope, autoBudget, galleryAheadUrls, galleryAllUrls, galleryLookaheadUrls, episodeManifest, manifestAheadUrls, puzzleTileMap, hotlinkRule, hotlinkRetryable, HOTLINK_RULE_ID, seamLinked, seamInkLinked, seamTruncated, seamEdgeSuspect, boxIoU, boxContained, dropContainedBoxes, dropDuplicateBoxes, bandSpan, seamRowsMatch, srcAssignBlocked, cooldownMark, cooldownClear, cooldownParked, COOLDOWN_MAX, uniformPixels, pickActivity, fetchImageBlocked, isResumable, detFromPartial, detFromCacheEntry, partialEntry, parseWarming, warmingFresh, WARM_TTL_MS, takeOrdered, progressGetT0, progressPutT0, LLP_TTL_MS, samePagePath, handoffRead, handoffDrop, pagedChapterUuid, buildPagedUrls, readerChapterFiles, hashReaderId, hashReaderFiles, hashReaderUrls, regionChunks, nextChunkSize, requestImages, pageKey, pageEntryDecision, bytesCrops, INPAINT_PATCH_GEN, PAGE_KEY_GEN, unloadedPageUrls, sweepPhase, sweepPoolSize, paintLaneSize, registerLookaheadAbort, abortLookahead, annotFont, withSources, pickInferIndex, cloudSplitFresh, CLOUD_SPLIT_GEN, priorityIndices, usableAnchor } =
   await import(new URL('../.test-build/page-cache.mjs', import.meta.url).href);
 const { sessionKey } = await import(new URL('../.test-build/page-cache-adapters.mjs', import.meta.url).href);
 
@@ -85,6 +85,30 @@ test('boxContained/dropContainedBoxes: IoU-blind fragment inside a real box', ()
   const outer = { x1: 0, y1: 0, x2: 100, y2: 100, conf: 0.8 };
   const inner = { x1: 10, y1: 10, x2: 90, y2: 90, conf: 0.8 };
   assert.deepEqual(dropContainedBoxes([inner, outer]), [outer]);
+});
+
+test('dropDuplicateBoxes: offset double-detection of one text collapses to the winner', () => {
+  // live S16 p11: the same tail line detected twice (offset 13px, containment 0.79 < 0.9),
+  // both translated and painted on top of each other — unreadable on the page.
+  const a = { x1: 1889, y1: 2324, x2: 1986, y2: 2440, conf: 0.6 };
+  const b = { x1: 1876, y1: 2339, x2: 1967, y2: 2448, conf: 0.77 };
+  assert.ok(boxContained(a, b) < 0.9, 'the containment guard alone lets it through');
+  assert.deepEqual(dropDuplicateBoxes([a, b]), [b]); // lower conf loses
+  assert.deepEqual(dropDuplicateBoxes([b, a]), [b]); // order-independent
+  // tie conf → smaller area loses
+  const a2 = { ...a, conf: 0.77 };
+  assert.deepEqual(dropDuplicateBoxes([a2, b]), [a2]);
+  // similar dims but only sliver overlap (two side-by-side columns of one balloon) survives
+  const col1 = { x1: 0, y1: 0, x2: 60, y2: 200, conf: 0.9 };
+  const col2 = { x1: 64, y1: 6, x2: 124, y2: 206, conf: 0.9 };
+  assert.deepEqual(dropDuplicateBoxes([col1, col2]), [col1, col2]);
+  // deep overlap with different shapes (ruby text over a block) survives
+  const word = { x1: 0, y1: 0, x2: 100, y2: 40, conf: 0.9 };
+  const block = { x1: 10, y1: -20, x2: 60, y2: 200, conf: 0.8 };
+  assert.deepEqual(dropDuplicateBoxes([word, block]), [word, block]);
+  // far-apart same-size boxes survive
+  const far = { x1: 500, y1: 500, x2: 596, y2: 616, conf: 0.6 };
+  assert.deepEqual(dropDuplicateBoxes([a2, far]), [a2, far]);
 });
 
 test('packMask: downscales to ≤maxSide, block-max keeps text pixels', () => {

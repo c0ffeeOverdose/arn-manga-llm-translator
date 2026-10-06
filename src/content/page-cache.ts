@@ -1037,6 +1037,35 @@ export function dropContainedBoxes<T extends SeamBox & { conf: number }>(boxes: 
     return boxes.filter(b => !drop.has(b));
 }
 
+// Near-identical duplicates: one text detected twice with a few px offset (two passes over the
+// same balloon). Both get translated, and painting both stacks two translations on one another —
+// unreadable (live S16 p11: same tail box at conf 0.6 + 0.77, 79% of the smaller overlapped,
+// containment 0.79 < the 0.9 guard). Distinct texts never share a deep overlap with similar
+// dimensions AND co-centred boxes, so all three gates must pass. Loser = lower conf (tie:
+// smaller area). Paint-time only: detection output and its fixtures stay untouched. Pure.
+export function dropDuplicateBoxes<T extends SeamBox & { conf: number }>(boxes: T[], overSmaller = 0.65, dimsRatio = 0.6, centerFrac = 0.35): T[] {
+    const drop = new Set<T>();
+    for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+            const a = boxes[i], b = boxes[j];
+            if (drop.has(a) || drop.has(b)) continue;
+            const aw = a.x2 - a.x1, ah = a.y2 - a.y1, bw = b.x2 - b.x1, bh = b.y2 - b.y1;
+            if (aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0) continue;
+            if (Math.min(aw, bw) / Math.max(aw, bw) < dimsRatio || Math.min(ah, bh) / Math.max(ah, bh) < dimsRatio) continue;
+            const inter = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
+                * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+            if (inter / Math.min(aw * ah, bw * bh) < overSmaller) continue;
+            const dist = Math.hypot((a.x1 + a.x2 - b.x1 - b.x2) / 2, (a.y1 + a.y2 - b.y1 - b.y2) / 2);
+            if (dist > centerFrac * Math.max(aw, ah, bw, bh)) continue;
+            const loser = a.conf !== b.conf
+                ? (a.conf < b.conf ? a : b)
+                : (aw * ah <= bw * bh ? a : b);
+            drop.add(loser);
+        }
+    }
+    return boxes.filter(b => !drop.has(b));
+}
+
 // IoU of two boxes — the stitch safety net (below) uses it to suppress solo
 // boxes the stitch detector already found. Pure.
 export function boxIoU(a: SeamBox, b: SeamBox): number {

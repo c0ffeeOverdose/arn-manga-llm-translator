@@ -337,7 +337,7 @@ export function paintRegions(
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const { boxesToErase, keepBoxes, keepIdx, dupIdx, missedIdx } = erasePlan(det, outputs);
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
-    if (dupIdx.size && isDebug()) console.log('[mt] contained-duplicate boxes kept as-is:', [...dupIdx].join(','));
+    if (dupIdx.size && isDebug()) console.log('[mt] duplicate boxes kept as-is:', [...dupIdx].join(','));
     if (patches?.length) {
         // AI cleanup ran on the original page: paint the patches instead of the built-in fill.
         // Drawn into the full rect (not 1:1): capped-upload cloud patches come back smaller —
