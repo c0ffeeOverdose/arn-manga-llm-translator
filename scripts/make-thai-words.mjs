@@ -59,9 +59,20 @@ function misaligned(probe, w) {
 const lexicon = [...new Set(source.split(/\r?\n/).map(s => s.trim()).filter(Boolean))]
     .filter(w => /^[\p{Script=Thai}]+$/u.test(w) && [...w].length >= 2);
 
-const words = lexicon
+// Curated protection for live-QA cases whose mis-split context the PRE/POST probes do
+// not reach (ICU resyncs after a junction the probes lack: อย่ามา|รบกวน → รบก|วน,
+// เหมือน|โฮล → เห|มือ|น). The guard keeps entries honest: each must be a real lexicon
+// word that ICU keeps whole standalone — never a compound (สุด|ยอด) that stays breakable.
+const CURATED = ['รบกวน', 'เหมือน'];
+for (const w of CURATED) {
+    if (!lexicon.includes(w)) throw new Error(`curated word not in lexicon: ${w}`);
+    if (parts(w).length !== 1) throw new Error(`curated word is not an ICU whole: ${w}`);
+}
+
+const probed = lexicon
     .filter(w => [...w].length <= MAX_LEN)
     .filter(w => PRE.some(p => misaligned(p + w, w)) || POST.some(q => misaligned(w + q, w)));
+const words = [...probed, ...CURATED.filter(w => !probed.includes(w))];
 
 // A tail is a trigger when it mis-splits at least one word ICU keeps whole standalone.
 const triggers = TAIL_CANDIDATES

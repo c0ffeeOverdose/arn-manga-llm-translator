@@ -2013,7 +2013,9 @@ export const THAI_SPLIT_WORDS = `กดคอ
 ไฮแจ็ค
 ไฮโซ
 ไฮโดร
-ไฮติ`;
+ไฮติ
+รบกวน
+เหมือน`;
 export const THAI_TAIL_TRIGGERS = `เนี่ยนะ
 รึเปล่า
 เนี่ย

@@ -17,7 +17,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 34;
+export const RENDER_GEN = 35;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -146,8 +146,14 @@ function wrapUnits(line: string): Unit[] {
         if (hasThai(part)) {
             let first = true;
             for (const w of thaiWords(part)) {
-                if (!first && /^[\p{Pe}\p{Pf}.,!?…:;]+$/u.test(w)) { units[units.length - 1].t += w; continue; }
-                units.push({ t: w, spaceBefore: spaceBefore && first });
+                // Thai closing punctuation glues to the previous unit; ๆ/ฯ must never
+                // START a line, so a part made of those marks rides the unit before it.
+                const tail = /^[ๆฯ]/.test(w);
+                if (units.length && (tail || (!first && /^[\p{Pe}\p{Pf}.,!?…:;]+$/u.test(w)))) {
+                    units[units.length - 1].t += (tail && spaceBefore ? ' ' : '') + w;
+                } else {
+                    units.push({ t: w, spaceBefore: spaceBefore && first });
+                }
                 first = false;
             }
         } else {
