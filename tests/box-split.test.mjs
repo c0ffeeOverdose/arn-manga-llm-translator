@@ -222,6 +222,27 @@ test('stacked balloons in one column split when the gap is deep (live case)', ()
   ]);
 });
 
+// Live case (S02 p44): an over-wide head box (504,160,842,543) swallows the LEFT glyph
+// column of the neighbouring bubble (its own box 734,100,1062,338). Those glyph comps'
+// centres sit inside the parent, so they used to stretch the split child to x=842 and its
+// translation ran into the neighbour. A comp another box already claims is not this box's
+// split evidence (SPLIT_CLAIM_FRAC); the child now hugs its own column.
+test('a comp claimed by a neighbouring box never stretches this box\'s split child', () => {
+  const parent = box(504, 160, 842, 543, 0.66);
+  const right = box(734, 100, 1062, 338, 0.68);
+  const comps = [
+    box(506, 233, 592, 332), box(529, 188, 628, 236), box(593, 234, 651, 330),
+    box(630, 202, 657, 217), box(652, 298, 664, 312), box(666, 298, 678, 313),
+    box(686, 467, 727, 515), box(726, 422, 811, 517), box(734, 532, 766, 546),
+    box(743, 246, 783, 293), box(782, 199, 872, 342),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent, right], comps, GAP), [
+    { x1: 506, y1: 188, x2: 678, y2: 372, conf: 0.66, clip: { x1: 504, y1: 160, x2: 842, y2: 389 }, cutAxis: 'y' },
+    { x1: 686, y1: 382, x2: 811, y2: 543, conf: 0.66, clip: { x1: 504, y1: 365, x2: 842, y2: 543 }, cutAxis: 'y' },
+    { x1: 734, y1: 100, x2: 1062, y2: 338, conf: 0.68 },
+  ]);
+});
+
 test('words on one line (large x gaps, same y) do not split', () => {
   const b = box(0, 0, 100, 150);
   const comps = [

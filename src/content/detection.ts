@@ -135,6 +135,11 @@ export function mergeTileBoxes(tiled: { tile: Tile; boxes: DetBox[] }[]): DetBox
 // padded by half the adjacent gap and clamped to the parent. Pure geometry — unit tested.
 export const SPLIT_GAP_FACTOR = 2;  // × same-block gap — a cut is never tighter
 export const SPLIT_GAP_RATIO = 0.8; // × median cluster extent along the cut axis
+// Splitting a box: a comp that another, unrelated box already claims (≥ CLAIM of its area
+// inside it) is not this box's evidence (see splitMergedBoxes); near-duplicate / nested
+// boxes (≥ FAMILY of the smaller inside each other) are one region family and may share.
+export const SPLIT_CLAIM_FRAC = 0.6;
+export const SPLIT_FAMILY_FRAC = 0.7;
 // × thr — cross-spanning groups this far apart on the axis are separate balloons, not a
 // mask hole inside one block. Stacked balloons share the cross span (full-width lines), so
 // the disjointness merge below used to fuse them into one region and one translation ran
@@ -303,11 +308,32 @@ export function lineOutlierSplit<T extends SplitComp>(members: T[]): { line: T[]
 
 export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[], sameBlockGap: number, boxComps: SplitComp[] = comps): T[] {
     if (comps.length < 2) return [...boxes];
+    // An over-wide head box can swallow a neighbouring box's glyph column: those comps'
+    // centres fall inside this box, so they entered its split evidence and stretched the
+    // child across the neighbour (live S02 p44: a child kept the right bubble's left
+    // glyphs and its translation ran into that bubble). A comp that another, unrelated
+    // box already claims is not this box's evidence — same principle as the emission-time
+    // overlap gate. Near-duplicate / nested pairs are one region family and may share.
+    const interArea = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
+        Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1)) * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+    const areaOf = (r: { x1: number; y1: number; x2: number; y2: number }) => Math.max(0, r.x2 - r.x1) * Math.max(0, r.y2 - r.y1);
+    const claimedByOther = (c: SplitComp, self: T): boolean => {
+        const ca = areaOf(c);
+        if (ca <= 0) return false;
+        for (const o of boxes) {
+            if (o === self) continue;
+            const family = interArea(o, self) >= SPLIT_FAMILY_FRAC * Math.min(areaOf(o), areaOf(self));
+            if (family) continue;
+            if (interArea(c, o) >= SPLIT_CLAIM_FRAC * ca) return true;
+        }
+        return false;
+    };
     const out: T[] = [];
     for (const b of boxes) {
         const cs = comps.filter(c =>
             (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
-            (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2);
+            (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2 &&
+            !claimedByOther(c, b));
         // Strict set (higher text likelihood): the cut evidence may include a texture false
         // positive (the box head corroborates it), but the child BOX must hug the text.
         const bs = boxComps === comps ? cs : boxComps.filter(c =>
