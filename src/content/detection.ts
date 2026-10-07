@@ -22,6 +22,10 @@ export interface DetBox {
     // clamps the clip on this axis only; the cross axis stays free so the flood can still reach
     // the bubble's own walls — clamping both traps children inside the parent's box.
     cutAxis?: 'x' | 'y';
+    // Split children only: siblings of one parent share this id. They are one balloon, so the
+    // reading-order pass treats them as a single unit (a tall lower block must not band away
+    // from its upper block past a neighbouring bubble).
+    sib?: number;
 }
 
 export interface DetectResult {
@@ -327,7 +331,8 @@ export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[
         return false;
     };
     const out: T[] = [];
-    for (const b of boxes) {
+    for (let bi = 0; bi < boxes.length; bi++) {
+        const b = boxes[bi];
         const cs = comps.filter(c =>
             (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
             (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2 &&
@@ -338,6 +343,7 @@ export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[
             (c.x1 + c.x2) / 2 >= b.x1 && (c.x1 + c.x2) / 2 <= b.x2 &&
             (c.y1 + c.y2) / 2 >= b.y1 && (c.y1 + c.y2) / 2 <= b.y2);
         const parts = splitBox(b, cs, sameBlockGap, bs);
+        if (parts) for (const p of parts) p.sib = bi; // one parent → one balloon family
         out.push(...(parts ?? [b]));
     }
     return out;
@@ -815,11 +821,48 @@ function corridorSplit<T>(items: T[], rect: (t: T) => DetBox, dir: 'rtl' | 'ltr'
     return dir === 'rtl' ? [best.R, best.L] : [best.L, best.R]; // reading-start group first
 }
 
+// Split siblings with a small cut gap are text blocks of one balloon: they read
+// consecutively (a tall lower block must not band away from its upper block past a
+// neighbouring bubble). A deep cut gap means two separate balloons — they keep their banded
+// positions (see SPLIT_BIG_GAP). Later members move directly after the first, order kept.
+export const SPLIT_JOIN_GAP = 96; // px — children touch or near-touch across the cut
+function joinFamilies<T>(ordered: T[], rect: (t: T) => DetBox): T[] {
+    const fam = new Map<number, T[]>();
+    for (const t of ordered) {
+        const s = rect(t).sib;
+        if (s == null) continue;
+        const g = fam.get(s);
+        if (g) g.push(t); else fam.set(s, [t]);
+    }
+    let out = ordered;
+    for (const g of fam.values()) {
+        if (g.length < 2) continue;
+        const near = g.every((t, i) => {
+            if (i === 0) return true;
+            const a = rect(g[i - 1]), b = rect(t);
+            const gapX = Math.max(0, a.x1 - b.x2, b.x1 - a.x2);
+            const gapY = Math.max(0, a.y1 - b.y2, b.y1 - a.y2);
+            // the siblings separate on the axis they do NOT overlap on (stacked blocks keep
+            // overlapping x); a diagonal pair reads by its smaller separation
+            const gap = gapX > 0 && gapY > 0 ? Math.min(gapX, gapY) : Math.max(gapX, gapY);
+            return gap <= SPLIT_JOIN_GAP;
+        });
+        if (!near) continue;
+        const at = out.indexOf(g[0]);
+        if (at < 0 || out[at + 1] === g[1]) continue; // already consecutive
+        const before = out.slice(0, at).filter(t => !g.includes(t)).length;
+        const rest = out.filter(t => !g.includes(t));
+        rest.splice(before, 0, ...g);
+        out = rest;
+    }
+    return out;
+}
+
 // Generic core so panel rects order with the same rules as text boxes.
 export function sortReadingOrderBy<T>(items: T[], rect: (t: T) => DetBox, dir: 'rtl' | 'ltr', page?: { w: number; h: number }, defer = true): T[] {
     if (items.length < 2) return [...items];
     const split = corridorSplit(items, rect, dir);
-    if (split) return [...sortReadingOrderBy(split[0], rect, dir, page, defer), ...sortReadingOrderBy(split[1], rect, dir, page, defer)];
+    if (split) return joinFamilies([...sortReadingOrderBy(split[0], rect, dir, page, defer), ...sortReadingOrderBy(split[1], rect, dir, page, defer)], rect);
     const cy = (t: T) => (rect(t).y1 + rect(t).y2) / 2;
     const hs = items.map(t => { const r = rect(t); return r.y2 - r.y1; }).sort((a, b) => a - b);
     const gap = Math.max(1, hs[Math.floor(hs.length / 2)] * 0.5);
@@ -829,14 +872,14 @@ export function sortReadingOrderBy<T>(items: T[], rect: (t: T) => DetBox, dir: '
         if (last && cy(t) - cy(last[last.length - 1]) <= gap) last.push(t);
         else bands.push([t]);
     }
-    return bands.flatMap(band => {
+    return joinFamilies(bands.flatMap(band => {
         // labels sink to the band's end (stable) — never across rows, see splitDeferred
         if (!page || !defer) return sortBandBy(band, rect, dir);
         const { main, deferred } = splitDeferred(band.map(t => rect(t)), page.w, page.h);
         const back = new Map<DetBox, T>();
         band.forEach(t => back.set(rect(t), t));
         return [...sortBandBy(main.map(m => back.get(m)!), rect, dir), ...sortBandBy(deferred.map(m => back.get(m)!), rect, dir)];
-    });
+    }), rect);
 }
 
 // one row band: x-overlap columns from the reading-start side, top first

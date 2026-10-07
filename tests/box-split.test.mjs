@@ -135,8 +135,8 @@ test('overhang cut separates touching blocks with independent row grids', () => 
   const parent = box(809, 772, 1091, 1116, 0.5);
   const comps = TOUCHING_BLOCKS.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [
-    { x1: 809, y1: 772, x2: 969, y2: 1116, conf: 0.5, clip: { x1: 809, y1: 772, x2: 974, y2: 1116 }, cutAxis: 'x' },
-    { x1: 970, y1: 811, x2: 1088, y2: 1003, conf: 0.5, clip: { x1: 966, y1: 772, x2: 1091, y2: 1116 }, cutAxis: 'x' },
+    { x1: 809, y1: 772, x2: 969, y2: 1116, conf: 0.5, clip: { x1: 809, y1: 772, x2: 974, y2: 1116 }, sib: 0, cutAxis: 'x' },
+    { x1: 970, y1: 811, x2: 1088, y2: 1003, conf: 0.5, clip: { x1: 966, y1: 772, x2: 1091, y2: 1116 }, sib: 0, cutAxis: 'x' },
   ]);
 });
 
@@ -176,8 +176,8 @@ test('live two-balloon box splits at the cluster gap, children clamped to parent
     box(1074, 777, 1148, 826), box(1161, 783, 1266, 827),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
-    { x1: 1312, y1: 376, x2: 1408, y2: 535, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 547 }, cutAxis: 'y' }, // x tight to the comps, y padded 33 toward the cut
-    { x1: 1062, y1: 535, x2: 1287, y2: 825, conf: 0.92, clip: { x1: 1061, y1: 523, x2: 1413, y2: 825 }, cutAxis: 'y' },
+    { x1: 1312, y1: 376, x2: 1408, y2: 535, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 547 }, sib: 0, cutAxis: 'y' }, // x tight to the comps, y padded 33 toward the cut
+    { x1: 1062, y1: 535, x2: 1287, y2: 825, conf: 0.92, clip: { x1: 1061, y1: 523, x2: 1413, y2: 825 }, sib: 0, cutAxis: 'y' },
   ]);
 });
 
@@ -217,8 +217,8 @@ test('stacked balloons in one column split when the gap is deep', () => {
     box(69, 652, 110, 699), box(182, 703, 227, 743),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
-    { x1: 48, y1: 461, x2: 229, y2: 788, conf: 0.83, clip: { x1: 48, y1: 461, x2: 232, y2: 868 }, cutAxis: 'y' },
-    { x1: 53, y1: 923, x2: 181, y2: 1072, conf: 0.83, clip: { x1: 48, y1: 844, x2: 232, y2: 1075 }, cutAxis: 'y' },
+    { x1: 48, y1: 461, x2: 229, y2: 788, conf: 0.83, clip: { x1: 48, y1: 461, x2: 232, y2: 868 }, sib: 0, cutAxis: 'y' },
+    { x1: 53, y1: 923, x2: 181, y2: 1072, conf: 0.83, clip: { x1: 48, y1: 844, x2: 232, y2: 1075 }, sib: 0, cutAxis: 'y' },
   ]);
 });
 
@@ -236,8 +236,8 @@ test('a comp claimed by a neighbouring box never stretches this box\'s split chi
     box(743, 246, 783, 293), box(782, 199, 872, 342),
   ];
   assert.deepEqual(splitMergedBoxes([parent, right], comps, GAP), [
-    { x1: 506, y1: 188, x2: 678, y2: 372, conf: 0.66, clip: { x1: 504, y1: 160, x2: 842, y2: 389 }, cutAxis: 'y' },
-    { x1: 686, y1: 382, x2: 811, y2: 543, conf: 0.66, clip: { x1: 504, y1: 365, x2: 842, y2: 543 }, cutAxis: 'y' },
+    { x1: 506, y1: 188, x2: 678, y2: 372, conf: 0.66, clip: { x1: 504, y1: 160, x2: 842, y2: 389 }, sib: 0, cutAxis: 'y' },
+    { x1: 686, y1: 382, x2: 811, y2: 543, conf: 0.66, clip: { x1: 504, y1: 365, x2: 842, y2: 543 }, sib: 0, cutAxis: 'y' },
     { x1: 734, y1: 100, x2: 1062, y2: 338, conf: 0.68 },
   ]);
 });
@@ -257,8 +257,8 @@ test('median cluster extent raises the cut threshold on large scales', () => {
   assert.equal(splitMergedBoxes([b], near, GAP).length, 1);
   const far = [box(0, 0, 100, 100), box(140, 240, 200, 340)];  // gap 140 ≥ 80
   assert.deepEqual(splitMergedBoxes([b], far, GAP), [
-    { x1: 0, y1: 0, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 200, y2: 182 }, cutAxis: 'y' },   // pad 70→cap 40 toward the cut only
-    { x1: 140, y1: 200, x2: 200, y2: 340, conf: 0.9, clip: { x1: 0, y1: 158, x2: 200, y2: 400 }, cutAxis: 'y' },
+    { x1: 0, y1: 0, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 200, y2: 182 }, sib: 0, cutAxis: 'y' },   // pad 70→cap 40 toward the cut only
+    { x1: 140, y1: 200, x2: 200, y2: 340, conf: 0.9, clip: { x1: 0, y1: 158, x2: 200, y2: 400 }, sib: 0, cutAxis: 'y' },
   ]);
 });
 
@@ -266,8 +266,8 @@ test('vertical text columns split along x when the y scan finds no gap', () => {
   const b = box(0, 0, 200, 300);
   const comps = [box(20, 20, 60, 140), box(140, 180, 180, 300)];
   assert.deepEqual(splitMergedBoxes([b], comps, GAP), [
-    { x1: 20, y1: 20, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 112, y2: 300 }, cutAxis: 'x' },
-    { x1: 100, y1: 180, x2: 180, y2: 300, conf: 0.9, clip: { x1: 88, y1: 0, x2: 200, y2: 300 }, cutAxis: 'x' },
+    { x1: 20, y1: 20, x2: 100, y2: 140, conf: 0.9, clip: { x1: 0, y1: 0, x2: 112, y2: 300 }, sib: 0, cutAxis: 'x' },
+    { x1: 100, y1: 180, x2: 180, y2: 300, conf: 0.9, clip: { x1: 88, y1: 0, x2: 200, y2: 300 }, sib: 0, cutAxis: 'x' },
   ]);
 });
 
@@ -275,9 +275,9 @@ test('three diagonal clusters cut twice', () => {
   const b = box(0, 0, 270, 240);
   const comps = [box(10, 0, 90, 40), box(100, 100, 180, 140), box(190, 200, 270, 240)];
   assert.deepEqual(splitMergedBoxes([b], comps, GAP), [
-    { x1: 10, y1: 0, x2: 90, y2: 70, conf: 0.9, clip: { x1: 0, y1: 0, x2: 270, y2: 82 }, cutAxis: 'y' },
-    { x1: 100, y1: 70, x2: 180, y2: 170, conf: 0.9, clip: { x1: 0, y1: 58, x2: 270, y2: 182 }, cutAxis: 'y' },
-    { x1: 190, y1: 170, x2: 270, y2: 240, conf: 0.9, clip: { x1: 0, y1: 158, x2: 270, y2: 240 }, cutAxis: 'y' },
+    { x1: 10, y1: 0, x2: 90, y2: 70, conf: 0.9, clip: { x1: 0, y1: 0, x2: 270, y2: 82 }, sib: 0, cutAxis: 'y' },
+    { x1: 100, y1: 70, x2: 180, y2: 170, conf: 0.9, clip: { x1: 0, y1: 58, x2: 270, y2: 182 }, sib: 0, cutAxis: 'y' },
+    { x1: 190, y1: 170, x2: 270, y2: 240, conf: 0.9, clip: { x1: 0, y1: 158, x2: 270, y2: 240 }, sib: 0, cutAxis: 'y' },
   ]);
 });
 
@@ -423,8 +423,8 @@ test('lane 2: diagonal two-line groups are two blocks and split', () => {
     box(1062, 534, 1287, 575), box(1062, 600, 1287, 640),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
-    { x1: 1305, y1: 369, x2: 1413, y2: 519, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 531 }, cutAxis: 'y' },
-    { x1: 1062, y1: 519, x2: 1287, y2: 640, conf: 0.92, clip: { x1: 1061, y1: 507, x2: 1413, y2: 825 }, cutAxis: 'y' },
+    { x1: 1305, y1: 369, x2: 1413, y2: 519, conf: 0.92, clip: { x1: 1061, y1: 362, x2: 1413, y2: 531 }, sib: 0, cutAxis: 'y' },
+    { x1: 1062, y1: 519, x2: 1287, y2: 640, conf: 0.92, clip: { x1: 1061, y1: 507, x2: 1413, y2: 825 }, sib: 0, cutAxis: 'y' },
   ]);
 });
 
@@ -516,8 +516,8 @@ test('live YES-lobe fragment splits off its balloon (10px split-input floor)', (
     box(114, 565, 168, 580), box(117, 584, 165, 599), box(112, 603, 170, 618),
   ];
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [
-    { x1: 180, y1: 504, x2: 211, y2: 541, conf: 0.9, clip: { x1: 108, y1: 500, x2: 211, y2: 553 }, cutAxis: 'y' },
-    { x1: 112, y1: 541, x2: 170, y2: 618, conf: 0.9, clip: { x1: 108, y1: 529, x2: 211, y2: 621 }, cutAxis: 'y' },
+    { x1: 180, y1: 504, x2: 211, y2: 541, conf: 0.9, clip: { x1: 108, y1: 500, x2: 211, y2: 553 }, sib: 0, cutAxis: 'y' },
+    { x1: 112, y1: 541, x2: 170, y2: 618, conf: 0.9, clip: { x1: 108, y1: 529, x2: 211, y2: 621 }, sib: 0, cutAxis: 'y' },
   ]);
 });
 
@@ -685,8 +685,8 @@ test('live vertical twins: a weak comp cannot veto the cut by nesting', () => {
   const loose = VERTICAL_TWIN_LOOSE.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
   const strict = loose.filter(c => c.x1 !== 596);
   assert.deepEqual(splitMergedBoxes([parent], loose, GAP, strict), [
-    { x1: 606, y1: 312, x2: 716, y2: 449, conf: 0.9, clip: { x1: 606, y1: 90, x2: 725, y2: 473 }, cutAxis: 'x' },
-    { x1: 716, y1: 93, x2: 793, y2: 310, conf: 0.9, clip: { x1: 707, y1: 90, x2: 797, y2: 473 }, cutAxis: 'x' },
+    { x1: 606, y1: 312, x2: 716, y2: 449, conf: 0.9, clip: { x1: 606, y1: 90, x2: 725, y2: 473 }, sib: 0, cutAxis: 'x' },
+    { x1: 716, y1: 93, x2: 793, y2: 310, conf: 0.9, clip: { x1: 707, y1: 90, x2: 797, y2: 473 }, sib: 0, cutAxis: 'x' },
   ]);
 });
 
@@ -698,8 +698,8 @@ test('weak comp outside the strict core stays out of the merge evidence', () => 
     [130, 20, 160, 200], [170, 20, 200, 200]].map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
   const strict = loose.filter(c => c.y1 >= 200);
   assert.deepEqual(splitMergedBoxes([parent], loose, GAP, strict), [
-    { x1: 40, y1: 220, x2: 120, y2: 380, conf: 0.9, clip: { x1: 0, y1: 0, x2: 130, y2: 400 }, cutAxis: 'x' },
-    { x1: 120, y1: 20, x2: 200, y2: 200, conf: 0.9, clip: { x1: 110, y1: 0, x2: 220, y2: 400 }, cutAxis: 'x' },
+    { x1: 40, y1: 220, x2: 120, y2: 380, conf: 0.9, clip: { x1: 0, y1: 0, x2: 130, y2: 400 }, sib: 0, cutAxis: 'x' },
+    { x1: 120, y1: 20, x2: 200, y2: 200, conf: 0.9, clip: { x1: 110, y1: 0, x2: 220, y2: 400 }, sib: 0, cutAxis: 'x' },
   ]);
 });
 
@@ -742,8 +742,8 @@ test('live peanut lobes: a sub-floor diagonal gap splits the two masses', () => 
   const parent = box(985, 182, 1127, 647, 0.92);
   const comps = PEANUT_LOBE.map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2 }));
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [
-    { x1: 1050, y1: 182, x2: 1127, y2: 462, conf: 0.92, clip: { x1: 985, y1: 182, x2: 1127, y2: 466 }, cutAxis: 'y' },
-    { x1: 990, y1: 462, x2: 1046, y2: 641, conf: 0.92, clip: { x1: 985, y1: 458, x2: 1127, y2: 647 }, cutAxis: 'y' },
+    { x1: 1050, y1: 182, x2: 1127, y2: 462, conf: 0.92, clip: { x1: 985, y1: 182, x2: 1127, y2: 466 }, sib: 0, cutAxis: 'y' },
+    { x1: 990, y1: 462, x2: 1046, y2: 641, conf: 0.92, clip: { x1: 985, y1: 458, x2: 1127, y2: 647 }, sib: 0, cutAxis: 'y' },
   ]);
 });
 

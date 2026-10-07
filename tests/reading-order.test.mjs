@@ -24,6 +24,24 @@ test('rtl: rows top-to-bottom, right-to-left within each row', () => {
   assert.deepEqual(out, [rightTop, leftTop, rightBottom, leftBottom]);
 });
 
+test('split siblings with a small cut gap read consecutively (one balloon)', () => {
+  // The right balloon's two blocks (same sib) vs the left balloon between them by centre-y:
+  // the lower block must follow its upper block, not the neighbouring bubble.
+  const upper = { ...box(801, 194, 999, 401), sib: 5 };
+  const left = box(207, 278, 431, 486);
+  const lower = { ...box(787, 401, 994, 718), sib: 5 };
+  const leftLow = box(225, 575, 345, 701);
+  assert.deepEqual(sortReadingOrder([upper, left, lower, leftLow], 'rtl'), [upper, lower, left, leftLow]);
+});
+
+test('a deep cut gap keeps siblings in their banded positions (two balloons)', () => {
+  // Stacked balloons from one over-wide box: the centre bubble between them is its own row.
+  const upper = { ...box(48, 461, 229, 788), sib: 0 };
+  const mid = box(658, 728, 892, 963);
+  const lower = { ...box(53, 923, 181, 1072), sib: 0 };
+  assert.deepEqual(sortReadingOrder([upper, mid, lower], 'rtl'), [upper, mid, lower]);
+});
+
 test('ltr mirrors rtl', () => {
   const leftTop = box(10, 10, 100, 100);
   const leftBottom = box(10, 120, 100, 200);
