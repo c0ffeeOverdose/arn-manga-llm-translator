@@ -135,6 +135,13 @@ export function mergeTileBoxes(tiled: { tile: Tile; boxes: DetBox[] }[]): DetBox
 // padded by half the adjacent gap and clamped to the parent. Pure geometry — unit tested.
 export const SPLIT_GAP_FACTOR = 2;  // × same-block gap — a cut is never tighter
 export const SPLIT_GAP_RATIO = 0.8; // × median cluster extent along the cut axis
+// × thr — cross-spanning groups this far apart on the axis are separate balloons, not a
+// mask hole inside one block. Stacked balloons share the cross span (full-width lines), so
+// the disjointness merge below used to fuse them into one region and one translation ran
+// across both bubbles (live case, S02 p39: two stacked balloons, 215px apart, fused).
+// A paragraph's dropped line leaves one/two line pitches (~120px on large type here),
+// far below the gate.
+export const SPLIT_BIG_GAP = 3;
                                     // (line gaps run ~0.5–0.6× glyph height; a balloon boundary ≥1×)
 export const SPLIT_PAD_CAP = 40;    // px — max half-gap padding of a child box
 export const SPLIT2_FLOOR_RATIO = 0.5; // × median cluster minor extent (glyph size)
@@ -583,9 +590,14 @@ function splitBoxLane1<T extends DetBox>(box: T, cs: SplitComp[], sameBlockGap: 
         }
         if (groups.length < 2) continue;
         // Two runs sharing cross-axis space are one text block: a paragraph's lines share a
-        // span, and a partially-dropped mask invents fake gaps inside it. Only diagonal runs split.
+        // span, and a partially-dropped mask invents fake gaps inside it. Only diagonal runs
+        // split — unless the axis gap is deep enough to be a real balloon boundary
+        // (SPLIT_BIG_GAP × thr): stacked balloons also share the span, and fusing them put
+        // one translation across both bubbles.
         for (;;) {
-            const k = groups.findIndex((g, i) => i + 1 < groups.length && Math.min(cHi(g), cHi(groups[i + 1])) > Math.max(cLo(g), cLo(groups[i + 1])));
+            const k = groups.findIndex((g, i) => i + 1 < groups.length
+                && Math.min(cHi(g), cHi(groups[i + 1])) > Math.max(cLo(g), cLo(groups[i + 1]))
+                && lo(groups[i + 1]) - hi(g) < SPLIT_BIG_GAP * thr);
             if (k < 0) break;
             const b = groups[k + 1];
             groups[k] = {

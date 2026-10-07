@@ -205,6 +205,23 @@ test('stacked runs sharing the cross axis never split', () => {
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [parent]);
 });
 
+// Live case (S02 p39): two STACKED balloons in one column — their lines share the full
+// cross span, so the disjointness merge above used to fuse them and one translation ran
+// across both bubbles. The 215px gap is far deeper than the 120px in-block hole of the
+// test above: the big-gap exemption (SPLIT_BIG_GAP × thr) splits them.
+test('stacked balloons in one column split when the gap is deep (live case)', () => {
+  const parent = box(48, 461, 232, 1075, 0.83);
+  const comps = [
+    box(47, 461, 229, 653), box(53, 963, 181, 1072), box(53, 700, 181, 748),
+    box(168, 652, 214, 698), box(162, 556, 206, 603), box(112, 652, 152, 701),
+    box(69, 652, 110, 699), box(182, 703, 227, 743),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [
+    { x1: 48, y1: 461, x2: 229, y2: 788, conf: 0.83, clip: { x1: 48, y1: 461, x2: 232, y2: 868 }, cutAxis: 'y' },
+    { x1: 53, y1: 923, x2: 181, y2: 1072, conf: 0.83, clip: { x1: 48, y1: 844, x2: 232, y2: 1075 }, cutAxis: 'y' },
+  ]);
+});
+
 test('words on one line (large x gaps, same y) do not split', () => {
   const b = box(0, 0, 100, 150);
   const comps = [
