@@ -153,6 +153,10 @@ export const SPLIT_BIG_GAP = 3;
                                     // (line gaps run ~0.5–0.6× glyph height; a balloon boundary ≥1×)
 export const SPLIT_PAD_CAP = 40;    // px — max half-gap padding of a child box
 export const SPLIT2_FLOOR_RATIO = 0.5; // × median cluster minor extent (glyph size)
+// Lane 2 axis preference: the stacked (y) cut yields to x only when y would trim a sliver
+// (< this × the box's height) while x yields two real blocks (≥ this × the box's width).
+export const SPLIT_AXIS_TRIM_FRAC = 0.05;
+export const SPLIT_AXIS_BLOCK_FRAC = 0.25;
 export const SPLIT2_FLOOR_MIN = 8;     // px — absolute floor on small pages
 export const SPLIT2_OVERLAP_MAX = 0.5; // cross-span overlap / smaller span
 export const SPLIT2_STRONG_FACTOR = 1.5; // × floor — cuts despite cross overlap when neither span contains the other
@@ -694,6 +698,12 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
             ? { lo: Math.min(...ss.map(c => c.x1)), hi: Math.max(...ss.map(c => c.x2)) }
             : { lo: Math.min(...ss.map(c => c.y1)), hi: Math.max(...ss.map(c => c.y2)) };
     };
+    // Both axes can qualify on 2-D shapes. The y (stacked) cut stays the default; it yields
+    // to x only when y would merely trim a sliver (a trailing strip far below the block
+    // scale) while x separates two real blocks — a two-lobe balloon then reads lobe by lobe
+    // instead of leaving both lobes merged behind a dots-trim.
+    let yCand: { groups: SplitGroup[]; span: number } | null = null;
+    let xCand: { groups: SplitGroup[]; span: number } | null = null;
     for (const axis of ['y', 'x'] as const) {
         const lo = (g: SplitGroup) => (axis === 'y' ? g.y1 : g.x1);
         const hi = (g: SplitGroup) => (axis === 'y' ? g.y2 : g.x2);
@@ -741,9 +751,19 @@ function splitBoxLane2<T extends DetBox>(box: T, cs: SplitComp[], boxComps: Spli
                 prev.x2 = Math.max(prev.x2, g.x2); prev.y2 = Math.max(prev.y2, g.y2);
             }
         }
-        if (merged.length >= 2) return emitSplit(box, merged, axis, cs, boxComps);
+        if (merged.length >= 2) {
+            const span = Math.min(...merged.map(g => hi(g) - lo(g)));
+            if (axis === 'y') yCand = { groups: merged, span };
+            else xCand = { groups: merged, span };
+        }
     }
-    return null;
+    const preferX = !!yCand && !!xCand
+        && yCand.span < SPLIT_AXIS_TRIM_FRAC * (box.y2 - box.y1)
+        && xCand.span >= SPLIT_AXIS_BLOCK_FRAC * (box.x2 - box.x1);
+    const chosen: { axis: 'y' | 'x'; groups: SplitGroup[] } | null = preferX
+        ? { axis: 'x', groups: xCand!.groups }
+        : yCand ? { axis: 'y', groups: yCand.groups } : xCand ? { axis: 'x', groups: xCand.groups } : null;
+    return chosen ? emitSplit(box, chosen.groups, chosen.axis, cs, boxComps) : null;
 }
 
 // Pass-3 rescue for mask-component pipelines (see worker runDetect): a merged comp killed

@@ -242,6 +242,23 @@ test('a comp claimed by a neighbouring box never stretches this box\'s split chi
   ]);
 });
 
+// A two-lobe balloon: the trailing "..." strip sits at its bottom, so a y-cut (text above,
+// strip below) qualifies too — but that split would leave the two lobes merged. With both
+// axes qualifying, the axis whose smallest piece is largest wins (the left/right lobe cut).
+test('a tiny trailing strip does not preempt the lobe cut (axis preference)', () => {
+  const parent = box(580, 1039, 944, 1362, 0.85);
+  const comps = [
+    box(808, 1046, 869, 1084), box(866, 1071, 898, 1083), box(773, 1091, 935, 1131),
+    box(765, 1139, 852, 1179), box(866, 1139, 941, 1179), box(596, 1161, 642, 1196),
+    box(653, 1161, 707, 1196), box(795, 1184, 913, 1226), box(580, 1203, 721, 1238),
+    box(584, 1245, 721, 1280), box(573, 1285, 729, 1323), box(649, 1352, 667, 1364),
+  ];
+  assert.deepEqual(splitMergedBoxes([parent], comps, GAP, comps), [
+    { x1: 580, y1: 1161, x2: 747, y2: 1362, conf: 0.85, clip: { x1: 580, y1: 1039, x2: 759, y2: 1362 }, cutAxis: 'x', sib: 0 },
+    { x1: 747, y1: 1046, x2: 941, y2: 1226, conf: 0.85, clip: { x1: 735, y1: 1039, x2: 944, y2: 1362 }, cutAxis: 'x', sib: 0 },
+  ]);
+});
+
 test('words on one line (large x gaps, same y) do not split', () => {
   const b = box(0, 0, 100, 150);
   const comps = [
