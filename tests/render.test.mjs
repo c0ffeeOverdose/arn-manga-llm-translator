@@ -336,9 +336,8 @@ test('layoutText: a real word ending with a trigger tail is not split', () => {
 });
 
 test('layoutText: ๆ never starts a line (yamok rides the word before it)', () => {
-  // live case: ขอโทษจริง ๆ นะคะ… wrapped as …จริง / ๆ นะคะ… (yamok orphan).
-  // At f20/width 120 the old units break before " ๆ" (probe: eval/zz-yamok-probe.mjs);
-  // the mark must glue to จริง so the pair moves together.
+  // A break between a word and its ๆ (ยามก) is the orphan this guards: at f20/width 120 the
+  // ungated units break before " ๆ"; the mark must glue to จริง so the pair moves together.
   const t = 'ขอโทษจริง ๆ นะคะ…';
   const r = layoutText(fakeCtx(), t, 120, 400, 20);
   assert.ok(!r.lines.some(l => l.startsWith('ๆ')), `no line may start with ๆ, got ${JSON.stringify(r.lines)}`);
@@ -346,14 +345,14 @@ test('layoutText: ๆ never starts a line (yamok rides the word before it)', () 
 });
 
 test('layoutText: รบกวน is protected when a preceding word mis-resyncs ICU', () => {
-  // live case: อย่ามารบกวนสิ wrapped as อย่า / มารบก / วนสิ (ICU cuts มาร|บก|วน);
-  // the curated list entry forbids the mid-word boundary (probe: eval/zz-word-probe.mjs).
+  // ICU cuts มาร|บก|วน inside อย่ามารบกวนสิ; the curated list entry forbids the mid-word
+  // boundary so the word moves as one unit.
   const r = layoutText(fakeCtx(), 'อย่ามารบกวนสิ', 70, 400, 20);
   assert.ok(r.lines.some(l => l.includes('มารบกวน')), `"มารบกวน" must stay whole, got ${JSON.stringify(r.lines)}`);
 });
 
 test('layoutText: เหมือน stays whole before a loanword', () => {
-  // live case: ใช้ได้เหมือนออนนาโฮลเลย rendered เห / มือนออน… (ICU cuts เห|มือ|น).
+  // ICU cuts เห|มือ|น in this context; the curated list entry keeps the word one unit.
   const r = layoutText(fakeCtx(), 'ใช้ได้เหมือนออนนาโฮลเลย', 84, 400, 20);
   assert.ok(r.lines.some(l => l.includes('เหมือน')), `"เหมือน" must stay whole, got ${JSON.stringify(r.lines)}`);
 });

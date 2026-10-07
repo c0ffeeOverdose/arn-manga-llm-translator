@@ -205,11 +205,11 @@ test('stacked runs sharing the cross axis never split', () => {
   assert.deepEqual(splitMergedBoxes([parent], comps, GAP), [parent]);
 });
 
-// Live case (S02 p39): two STACKED balloons in one column — their lines share the full
-// cross span, so the disjointness merge above used to fuse them and one translation ran
-// across both bubbles. The 215px gap is far deeper than the 120px in-block hole of the
-// test above: the big-gap exemption (SPLIT_BIG_GAP × thr) splits them.
-test('stacked balloons in one column split when the gap is deep (live case)', () => {
+// Two STACKED balloons in one column: their lines share the full cross span, so the
+// disjointness merge above would fuse them and one translation would run across both
+// bubbles. A deep axis gap is a real balloon boundary — the big-gap exemption
+// (SPLIT_BIG_GAP × thr) splits them.
+test('stacked balloons in one column split when the gap is deep', () => {
   const parent = box(48, 461, 232, 1075, 0.83);
   const comps = [
     box(47, 461, 229, 653), box(53, 963, 181, 1072), box(53, 700, 181, 748),
@@ -222,11 +222,10 @@ test('stacked balloons in one column split when the gap is deep (live case)', ()
   ]);
 });
 
-// Live case (S02 p44): an over-wide head box (504,160,842,543) swallows the LEFT glyph
-// column of the neighbouring bubble (its own box 734,100,1062,338). Those glyph comps'
-// centres sit inside the parent, so they used to stretch the split child to x=842 and its
-// translation ran into the neighbour. A comp another box already claims is not this box's
-// split evidence (SPLIT_CLAIM_FRAC); the child now hugs its own column.
+// An over-wide head box swallows the LEFT glyph column of the neighbouring bubble (its own
+// box is the third element). Those glyph comps' centres sit inside the parent, so they used
+// to stretch the split child across the neighbour. A comp another box already claims is not
+// this box's split evidence (SPLIT_CLAIM_FRAC); the child hugs its own column.
 test('a comp claimed by a neighbouring box never stretches this box\'s split child', () => {
   const parent = box(504, 160, 842, 543, 0.66);
   const right = box(734, 100, 1062, 338, 0.68);

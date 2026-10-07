@@ -141,7 +141,7 @@ test('live page with P5: user-expected order (dialogue before labels, THEREFORE 
   assert.deepEqual(out.map(b => boxes.indexOf(b) + 1), [1, 2, 3, 4, 5, 9, 6, 7, 8, 11, 12, 14, 15, 10, 13, 16]);
 });
 
-test('panel reading order: a full-width banner does not chain the lower row (live case, S04 p66)', () => {
+test('panel reading order: a full-width banner does not chain the lower row', () => {
   // The top banner overlaps the bottom row's top edge; chaining it made the single row
   // sort columns by y and read the row left-first (1,2,3,4,5). With page dims the
   // banner is held to level starts, so the row orders right-to-left per panel.

@@ -1039,10 +1039,10 @@ export function dropContainedBoxes<T extends SeamBox & { conf: number }>(boxes: 
 
 // Near-identical duplicates: one text detected twice with a few px offset (two passes over the
 // same balloon). Both get translated, and painting both stacks two translations on one another —
-// unreadable (live S16 p11: same tail box at conf 0.6 + 0.77, 79% of the smaller overlapped,
-// containment 0.79 < the 0.9 guard). Distinct texts never share a deep overlap with similar
-// dimensions AND co-centred boxes, so all three gates must pass. Loser = lower conf (tie:
-// smaller area). Paint-time only: detection output and its fixtures stay untouched. Pure.
+// unreadable. Containment below the contained-dup ratio can still be a duplicate (offset
+// centres). Distinct texts never share a deep overlap with similar dimensions AND co-centred
+// boxes, so all three gates must pass. Loser = lower conf (tie: smaller area). Paint-time only:
+// detection output and its fixtures stay untouched. Pure.
 export function dropDuplicateBoxes<T extends SeamBox & { conf: number }>(boxes: T[], overSmaller = 0.65, dimsRatio = 0.6, centerFrac = 0.35): T[] {
     const drop = new Set<T>();
     for (let i = 0; i < boxes.length; i++) {

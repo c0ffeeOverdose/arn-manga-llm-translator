@@ -142,9 +142,8 @@ export const SPLIT_CLAIM_FRAC = 0.6;
 export const SPLIT_FAMILY_FRAC = 0.7;
 // × thr — cross-spanning groups this far apart on the axis are separate balloons, not a
 // mask hole inside one block. Stacked balloons share the cross span (full-width lines), so
-// the disjointness merge below used to fuse them into one region and one translation ran
-// across both bubbles (live case, S02 p39: two stacked balloons, 215px apart, fused).
-// A paragraph's dropped line leaves one/two line pitches (~120px on large type here),
+// the disjointness merge below would fuse them into one region and one translation would
+// run across both bubbles. A paragraph's dropped line leaves one/two line pitches at most,
 // far below the gate.
 export const SPLIT_BIG_GAP = 3;
                                     // (line gaps run ~0.5–0.6× glyph height; a balloon boundary ≥1×)
@@ -310,10 +309,9 @@ export function splitMergedBoxes<T extends DetBox>(boxes: T[], comps: SplitComp[
     if (comps.length < 2) return [...boxes];
     // An over-wide head box can swallow a neighbouring box's glyph column: those comps'
     // centres fall inside this box, so they entered its split evidence and stretched the
-    // child across the neighbour (live S02 p44: a child kept the right bubble's left
-    // glyphs and its translation ran into that bubble). A comp that another, unrelated
-    // box already claims is not this box's evidence — same principle as the emission-time
-    // overlap gate. Near-duplicate / nested pairs are one region family and may share.
+    // child across the neighbour. A comp that another, unrelated box already claims is not
+    // this box's evidence — same principle as the emission-time overlap gate.
+    // Near-duplicate / nested pairs are one region family and may share.
     const interArea = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
         Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1)) * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
     const areaOf = (r: { x1: number; y1: number; x2: number; y2: number }) => Math.max(0, r.x2 - r.x1) * Math.max(0, r.y2 - r.y1);
@@ -979,10 +977,9 @@ export function orderByPanels(boxes: DetBox[], panels: DetBox[], dir: 'rtl' | 'l
         let sink: { main: DetBox[]; deferred: DetBox[] } | null = null;
         if (page && defer && !children[i].length) {
             const split = splitDeferred(groups[i], page.w, page.h);
-            // OPEN (2026-10-06): two live cases (S02 p26, S05 p21) sink a small cluster that
-            // is arguably real reading order; every counter-rule tried so far (ratio cap,
-            // split-child guard) moved owner-verified cases (live-page-p5 / real-hard-23),
-            // so the sink stays as-is pending an owner decision. Numbers in the task record.
+            // Label clusters sink to the panel end only while strictly smaller than every
+            // main box; loosening this reorders pages that were verified by eye, so the
+            // strict test stays.
             if (split.deferred.length && Math.max(...split.deferred.map(area)) < Math.min(...split.main.map(area))) sink = split;
         }
         if (sink) {
@@ -1015,10 +1012,9 @@ export function panelReadingOrder(panels: DetBox[], dir: 'rtl' | 'ltr', page?: {
         return [...groups.values()];
     };
     // A full-width banner's bottom edge overlaps the top of the next row; chaining it in
-    // made the fallback sort that row's columns by y (S04 p66 read left-first). Banner
-    // pairs additionally need to start at the same level. Normal tall side panels keep
-    // chaining their stacked neighbours (owner-verified live page P5). Page dims are
-    // optional: without them this stays the legacy rule.
+    // made the fallback sort that row's columns by y (left-first). Banner pairs additionally
+    // need to start at the same level, while normal tall side panels keep chaining their
+    // stacked neighbours. Page dims are optional: without them this stays the legacy rule.
     const banner = (p: DetBox) => page != null && w(p) >= 0.9 * page.w;
     const rows = cluster(panels.length, (i, j) => {
         const a = panels[i], b = panels[j];

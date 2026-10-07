@@ -111,9 +111,9 @@ test('erasePlan: translated boxes erase, keep + contained dups stay, missing -> 
 });
 
 test('erasePlan: a near-identical double detection erases/paints only once', () => {
-  // live S16 p11 shape: same line twice, offset, both translated — painting both stacks
-  // two translations. The lower-conf copy must join the dup set and be erased (its offset
-  // area sticks out of the winner) but never painted.
+  // a double detection shape: same line twice, offset, both translated — painting both
+  // stacks two translations. The lower-conf copy must join the dup set and be erased (its
+  // offset area sticks out of the winner) but never painted.
   const a = { x1: 1889, y1: 2324, x2: 1986, y2: 2440, conf: 0.6 };
   const b = { x1: 1876, y1: 2339, x2: 1967, y2: 2448, conf: 0.77 };
   const det = { boxes: [a, b], mask: { width: 1, height: 1, data: new ArrayBuffer(1) } };

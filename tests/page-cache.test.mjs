@@ -88,7 +88,7 @@ test('boxContained/dropContainedBoxes: IoU-blind fragment inside a real box', ()
 });
 
 test('dropDuplicateBoxes: offset double-detection of one text collapses to the winner', () => {
-  // live S16 p11: the same tail line detected twice (offset 13px, containment 0.79 < 0.9),
+  // the same tail line detected twice (offset 13px, containment 0.79 < 0.9),
   // both translated and painted on top of each other — unreadable on the page.
   const a = { x1: 1889, y1: 2324, x2: 1986, y2: 2440, conf: 0.6 };
   const b = { x1: 1876, y1: 2339, x2: 1967, y2: 2448, conf: 0.77 };

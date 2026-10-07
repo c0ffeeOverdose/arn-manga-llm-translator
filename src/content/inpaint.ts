@@ -396,7 +396,7 @@ export function erasePlan(det: DetectResult, outputs: RegionOutput[]): {
     // duplicate guards: the lower-conf copy of a double detection is never painted.
     // Contained losers keep their pixels (the winner's own erase window covers them);
     // near-identical losers are ERASED but not painted — their offset area can stick
-    // out of the winner and would otherwise leave the source text behind (live S16 p11).
+    // out of the winner and would otherwise leave the source text behind.
     const keptContained = dropContainedBoxes(det.boxes);
     const containedSet = new Set(keptContained);
     const keptAll = new Set(dropDuplicateBoxes(keptContained));
