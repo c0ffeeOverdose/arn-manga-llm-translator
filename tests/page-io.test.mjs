@@ -10,7 +10,7 @@ mkdirSync('.test-build', { recursive: true });
 await build({
   stdin: {
     contents: [
-      `export { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage, healImgBinding } from './src/content/page-io.ts';`
+      `export { shownSrc, ownCopyNeeded, ownOriginalUrl, OWN_COPY_MAX_PIXELS, readPage, writePage, healImgBinding } from './src/content/page-io.ts';`
       + `\nexport { setOverlayOn, setDebugOn } from './src/content/state.ts';`
       + `\nexport { identifyBitmap } from './src/image-identity.ts';`,
       `export { regPage, pages, retireBlob } from './src/content/state.ts';`,
@@ -26,7 +26,7 @@ await build({
 // state.ts computes contextChapter at import time (needs location)
 globalThis.location = { origin: 'https://test.local', pathname: '/chapter/1', search: '', hash: '' };
 
-const { shownSrc, ownCopyNeeded, OWN_COPY_MAX_PIXELS, readPage, writePage, healImgBinding, identifyBitmap, setOverlayOn, setDebugOn,
+const { shownSrc, ownCopyNeeded, ownOriginalUrl, OWN_COPY_MAX_PIXELS, readPage, writePage, healImgBinding, identifyBitmap, setOverlayOn, setDebugOn,
   regPage, pages, retireBlob, readView, viewToken, cacheGeneration, acceptCacheGeneration } =
   await import(new URL('../.test-build/page-io.mjs', import.meta.url).href);
 
@@ -64,6 +64,31 @@ test('ownCopyNeeded: only blob origins under the strip cap', () => {
   assert.equal(ownCopyNeeded('blob:https://x/strip', 800, 13650), false, `giant strips skip the copy (cap ${OWN_COPY_MAX_PIXELS})`);
   assert.equal(ownCopyNeeded('blob:https://x/edge', 2000, 2000), true, 'exactly at the cap is allowed');
   assert.equal(ownCopyNeeded('blob:https://x/edge2', 2001, 2000), false);
+});
+
+test('a revoked-blob original is preserved without waiting for the async canvas encoder', async () => {
+    const previous = { document: globalThis.document, OffscreenCanvas: globalThis.OffscreenCanvas, fetch: globalThis.fetch };
+    let copied = 0, url;
+    globalThis.OffscreenCanvas = class {
+        constructor(w, h) { this.width = w; this.height = h; }
+        getContext() { return { drawImage() {} }; }
+        convertToBlob() { throw new Error('Async encoder must not run'); }
+    };
+    globalThis.document = { createElement: () => ({
+        getContext: () => ({ drawImage() { copied++; } }),
+        toDataURL: () => 'data:image/png;base64,' + Buffer.from('lossless-original').toString('base64'),
+    }) };
+    try {
+        url = await ownOriginalUrl({ width: 600, height: 800 });
+        assert.ok(url?.startsWith('blob:'));
+        const blob = await (await previous.fetch(url)).blob();
+        assert.equal(await blob.text(), 'lossless-original');
+        assert.equal(blob.type, 'image/png');
+        assert.equal(copied, 1);
+    } finally {
+        if (url) URL.revokeObjectURL(url);
+        Object.assign(globalThis, previous);
+    }
 });
 
 // re-translate used to decode the live <img>, which after a render shows our

@@ -3,7 +3,7 @@
 
 import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type InpaintPatch, type MtOnStatus } from './detection';
 import { inpaint, inpaintBoxRegion, erasePlan } from './inpaint';
-import { boxIsVertical, renderRegion, sizeCapFrom, effBoxesForAreas } from './render';
+import { boxIsVertical, renderRegion, sizeCapFrom, effBoxesForAreas, mergeParagraphLines } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
@@ -100,6 +100,12 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
 // Box ordering for one detection (panel-guided, strip-banding, or cloud banding) —
 // mutates det in place, same shared call as above.
 export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Promise<void> {
+    if (det.ep !== 'cloud' && !det.cloudTexts && !det.cloudPatches?.length) det.boxes = mergeParagraphLines(det.boxes, () => {
+        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+        ctx.drawImage(bitmap, 0, 0);
+        return ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+    }, det.mask);
     // cloud texts ride with their boxes: ordering sorts the same box OBJECTS, so reattach
     // by identity afterwards
     const cloudTextByBox = det.cloudTexts ? new Map<DetBox, string>(det.boxes.map((b, i) => [b, det.cloudTexts![i] ?? ''])) : null;

@@ -126,12 +126,39 @@ test('box outside every panel joins the nearest one', () => {
   assert.deepEqual(out, [inRight, stray]);
 });
 
-test('live page replica: dump boxes + probed panels order 1..16', () => {
-  // badges 1..16 in dump order; panels probed at thr 0.25 (P5 absent)
+test('missing tall panel keeps its dialogue together after the neighbouring stack', () => {
   const boxes = [{"x1":1526,"y1":197,"x2":1581,"y2":311,"conf":0.89},{"x1":1053,"y1":798,"x2":1143,"y2":871,"conf":0.47},{"x1":1328,"y1":890,"x2":1355,"y2":954,"conf":0.77},{"x1":818,"y1":227,"x2":974,"y2":416,"conf":0.87},{"x1":293,"y1":178,"x2":445,"y2":370,"conf":0.94},{"x1":648,"y1":335,"x2":750,"y2":516,"conf":0.72},{"x1":651,"y1":606,"x2":810,"y2":676,"conf":0.78},{"x1":566,"y1":703,"x2":655,"y2":769,"conf":0.73},{"x1":249,"y1":603,"x2":444,"y2":898,"conf":0.9},{"x1":582,"y1":1218,"x2":819,"y2":1461,"conf":0.9},{"x1":1242,"y1":1422,"x2":1657,"y2":1555,"conf":0.63},{"x1":908,"y1":1378,"x2":1062,"y2":1651,"conf":0.87},{"x1":246,"y1":1791,"x2":802,"y2":1894,"conf":0.5},{"x1":1342,"y1":1924,"x2":1515,"y2":2123,"conf":0.88},{"x1":904,"y1":2024,"x2":1058,"y2":2186,"conf":0.77},{"x1":394,"y1":1947,"x2":744,"y2":2314,"conf":0.45}];
   const panels = [P(1021, 1, 1698, 997), P(861, 1023, 1698, 1761), P(857, 1791, 1700, 2399), P(149, 8, 1013, 994)];
-  const out = orderByPanels(boxes, panels, 'rtl');
-  assert.deepEqual(out.map(b => boxes.indexOf(b) + 1), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  const out = orderByPanels(boxes, panels, 'rtl', { w: 1700, h: 2400 });
+  assert.deepEqual(out.map(b => boxes.indexOf(b) + 1), [1, 2, 3, 4, 5, 9, 6, 7, 8, 11, 12, 14, 15, 10, 13, 16]);
+});
+
+test('missing side panel follows the detected stack in either reading direction', () => {
+    const page = { w: 1000, h: 1600 };
+    for (const dir of ['rtl', 'ltr']) {
+        const mirror = b => Object.freeze(dir === 'rtl' ? b : { ...b, x1: page.w - b.x2, x2: page.w - b.x1 });
+        const panels = Object.freeze([P(0, 0, 1000, 600), P(520, 620, 1000, 1050), P(520, 1070, 1000, 1600)].map(mirror));
+        const [top, middle, bottom, sideTop, sideBottom] = [box(600, 50, 900, 200), box(600, 750, 900, 900),
+            box(600, 1200, 900, 1350), box(80, 750, 450, 900), box(100, 1200, 430, 1350)].map(mirror);
+        const input = Object.freeze([sideBottom, middle, sideTop, bottom, top]);
+        assert.deepEqual(orderByPanels(input, panels, dir, page), [top, middle, bottom, sideTop, sideBottom]);
+    }
+});
+
+test('uncovered text across a detected full-width panel stays in separate regions', () => {
+    const page = { w: 1000, h: 2000 };
+    const panels = [P(0, 0, 1000, 400), P(0, 1000, 1000, 1200), P(520, 1220, 1000, 2000)];
+    const top = box(600, 50, 900, 200), middle = box(600, 1020, 900, 1180), right = box(600, 1500, 900, 1700);
+    const a = box(20, 450, 480, 650), b = box(20, 750, 480, 950);
+    const c = box(20, 1250, 480, 1450), d = box(20, 1750, 480, 1950);
+    assert.deepEqual(orderByPanels([d, c, b, a, right, middle, top], panels, 'rtl', page), [top, a, b, middle, right, c, d]);
+});
+
+test('scattered narrow gutter text keeps its nearest panel', () => {
+    const panels = [P(0, 0, 400, 1000), P(600, 0, 1000, 1000)];
+    const upper = box(450, 100, 500, 200), lower = box(450, 800, 500, 900);
+    const left = box(100, 400, 200, 500), right = box(700, 400, 800, 500);
+    assert.deepEqual(orderByPanels([lower, left, upper, right], panels, 'rtl', { w: 1000, h: 1000 }), [right, upper, left, lower]);
 });
 
 test('live page with P5: user-expected order (dialogue before labels, THEREFORE sinks)', () => {

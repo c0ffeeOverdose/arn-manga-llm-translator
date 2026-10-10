@@ -6,6 +6,7 @@ import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
 import { identifyBitmap, verifyBitmap } from '../image-identity';
 import { cacheGeneration, cacheCurrent } from '../cache-generation';
+import { canvasPngBlob } from './encode';
 
 // page identity: img = its original src (translated blobs alias via pages.get), canvas =
 // the manifest image URL when the reader embeds one (stable across canvas recreation),
@@ -521,8 +522,8 @@ export function ownCopyNeeded(orig: string, w: number, h: number): boolean {
 export async function ownOriginalUrl(bitmap: ImageBitmap): Promise<string | undefined> {
     try {
         const c = new OffscreenCanvas(bitmap.width, bitmap.height);
-        c.getContext('2d')!.drawImage(bitmap, 0, 0);
-        return URL.createObjectURL(await c.convertToBlob({ type: 'image/png' }));
+        c.getContext('2d', { willReadFrequently: true })!.drawImage(bitmap, 0, 0);
+        return URL.createObjectURL(await canvasPngBlob(c));
     } catch {
         return undefined; // no copy — the old (blocked) behavior, never a broken page
     }

@@ -967,6 +967,48 @@ function nearestPanel(b: DetBox, panels: DetBox[]): number {
     return best;
 }
 
+// Recover a panel-sized empty region only when multiple uncovered texts span it.
+// Known panels bound the region; isolated edge text keeps the nearest-panel fallback.
+function fillPanelGaps(boxes: DetBox[], panels: DetBox[], page: { w: number; h: number }): DetBox[] {
+    const area = (b: DetBox) => (b.x2 - b.x1) * (b.y2 - b.y1);
+    const inter = (a: DetBox, b: DetBox) => Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
+        * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+    const contains = (p: DetBox, b: DetBox) => inter(p, b) >= 0.9 * area(b);
+    let uncovered = boxes.filter(b => panels.every(p => {
+        const cx = (b.x1 + b.x2) / 2, cy = (b.y1 + b.y2) / 2;
+        return !(cx >= p.x1 && cx <= p.x2 && cy >= p.y1 && cy <= p.y2) && inter(p, b) < 0.5 * area(b);
+    }));
+    if (uncovered.length < 2) return panels;
+    const xs = [...new Set([0, page.w, ...panels.flatMap(p => [p.x1, p.x2])])].sort((a, b) => a - b);
+    const minArea = 0.1 * page.w * page.h;
+    const candidates: DetBox[] = [];
+    for (let l = 0; l + 1 < xs.length; l++) for (let r = l + 1; r < xs.length; r++) {
+        const blocked = panels.filter(p => p.x1 < xs[r] && p.x2 > xs[l]).sort((a, b) => a.y1 - b.y1);
+        let y = 0;
+        for (const p of [...blocked, { y1: page.h, y2: page.h }]) {
+            const gap = { x1: xs[l], x2: xs[r], y1: y, y2: p.y1, conf: 0 };
+            if (area(gap) >= minArea) candidates.push(gap);
+            y = Math.max(y, p.y2);
+        }
+    }
+    const added: DetBox[] = [];
+    while (uncovered.length >= 2) {
+        const supported = candidates.filter(p => added.every(a => inter(a, p) === 0)).map(p => {
+            const members = uncovered.filter(b => contains(p, b));
+            const span = members.length < 2 ? 0 : (Math.max(...members.map(b => b.x2)) - Math.min(...members.map(b => b.x1)))
+                * (Math.max(...members.map(b => b.y2)) - Math.min(...members.map(b => b.y1)));
+            return { p, members, span };
+        }).filter(c => c.span >= minArea);
+        supported.sort((a, b) => b.members.length - a.members.length || area(a.p) - area(b.p));
+        const best = supported[0];
+        if (!best) break;
+        added.push(best.p);
+        const claimed = new Set(best.members);
+        uncovered = uncovered.filter(b => !claimed.has(b));
+    }
+    return added.length ? [...panels, ...added] : panels;
+}
+
 // Descriptive labels (room plates, signs) read after a panel's balloon dialogue. Proxy, not
 // balloon detection — the model has no balloon class: small boxes (area < SMALL_FRAC of the
 // page) clustered with another small box nearby sink to the end, stably. Isolated small boxes
@@ -1011,6 +1053,7 @@ const PANEL_CONTAIN_FRAC = 0.7; // of the child's area inside the candidate pare
 export function orderByPanels(boxes: DetBox[], panels: DetBox[], dir: 'rtl' | 'ltr', page?: { w: number; h: number }, defer = true): DetBox[] {
     // no page dims → can't judge usability, keep the old trust-panels behavior
     if (!panels.length || (page && !panelsUsable(panels, page.w, page.h))) return sortReadingOrder(boxes, dir, page, defer);
+    if (page) panels = fillPanelGaps(boxes, panels, page);
     const area = (p: DetBox) => (p.x2 - p.x1) * (p.y2 - p.y1);
     const inter = (a: DetBox, b: DetBox) => Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1))
         * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));

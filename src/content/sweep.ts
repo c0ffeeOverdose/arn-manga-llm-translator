@@ -22,12 +22,15 @@ import { cacheReady, cacheCurrent, assertCacheCurrent } from '../cache-generatio
 import { cloudConfig, cloudWarm } from './detection';
 import { sendToBackground } from '../bg-rpc';
 import { chapterLogError, type ChapterLogInput } from '../chapter/log';
+import { canvasPngBlob } from './encode';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
 let startCancelled = false;
 let observedChapter = '';
 let refreshBusy = false;
+let refreshPending = false;
+let preloadBusy = false;
 let discoverAt = 0;
 let notified = '';
 let foldedChapter = '';
@@ -45,6 +48,7 @@ const imageBindings = new WeakMap<Element, { run: string; token: string; page: s
 const imageAliases = new Map<string, string>();
 const evidence = new Map<string, Promise<ImageIdentity | undefined>>();
 const sourceImages = new Map<string, Promise<ImageIdentity>>();
+const preloadViews = new WeakMap<Element, string>();
 
 function syncBook(): void {
     if (foldedChapter !== chapterKey()) { foldedChapter = chapterKey(); folded.clear(); }
@@ -155,7 +159,7 @@ async function pageEvidence(page: ProgressPage): Promise<ImageIdentity | undefin
     return task;
 }
 // URL identity may prioritize work; only unique, pixel-verified evidence binds opaque images.
-export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): Promise<ProgressPage | undefined> {
+export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot, pixelOnly = false): Promise<ProgressPage | undefined> {
     const token = await cacheReady();
     if (!progress || progress.chapter !== chapterKey()) return;
     const run = progress.id, chapter = chapterKey();
@@ -164,6 +168,13 @@ export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): 
     const binding = imageBindings.get(ref.el), state = stateFor(ref);
     const live = ref.kind === 'img' ? ref.el.currentSrc || ref.el.src : '';
     const bound = progress.pages.find(p => p.id === binding?.page);
+    if (!pixelOnly && ref.kind === 'img' && state && progress.completeManifest
+        && [state.translated, state.origOwn].includes(live)) {
+        const order = (urlPageNumber() ?? 0) - 1;
+        const painted = progress.pages.find(p => p.phase === 'ready' && p.order === order
+            && applied.get(ref.el) === `${run}:${p.id}:${p.revision ?? 0}`);
+        if (painted) return { ...painted, matchedBy: 'url' };
+    }
     // A page we already painted resolves from its binding: the element displays OUR render and
     // the run/source/identity/revision all agree, so re-reading its pixels only re-decodes an
     // immutable image — on a data:-backed reader that decode is a whole page, every sweep tick
@@ -208,6 +219,7 @@ export async function resolveChapterRef(ref: PageRef, supplied?: PageSnapshot): 
         if (isDebug()) console.log('[mt] resolve pixel probe failed', String((e as Error)?.message ?? e).slice(0, 140));
     } finally { if (!supplied) snapshot?.bitmap.close(); }
     if (!cacheCurrent(token) || progress?.id !== run || chapterKey() !== chapter) return;
+    if (pixelOnly) return;
     // Pixel evidence resolved nothing (or was impossible): for a reader that ships an
     // authoritative chapter manifest, the URL's own page number is a reliable position. A paged
     // reader shows one page per /N, and the run enumerated the chapter in order from the
@@ -588,7 +600,7 @@ async function capture(page: Pick<ChapterPage, 'id' | 'url'>): Promise<string | 
     sourceRequests.set(page.id, task);
     return task;
 }
-async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Promise<void> {
+async function attach(ref: PageRef, page: ChapterProgress['pages'][number], preloaded?: PageSnapshot): Promise<void> {
     const bail = (why: string): void => {
         attachWhy = `${page.id}:${why}`;
         if (isDebug()) console.log('[mt] attach skipped', JSON.stringify({ page: page.id, why }));
@@ -596,7 +608,8 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
     if (!progress) { bail('no-progress'); return; }
     if (attaching.has(ref.el)) return; // a normal retry beat the in-flight attempt — not a refusal
     if (document.hidden) { bail('document-hidden'); return; }
-    if (viewportOverlap(ref) <= 0) { bail('offscreen'); return; }
+    if (viewportOverlap(ref) <= 0 && (!preloaded || page.matchedBy !== 'image')) { bail('offscreen'); return; }
+    if (preloaded && viewToken(ref) !== preloaded.token) { bail('view-changed'); return; }
     const stamp = `${progress.id}:${page.id}:${page.revision ?? 0}`;
     if (applied.get(ref.el) === stamp && stateFor(ref)) return;
     const chapter = chapterKey(), run = progress.id;
@@ -604,7 +617,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
     const startedAt = Date.now();
     const marks: Record<string, number> = {};
     const mark = (name: string): void => { marks[name] = Date.now() - startedAt; };
-    let snapshot: PageSnapshot | undefined;
+    let snapshot = preloaded;
     let translated = '', origOwn: string | undefined, translatedBmp: ImageBitmap | undefined;
     let committed = false;
     try {
@@ -616,12 +629,14 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         const positional = page.matchedBy === 'url' && progress.completeManifest;
         let deferredIdentity = false;
         let img: HTMLImageElement | undefined;
-        if (positional && ref.kind === 'img') {
-            img = ref.el as HTMLImageElement;
-            snapshot = await readViewLocal(ref);
-            deferredIdentity = !snapshot;
-        } else {
-            snapshot = await readView(ref);
+        if (!snapshot) {
+            if (positional && ref.kind === 'img') {
+                img = ref.el as HTMLImageElement;
+                snapshot = await readViewLocal(ref);
+                deferredIdentity = !snapshot;
+            } else {
+                snapshot = await readView(ref);
+            }
         }
         mark('readView'); // decode of what the reader is showing
         if (deferredIdentity && (!img!.complete || img!.naturalWidth < 1 || img!.naturalHeight < 1)) {
@@ -667,7 +682,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         if (w !== entry.w || h !== entry.h) {
             const resized = new OffscreenCanvas(w, h);
             resized.getContext('2d')!.drawImage(translatedBmp, 0, 0, w, h);
-            imageBlob = await resized.convertToBlob({ type: 'image/png' });
+            imageBlob = await canvasPngBlob(resized);
             translatedBmp.close();
             translatedBmp = await createImageBitmap(imageBlob);
         }
@@ -686,7 +701,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
             if (!snapshot) { bail('view-unavailable'); return; }
             const originalCanvas = new OffscreenCanvas(w, h);
             originalCanvas.getContext('2d')!.drawImage(snapshot.bitmap, 0, 0);
-            const data = await blobDataUrl(await originalCanvas.convertToBlob({ type: 'image/png' }));
+            const data = await blobDataUrl(await canvasPngBlob(originalCanvas));
             origBytes = Uint8Array.from(atob(data.split(',')[1]), c => c.charCodeAt(0)).buffer;
         }
         const paintedImage = ref.kind === 'canvas' && snapshot ? identifyBitmap(translatedBmp, boxes) : undefined;
@@ -770,15 +785,66 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number]): Pro
         }
     } catch (e) { console.debug('[mt] chapter image attach deferred', e); }
     finally {
-        snapshot?.bitmap.close();
+        if (snapshot !== preloaded) snapshot?.bitmap.close();
         if (!committed) { if (translated) URL.revokeObjectURL(translated); if (origOwn) URL.revokeObjectURL(origOwn); }
         if (!committed || ref.kind === 'img') translatedBmp?.close();
         attaching.delete(ref.el);
     }
 }
+
+// Only verified opaque images may prepare offscreen; the URL's page number belongs to
+// the viewed page and cannot authorize a hidden neighbour. Keep at most two pages ahead.
+async function preloadNextPages(viewed: ProgressPage): Promise<void> {
+    if (preloadBusy || document.hidden || !progress || viewed.order == null) return;
+    const next = progress.pages.filter(p => p.order != null && p.order > viewed.order!)
+        .sort((a, b) => a.order! - b.order!).slice(0, 2).filter(p => p.phase === 'ready');
+    if (!next.length) return;
+    const run = progress.id, chapter = chapterKey();
+    const revision = `${run}:${next.map(p => `${p.id}:${p.revision ?? 0}`).join(',')}`;
+    const candidates = getPages().filter(ref => {
+        if (ref.kind !== 'img' || !ref.el.complete || viewportOverlap(ref) > 0) return false;
+        const live = ref.el.currentSrc || ref.el.src;
+        if (!live.startsWith('blob:')) return false;
+        const state = stateFor(ref);
+        return !(state && [state.translated, state.origOwn, state.debug, state.debugOrig].includes(live)
+            && progress!.pages.some(p => p.phase === 'ready' && applied.get(ref.el) === `${run}:${p.id}:${p.revision ?? 0}`));
+    });
+    preloadBusy = true;
+    try {
+        for (const ref of candidates) {
+            await new Promise<void>(resolve => {
+                if (typeof requestIdleCallback === 'function') requestIdleCallback(() => resolve(), { timeout: 250 });
+                else setTimeout(resolve, 0);
+            });
+            if (document.hidden || progress?.id !== run || chapterKey() !== chapter) return;
+            const token = `${revision}:${viewToken(ref)}`;
+            if (!ref.el.isConnected || preloadViews.get(ref.el) === token) continue;
+            let snapshot: PageSnapshot | undefined;
+            try {
+                snapshot = await readViewLocal(ref);
+                if (!snapshot) continue;
+                const page = await resolveChapterRef(ref, snapshot, true);
+                if (page?.matchedBy === 'image' && next.some(p => p.id === page.id && p.revision === page.revision)) {
+                    await attach(ref, page, snapshot);
+                    if (applied.get(ref.el) === `${run}:${page.id}:${page.revision ?? 0}` && stateFor(ref)) {
+                        preloadViews.set(ref.el, `${revision}:${viewToken(ref)}`);
+                    }
+                } else if (viewToken(ref) === snapshot.token) {
+                    preloadViews.set(ref.el, token);
+                }
+            } finally { snapshot?.bitmap.close(); }
+        }
+    } finally { preloadBusy = false; }
+}
+
+function requestRefresh(): void {
+    refreshPending = true;
+    if (!refreshBusy) void refresh();
+}
 async function refresh(): Promise<void> {
     if (refreshBusy) return;
     refreshBusy = true;
+    refreshPending = false;
     const chapter = chapterKey();
     try {
         const token = await cacheReady();
@@ -794,12 +860,19 @@ async function refresh(): Promise<void> {
             progress = response.status; showProgress();
         }
         if (!progress) return;
-        for (const ref of getPages()) {
+        const visibleRefs = getPages().filter(ref => viewportOverlap(ref) > 0)
+            .sort((a, b) => viewportOverlap(b) - viewportOverlap(a));
+        for (const ref of visibleRefs) {
             if (viewportOverlap(ref) <= 0) continue;
             const page = await resolveChapterRef(ref);
             if (!page) continue;
             refs.set(page.id, ref);
-            if (page.phase === 'ready') void attach(ref, page);
+            if (page.phase === 'ready') void attach(ref, page).then(() => {
+                if (ref === visibleRefs[0] && viewportOverlap(ref) > 0 && stateFor(ref)
+                    && applied.get(ref.el) === `${progress?.id}:${page.id}:${page.revision ?? 0}`) {
+                    void preloadNextPages(page).catch(() => {});
+                }
+            });
             else if (page.phase === 'waiting') {
                 const source = await capture(page);
                 if (source) await control('append', { pages: [{ id: page.id, url: page.url, order: page.order ?? 0, descramble: false, source }] });
@@ -818,7 +891,10 @@ async function refresh(): Promise<void> {
             if (added.length || found.complete) await control('append', { pages: added, completeManifest: found.complete });
         }
     } catch { /* navigation/extension startup: next heartbeat reconnects */ }
-    finally { refreshBusy = false; }
+    finally {
+        refreshBusy = false;
+        if (refreshPending) queueMicrotask(() => void refresh());
+    }
 }
 export function initSweep(): void {
     registerSweepWaiter(async () => {});
@@ -828,7 +904,7 @@ export function initSweep(): void {
             if (progress?.id !== msg.status.id) { imageAliases.clear(); evidence.clear(); }
             progress = msg.status;
             showProgress();
-            void refresh();
+            requestRefresh();
         }
         if (msg?.type === 'mt:chapter-context-updated' && msg.chapter === chapterKey()) acceptChapterContext(msg.context);
         if (msg?.type === 'mt:chapter-source' && msg.chapter === chapterKey()) {
@@ -836,6 +912,12 @@ export function initSweep(): void {
             return true;
         }
     });
+    document.addEventListener('load', event => {
+        if (event.target instanceof HTMLImageElement && event.target.naturalWidth >= 400
+            && event.target.naturalHeight >= 300) requestRefresh();
+    }, true);
+    window.addEventListener('popstate', requestRefresh);
+    window.addEventListener('hashchange', requestRefresh);
     setInterval(() => void refresh(), 1000);
     void sendToBackground({ type: 'mt:chapter-log-reader', chapter: chapterKey(), readerUrl: location.href },
         { timeoutMs: 10_000, label: 'chapter log reader' }).catch(() => {});

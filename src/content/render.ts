@@ -17,7 +17,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 35;
+export const RENDER_GEN = 37;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -362,6 +362,7 @@ export interface InteriorFill {
     count: number;
     // Hard window the fill could not leave: a run reaching it was clipped by the window, not ink.
     loX: number; loY: number; hiX: number; hiY: number;
+    support?: number[]; // covered pixels per requested region on this fill
 }
 
 // CTD text mask (full-res, 255 = text): text pixels are passable in every fill/profile walk.
@@ -375,7 +376,7 @@ function maskView(mask: TextMask | undefined, W: number, H: number): Uint8Array 
 
 // Bounded flood fill of the bubble interior; seed = modal color with center pixel as alternate, largest wins.
 // Bounded to box ± grow (growX sideways) so a white page cannot be claimed.
-function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, widen = false, mask?: TextMask): InteriorFill {
+function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, widen = false, mask?: TextMask, cover?: DetBox[]): InteriorFill {
     const { width: W, height: H, data } = img;
     const cx = Math.floor((box.x1 + box.x2) / 2);
     const cy = Math.floor((box.y1 + box.y2) / 2);
@@ -476,7 +477,16 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
                 }
             }
         }
-        return { minX, minY, maxX, maxY, count, seed };
+        const support = cover?.map(b => {
+            let n = 0;
+            for (let y = Math.max(vy, Math.ceil(b.y1)); y < Math.min(vy + vh, Math.ceil(b.y2)); y++) {
+                for (let x = Math.max(vx, Math.ceil(b.x1)); x < Math.min(vx + vw, Math.ceil(b.x2)); x++) {
+                    if (visited[(y - vy) * vw + x - vx]) n++;
+                }
+            }
+            return n;
+        });
+        return { minX, minY, maxX, maxY, count, seed, support };
     };
     // Candidates: modal interior color, center pixel, corner/outside probe colors (4-bit dedup).
     // Whichever surface floods largest is the one the box sits on.
@@ -530,6 +540,52 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
         if (g.count > f.count && longStable) pick = wide;
     }
     return { ...pick.fill, ...pick.win };
+}
+
+// Only reunite sibling horizontal lines when one bounded surface covers each line.
+// Pixel reads are lazy; missing evidence, separate balloons and offset lobes keep their cuts.
+export function mergeParagraphLines(boxes: DetBox[], readPixels: () => ImageData, mask?: TextMask): DetBox[] {
+    if (!mask) return boxes;
+    const families = new Map<number, DetBox[]>();
+    for (const b of boxes) if (b.sib != null) {
+        const family = families.get(b.sib) ?? [];
+        family.push(b);
+        families.set(b.sib, family);
+    }
+    const merged = new Map<DetBox, DetBox>(), removed = new Set<DetBox>();
+    let frame: ImageData | undefined;
+    for (const family of families.values()) {
+        if (family.length < 3 || family.some(b => b.cutAxis !== 'y' || !b.clip
+            || b.clip.x1 !== family[0].clip?.x1 || b.clip.x2 !== family[0].clip?.x2)) continue;
+        const rows = [...family].sort((a, b) => a.y1 - b.y1);
+        const widths = rows.map(b => b.x2 - b.x1), heights = rows.map(b => b.y2 - b.y1);
+        if (rows.some((_, i) => widths[i] < 1.5 * heights[i])) continue;
+        if (Math.max(...heights) > 1.5 * Math.min(...heights)) continue;
+        const shared = Math.min(...rows.map(b => b.x2)) - Math.max(...rows.map(b => b.x1));
+        if (shared < 0.8 * Math.min(...widths)) continue;
+        const pitches = rows.slice(1).map((b, i) => (b.y1 + b.y2 - rows[i].y1 - rows[i].y2) / 2);
+        if (Math.max(...pitches) > 1.2 * Math.min(...pitches)) continue;
+        if (rows.some((b, i) => i > 0 && (b.y1 < rows[i - 1].y2
+            || b.y1 - rows[i - 1].y2 > 0.6 * Math.min(heights[i], heights[i - 1])))) continue;
+        const parent = {
+            x1: Math.min(...rows.map(b => b.clip!.x1)), y1: Math.min(...rows.map(b => b.clip!.y1)),
+            x2: Math.max(...rows.map(b => b.clip!.x2)), y2: Math.max(...rows.map(b => b.clip!.y2)),
+            conf: Math.min(...rows.map(b => b.conf)),
+        };
+        if (!frame) {
+            try { frame = readPixels(); } catch { return boxes; }
+        }
+        if (mask.width !== frame.width || mask.height !== frame.height || mask.data.byteLength !== frame.width * frame.height) return boxes;
+        const fill = interiorFill(frame, parent, 1.2, 1.2, false, mask, rows);
+        const bounded = (edge: number, limit: number, pageEdge: number, lower: boolean) =>
+            (lower ? edge > limit + 1 : edge < limit - 1) || (limit === pageEdge && edge === pageEdge);
+        if (fill.minX <= fill.loX + 1 || fill.maxX >= fill.hiX - 1
+            || !bounded(fill.minY, fill.loY, 0, true) || !bounded(fill.maxY, fill.hiY, frame.height - 1, false)) continue;
+        if (rows.some((b, i) => fill.support![i] < 0.9 * widths[i] * heights[i])) continue;
+        merged.set(rows[0], parent);
+        for (const b of rows.slice(1)) removed.add(b);
+    }
+    return merged.size ? boxes.filter(b => !removed.has(b)).map(b => merged.get(b) ?? b) : boxes;
 }
 
 // Sideways trim for the no-frame rect (see bubbleArea): per-row runs through the box center with the RUN_JUMP rule.

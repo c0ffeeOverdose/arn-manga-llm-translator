@@ -7,7 +7,7 @@ import { bitmap, grayPage, imageRef, installCanvas } from './helpers/image-fixtu
 const stubs = {
     state: `export const pipeline = {}; export const context = {}; export const shareContext = false;
         export const pages = new Map(); export const elStates = new WeakMap(); export const retiredBlobs = new Map(); export const overlayChoice = 'auto';
-        export const chapterKey = () => globalThis.fixture.chapter ?? 'chapter:test'; export const stateFor = () => undefined;
+        export const chapterKey = () => globalThis.fixture.chapter ?? 'chapter:test'; export const stateFor = ref => fixture.states.get(ref.el);
         export const bookKey = () => 'book'; export const loadContext = async () => {}; export const loadPipeline = async () => {};
         export const regPage = state => globalThis.fixture.paints.push(state);
         export const unregPage = () => {}; export const setOverlayChoice = () => {}; export const setOverlayOn = () => {};
@@ -20,8 +20,9 @@ const stubs = {
         export const pagedTierAlternates = () => [];
         export const galleryManifestJson = async () => null; export const collectUnloadedUrls = () => [];
         export const hashReaderManifest = async () => null;
-        export const bitmapBlank = async () => false; export const writePage = () => {};`,
-    queue: `export const viewportOverlap = () => 1; export const dropAutoQueued = () => {};
+        export const bitmapBlank = async () => false;
+        export const writePage = (ref, state) => { fixture.states.set(ref.el, state); };`,
+    queue: `export const viewportOverlap = ref => fixture.hidden.has(ref.el) ? 0 : 1; export const dropAutoQueued = () => {};
         export const resumeAuto = () => {}; export const isBusy = () => false; export const paintBusy = () => false;
         export const haltAuto = () => {};`,
     auto: `export const lookaheadActive = () => false;`,
@@ -42,15 +43,15 @@ await build({ entryPoints: ['src/content/sweep.ts'], bundle: true, format: 'esm'
         });
         build.onLoad({ filter: /./, namespace: 'fixture' }, args => ({ contents: stubs[args.path], loader: 'js' }));
         build.onLoad({ filter: /src\/content\/sweep\.ts$/ }, args => ({ loader: 'ts', contents:
-            readFileSync(args.path, 'utf8') + '\nexport const testProgress = p => { progress = p; evidence.clear(); imageAliases.clear(); };\nexport { attach as testAttach };\nexport { settingsFingerprint } from \'./page-cache\';' }));
+            readFileSync(args.path, 'utf8') + '\nexport const testProgress = p => { progress = p; evidence.clear(); imageAliases.clear(); };\nexport { attach as testAttach, preloadNextPages as testPreload };\nexport { settingsFingerprint } from \'./page-cache\';' }));
     } }] });
 await build({ entryPoints: ['src/image-identity.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-order-image.mjs' });
 const { identifyBitmap, signatureOf } = await import('../.test-build/chapter-order-image.mjs');
-const { testProgress, resolveChapterRef, elementMap, testAttach, idlePageOrder, settingsFingerprint } = await import('../.test-build/chapter-order.mjs');
+const { testProgress, resolveChapterRef, elementMap, testAttach, testPreload, idlePageOrder, settingsFingerprint } = await import('../.test-build/chapter-order.mjs');
 
 beforeEach(() => {
     installCanvas();
-    globalThis.fixture = { live: [], artifacts: new Map(), paints: [], onResult: undefined };
+    globalThis.fixture = { live: [], artifacts: new Map(), paints: [], states: new WeakMap(), hidden: new Set(), onResult: undefined };
     globalThis.document = { hidden: false, querySelectorAll: () => fixture.live.map(r => r.el) };
     globalThis.chrome = { runtime: { sendMessage: async msg => {
         if (fixture.onResult) await fixture.onResult(msg);
@@ -62,6 +63,61 @@ beforeEach(() => {
         return { id: `p${order}`, url: `https://cdn.test/${order}.png`, order, phase: 'ready', revision: 1, image: signatureOf(identity) };
     });
     testProgress({ id: crypto.randomUUID(), chapter: 'chapter:test', phase: 'complete', pages });
+});
+
+function readyArtifact(n) {
+    return { ...fixture.artifacts.get(`p${n}`), hash: `hash${n}`,
+        image: 'data:image/png;base64,AA==',
+        entry: { key: `k${n}`, fp: settingsFingerprint({}), w: 600, h: 800,
+            boxes: [{ x1: 10, y1: 10, x2: 200, y2: 200 }], panels: [],
+            outputs: [{ index: 1, translation: `page ${n}` }], extras: [] },
+        mask: { w: 1, h: 1, data: 'data:application/octet-stream;base64,AA==' } };
+}
+
+test('preloaded opaque neighbours prepare only the next two verified chapter pages', async () => {
+    fixture.live = [1, 2, 3, 4].map(n => imageRef(`blob:preload-${n}`, bitmap(grayPage(n))));
+    fixture.hidden = new Set(fixture.live.slice(1).map(ref => ref.el));
+    for (const n of [2, 3, 4]) fixture.artifacts.set(`p${n}`, readyArtifact(n));
+    let requests = 0;
+    fixture.onResult = () => { requests++; };
+    await testPreload({ id: 'p1', order: 1 });
+    assert.deepEqual(fixture.paints.map(s => s.outputs[0].translation), ['page 2', 'page 3']);
+    assert.equal(fixture.states.has(fixture.live[0].el), false, 'the viewed page keeps its own attachment');
+    assert.equal(fixture.states.has(fixture.live[3].el), false, 'pages beyond the lookahead stay untouched');
+    const before = requests;
+    await testPreload({ id: 'p1', order: 1 });
+    assert.equal(requests, before, 'unchanged preloaded views must not fetch or paint again');
+});
+
+test('a hidden neighbour cannot borrow the viewed page number when pixels do not match', async () => {
+    fixture.chapter = 'https://reader.test/chapter/uuid';
+    globalThis.location = { origin: 'https://reader.test', pathname: '/chapter/uuid/2', search: '', hash: '' };
+    const identity = identifyBitmap(bitmap(grayPage(2)), [{ x1: 10, y1: 10, x2: 200, y2: 200 }]);
+    testProgress({ id: 'hidden', chapter: fixture.chapter, completeManifest: true,
+        pages: [{ id: 'p2', url: 'https://cdn.test/2.png', order: 1, phase: 'ready', revision: 1, image: signatureOf(identity) }] });
+    fixture.artifacts.set('p2', { ...readyArtifact(2), identity });
+    fixture.live = [imageRef('blob:other-page', bitmap(grayPage(5)))];
+    fixture.hidden.add(fixture.live[0].el);
+    await testPreload({ id: 'p1', order: 0 });
+    assert.deepEqual(fixture.paints, []);
+});
+
+test('a preloaded image recycled during verification cannot receive the late artifact', async () => {
+    const ref = imageRef('blob:preload-before', bitmap(grayPage(2)));
+    fixture.live = [ref]; fixture.hidden.add(ref.el);
+    fixture.artifacts.set('p2', readyArtifact(2));
+    fixture.onResult = () => {
+        ref.el.src = ref.el.currentSrc = 'blob:preload-after';
+        ref.el.pixels = bitmap(grayPage(5));
+    };
+    await testPreload({ id: 'p1', order: 1 });
+    assert.deepEqual(fixture.paints, []);
+    assert.equal(ref.el.src, 'blob:preload-after');
+    fixture.onResult = undefined;
+    fixture.artifacts.set('p3', readyArtifact(3));
+    ref.el.pixels = bitmap(grayPage(3));
+    await testPreload({ id: 'p1', order: 1 });
+    assert.equal(fixture.paints[0]?.outputs[0].translation, 'page 3', 'the replacement image must still be eligible');
 });
 
 test('idlePageOrder names the page from the reader URL so a reopen can find its cache', () => {
@@ -163,6 +219,29 @@ test('a positional page paints from the artifact without reading cross-origin pi
     assert.equal(page?.matchedBy, 'url');
     await testAttach(ref, page);
     assert.equal(fixture.paints.length, 1, 'the artifact must paint without the original pixels');
+});
+
+test('an attached positional artifact resolves without re-reading an unavailable original', async () => {
+    fixture.chapter = 'https://reader.test/chapter/uuid';
+    globalThis.location = { origin: 'https://reader.test', pathname: '/chapter/uuid/2', search: '', hash: '' };
+    const artifact = readyArtifact(2);
+    fixture.artifacts.set('p2', artifact);
+    testProgress({ id: 'pos-painted', chapter: fixture.chapter, completeManifest: true,
+        pages: [{ id: 'p2', url: 'https://cdn.test/2.png', order: 1, phase: 'ready', revision: 1, image: signatureOf(artifact.identity) }] });
+    const ref = imageRef('blob:unreadable-original', bitmap(grayPage(2), { clean: false }));
+    const page = await resolveChapterRef(ref);
+    assert.equal(page?.matchedBy, 'url');
+    await testAttach(ref, page);
+    const state = fixture.states.get(ref.el);
+    assert.ok(state);
+    ref.el.src = ref.el.currentSrc = state.translated;
+    const decode = globalThis.createImageBitmap;
+    globalThis.createImageBitmap = async () => { throw new Error('Original must not be re-read'); };
+    try {
+        assert.equal((await resolveChapterRef(ref))?.id, 'p2');
+        location.pathname = '/chapter/uuid/3';
+        assert.equal(await resolveChapterRef(ref), undefined, 'a changed page number invalidates the painted position');
+    } finally { globalThis.createImageBitmap = decode; }
 });
 test('a different aspect ratio never matches one page of a composite', async () => {
     const ref = imageRef('blob:spread', bitmap(grayPage(2), { width: 1200, height: 800 }));
