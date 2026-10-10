@@ -57,37 +57,46 @@ export async function callLLM(
     const temp = typeof temperature === 'number' && Number.isFinite(temperature) ? temperature : null;
     const imgs = imagesB64?.length ? imagesB64 : undefined;
     const bp = asPrompt(prompt);
+    const ck = cacheKeyFor(s, cacheKey);
     const t0 = Date.now();
     try {
-        const r = await dispatch(base, s, bp, imgs, thinking, cacheKey, temp, maxTokens);
+        const r = await dispatch(base, s, bp, imgs, thinking, ck, temp, maxTokens);
         return { ...r, ms: Date.now() - t0 };
     } catch (e) {
         // refused by the provider: arm the window for this provider|baseUrl
         if (e instanceof LlmHttpError && e.status === 429) noteRateLimit(s, e.retryAfterMs ?? RATE_LIMIT_DEFAULT_MS);
+        // a metered gateway rejects the prompt-cache routing field outright: remember it for
+        // this provider|baseUrl, then run the chain again without it (the other fallbacks still apply)
+        if (ck && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /prompt_cache_key/i.test(e.message)) {
+            console.warn('[mt:bg] provider rejected prompt_cache_key — retrying without it');
+            dropCacheKey.add(rlKey(s));
+            const r = await callLLM(s, prompt, imagesB64, thinkingLevel, undefined, temperature, maxTokens);
+            return { ...r, ms: Date.now() - t0, cacheKeyDropped: true };
+        }
         // a provider/proxy that rejects the system role: merge it into the user message and
         // retry once — the same rules still reach the model, just as a single message.
         if (bp.system && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /system|role|instruction/i.test(e.message)) {
             console.warn('[mt:bg] provider rejected the system role, retrying as one user message');
-            const r = await dispatch(base, s, { system: '', user: bp.system + '\n' + bp.user }, imgs, thinking, cacheKey, temp, maxTokens);
+            const r = await dispatch(base, s, { system: '', user: bp.system + '\n' + bp.user }, imgs, thinking, ck, temp, maxTokens);
             return { ...r, ms: Date.now() - t0, systemDropped: true };
         }
         // some models reject the thinking param entirely — retry once without it
         if (thinking && e instanceof LlmHttpError && (e.status === 400 || e.status === 422)) {
             console.warn('[mt:bg] model rejected thinking level, retrying without');
             try {
-                const r = await dispatch(base, s, bp, imgs, null, cacheKey, temp, maxTokens);
+                const r = await dispatch(base, s, bp, imgs, null, ck, temp, maxTokens);
                 return { ...r, ms: Date.now() - t0, thinkingDropped: true };
             } catch (e2) {
                 if (!(temp != null && e2 instanceof LlmHttpError && /temperature/i.test(e2.message))) throw e2;
                 console.warn('[mt:bg] model rejected pinned temperature, retrying without');
-                const r = await dispatch(base, s, bp, imgs, null, cacheKey, null, maxTokens);
+                const r = await dispatch(base, s, bp, imgs, null, ck, null, maxTokens);
                 return { ...r, ms: Date.now() - t0, tempDropped: true, thinkingDropped: true };
             }
         }
         // reasoning-first models may reject any non-default temperature — error-driven, no model-name table
         if (temp != null && e instanceof LlmHttpError && (e.status === 400 || e.status === 422) && /temperature/i.test(e.message)) {
             console.warn('[mt:bg] model rejected pinned temperature, retrying without');
-            const r = await dispatch(base, s, bp, imgs, thinking, cacheKey, null, maxTokens);
+            const r = await dispatch(base, s, bp, imgs, thinking, ck, null, maxTokens);
             return { ...r, ms: Date.now() - t0, tempDropped: true };
         }
         throw e;
@@ -154,6 +163,7 @@ export interface LlmResult {
     tempDropped?: boolean; // the model rejected the pinned temperature; retried without it (OCR memoizes this per model)
     thinkingDropped?: boolean; // the model rejected the thinking param; retried without (OCR memoizes this per model)
     systemDropped?: boolean; // the provider rejected the system role; retried as one user message
+    cacheKeyDropped?: boolean; // the gateway rejected prompt_cache_key; retried without (kept off for this provider|baseUrl)
 }
 
 // Provider JSON is untrusted (BYOK baseUrl can be a proxy): coerce usage counters
@@ -193,6 +203,14 @@ function noteRateLimit(s: LLMSettings, ms: number): void {
     rateLimitedUntil.set(rlKey(s), Date.now() + Math.min(RATE_LIMIT_MAX_MS, Math.max(1000, ms)));
 }
 
+// ---- provider prompt-cache routing breaker ----
+// Metered gateways can 400 the prompt_cache_key routing field outright (live: "Metered
+// requests do not support prompt_cache_key") — once one refuses, keep it off that provider.
+const dropCacheKey = new Set<string>();
+function cacheKeyFor(s: LLMSettings, cacheKey?: string): string | undefined {
+    return cacheKey && !dropCacheKey.has(rlKey(s)) ? cacheKey : undefined;
+}
+
 async function checkOk(resp: Response): Promise<string> {
     const text = await resp.text();
     if (!resp.ok) throw new LlmHttpError(resp.status, `LLM API ${resp.status}: ${text.slice(0, 300)}`,
@@ -215,7 +233,7 @@ export function toMtError(e: unknown): MtError {
         if (e.status === 429) return new MtError('ratelimit', e.message,
             'Rate limited by the provider — auto-translate is stopped. Wait for the cooldown, then press Translate on a page (or lower Parallel LLM / check the model quota)',
             undefined, e.retryAfterMs);
-        if (e.status === 400 && /image|base64|data uri|input_image|multimodal|media_type|content\[|not support/i.test(e.message))
+        if (e.status === 400 && /image|base64|data uri|input_image|multimodal|media_type|content\[/i.test(e.message))
             return new MtError('parse', e.message, "This model can't read images — switch to Local OCR or pick another model");
         if (e.status >= 500) return new MtError('server', e.message, 'Provider is temporarily down — you can retry');
     }
@@ -257,7 +275,7 @@ export function thinkingSmell(e: unknown): boolean {
 // Silent-ignore providers report accepted without effect — rejection, not effect, is what's probed.
 export async function checkThinking(s: LLMSettings, thinking: string, cacheKey?: string): Promise<'accepted'> {
     const base = (s.baseUrl || DEFAULT_BASES[s.provider]).replace(/\/$/, '');
-    await dispatch(base, s, 'Reply with exactly: pong', undefined, thinking, cacheKey);
+    await dispatch(base, s, 'Reply with exactly: pong', undefined, thinking, cacheKeyFor(s, cacheKey));
     return 'accepted';
 }
 

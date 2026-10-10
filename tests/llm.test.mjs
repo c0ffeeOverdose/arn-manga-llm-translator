@@ -512,6 +512,16 @@ test('toMtError: plain 400 without image keywords gets no hint', () => {
   assert.equal(m.hint, undefined);
 });
 
+// live: a metered gateway 400s the prompt_cache_key routing field —
+// "do not support" must not read as an image-capability problem
+test('toMtError: 400 rejecting prompt_cache_key gets no image hint', () => {
+  const m = toMtError(new LlmHttpError(400,
+    'LLM API 400: {"error":{"message":"Metered requests do not support prompt_cache_key",' +
+    '"type":"invalid_request_error","code":"unsupported_metering_shape","param":"prompt_cache_key"}}'));
+  assert.equal(m.kind, 'parse');
+  assert.equal(m.hint, undefined);
+});
+
 // live: Cloudflare Workers AI 403 for un-agreed Meta models — the generic
 // "API key is wrong" hint sent the user to re-check a working token
 test('toMtError: CF license 403 gets the agree hint, other 403s keep the key hint', () => {
@@ -621,6 +631,39 @@ test('callLLM: a rejected temperature is retried without it and reported (tempDr
     const r2 = await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, 0.25);
     assert.equal(calls, 1);
     assert.equal(r2.tempDropped, undefined, 'accepted temperature reports nothing');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('callLLM: a rejected prompt_cache_key is retried without it, then kept off (cacheKeyDropped)', async () => {
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  // the stub behaves like the live gateway: any request carrying the routing field is 400
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    seen.push(body);
+    if ('prompt_cache_key' in body) {
+      return {
+        ok: false, status: 400,
+        async text() { return JSON.stringify({ error: { message: 'Metered requests do not support prompt_cache_key', param: 'prompt_cache_key' } }); },
+      };
+    }
+    return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }); } };
+  };
+  const s = { provider: 'openai', baseUrl: 'https://metered-ck.test/v1', model: 'm', apiKey: 'k' };
+  try {
+    const r = await callLLM(s, 'p', undefined, 'auto', 'manga-1');
+    assert.equal(seen.length, 2, 'rejected request + clean retry');
+    assert.equal(seen[0].prompt_cache_key, 'manga-1', 'the routing key ships on the first try');
+    assert.ok(!('prompt_cache_key' in seen[1]), 'the retry drops it');
+    assert.equal(r.text, 'ok');
+    assert.equal(r.cacheKeyDropped, true, 'the caller can memoize the rejection');
+    seen.length = 0;
+    const r2 = await callLLM(s, 'p', undefined, 'auto', 'manga-1');
+    assert.equal(seen.length, 1, 'memoized: later calls never attach the rejected field');
+    assert.ok(!('prompt_cache_key' in seen[0]));
+    assert.equal(r2.cacheKeyDropped, undefined, 'nothing to report once it is kept off');
   } finally {
     globalThis.fetch = realFetch;
   }
