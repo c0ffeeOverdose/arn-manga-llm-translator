@@ -113,7 +113,7 @@ async function prefetchHeadless(url: string, descramble = false, onStatus: MtOnS
         let o: TranslateOutcome;
         try {
             o = await translateRegions(bitmap, det, onStatus,
-                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled, lo: true, cacheEpoch, onStarve: starveNotice });
+                { progressKey: url, continued: r.resumed || !pipeline.cacheEnabled, lo: true, cacheEpoch, cacheFingerprint: fp, onStarve: starveNotice });
         } finally {
             endKeepalive();
         }

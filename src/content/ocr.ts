@@ -2,8 +2,9 @@
 // overlay views, and the LLM translate RPC (translateRegions).
 
 import { ocrInWorker, ocrLangsInstalled, baberuOcr, baberuInstalled, panelReadingOrder, type DetectResult, type DetBox, type MtOnStatus } from './detection';
+import { restoreDetection } from './retained-detection';
 import { canvasJpegB64 } from './encode';
-import { EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
+import { EMPTY_CONTEXT, type ContextState, type RegionInput, type RegionOutput, type ExtraRegion, type Mention, type BookOp, type ImageContent } from '../llm/core';
 import { isDebug } from '../debug';
 import { pipeline, context, setContext, shareContext, loadContext, saveContext, chapterKey, resolveMangaId, bookKey, uniquePages, pages } from './state';
 import type { PageState } from './state';
@@ -19,6 +20,7 @@ import { PageTimer } from '../page-timing';
 import { sendToBackground } from '../bg-rpc';
 import { recordChapterLog } from '../chapter/log-store';
 import type { ChapterTrace } from '../chapter/log';
+import { planAnnotations, drawAnnotations, sourceExtras } from './vlm-annotations';
 
 // Warm-path AI cleanup: compute cleanup patches for a freshly translated page
 // and hand them to the caller's cache entry. Gated on cache-on + local mode;
@@ -196,8 +198,7 @@ export function pageIsGrayscale(bitmap: ImageBitmap): boolean {
     return maxSat < 24;
 }
 
-// one numbered badge: red disc + white number, the same mark the VLM sees.
-// center clamped into the canvas.
+// Debug views use compact red discs; their centers stay inside the canvas.
 function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, x: number, y: number, num: number, r: number, W: number, H: number): void {
     x = Math.min(Math.max(x, r), W - r);
     y = Math.min(Math.max(y, r), H - r);
@@ -216,25 +217,37 @@ function drawBadge(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingConte
     ctx.fillText(String(num), x, y + r * 0.055);
 }
 
-// Badge size comes from page-cache's annotFont (pure + unit-tested); draw a
-// numbered badge over each region so the VLM can map them, downscale. A segment
-// annotates ONE page of a merged request; `offset` keeps badge numbers global.
-async function annotateForVLM(bitmap: ImageBitmap, boxes: DetBox[], grayscale: boolean, segment?: { y: number; h: number }, offset = 0): Promise<string> {
+// Each page keeps stable marker IDs, including inside merged/chunked requests.
+// Return the content rectangle so extra coordinates exclude annotation margins.
+async function annotateForVLM(bitmap: ImageBitmap, boxes: (DetBox & { marker: number })[], grayscale: boolean, segment?: { y: number; h: number }): Promise<{ image: string; width: number; height: number; content: ImageContent; radius: number }> {
     const srcY = segment?.y ?? 0;
     const srcH = segment?.h ?? bitmap.height;
     const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, srcH));
+    const plan = planAnnotations(boxes.map(box => ({
+        x1: box.x1 * scale, y1: (box.y1 - srcY) * scale,
+        x2: box.x2 * scale, y2: (box.y2 - srcY) * scale, marker: box.marker,
+    })), Math.round(bitmap.width * scale), Math.round(srcH * scale), annotFont(scale));
+    const fit = Math.min(1, pipeline.fullPageSize / Math.max(plan.width, plan.height));
+    const content = { x: plan.content.x * fit, y: plan.content.y * fit,
+        w: plan.content.w * fit, h: plan.content.h * fit };
     const c = document.createElement('canvas');
-    c.width = Math.round(bitmap.width * scale);
-    c.height = Math.round(srcH * scale);
+    c.width = Math.floor(plan.width * fit); c.height = Math.floor(plan.height * fit);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
-    if (grayscale) ctx.filter = 'grayscale(1)';
-    ctx.drawImage(bitmap, 0, srcY, bitmap.width, srcH, 0, 0, c.width, c.height);
-    // canvas filters stick to every later draw: reset, or the badges come out
-    // gray whenever the page was grayscale-stripped.
-    ctx.filter = 'none';
-    const font = annotFont(scale);
-    boxes.forEach((b, i) => drawBadge(ctx, b.x1 * scale, (b.y1 - srcY) * scale, offset + i + 1, font * 0.9, c.width, c.height));
-    return canvasJpegB64(c, pipeline.jpegQuality);
+    try {
+        ctx.scale(fit, fit);
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, plan.width, plan.height);
+        const drawSource = () => {
+            ctx.save();
+            if (grayscale) ctx.filter = 'grayscale(1)';
+            ctx.drawImage(bitmap, 0, srcY, bitmap.width, srcH,
+                plan.content.x, plan.content.y, plan.content.w, plan.content.h);
+            ctx.restore();
+        };
+        drawSource();
+        drawAnnotations(ctx, plan, drawSource);
+        return { image: await canvasJpegB64(c, pipeline.jpegQuality), width: c.width, height: c.height,
+            content, radius: (plan.marks[0]?.label.r ?? annotFont(scale) * 0.9) * fit };
+    } finally { c.width = c.height = 0; }
 }
 
 // dark pill with exact conf in threshold units — answers "what threshold catches this box?"
@@ -340,7 +353,7 @@ export async function ensurePageDebugViews(state: PageState, original?: ImageBit
     const pending = debugWork.get(state);
     if (pending) return pending;
     const token = state.cacheEpoch ?? cacheGeneration();
-    const det = state.det, ranks = panelRanks(det.panels ?? []);
+    const det = restoreDetection(state.det), ranks = panelRanks(det.panels ?? []);
     const task = (async () => {
         for (const side of ['debugOrig', 'debug'] as const) {
             if (state[side] || !cacheCurrent(token)) continue;
@@ -424,7 +437,7 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer; chapterTrace?: ChapterTrace },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; cacheFingerprint?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer; chapterTrace?: ChapterTrace },
 ): Promise<TranslateOutcome> {
     const timing = opts?.timing ?? new PageTimer();
     const notify = onStatus;
@@ -450,9 +463,10 @@ export async function translateRegions(
     // detect wrote, so a reload/retry resumes at translation instead of
     // re-paying the OCR. Written even with the cache off (in-flight work).
     const checkpointOcr = (texts: string[]) => {
+        if (opts?.cacheFingerprint && opts.cacheFingerprint !== settingsFingerprint(pipeline)) return;
         if (opts?.checkpoint === false || det.cloudTexts || !texts.some(t => t)) return;
         const boxes = det.boxes.length === texts.length ? det.boxes : det.boxes.slice(0, texts.length);
-        void cachePut(partialEntry(cacheKey(chapterKey(), pageHashFromBitmap(bitmap)), settingsFingerprint(pipeline),
+        void cachePut(partialEntry(cacheKey(chapterKey(), pageHashFromBitmap(bitmap)), opts?.cacheFingerprint ?? settingsFingerprint(pipeline),
             { ...det, boxes, cloudTexts: texts }, bitmap.width, bitmap.height), pipeline.cacheMax, cacheEpoch);
     };
     try {
@@ -473,6 +487,7 @@ export async function translateRegions(
         // dims of the annotated image the model actually sees (extras coords come
         // back in THIS space — the model can't know the full-resolution page)
         let annW = bitmap.width, annH = bitmap.height;
+        let pageContent: ImageContent | undefined;
         let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
         // OCR crops grow past edge-cut glyphs — one shared readback, not one per region.
         const pageImg = await timing.measureAsync('pixelRead', () => pageImageData(bitmap));
@@ -517,22 +532,28 @@ export async function translateRegions(
             const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
             const crops: string[] = [];
             for (const box of det.boxes) crops.push(await cropRegion(bitmap, box, gs, pageImg, timing));
+            const numberedBoxes = det.boxes.map((box, i) => ({ ...box, marker: regions[i].index }));
+            if (!cropsOnly) regions.forEach((region, i) => {
+                const page = segs.length > 1
+                    ? segs.findIndex(segment => det.boxes[i].y1 >= segment.y && det.boxes[i].y1 < segment.y + segment.h) + 1
+                    : 1;
+                if (page < 1) throw new Error('A text region has no matching full-page image');
+                region.marker = numberedBoxes[i].marker; region.page = page;
+            });
             if (!cropsOnly && segs.length > 1) {
                 // merged page mode: one annotated page per segment, badges numbered globally.
                 // Extras stay off — their coordinates would need one shared page space.
-                let offset = 0;
                 for (const seg of segs) {
-                    const segBoxes = det.boxes.filter(b => b.y1 >= seg.y && b.y1 < seg.y + seg.h);
-                    pageImages.push(await timing.measureAsync('annotate', () => annotateForVLM(bitmap, segBoxes, gs, seg, offset)));
-                    offset += segBoxes.length;
+                    const segBoxes = numberedBoxes.filter(b => b.y1 >= seg.y && b.y1 < seg.y + seg.h);
+                    const annotated = await timing.measureAsync('annotate', () => annotateForVLM(bitmap, segBoxes, gs, seg));
+                    pageImages.push(annotated.image);
                 }
                 annW = 0; annH = 0; badgeR = undefined;
             } else if (!cropsOnly) {
-                const scale = Math.min(1, pipeline.fullPageSize / Math.max(bitmap.width, bitmap.height));
-                annW = Math.round(bitmap.width * scale);
-                annH = Math.round(bitmap.height * scale);
-                badgeR = Math.round(annotFont(scale) * 0.9);
-                pageImages.push(await timing.measureAsync('annotate', () => annotateForVLM(bitmap, det.boxes, gs)));
+                const annotated = await timing.measureAsync('annotate', () => annotateForVLM(bitmap, numberedBoxes, gs));
+                annW = annotated.width; annH = annotated.height;
+                pageContent = annotated.content; badgeR = annotated.radius;
+                pageImages.push(annotated.image);
             }
             imagesB64 = requestImages({ mode: cropsOnly ? 'crops' : 'page', pages: pageImages, crops });
         }
@@ -609,6 +630,7 @@ export async function translateRegions(
             // extras need ONE page space; a merged request has several, so it opts out
             pageW: mergedCount ? undefined : annW,
             pageH: mergedCount ? undefined : annH,
+            pageContent,
             pageCount: mergedCount || undefined,
             cacheKey: await resolveMangaId() ?? chapterKey(), // stable per manga → prompt-cache affinity
             bookKey: bookKey(), // scopes user overrides to this story's book
@@ -745,12 +767,8 @@ export async function translateRegions(
             llmMs: merged.ms, context: merged.context };
         // extras arrive in annotated-image space → rescale to full-page pixels.
         const rawExtras: ExtraRegion[] = resp.extras ?? [];
-        const extras: ExtraRegion[] = rawExtras
-            .map(e => ({
-                ...e,
-                x1: e.x1 * bitmap.width / annW, y1: e.y1 * bitmap.height / annH,
-                x2: e.x2 * bitmap.width / annW, y2: e.y2 * bitmap.height / annH,
-            }))
+        const extras: ExtraRegion[] = (mergedCount ? [] : sourceExtras(rawExtras,
+            pageContent ?? { x: 0, y: 0, w: annW, h: annH }, bitmap.width, bitmap.height))
             .filter(e =>
                 e.x2 > e.x1 && e.y2 > e.y1 &&
                 e.x2 <= bitmap.width * 1.05 && e.y2 <= bitmap.height * 1.05 &&

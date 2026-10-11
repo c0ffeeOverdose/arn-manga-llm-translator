@@ -22,16 +22,19 @@ test('canvasJpegB64 returns the payload after the comma', () => {
 
 test('canvasPngBlob encodes a foreign canvas through a sync data URL', async () => {
   let drew = 0;
-  globalThis.document = { createElement: () => ({
+  const temporary = {
     width: 0, height: 0,
     getContext: () => ({ drawImage: () => { drew++; } }),
     toDataURL: () => 'data:image/png;base64,' + Buffer.from('png-bytes').toString('base64'),
-  }) };
+  };
+  globalThis.document = { createElement: () => temporary };
   const source = { width: 10, height: 20 }; // Offscreen-like: no toDataURL
   const blob = await canvasPngBlob(source);
   assert.equal(drew, 1, 'the source pixels are copied once');
   assert.equal(blob.type, 'image/png');
   assert.equal(Buffer.from(await blob.arrayBuffer()).toString(), 'png-bytes');
+  assert.equal(temporary.width * temporary.height, 0, 'owned pixel storage is released after encoding');
+  assert.deepEqual(source, { width: 10, height: 20 }, 'caller keeps its source');
 });
 
 test('canvasPngBlob uses an HTML canvas directly', async () => {
@@ -41,4 +44,15 @@ test('canvasPngBlob uses an HTML canvas directly', async () => {
   };
   const blob = await canvasPngBlob(canvas);
   assert.equal(Buffer.from(await blob.arrayBuffer()).toString(), 'direct');
+  assert.equal(canvas.width * canvas.height, 16, 'caller-owned pixels remain available');
+});
+
+for (const stage of ['draw', 'encode']) test(`canvasPngBlob releases its temporary canvas after ${stage} failure`, async () => {
+  const temporary = { width: 0, height: 0,
+    getContext: () => ({ drawImage() { if (stage === 'draw') throw Error('draw failed'); } }),
+    toDataURL() { throw Error('encode failed'); },
+  };
+  globalThis.document = { createElement: () => temporary };
+  await assert.rejects(canvasPngBlob({ width: 100, height: 200 }), /failed/);
+  assert.equal(temporary.width * temporary.height, 0);
 });

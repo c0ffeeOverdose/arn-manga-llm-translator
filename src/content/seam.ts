@@ -16,6 +16,8 @@ import { translateRegions, renderDebugView, panelRanks } from './ocr';
 import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet, paintFind } from './queue';
 import { bookAdd, bookDrop } from './sweep';
 import { starveNotice } from './status-ui';
+import { retainPreparedJob } from './prepared-job';
+import { retainDetection, restoreDetection } from './retained-detection';
 
 interface SeamMember { ref: PageRef; key: string; srcUrl: string; bitmap: ImageBitmap; hash: string; det: DetectResult }
 export const SEAM_MAX = 4; // owner + 3 — bounds the stitch canvas + pulled jobs
@@ -51,8 +53,9 @@ async function bandConfirms(u: SeamMember, l: SeamMember): Promise<boolean> {
         const bctx = band.getContext('2d', { willReadFrequently: true })!;
         bctx.drawImage(u.bitmap, 0, u.bitmap.height - Bu, u.bitmap.width, Bu, 0, 0, W, Bu);
         bctx.drawImage(l.bitmap, 0, 0, l.bitmap.width, Bl, 0, Bu, W, Bl);
-        const det = await detectPage(await createImageBitmap(band), () => {});
-        return bandSpan(det.boxes, Bu);
+        const bitmap = await createImageBitmap(band);
+        try { return bandSpan((await detectPage(bitmap, () => {})).boxes, Bu); }
+        finally { bitmap.close(); }
     } catch { return false; }
 }
 
@@ -66,6 +69,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
     // prune helper (declared here so the catch below can also reach it):
     // pulled members outside the final chain return to the pool.
     const pulled: PageRef[] = [];
+    const owned = new Set<ImageBitmap>();
+    const borrowed: (() => void)[] = [];
     const chainKeys = new Set<string>();
     const prune = () => {
         for (const ref of pulled) {
@@ -119,13 +124,14 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 const q = queueFind(key) ?? paintFind(key);
                 let mp: Prep | null = null;
                 try {
-                    if (q) mp = await q.prep;
+                    if (q) { borrowed.push(retainPreparedJob(q)); mp = await q.prep; }
                     else if (key === activeKeyGet() && activePrepGet()) mp = await activePrepGet();
                     else if (job.auto || job.force) {
                         const r = enqueue(ref, false, true);
                         const jq = (r === 'queued' || r === 'dup') ? queueFind(key) : undefined;
                         if (jq) pulled.push(ref);
-                        mp = jq ? await jq.prep : (key === activeKeyGet() && activePrepGet() ? await activePrepGet() : null);
+                        if (jq) { borrowed.push(retainPreparedJob(jq)); mp = await jq.prep; }
+                        else mp = key === activeKeyGet() && activePrepGet() ? await activePrepGet() : null;
                     }
                 } catch (e) { trace('member-prep-fail', { member: key.slice(-16), err: String((e as Error)?.message ?? e).slice(0, 80) }); mp = null; }
                 const st = pages.get(key);
@@ -137,7 +143,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     // rendered before: re-derive pixels and re-detect on the stitch.
                     try {
                         const { bitmap } = await fetchBitmap(st.orig);
-                        return { idx, m: { ref, key, srcUrl: st.orig, bitmap, hash: pageHashFromBitmap(bitmap), det: st.det ?? prep.det } };
+                        owned.add(bitmap);
+                        return { idx, m: { ref, key, srcUrl: st.orig, bitmap, hash: pageHashFromBitmap(bitmap), det: st.det ? restoreDetection(st.det) : prep.det } };
                     } catch { return { idx, m: null }; }
                 }
                 trace('hole', { member: key.slice(-24) });
@@ -250,6 +257,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         let y = 0;
         for (const m of chain) { y0.push(y); sctx.drawImage(m.bitmap, 0, y); y += m.bitmap.height; }
         const stitchBmp = await createImageBitmap(stitch);
+        owned.add(stitchBmp);
         const det = await detectPage(stitchBmp, onStatus);
         // safety net: stitch context can drop a marginal edge line the solo pass
         // caught. Re-add solo boxes the stitch missed — EXCEPT fragments of a
@@ -318,7 +326,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             const my0 = y0[i], mh = m.bitmap.height;
             const slice = await createImageBitmap(stitch, 0, my0, W, mh);
             const sc = new OffscreenCanvas(W, mh);
-            sc.getContext('2d')!.drawImage(slice, 0, 0);
+            try { sc.getContext('2d')!.drawImage(slice, 0, 0); }
+            finally { slice.close(); }
             const blob = await sc.convertToBlob({ type: 'image/png' });
             const spans = (b: DetBox) => b.y1 < my0 || b.y2 > my0 + mh;
             const inRange = (b: DetBox) => b.y2 > my0 && b.y1 < my0 + mh;
@@ -348,7 +357,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 cacheEpoch,
                 orig: m.srcUrl,
                 translated: URL.createObjectURL(blob),
-                det: localDet,
+                det: retainDetection(localDet),
                 outputs: memberOutputs,
                 mentions: i === 0 ? mentions : [], // page-level list — top member only, folds once
                 bookBefore,
@@ -362,7 +371,9 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             }
             if (debugOn && boxes.length) {
                 state.debugOrig = await renderDebugView(m.bitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask);
-                state.debug = await renderDebugView(await createImageBitmap(sc), boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask);
+                const debugBitmap = await createImageBitmap(sc);
+                try { state.debug = await renderDebugView(debugBitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask); }
+                finally { debugBitmap.close(); }
             }
             const existing = pages.get(m.key);
             assertCacheCurrent(cacheEpoch);
@@ -409,5 +420,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         try { prune(); } catch { /* prune is best-effort */ }
         console.warn('[mt] seam failed, solo fallback:', (e as Error)?.message ?? e);
         return null;
+    } finally {
+        for (const bitmap of owned) bitmap.close();
+        for (const release of borrowed) release();
     }
 }

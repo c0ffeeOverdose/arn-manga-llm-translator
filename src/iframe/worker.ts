@@ -254,39 +254,43 @@ async function runDetect(png: ArrayBuffer, confThr: number, minSize: number, for
     const w = bitmap.width, h = bitmap.height;
     // strips tile (splitTiles [] unless aspect>3): each tile infers at near-
     // natural scale, then boxes seam-merge + masks max-stitch below.
-    const tiles = splitTiles(w, h);
     let boxes: number[][], confs: number[], lowBoxes: number[][], lowConfs: number[];
     let prob: Float32Array, inferMs = 0;
-    if (!tiles.length) {
-        ({ boxes, confs, lowBoxes, lowConfs, prob, inferMs } = await inferOnce(bitmap, confThr));
-    } else {
-        const per: { tile: Tile; r: Awaited<ReturnType<typeof inferOnce>> }[] = [];
-        for (const t of tiles) {
-            const tc = new OffscreenCanvas(t.w, t.h);
-            tc.getContext('2d')!.drawImage(bitmap, t.x0, t.y0, t.w, t.h, 0, 0, t.w, t.h);
-            per.push({ tile: t, r: await inferOnce(await createImageBitmap(tc), confThr) });
-        }
-        const merged = mergeTileBoxes(per.map(p => ({
-            tile: p.tile,
-            boxes: p.r.boxes.map((b, i) => ({ x1: b[0], y1: b[1], x2: b[2], y2: b[3], conf: p.r.confs[i] })),
-        })));
-        boxes = merged.map(b => [b.x1, b.y1, b.x2, b.y2]);
-        confs = merged.map(b => b.conf);
-        lowBoxes = per.flatMap(p => p.r.lowBoxes.map(b => [b[0] + p.tile.x0, b[1] + p.tile.y0, b[2] + p.tile.x0, b[3] + p.tile.y0]));
-        lowConfs = per.flatMap(p => p.r.lowConfs);
-        prob = new Float32Array(w * h);
-        for (const p of per) {
-            const { tile: t, r } = p;
-            for (let y = 0; y < t.h; y++) {
-                for (let x = 0; x < t.w; x++) {
-                    const v = r.prob[y * t.w + x];
-                    const o = (t.y0 + y) * w + (t.x0 + x);
-                    if (v > prob[o]) prob[o] = v;
-                }
+    try {
+        const tiles = splitTiles(w, h);
+        if (!tiles.length) {
+            ({ boxes, confs, lowBoxes, lowConfs, prob, inferMs } = await inferOnce(bitmap, confThr));
+        } else {
+            const per: { tile: Tile; r: Awaited<ReturnType<typeof inferOnce>> }[] = [];
+            for (const t of tiles) {
+                const tc = new OffscreenCanvas(t.w, t.h);
+                tc.getContext('2d')!.drawImage(bitmap, t.x0, t.y0, t.w, t.h, 0, 0, t.w, t.h);
+                const tileBitmap = await createImageBitmap(tc);
+                try { per.push({ tile: t, r: await inferOnce(tileBitmap, confThr) }); }
+                finally { tileBitmap.close(); }
             }
-            inferMs += r.inferMs;
+            const merged = mergeTileBoxes(per.map(p => ({
+                tile: p.tile,
+                boxes: p.r.boxes.map((b, i) => ({ x1: b[0], y1: b[1], x2: b[2], y2: b[3], conf: p.r.confs[i] })),
+            })));
+            boxes = merged.map(b => [b.x1, b.y1, b.x2, b.y2]);
+            confs = merged.map(b => b.conf);
+            lowBoxes = per.flatMap(p => p.r.lowBoxes.map(b => [b[0] + p.tile.x0, b[1] + p.tile.y0, b[2] + p.tile.x0, b[3] + p.tile.y0]));
+            lowConfs = per.flatMap(p => p.r.lowConfs);
+            prob = new Float32Array(w * h);
+            for (const p of per) {
+                const { tile: t, r } = p;
+                for (let y = 0; y < t.h; y++) {
+                    for (let x = 0; x < t.w; x++) {
+                        const v = r.prob[y * t.w + x];
+                        const o = (t.y0 + y) * w + (t.x0 + x);
+                        if (v > prob[o]) prob[o] = v;
+                    }
+                }
+                inferMs += r.inferMs;
+            }
         }
-    }
+    } finally { bitmap.close(); }
     // binary text mask from the stitched/single probability field.
     const keep = nms(boxes, confs).filter(i => {
         const b = boxes[i];
@@ -545,9 +549,13 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
     if (!(await ensurePanelSession())) throw new Error('panel model unavailable — panel ordering falls back to banding');
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     const w = bitmap.width, h = bitmap.height;
-    const c = new OffscreenCanvas(PANEL_INPUT, PANEL_INPUT);
-    const ctx = c.getContext('2d', { willReadFrequently: true })!;
-    ctx.drawImage(bitmap, 0, 0, PANEL_INPUT, PANEL_INPUT);
+    let ctx: OffscreenCanvasRenderingContext2D;
+    try {
+        const c = new OffscreenCanvas(PANEL_INPUT, PANEL_INPUT);
+        ctx = c.getContext('2d', { willReadFrequently: true })!;
+        ctx.drawImage(bitmap, 0, 0, PANEL_INPUT, PANEL_INPUT);
+    }
+    finally { bitmap.close(); }
     const data = ctx.getImageData(0, 0, PANEL_INPUT, PANEL_INPUT).data;
     const x = new Float32Array(3 * PANEL_INPUT * PANEL_INPUT);
     const N = PANEL_INPUT * PANEL_INPUT;
@@ -665,10 +673,14 @@ async function runBaberu(png: ArrayBuffer, prio: InferPrio = 0): Promise<string>
     const { vis, pre, stp } = baberuSessions!;
     // preprocess: RGB 224×224 bicubic + ImageNet norm → [1,3,224,224].
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
-    const c = new OffscreenCanvas(224, 224);
-    const ctx = c.getContext('2d', { willReadFrequently: true })!;
-    ctx.imageSmoothingQuality = 'high'; // bicubic-ish
-    ctx.drawImage(bitmap, 0, 0, 224, 224);
+    let ctx: OffscreenCanvasRenderingContext2D;
+    try {
+        const c = new OffscreenCanvas(224, 224);
+        ctx = c.getContext('2d', { willReadFrequently: true })!;
+        ctx.imageSmoothingQuality = 'high'; // bicubic-ish
+        ctx.drawImage(bitmap, 0, 0, 224, 224);
+    }
+    finally { bitmap.close(); }
     const d = ctx.getImageData(0, 0, 224, 224).data;
     const x = new Float32Array(3 * 224 * 224);
     const N = 224 * 224;
@@ -832,11 +844,14 @@ async function runInpaint(png: ArrayBuffer, mask: Uint8Array, boxes: InpaintBox[
     await ensureInpaintSession(noDownload);
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     const W = bitmap.width, H = bitmap.height;
-    const src = new OffscreenCanvas(W, H);
-    const sctx = src.getContext('2d', { willReadFrequently: true })!;
-    sctx.drawImage(bitmap, 0, 0);
-    bitmap.close();
-    const out = new ImageData(new Uint8ClampedArray(sctx.getImageData(0, 0, W, H).data), W, H);
+    let src: OffscreenCanvas, sctx: OffscreenCanvasRenderingContext2D;
+    try {
+        src = new OffscreenCanvas(W, H);
+        sctx = src.getContext('2d', { willReadFrequently: true })!;
+        sctx.drawImage(bitmap, 0, 0);
+    }
+    finally { bitmap.close(); }
+    const out = sctx.getImageData(0, 0, W, H);
     const sq = new OffscreenCanvas(1, 1);
     const sqc = sq.getContext('2d', { willReadFrequently: true })!;
     const img512 = new OffscreenCanvas(INPAINT_SIZE, INPAINT_SIZE);

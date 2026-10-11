@@ -1,5 +1,4 @@
-// Unit tests for the persistent translation cache (pure logic only —
-// IndexedDB wrappers are best-effort by design and stay untested).
+// Reader helper and cache compatibility tests. Storage transactions have their own suite.
 import { build } from 'esbuild';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -807,7 +806,7 @@ test('detFromPartial: rebuilds detect output verbatim, texts ride cloudTexts', (
 });
 
 test('detFromCacheEntry: the one full-entry gate, and splitGen rides along', () => {
-  const full = partialFixture({ partial: undefined, ep: 'cloud', splitGen: CLOUD_SPLIT_GEN });
+  const full = partialFixture({ partial: undefined, outputs: [{ index: 1, text: 'hello' }], ep: 'cloud', splitGen: CLOUD_SPLIT_GEN });
   const det = detFromCacheEntry(full, RESUME_FP, 4, 4, true);
   assert.ok(det);
   assert.equal(det.ep, 'cache');
@@ -1112,7 +1111,7 @@ test('buildPagedUrls kinds: data default, data-saver on request, junk kind rejec
 
 test('pageEntryDecision: page identity survives an encoder change, crops do not', () => {
   const fp = 'fp1', W = 836, H = 1200;
-  const entry = (over = {}) => ({ key: `ch#aaa`, fp, w: W, h: H, keyGen: PAGE_KEY_GEN, ...over });
+  const entry = (over = {}) => ({ key: `ch#aaa`, sourceHash: 'aaa', fp, w: W, h: H, keyGen: PAGE_KEY_GEN, ...over });
   // Same bytes: everything reusable.
   assert.deepEqual(pageEntryDecision(entry(), 'aaa', fp, W, H), { usable: true, dropPatches: false, reason: 'ok' });
   // Different bytes (another host / encoder / data-saver tier): the translation still holds,

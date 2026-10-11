@@ -18,13 +18,17 @@ export async function canvasPngBlob(canvas: OffscreenCanvas | HTMLCanvasElement)
         source = document.createElement('canvas');
         source.width = canvas.width;
         source.height = canvas.height;
-        source.getContext('2d', { willReadFrequently: true })!
-            .drawImage(canvas as unknown as CanvasImageSource, 0, 0);
     }
-    const url = source.toDataURL('image/png');
-    const b64 = url.slice(url.indexOf(',') + 1);
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new Blob([bytes], { type: 'image/png' });
+    try {
+        if (source !== canvas) source.getContext('2d', { willReadFrequently: true })!
+            .drawImage(canvas as unknown as CanvasImageSource, 0, 0);
+        const url = source.toDataURL('image/png');
+        const b64 = url.slice(url.indexOf(',') + 1);
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new Blob([bytes], { type: 'image/png' });
+    } finally {
+        if (source !== canvas) source.width = source.height = 0;
+    }
 }

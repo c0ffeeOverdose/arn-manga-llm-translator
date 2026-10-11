@@ -1,8 +1,9 @@
+import './cache-broker';
 // Background service worker: LLM translation (BYOK). Detection runs in the
 // content script's iframe — this worker owns LLM calls only.
 
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
-import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, EMPTY_CONTEXT, type ContextState, type CharOverride, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt } from '../llm/core';
+import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, subsetRegionImages, EMPTY_CONTEXT, type ContextState, type CharOverride, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt, type ImageContent } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl, isChapterRunnerSender } from './chapter-broker';
 import { cacheReady, cacheCurrent, onCacheReset } from '../cache-generation';
@@ -28,6 +29,7 @@ interface TranslateMsg {
     ocr?: boolean;            // OCR mode: source text provided per region
     pageW?: number;           // px — for validating VLM-reported extra regions (merged requests omit)
     pageH?: number;
+    pageContent?: ImageContent;
     pageCount?: number;       // merged request: number of annotated full pages leading imagesB64
     cacheKey?: string;        // stable per manga — routes provider-side prompt caching
     bookKey?: string;         // the book this context belongs to — scopes user overrides per story
@@ -130,11 +132,11 @@ interface TranscribeResult { preRaw: string; sources: Map<number, string>; usage
 // Deliberately 6 params: OCR must NOT opt into retryEmpty (it has its own
 // per-region fallback and an explicit zero-text gate), so the knob is not exposed here.
 type LlmCaller = (s: LLMSettings, p: string | BuiltPrompt, imgs?: string[], thinking?: string, temperature?: number | null, maxTokens?: number) => Promise<{ text: string; usage?: LlmUsage; calls: number; ms: number; tempDropped?: boolean; thinkingDropped?: boolean }>;
-// transcribe calls send NO output cap: the cap includes reasoning tokens on
-// reasoning models, and a drifting generation is bounded by the adapter default.
+// Transcribe calls leave the output cap to the provider contract; an explicit
+// cap can be consumed by reasoning before the transcription starts.
 
 async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller, temperature: number | null): Promise<TranscribeResult> {
-    const prompt = buildPrompt(msg.regions, EMPTY_CONTEXT, true, { textOnly: msg.textOnly, transcribeOnly: true, chars: false });
+    const prompt = buildPrompt(msg.regions, EMPTY_CONTEXT, true, { textOnly: msg.textOnly, pageCount: msg.pageCount, transcribeOnly: true, chars: false });
     const t = await call(ocr, prompt, msg.imagesB64, pipeline.ocrThinking, temperature);
     const sources = new Map(parseResponse(t.text, msg.regions.length).regions
         .map(o => [o.index, o.translation === 'keep' ? '' : o.translation] as const));
@@ -156,7 +158,7 @@ async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline
     let thinkingDropped = false;
     let firstErr: unknown;
     const t0 = performance.now();
-    const width = Math.max(1, Math.min(6, pipeline.parallelLlm || 3));
+    const width = Math.max(1, Math.min(6, pipeline.parallelLlm || DEFAULT_PIPELINE_SETTINGS.parallelLlm));
     for (let i = 0; i < msg.regions.length; i += width) {
         await Promise.all(msg.regions.slice(i, i + width).map(async (r, j) => {
             const crop = crops[i + j];
@@ -209,7 +211,7 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
             const all = await sessGet(null);
             const keys = Object.keys(all).filter(k => k.startsWith('mtWorkerToken:'));
             if (keys.length >= 32) {
-                await sessRemove(keys.slice(0, keys.length - 31).map(k => k.slice('mtWorkerToken:'.length)));
+                await sessRemove(keys.slice(0, keys.length - 31));
             }
             await sessSet({ ['mtWorkerToken:' + msg.nonce]: msg.token });
             sendResponse({ ok: true });
@@ -678,6 +680,7 @@ function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: 
                     regions: msg.regions, context: msgCtx,
                     vision, textOnly: !!msg.textOnly, ocr: !!msg.ocr, split,
                     requestNonce: msg.requestNonce,
+                    pageCount: msg.pageCount, pageContent: msg.pageContent,
                 },
                 {
                     provider: settings.provider, model: settings.model, baseUrl: settings.baseUrl ?? '',
@@ -779,6 +782,7 @@ function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: 
                 targetLang: pipeline.targetLang,
                 pageW: msg.pageW,
                 pageH: msg.pageH,
+                pageContent: msg.pageContent,
                 pageCount: msg.pageCount,
                 textOnly: split ? true : msg.textOnly,
                 ocr: split ? true : msg.ocr,
@@ -822,14 +826,10 @@ function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: 
                     transcribeSrc: split ? false : pipeline.transcribeSrc,
                 });
                 if (isDebug()) console.log('[mt:bg] llm prompt (retry missing: ' + missing.map(r => r.index).join(',') + ')', retryPrompt);
-                // Crops for the missing regions; the annotated page prefix is kept (all pages
-                // of a merged request). cropStart is where the crops begin in imagesB64.
-                const cropStart = msg.pageCount && msg.pageCount > 1 ? msg.pageCount : (msg.textOnly ? 0 : 1);
+                // Retain every full page and pair the sparse retry list with its own crops.
                 const retryImgs = vision2 && msg.imagesB64
-                    ? [
-                        ...msg.imagesB64.slice(0, cropStart),
-                        ...missing.map(r => msg.imagesB64![cropStart + r.index - 1]).filter((b): b is string => !!b),
-                    ]
+                    ? subsetRegionImages(msg.imagesB64, regions2, missing,
+                        { pageCount: msg.pageCount, textOnly: msg.textOnly })
                     : undefined;
                 const r2 = await callWithRetry(settings, retryPrompt, retryImgs, undefined, pipeline.temperature, undefined, true);
                 rawAll += '\n--- retry (missing regions) ---\n' + r2.text;

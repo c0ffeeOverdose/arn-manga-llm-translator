@@ -4,13 +4,14 @@ import { chapterKey, pipeline, context, loadContext, loadPipeline, bookKey, shar
 import { getPages, refKey, episodeManifestSrcs, fetchPagedUrls, pagedTierAlternates, galleryManifestJson,
     collectUnloadedUrls, bitmapBlank, writePage, fetchBitmap, ownOriginalUrl, hashReaderManifest } from './page-io';
 import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMask,
-    registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cacheKey,
-    pageKey, PAGE_KEY_GEN, readerPageNumber } from './page-cache';
+    registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cachePutMany, cacheKey,
+    pageKey, PAGE_KEY_GEN, readerPageNumber, resizeCachedPage } from './page-cache';
 import { viewportOverlap, dropAutoQueued, resumeAuto, isBusy, paintBusy, haltAuto } from './queue';
 import { lookaheadActive } from './auto';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, logError } from './status-ui';
 import { remainingPages, sweepCount, type SweepCountReason, chapterMessage, type ChapterPage, type ChapterProgress, type ChapterStart } from '../chapter/model';
 import { blobDataUrl } from '../chapter/store';
+import { retainDetection, restoreDetection } from './retained-detection';
 import type { CachedPage } from './page-cache';
 import { chapterSignature } from '../chapter/protocol';
 import { identifyBitmap, imageCandidates, verifyBitmap, signatureOf, type ImageIdentity } from '../image-identity';
@@ -23,6 +24,7 @@ import { cloudConfig, cloudWarm } from './detection';
 import { sendToBackground } from '../bg-rpc';
 import { chapterLogError, type ChapterLogInput } from '../chapter/log';
 import { canvasPngBlob } from './encode';
+import { artifactAuthorized, runPhaseActive } from './attach-policy';
 
 let progress: ChapterProgress | null = null;
 let starting = false;
@@ -149,10 +151,15 @@ async function pageEvidence(page: ProgressPage): Promise<ImageIdentity | undefin
     const key = `${run}:${page.id}:${page.revision ?? 0}`;
     let task = evidence.get(key);
     if (!task) {
+        // Same authority rule as attach: a mid-run settings change must not blind image matching
+        // to the run's own finished pages.
+        const activeOwns = runPhaseActive(progress?.phase)
+            && !!progress?.pages.some(p => p.id === page.id && p.phase === 'ready' && p.revision === page.revision);
         task = sendToBackground<{ result?: { signature?: string; identity?: ImageIdentity } }>(
             { type: 'mt:chapter-result', chapter: chapterKey(), page: page.id, evidenceOnly: true },
             { timeoutMs: 30_000, label: 'chapter evidence' })
-            .then(r => r?.result?.signature === chapterSignature(pipeline) ? r.result.identity : undefined)
+            .then(r => r?.result && artifactAuthorized(r.result.signature ?? '', chapterSignature(pipeline), activeOwns)
+                ? r.result.identity : undefined)
             .catch(() => undefined);
         evidence.set(key, task!);
     }
@@ -485,7 +492,7 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
             const ref = getPages().find(r => original(r) === page.url);
             const state = ref && stateFor(ref);
             if (!state?.det || !state.hash || !state.outputs) continue;
-            const mask = packMask(state.det.mask);
+            const mask = packMask(restoreDetection(state.det).mask);
             const encoded = await blobDataUrl(new Blob([mask.data]));
             seeds.push({ page: page.id, image: await blobDataUrl(await (await fetch(state.translated)).blob()),
                 maskData: encoded.split(',')[1], entry: {
@@ -651,15 +658,19 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number], prel
         mark('result'); // background roundtrip incl. the artifact transfer
         const result = response?.result;
         if (!result) { bail(`no-result:${response?.error ?? 'empty'}`); return; }
+        // The run's own pages stay authoritative while it is active: it translated them with the
+        // settings it captured at start, so a mid-run settings change must not strand them.
+        const runOwns = (): boolean => !!progress && progress.pages.some(p => p.id === page.id && p.phase === 'ready' && p.revision === page.revision);
+        const activeRunOwns = (): boolean => runOwns() && runPhaseActive(progress?.phase);
+        const authorized = (): boolean => artifactAuthorized(result.signature, chapterSignature(pipeline), activeRunOwns());
         // The reader mints a fresh blob for the same page while we await the artifact, so the
         // view token legitimately moves. The token is a fast path, not the authority: a moved
         // token is re-verified against the artifact's pixels (verifyView) before painting, so a
         // recycled element showing another page is still refused. Requiring the token to be
         // frozen refused EVERY attach on a blob-rotating reader.
         const current = (): boolean => cacheCurrent(cacheEpoch) && chapterKey() === chapter && progress?.id === run && ref.el.isConnected
-            && progress.pages.some(p => p.id === page.id && p.phase === 'ready' && p.revision === page.revision)
-            && result.signature === chapterSignature(pipeline);
-        if (!current()) { bail('view-changed'); return; }
+            && runOwns() && authorized();
+        if (!current()) { bail(authorized() ? 'view-changed' : 'signature'); return; }
         if (!result.identity) { bail('image-mismatch'); return; }
         // Pixel agreement is the default authorization. A complete, reader-authored manifest
         // plus the URL's own page number is an equally authoritative position for a paged
@@ -675,7 +686,7 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number], prel
             data: Uint8Array.from(atob(result.mask.data.split(',')[1]), c => c.charCodeAt(0)).buffer } : undefined;
         const entry = { ...result.entry, mask: packed } as CachedPage;
         if (!packed) { bail('no-mask'); return; }
-        if (entry.fp !== settingsFingerprint(pipeline)) { bail('fingerprint'); return; }
+        if (entry.fp !== settingsFingerprint(pipeline) && !activeRunOwns()) { bail('fingerprint'); return; }
         translatedBmp = await createImageBitmap(imageBlob);
         mark('decode');
         if (translatedBmp.width !== entry.w || translatedBmp.height !== entry.h) { bail('artifact-dims'); return; }
@@ -707,8 +718,8 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number], prel
         const paintedImage = ref.kind === 'canvas' && snapshot ? identifyBitmap(translatedBmp, boxes) : undefined;
         const state = { cacheEpoch, orig: src, origOwn, translated, translatedBmp: ref.kind === 'canvas' ? translatedBmp : undefined,
             origBytes, outputs: entry.outputs, mentions: entry.mentions, hash, image, paintedImage,
-            det: { boxes, panels: entry.panels.map(scale), inferMs: 0, ep: 'cache',
-                mask: { width: w, height: h, data: unpackMask(packed, w, h) } } };
+            det: retainDetection({ boxes, panels: entry.panels.map(scale), inferMs: 0, ep: 'cache', splitGen: entry.splitGen,
+                mask: { width: w, height: h, data: unpackMask(packed, w, h) } }) };
         // The view may have re-blobbed while the artifact was in flight; verify the CURRENT
         // pixels against the artifact identity instead of a frozen token (same-page only).
         // A complete, reader-authored manifest plus the URL's page number already fixed which
@@ -721,7 +732,8 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number], prel
             ? await verifyView(ref, snapshot, result.identity)
             : await verifyViewFresh(ref, result.identity)));
         mark('verify');
-        if (!verified || !current()) { bail('view-changed'); return; }
+        if (!verified) { bail('view-changed'); return; }
+        if (!current()) { bail(authorized() ? 'view-changed' : 'signature'); return; }
         if (old) { unregPage(old); URL.revokeObjectURL(old.translated); }
         regPage(state);
         committed = true;
@@ -731,14 +743,16 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number], prel
             // later "Translate this page" looks up the live-pixels hash and the page slot and
             // missed — re-paying the LLM for a page the chapter already finished. Page identity
             // is rendition-independent; the live hash makes the immediate revisit a hit too.
-            const row = { ...entry, order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN };
-            void cachePut({ ...row, key: cacheKey(chapter, result.hash) }, pipeline.cacheMax, cacheEpoch);
-            if (hash) void cachePut({ ...row, key: cacheKey(chapter, hash) }, pipeline.cacheMax, cacheEpoch);
-            // The page-slot row carries pixel evidence for an idle reopen: with no live run the
-            // reader's own /N is the only identity left, and a slot alone cannot reject a wrong
-            // page. signatureOf()+gray let the prep gate verify before reusing.
-            if (page.order != null) void cachePut({ ...row, key: pageKey(chapter, page.order),
-                idSig: signatureOf(result.identity), idGray: result.identity.gray }, pipeline.cacheMax, cacheEpoch);
+            const viewEntry = resizeCachedPage(entry, w, h);
+            const row = { ...viewEntry!, patches: undefined, patchesGen: undefined,
+                order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN, sourceHash: hash ?? result.hash };
+            const rows = viewEntry ? [
+                ...(hash ? [{ ...row, key: cacheKey(chapter, hash), idSig: undefined, idGray: undefined, idRegions: undefined }] : []),
+                ...(page.order != null ? [{ ...row, key: pageKey(chapter, page.order),
+                    idSig: signatureOf(state.image ?? result.identity), idGray: (state.image ?? result.identity).gray,
+                    idRegions: (state.image ?? result.identity).regions }] : []),
+            ] : [];
+            void cachePutMany(rows, pipeline.cacheMax, cacheEpoch);
         }
         if (page.hash) bookAdd(page.hash);
         applied.set(ref.el, stamp);
@@ -771,7 +785,10 @@ async function attach(ref: PageRef, page: ChapterProgress['pages'][number], prel
                         state.image = identifyBitmap(bitmap, boxes);
                         regPage(state); // index the hash for the repaint lane now that it exists
                         if (pipeline.cacheEnabled && result.hash) {
-                            const row = { ...entry, order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN };
+                            const viewEntry = resizeCachedPage(entry, bitmap.width, bitmap.height);
+                            if (!viewEntry) return;
+                            const row = { ...viewEntry, order: page.order ?? entry.order, keyGen: PAGE_KEY_GEN, sourceHash: liveHash,
+                                idSig: undefined, idGray: undefined, idRegions: undefined };
                             void cachePut({ ...row, key: cacheKey(chapter, liveHash) }, pipeline.cacheMax, cacheEpoch);
                         }
                         if (isDebug()) {

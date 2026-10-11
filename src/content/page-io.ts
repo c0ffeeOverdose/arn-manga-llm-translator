@@ -7,6 +7,7 @@ import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPen
 import { identifyBitmap, verifyBitmap } from '../image-identity';
 import { cacheGeneration, cacheCurrent } from '../cache-generation';
 import { canvasPngBlob } from './encode';
+import { sendToBackground } from '../bg-rpc';
 
 // page identity: img = its original src (translated blobs alias via pages.get), canvas =
 // the manifest image URL when the reader embeds one (stable across canvas recreation),
@@ -277,11 +278,8 @@ async function screenshotPage(el: Element): Promise<ImageBitmap> {
     el.scrollIntoView({ block: 'center' });
     await new Promise(r => setTimeout(r, 350));
     const r = el.getBoundingClientRect();
-    const resp = await Promise.race([
-        chrome.runtime.sendMessage({ type: 'mt:screenshot' }) as
-            { ok: boolean; dataUrl?: string; error?: string } | Promise<{ ok: boolean; dataUrl?: string; error?: string }>,
-        new Promise<{ ok: boolean; dataUrl?: string; error?: string }>(res => setTimeout(() => res({ ok: false, error: 'screenshot timed out' }), 20_000)),
-    ]) as { ok: boolean; dataUrl?: string; error?: string };
+    const resp = await sendToBackground<{ ok: boolean; dataUrl?: string; error?: string }>(
+        { type: 'mt:screenshot' }, { timeoutMs: 20_000, label: 'screenshot' });
     if (!resp?.ok || !resp.dataUrl) throw new Error(resp?.error ?? 'screenshot failed');
     const blob = await (await fetch(resp.dataUrl)).blob();
     const probe = await createImageBitmap(blob);
@@ -312,10 +310,8 @@ export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap
     type FetchResp = { ok: boolean; b64?: string; error?: string };
     // the SW caps its own fetch at 60s, but a wedged/killed handler can leave this channel
     // pended — race a content-side cap so the job gets a catchable error, not a stuck pill
-    const via = (url: string): Promise<FetchResp> => Promise.race([
-        chrome.runtime.sendMessage({ type: 'mt:fetch-image', url }) as Promise<FetchResp>,
-        new Promise<FetchResp>(res => setTimeout(() => res({ ok: false, error: 'proxy fetch timed out (75s)' }), 75_000)),
-    ]);
+    const via = (url: string): Promise<FetchResp> => sendToBackground<FetchResp>(
+        { type: 'mt:fetch-image', url }, { timeoutMs: 75_000, label: 'proxy fetch' });
     let r = await via(srcUrl);
     // hotlink-guarded CDN (refuses the Referer-less worker fetch — 403, or 404 on MangaDex's
     // network): stamp the reader's origin as Referer via a DNR session rule, then retry ONCE —
@@ -328,11 +324,9 @@ export async function fetchBitmap(srcUrl: string): Promise<{ bitmap: ImageBitmap
         // Referer; a wrong/unparseable URL just falls back to the default set.
         let imgHost: string | undefined;
         try { imgHost = new URL(srcUrl).hostname; } catch { /* default set only */ }
-        const rule = await Promise.race([
-            chrome.runtime.sendMessage({ type: 'mt:hotlink-rule', origin, ...(imgHost ? { hosts: [imgHost] } : {}) }) as
-                Promise<{ ok: boolean; error?: string }>,
-            new Promise<{ ok: boolean; error?: string }>(res => setTimeout(() => res({ ok: false, error: 'hotlink rule timed out' }), 15_000)),
-        ]);
+        const rule = await sendToBackground<{ ok: boolean; error?: string }>(
+            { type: 'mt:hotlink-rule', origin, ...(imgHost ? { hosts: [imgHost] } : {}) },
+            { timeoutMs: 15_000, label: 'hotlink rule' });
         if (rule?.ok) r = await via(srcUrl);
     }
     if (!r?.ok || !r.b64) throw new Error(r?.error ?? `fetch failed: ${srcUrl.slice(0, 80)}`);

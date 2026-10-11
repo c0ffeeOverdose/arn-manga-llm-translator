@@ -1,7 +1,6 @@
 // Content script entry: pipeline is detect (iframe) → translate (background LLM) → inpaint → render.
 // This module only boots; orchestration lives in the sibling modules.
 
-import { ensureDetector } from './detection';
 import { setUi, ui, loadPipeline, loadTheme, applyTheme, onThemeChange } from './state';
 import { makePill, loadDebug, renderStatus } from './status-ui';
 import { applyOverlays } from './overlays';
@@ -37,7 +36,6 @@ async function main() {
     await loadPipeline();
     // first-page cost: load the bundled font during boot instead of inside the first render
     void ensureFont().catch(() => { /* first render retries (fontReady resets on failure) */ });
-    await ensureDetector().catch(e => console.error('[mt] detector init failed:', e));
     const t = setInterval(() => {
         if (document.body && !ui) {
             const pill = makePill();

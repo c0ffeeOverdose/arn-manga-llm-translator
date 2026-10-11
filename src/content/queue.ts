@@ -17,6 +17,7 @@ import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logEr
 import { applyOverlays } from './overlays';
 import { bookHas, chapterOwnsRequest } from './sweep';
 import type { PageTimer } from '../page-timing';
+import { disposePreparedJob } from './prepared-job';
 
 export const queue: Job[] = [];
 let running = false;
@@ -138,7 +139,7 @@ export function enqueue(ref: PageRef, force = false, auto = false): 'queued' | '
     const twin = queue.findIndex(j => j.key === key);
     if (twin !== -1) {
         if (!force) return 'dup';
-        queue.splice(twin, 1); // force replaces the queued twin (its prep resolves, dropped)
+        disposePreparedJob(queue.splice(twin, 1)[0]);
         removeActivity(key); // the twin's activity entry dies with the job (new prep re-creates it below)
     }
     // detection kicks off NOW — it overlaps whatever LLM call is in flight. Status goes to
@@ -163,7 +164,7 @@ export function dequeue(ref: PageRef): boolean {
     const key = pageKeyOf(ref);
     const i = queue.findIndex(j => j.key === key);
     if (i === -1) return false;
-    queue.splice(i, 1);
+    disposePreparedJob(queue.splice(i, 1)[0]);
     removeActivity(key); // its in-flight prep must not resurrect as a ghost
     return true;
 }
@@ -224,6 +225,7 @@ function pumpPaint(): void {
                 renderStatus();
                 void logError(err.message, err.hint, err.kind);
             } finally {
+                disposePreparedJob(job);
                 paintActive.delete(job.key);
                 releasePaint(job.key);
                 paintRunning--;
@@ -276,6 +278,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     // caught by the sweep's clearQueue, so the only stale case left is the <2s race — drop if
     // the chapter moved on (and remove the activity entry, or a dead "Reading page…" shows forever).
     if (chapterKey() !== contextChapter) {
+        disposePreparedJob(job);
         removeActivity(job.key);
         renderStatus();
         return;
@@ -287,6 +290,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     const endKeepalive = keepaliveOpen();
     const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
     let timing: PageTimer | undefined;
+    let handedToPaint = false;
     try {
         let prep;
         try {
@@ -316,6 +320,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if (prep.cached && bookHas(prep.hash)) {
             if (isDebug()) console.log('[mt] paint lane divert:', job.key.slice(-14));
             paintQueue.push(job);
+            handedToPaint = true;
             pumpPaint();
             return;
         }
@@ -368,6 +373,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if (!job.auto) makeToast(msg, 'error', err.hint);
         void logError(err.message, err.hint, err.kind);
     } finally {
+        if (!handedToPaint) disposePreparedJob(job);
         endKeepalive();
         activeRef = null;
         activeKey = null;
@@ -379,9 +385,9 @@ export async function runJob(allowSeam: boolean): Promise<void> {
 // runs to completion — aborting mid-LLM would corrupt the book (and the tokens are spent
 // already). Paint-lane backlog drops too (in-flight paints run out on their own).
 export function clearQueue(): void {
-    for (const j of queue) removeActivity(j.key);
+    for (const j of queue) { disposePreparedJob(j); removeActivity(j.key); }
     queue.length = 0;
-    for (const j of paintQueue) removeActivity(j.key);
+    for (const j of paintQueue) { disposePreparedJob(j); removeActivity(j.key); }
     paintQueue.length = 0;
 }
 
@@ -390,10 +396,10 @@ export function clearQueue(): void {
 export function dropAutoQueued(): number {
     let n = 0;
     for (let i = queue.length - 1; i >= 0; i--) {
-        if (queue[i].auto && !queue[i].force) { removeActivity(queue[i].key); queue.splice(i, 1); n++; }
+        if (queue[i].auto && !queue[i].force) { disposePreparedJob(queue[i]); removeActivity(queue[i].key); queue.splice(i, 1); n++; }
     }
     for (let i = paintQueue.length - 1; i >= 0; i--) {
-        if (paintQueue[i].auto && !paintQueue[i].force) { removeActivity(paintQueue[i].key); paintQueue.splice(i, 1); n++; }
+        if (paintQueue[i].auto && !paintQueue[i].force) { disposePreparedJob(paintQueue[i]); removeActivity(paintQueue[i].key); paintQueue.splice(i, 1); n++; }
     }
     return n;
 }

@@ -4,11 +4,12 @@
 import { unpackMask } from './page-cache';
 import { isDebug } from '../debug';
 import { fetchWorkerToken } from './worker-token';
-import { canvasJpegB64 } from './encode';
+import { canvasJpegB64, canvasPngBlob } from './encode';
 import type { PageTimer } from '../page-timing';
 import { sendToBackground } from '../bg-rpc';
 import { recordChapterLog } from '../chapter/log-store';
 import { chapterLogError, type ChapterTrace } from '../chapter/log';
+import { IdleResource } from './idle-resource';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -1147,10 +1148,29 @@ let ready = false;
 // per-iframe auth token (see worker.ts handshake) — the page shares our
 // postMessage origin, so without this any site JS could drive the worker
 let workerToken: string | null = null;
-const pending = new Map<number, { resolve: (r: DetectResult) => void; reject: (e: Error) => void }>();
+const pending = new Map<number, { resolve: (r: DetectResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 let nextId = 1;
-const waiters: { resolve: () => void; reject: (e: Error) => void }[] = [];
+const waiters: { resolve: () => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }[] = [];
 let listenerInstalled = false;
+const inferenceHost = new IdleResource(() => resetInferenceHost(new Error('inference worker released')));
+
+function resetInferenceHost(error: Error): void {
+    iframe?.remove();
+    iframe = null;
+    ready = false;
+    workerToken = null;
+    for (const w of waiters.splice(0)) { clearTimeout(w.timer); w.reject(error); }
+    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(error); }
+    pending.clear();
+}
+
+export function releaseIdleDetector(): void { inferenceHost.release(); }
+
+async function usingInference<T>(work: () => Promise<T>): Promise<T> {
+    const release = inferenceHost.retain();
+    try { return await work(); }
+    finally { release(); }
+}
 
 // the iframe lives in the PAGE's DOM, so the page can remove it (dead contentWindow → RPCs
 // time out forever) or swap in a srcdoc document that passes a bare source check. Two guards:
@@ -1158,7 +1178,7 @@ let listenerInstalled = false;
 // the next call recreates it instead of dying permanently.
 function iframeAlive(): boolean {
     if (iframe?.isConnected && iframe.contentWindow) return true;
-    if (iframe && !iframe.isConnected) { iframe = null; ready = false; workerToken = null; }
+    if (iframe && !iframe.isConnected) resetInferenceHost(new Error('inference iframe disconnected'));
     return false;
 }
 
@@ -1181,10 +1201,11 @@ function installListener(): void {
             if (iframe !== fr || !fr.isConnected) return; // stale generation
             if (workerToken === null) workerToken = t;
             ready = true;
-            for (const w of waiters.splice(0)) w.resolve();
+            for (const w of waiters.splice(0)) { clearTimeout(w.timer); w.resolve(); }
         } else if (ev.data?.type === 'mt:detect-result' || ev.data?.type === 'mt:rpc-result') {
             const p = pending.get(ev.data.id);
             pending.delete(ev.data.id);
+            if (p) clearTimeout(p.timer);
             // Firefox delivers worker replies that carried a transfer list as LIVE Xray wrappers,
             // not clones. Materialize our own realm's copy at the boundary so every downstream
             // read AND write is same-realm. On Chromium the payload is already plain — one extra
@@ -1210,18 +1231,12 @@ function ensureIframe(): Promise<void> {
             iframe.style.cssText = 'position:fixed;bottom:0;left:0;width:1px;height:1px;border:0;opacity:0;pointer-events:none';
             document.documentElement.append(iframe);
         }
-        waiters.push({ resolve, reject });
-        setTimeout(() => {
+        const timer = setTimeout(() => {
             const i = waiters.findIndex(w => w.resolve === resolve);
             if (i < 0) return;
-            waiters.splice(i, 1);
-            // a timed-out iframe is unusable but still in the DOM: leaving it made
-            // every later ensureIframe() short-circuit on the dead element and the
-            // whole session detect-less. Tear it down so the next call rebuilds.
-            if (iframe) { try { iframe.remove(); } catch { /* already gone */ } iframe = null; }
-            ready = false;
-            reject(new Error('detector iframe timeout'));
+            resetInferenceHost(new Error('detector iframe timeout'));
         }, 30000);
+        waiters.push({ resolve, reject, timer });
     });
 }
 
@@ -1229,12 +1244,15 @@ function ensureIframe(): Promise<void> {
 // leaves the token null and every inference call in this document failing until a reload.
 // Rebuild the iframe so a fresh worker registers again. One rebuild per call; callers bound
 // how many times they try.
+let healing: Promise<boolean> | null = null;
 async function healToken(): Promise<boolean> {
     if (workerToken !== null) return true;
-    if (iframe) { try { iframe.remove(); } catch { /* already gone */ } iframe = null; }
-    ready = false;
-    try { await ensureIframe(); } catch { return false; }
-    return workerToken !== null;
+    if (!healing) healing = (async () => {
+        resetInferenceHost(new Error('inference worker authentication failed'));
+        try { await ensureIframe(); } catch { return false; }
+        return workerToken !== null;
+    })().finally(() => { healing = null; });
+    return healing;
 }
 
 // pipeline stage for the status pill's stepper (typed so phases never ride inside message
@@ -1243,8 +1261,10 @@ export type MtStage = 'read' | 'detect' | 'ocr' | 'llm' | 'render';
 export type MtOnStatus = (s: string, stage?: MtStage) => void;
 
 export async function ensureDetector(onStatus?: MtOnStatus): Promise<void> {
-    onStatus?.('Starting inference worker…', 'detect');
-    await ensureIframe();
+    return usingInference(async () => {
+        onStatus?.('Starting inference worker…', 'detect');
+        await ensureIframe();
+    });
 }
 
 // Full-page canvas encodes are the heaviest main-thread work in a page job. Sweep/paint jobs
@@ -1263,67 +1283,53 @@ export async function detect(
     thresholds?: { confThr?: number; minSize?: number; forceWasm?: boolean; lo?: boolean },
     attempt = 0, // page can tear the iframe down on every mt:ready — cap rebuilds
 ): Promise<DetectResult> {
-    // alive-check BEFORE the PNG encode: a hostile remove-loop must not earn a full-page
-    // re-encode per cycle
-    if (!iframeAlive()) await ensureIframe();
-    if (workerToken === null) {
-        // A lost handshake registration used to fail this page (and every later attempt in the
-        // document) until a reload. Rebuild the worker once per attempt; a fresh worker
-        // registers again.
-        if (attempt >= 2 || !(await healToken())) throw new Error('worker auth token missing — reload the page');
-        return detect(img, onStatus, thresholds, attempt + 1);
-    }
-    const w = 'naturalWidth' in img ? img.naturalWidth : img.width;
-    const h = 'naturalHeight' in img ? img.naturalHeight : img.height;
-    if (w < 10 || h < 10) throw new Error(`image too small: ${w}x${h}`);
-    const png = await withEncodeLock(async () => {
-        const c = new OffscreenCanvas(w, h);
-        c.getContext('2d')!.drawImage(img, 0, 0);
-        const blob = await c.convertToBlob({ type: 'image/png' });
-        return blob.arrayBuffer();
-    });
+    return usingInference(async () => {
+        // alive-check BEFORE the PNG encode: a hostile remove-loop must not earn a full-page
+        // re-encode per cycle
+        if (!iframeAlive() || !ready) await ensureIframe();
+        if (workerToken === null) {
+            // A lost handshake registration used to fail this page (and every later attempt in the
+            // document) until a reload. Rebuild the worker once per attempt; a fresh worker
+            // registers again.
+            if (attempt >= 2 || !(await healToken())) throw new Error('worker auth token missing — reload the page');
+            return detect(img, onStatus, thresholds, attempt + 1);
+        }
+        const w = 'naturalWidth' in img ? img.naturalWidth : img.width;
+        const h = 'naturalHeight' in img ? img.naturalHeight : img.height;
+        if (w < 10 || h < 10) throw new Error(`image too small: ${w}x${h}`);
+        const png = await withEncodeLock(async () => {
+            const c = new OffscreenCanvas(w, h);
+            c.getContext('2d')!.drawImage(img, 0, 0);
+            const blob = await c.convertToBlob({ type: 'image/png' });
+            return blob.arrayBuffer();
+        });
 
-    onStatus?.('Detecting text…', 'detect');
-    if (!iframeAlive()) {
-        if (attempt >= 2) throw new Error('inference iframe kept being torn down — the page may be hostile');
-        return detect(img, onStatus, thresholds, attempt + 1); // rebuild + bounded retry
-    }
-    const cw = iframe!.contentWindow;
-    if (!cw) throw new Error('inference iframe unavailable');
-    const id = nextId++;
-    const p = new Promise<DetectResult>((resolve, reject) => {
-        pending.set(id, { resolve, reject });
-        setTimeout(() => {
-            if (pending.has(id)) {
-                pending.delete(id);
-                reject(new Error('detect timeout'));
-            }
-        }, 180000);
+        onStatus?.('Detecting text…', 'detect');
+        if (!iframeAlive()) {
+            if (attempt >= 2) throw new Error('inference iframe kept being torn down — the page may be hostile');
+            return detect(img, onStatus, thresholds, attempt + 1); // rebuild + bounded retry
+        }
+        return await iframeRpc(
+            { type: 'mt:detect', png, confThr: thresholds?.confThr, minSize: thresholds?.minSize, forceWasm: thresholds?.forceWasm === true, lo: thresholds?.lo === true },
+            [png],
+        ) as DetectResult;
     });
-    cw.postMessage(
-        { type: 'mt:detect', id, png, confThr: thresholds?.confThr, minSize: thresholds?.minSize, forceWasm: thresholds?.forceWasm === true, lo: thresholds?.lo === true, token: workerToken },
-        '*', [png],
-    );
-    return p;
 }
 
 // ---- OCR: Tesseract in the same iframe (lazy-loaded from CDN by the worker) ----
 
 export async function ocrLangsInstalled(langs: string[]): Promise<string[]> {
-    await ensureIframe();
     const resp = await iframeRpc({ type: 'mt:ocr-status', langs }) as { installed?: string[] };
     return resp?.installed ?? [];
 }
 
 export async function ocrInWorker(png: ArrayBuffer, langs: string[]): Promise<string> {
-    await ensureIframe();
     const resp = await iframeRpc({ type: 'mt:ocr', png, langs }, [png]) as { ok: boolean; text?: string; error?: string };
     if (!resp?.ok) throw new Error(resp?.error ?? 'OCR failed');
     return (resp.text ?? '').replace(/\s+/g, ' ').trim();
 }
 
 export async function baberuInstalled(): Promise<boolean> {
-    await ensureIframe();
     const resp = await iframeRpc({ type: 'mt:baberu-status' }) as { installed?: boolean };
     return !!resp?.installed;
 }
@@ -1331,7 +1337,6 @@ export async function baberuInstalled(): Promise<boolean> {
 // Baberu reads vertical text and dirty backgrounds natively — no rotation,
 // no binarization, tighter padding than Tesseract needs
 export async function baberuOcr(png: ArrayBuffer, opts?: { lo?: boolean }): Promise<{ text: string; lockWaitMs: number }> {
-    await ensureIframe();
     const resp = await iframeRpc({ type: 'mt:baberu-ocr', png, lo: opts?.lo === true }, [png]) as { ok: boolean; text?: string; lockWait?: number; error?: string };
     if (!resp?.ok) throw new Error(resp?.error ?? 'Baberu OCR failed');
     return { text: (resp.text ?? '').replace(/\s+/g, ' ').trim(), lockWaitMs: resp.lockWait ?? 0 };
@@ -1348,15 +1353,17 @@ export interface PanelDetectResult {
 }
 
 export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_THR): Promise<PanelDetectResult> {
-    await ensureIframe();
-    const c = new OffscreenCanvas(img.width, img.height);
-    c.getContext('2d')!.drawImage(img, 0, 0);
-    const blob = await c.convertToBlob({ type: 'image/png' });
-    const png = await blob.arrayBuffer();
-    const resp = await iframeRpc({ type: 'mt:panels', png, thr }, [png]) as
-        { ok: boolean; panels?: DetBox[]; dropped?: DetBox[]; ms?: number; lockWait?: number; error?: string };
-    if (!resp?.ok) throw new Error(resp?.error ?? 'panel detection failed');
-    return { panels: resp.panels ?? [], dropped: resp.dropped ?? [], inferMs: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0 };
+    return usingInference(async () => {
+        await ensureIframe();
+        const c = new OffscreenCanvas(img.width, img.height);
+        c.getContext('2d')!.drawImage(img, 0, 0);
+        const blob = await c.convertToBlob({ type: 'image/png' });
+        const png = await blob.arrayBuffer();
+        const resp = await iframeRpc({ type: 'mt:panels', png, thr }, [png]) as
+            { ok: boolean; panels?: DetBox[]; dropped?: DetBox[]; ms?: number; lockWait?: number; error?: string };
+        if (!resp?.ok) throw new Error(resp?.error ?? 'panel detection failed');
+        return { panels: resp.panels ?? [], dropped: resp.dropped ?? [], inferMs: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0 };
+    });
 }
 
 // ---- AI text cleanup (manga-LaMa in the iframe worker, WebGPU only) -------
@@ -1370,23 +1377,26 @@ export async function inpaintPage(
     mask: { width: number; height: number; data: ArrayBuffer | Uint8Array }, padRatio = 0.5,
     opts?: { lo?: boolean; noDownload?: boolean },
 ): Promise<{ patches: InpaintPatch[]; windows: number; ms: number; lockWaitMs: number; encodeMs: number }> {
-    await ensureIframe();
-    const tEnc = performance.now();
-    const png = await withEncodeLock(async () => {
-        const c = new OffscreenCanvas(bitmap.width, bitmap.height);
-        c.getContext('2d')!.drawImage(bitmap, 0, 0);
-        return (await c.convertToBlob({ type: 'image/png' })).arrayBuffer();
+    return usingInference(async () => {
+        await ensureIframe();
+        const tEnc = performance.now();
+        const png = await withEncodeLock(async () => {
+            const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+            c.getContext('2d')!.drawImage(bitmap, 0, 0);
+            // sync toDataURL encoder: convertToBlob is idle-scheduled and stalls ~1s+ per call
+            return await (await canvasPngBlob(c)).arrayBuffer();
+        });
+        const encodeMs = Math.round(performance.now() - tEnc);
+        const resp = await iframeRpc({
+            type: 'mt:inpaint', png,
+            mask: new Uint8Array(mask.data).slice(), // copy: the caller still needs det.mask (fill path, debug view, cache)
+            boxes: boxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 })),
+            padRatio, lo: opts?.lo === true, noDownload: opts?.noDownload === true,
+        }, [png]) as { ok: boolean; patches?: InpaintPatch[]; windows?: number; ms?: number; lockWait?: number; error?: string };
+        if (!resp?.ok) throw new Error(resp?.error ?? 'inpaint failed');
+        const patches = (resp.patches ?? []).map(p => ({ i: p.i, x1: +p.x1, y1: +p.y1, x2: +p.x2, y2: +p.y2, png: p.png as ArrayBuffer }));
+        return { patches, windows: resp.windows ?? patches.length, ms: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0, encodeMs };
     });
-    const encodeMs = Math.round(performance.now() - tEnc);
-    const resp = await iframeRpc({
-        type: 'mt:inpaint', png,
-        mask: new Uint8Array(mask.data).slice(), // copy: the caller still needs det.mask (fill path, debug view, cache)
-        boxes: boxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 })),
-        padRatio, lo: opts?.lo === true, noDownload: opts?.noDownload === true,
-    }, [png]) as { ok: boolean; patches?: InpaintPatch[]; windows?: number; ms?: number; lockWait?: number; error?: string };
-    if (!resp?.ok) throw new Error(resp?.error ?? 'inpaint failed');
-    const patches = (resp.patches ?? []).map(p => ({ i: p.i, x1: +p.x1, y1: +p.y1, x2: +p.x2, y2: +p.y2, png: p.png as ArrayBuffer }));
-    return { patches, windows: resp.windows ?? patches.length, ms: resp.ms ?? 0, lockWaitMs: resp.lockWait ?? 0, encodeMs };
 }
 
 // AI cleanup on the user's own endpoint (cloud engine): the client sends the page as base64
@@ -1635,22 +1645,27 @@ function b64buf(s: string): ArrayBuffer {
 
 // generic request/response over the iframe postMessage channel
 async function iframeRpc(msg: object, transfer?: Transferable[]): Promise<unknown> {
-    // null token = handshake failed — the worker would silently drop the RPC and we'd wait out
-    // the full 180s per call. Rebuild once (a fresh worker re-registers), then fail fast.
-    if (workerToken === null && !(await healToken())) throw new Error('worker auth token missing — reload the page');
-    if (!iframeAlive()) await ensureIframe(); // page tore the iframe down — rebuild
-    if (workerToken === null && !(await healToken())) throw new Error('worker auth token missing — reload the page');
-    const cw = iframe?.contentWindow;
-    if (!cw) throw new Error('inference iframe unavailable'); // torn down again mid-await
-    const id = nextId++;
-    return new Promise((resolve, reject) => {
-        pending.set(id, { resolve: resolve as (r: DetectResult) => void, reject });
-        setTimeout(() => {
-            if (pending.has(id)) {
+    return usingInference(async () => {
+        // null token = handshake failed — the worker would silently drop the RPC and we'd wait out
+        // the full 180s per call. Rebuild once (a fresh worker re-registers), then fail fast.
+        if (!iframeAlive() || !ready) await ensureIframe();
+        if (workerToken === null && !(await healToken())) throw new Error('worker auth token missing — reload the page');
+        const cw = iframe?.contentWindow;
+        if (!cw) throw new Error('inference iframe unavailable'); // torn down again mid-await
+        const id = nextId++;
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                if (pending.has(id)) {
+                    resetInferenceHost(new Error('iframe rpc timeout'));
+                }
+            }, 180000);
+            pending.set(id, { resolve: resolve as (r: DetectResult) => void, reject, timer });
+            try { cw.postMessage({ ...msg, id, token: workerToken }, '*', transfer); }
+            catch (e) {
+                clearTimeout(timer);
                 pending.delete(id);
-                reject(new Error('iframe rpc timeout'));
+                reject(e);
             }
-        }, 180000);
-        cw.postMessage({ ...msg, id, token: workerToken }, '*', transfer);
+        });
     });
 }

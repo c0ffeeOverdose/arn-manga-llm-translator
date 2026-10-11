@@ -51,7 +51,9 @@ test('a deadline revokes the lease before reporting timeout, exactly once', asyn
 test('a timed-out detector iframe is torn down so the next call can rebuild', () => {
   const fn = detection.slice(detection.indexOf('function ensureIframe'));
   const timeout = fn.slice(fn.indexOf('setTimeout('));
-  assert.match(timeout, /iframe\.remove\(\)/, 'the dead iframe must be removed');
-  assert.match(timeout, /iframe = null/, 'the module must forget the dead element');
-  assert.match(timeout, /ready = false/, 'readiness must be cleared so ensureIframe rebuilds');
+  assert.match(timeout, /resetInferenceHost\(new Error\('detector iframe timeout'\)\)/);
+  const reset = detection.slice(detection.indexOf('function resetInferenceHost'), detection.indexOf('export function releaseIdleDetector'));
+  assert.match(reset, /iframe\?\.remove\(\)/, 'the dead iframe must be removed');
+  assert.match(reset, /iframe = null/, 'the module must forget the dead element');
+  assert.match(reset, /ready = false/, 'readiness must be cleared so ensureIframe rebuilds');
 });

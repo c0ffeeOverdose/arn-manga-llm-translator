@@ -4,18 +4,20 @@
 import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea, effBoxesForAreas, growDarkArea } from './render';
 import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
-import { cacheKey, pageKey, PAGE_KEY_GEN, settingsFingerprint, cachePut, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN, type CachedPage } from './page-cache';
+import { cacheKey, pageKey, PAGE_KEY_GEN, settingsFingerprint, cachePutMany, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN, type CachedPage } from './page-cache';
 import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus, type DetectResult } from './detection';
 import { canvasPngBlob } from './encode';
 import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, loadContext, type PageRef, type PageState } from './state';
+import { retainDetection } from './retained-detection';
 import { stateFor } from './state';
-import { paintRegions, paintExtras, type Prep, type PaintPatch } from './pipeline';
+import { paintRegions, paintExtras, type Prep } from './pipeline';
+import { decodePaintPatches } from './paint-patches';
 import { eraseBoxesAndMask, erasePlan, computeAiPatches, type AiPatches } from './inpaint';
-import { sweepPageOrder } from './sweep';
+import { sweepPageOrder, idlePageOrder } from './sweep';
 import { inpaintMode } from '../llm/pipeline-settings';
-import { ownCopyNeeded, ownOriginalUrl } from './page-io';
+import { ownCopyNeeded, ownOriginalUrl, getPages } from './page-io';
 import { translateRegions, ensurePageDebugViews } from './ocr';
-import { rewindContextBefore, replayPagesAfter } from './queue';
+import { rewindContextBefore, replayPagesAfter, viewportOverlap } from './queue';
 import { bookHas, bookAdd, bookDrop } from './sweep';
 import { starveNotice } from './status-ui';
 import { saveContext } from './state';
@@ -62,7 +64,7 @@ function dumpAreas(
 // ordered commit still folds later (its !bookHas guard makes the double-visit
 // harmless). The book snapshot is skipped too (context is mid-chapter at paint time).
 export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean,
-    opts: { paintOnly?: boolean; detached?: boolean } = {}): Promise<PageState> {
+    opts: { paintOnly?: boolean; detached?: boolean; warm?: Promise<AiPatches | null>; onPatches?: (patches: CachedPage['patches']) => void } = {}): Promise<PageState> {
     const timing = prep.timing ?? new PageTimer();
     const notify = onStatus;
     onStatus = (s, stage) => { timing.setStage(s); notify(s, stage); };
@@ -113,7 +115,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
             {
                 progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled,
                 fresh: force,
-                cacheEpoch,
+                cacheEpoch, cacheFingerprint: prep.fp,
                 timing,
                 onStarve: starveNotice,
                 // AI cleanup warm: starts the moment OCR ends (the infer lock
@@ -159,7 +161,9 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
                 if (aiMode === 'local') {
                     // Warm patches cover every box with no keep clearing — usable only
                     // when no keep box sits inside an erase window. Patch `i` indexes det.boxes.
-                    const warm: AiPatches | null = aiWarm ? await (aiWarm as Promise<AiPatches | null>) : null;
+                    // The chapter runner hands its pre-LLM warm through opts.warm.
+                    const warm: AiPatches | null = aiWarm ? await (aiWarm as Promise<AiPatches | null>)
+                        : opts.warm ? await opts.warm : null;
                     let r: AiPatches | null = null;
                     if (warm) {
                         const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
@@ -227,35 +231,18 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         }
     }
     timing.add('cleanup', performance.now() - tCleanup);
-    let paintPatches: (PaintPatch & { url: string })[] | null = null;
-    if (aiPatches?.length) {
-        // img.decode() rides the standard image pipeline; createImageBitmap(Blob) stalls
-        // ~0.1-0.3s per patch on some Android builds (see LESSONS.md). Fallback keeps the
-        // old path for engines/CSP where a blob: image cannot load.
-        paintPatches = await timing.measureAsync('patchDecode', () => Promise.all(aiPatches!.map(async p => {
-            const url = URL.createObjectURL(new Blob([p.png], { type: 'image/png' }));
-            const box = { x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2 };
-            // img.decode() rides the standard image pipeline; createImageBitmap(Blob) stalls
-            // ~0.1-0.3s per patch on some Android builds (see LESSONS.md). The decode is
-            // raced: a decode that never settles must not hold a page (no other timeout
-            // covers this await in the offscreen chapter runner).
-            const decoded = await Promise.race([
-                (async () => { const img = new Image(); img.src = url; await img.decode(); return img; })().catch(() => null),
-                new Promise<null>(r => setTimeout(() => r(null), 2000)),
-            ]);
-            if (decoded) return { ...box, bmp: decoded as CanvasImageSource, url };
-            const bmp = await createImageBitmap(new Blob([p.png], { type: 'image/png' }));
-            return { ...box, bmp, url };
-        })));
-    }
-
     await timing.measureAsync('font', () => ensureFont());
-    const frame = timing.measure('renderRead', () => ctx.getImageData(0, 0, canvas.width, canvas.height));
+    const paintPatches = aiPatches?.length
+        ? await timing.measureAsync('patchDecode', () => decodePaintPatches(aiPatches!)) : null;
 
-    onStatus('Rendering…', 'render');
+    let layouts: ReturnType<typeof paintRegions>;
+    let frame: ImageData;
     const tRender0 = performance.now();
-    const layouts = timing.measure('paint', () => paintRegions(canvas, frame, det, outputs, paintPatches));
-    for (const p of paintPatches ?? []) URL.revokeObjectURL(p.url);
+    try {
+        frame = timing.measure('renderRead', () => ctx.getImageData(0, 0, canvas.width, canvas.height));
+        onStatus('Rendering…', 'render');
+        layouts = timing.measure('paint', () => paintRegions(canvas, frame, det, outputs, paintPatches));
+    } finally { for (const patch of paintPatches ?? []) patch.dispose(); }
 
     timing.measure('paint', () => paintExtras(canvas, frame, det, extras));
     const renderMs = Math.round(performance.now() - tRender0); // paint only (excludes PNG encode + overlays)
@@ -321,7 +308,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         cacheEpoch,
         orig: srcUrl,
         translated: URL.createObjectURL(blob),
-        det,
+        det: retainDetection(det),
         outputs,
         mentions,
         bookBefore,
@@ -334,7 +321,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         translatedBmp: ref.kind === 'canvas' ? canvas.transferToImageBitmap() : undefined,
     };
     // Execution hosts return a rendered artifact without touching reader/book state.
-    if (opts.detached) return state;
+    if (opts.detached) { opts.onPatches?.(aiPatches ?? undefined); return state; }
     // blob-origin readers: keep an extension-owned copy now — once we swap in
     // the translated blob the reader's URL may be dead (see ownOriginalUrl).
     if (ownCopyNeeded(srcUrl, bitmap.width, bitmap.height)) {
@@ -358,41 +345,24 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         if (existing.debugOrig) URL.revokeObjectURL(existing.debugOrig);
     }
     regPage(state);
-    // store fresh translations for the next visit (force overwrites).
-    // Fire-and-forget — a slow IDB write never blocks the sweep.
-    // Never cache a void result (boxes but zero outputs): it would sit
-    // "translated" with nothing on it until force.
-    // The entry is written under BOTH identities: bytes (its crops belong to these pixels)
-    // and page slot (so a chapter run, which addresses pages by slot, can reuse it).
-    const cacheKeys = (): string[] => {
-        const keys = [cacheKey(chapterKey(), prep.hash)];
-        const order = sweepPageOrder(prep.srcUrl);
-        if (order != null) keys.push(pageKey(chapterKey(), order));
-        return keys;
-    };
+    // Only a sole visible page may inherit the URL's slot; spreads need manifest or byte identity.
+    const soleVisible = viewportOverlap(ref) > 0 && getPages().filter(page => viewportOverlap(page) > 0).length === 1;
+    const order = sweepPageOrder(prep.srcUrl) ?? (soleVisible ? idlePageOrder() : null);
+    const slotKey = order != null ? pageKey(chapterKey(), order) : undefined;
+    const cacheKeys = (): string[] => [cacheKey(chapterKey(), prep.hash), ...(slotKey ? [slotKey] : [])];
     const entryBase = {
-        fp: settingsFingerprint(pipeline),
+        fp: prep.fp ?? settingsFingerprint(pipeline),
         w: bitmap.width, h: bitmap.height,
-        boxes: det.boxes, panels: det.panels ?? [],
-        outputs, extras, mentions,
-        mask: packMask(det.mask),
-        splitGen: det.splitGen ?? 0,
-        ep: det.ep,
+        boxes: det.boxes, panels: det.panels ?? [], outputs, extras, mentions,
+        mask: packMask(det.mask), splitGen: det.splitGen ?? 0, ep: det.ep, sourceHash: prep.hash,
+        ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
     };
-    // Page-slot rows carry page-level pixel evidence (idSig/idGray) so an idle reopen — no live
-    // run, only the reader's own /N — can verify the page before reusing; without it the prep
-    // gate must refuse the slot, because dims alone cannot reject a wrong page.
     const writeCache = (extra: Partial<CachedPage>): void => {
-        const order = sweepPageOrder(prep.srcUrl);
-        const slotKey = order != null ? pageKey(chapterKey(), order) : undefined;
-        const identityFields = slotKey && state.image ? { idSig: signatureOf(state.image), idGray: state.image.gray } : null;
-        for (const key of cacheKeys()) {
-            void cachePut({
-                ...entryBase, ...extra, key,
-                ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
-                ...(key === slotKey ? identityFields : null),
-            }, pipeline.cacheMax, cacheEpoch);
-        }
+        if (prep.fp && prep.fp !== settingsFingerprint(pipeline)) return;
+        const rows = cacheKeys().map(key => ({ ...entryBase, ...extra, key,
+            ...(key === slotKey ? { patches: undefined, patchesGen: undefined,
+                idSig: state.image && signatureOf(state.image), idGray: state.image?.gray, idRegions: state.image?.regions } : null) }));
+        void cachePutMany(rows, pipeline.cacheMax, cacheEpoch);
     };
     if (!prep.cached && pipeline.cacheEnabled && (det.boxes.length === 0 || outputs.length > 0)) {
         if (aiPatches?.length) savedPatches = true;

@@ -6,7 +6,7 @@ import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings 
 import { fontStackFor, setRenderTuning } from './render';
 import { sessGet } from '../storage-session';
 import { normalizeChapterKey, type EpisodeManifest, pickSeriesLink, pickStoryScope } from './page-cache';
-import type { DetectResult } from './detection';
+import type { RetainedDetection } from './retained-detection';
 import type { ImageIdentity } from '../image-identity';
 import { cacheGeneration, cacheCurrent } from '../cache-generation';
 import { sendToBackground } from '../bg-rpc';
@@ -22,7 +22,7 @@ export interface PageState {
     origOwn?: string;
     debug?: string; // full-res boxes+badges+conf view on the TRANSLATED image
     debugOrig?: string; // same boxes on the ORIGINAL (Show original keeps its debug)
-    det?: DetectResult;
+    det?: RetainedDetection;
     outputs?: RegionOutput[];
     mentions?: Mention[]; // page-level named people (folded into the book with outputs)
     // book/pairs exactly as they were BEFORE this page folded. rewindContextBefore restores

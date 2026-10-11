@@ -1,9 +1,10 @@
+import { verifyCachedIdentity } from '../cache/identity';
 import { configureChapterHost, loadPipeline, setShareContext } from '../content/state';
 import { fetchBitmap, unscrambleTiles } from '../content/page-io';
 import { resolveHeadlessDet } from '../content/pipeline';
 import { translateRegions, abortLiveRpcs } from '../content/ocr';
 import { renderPage } from '../content/render-page';
-import { cacheGet, cachePut, cacheKey, pageKey, pageEntryDecision, PAGE_KEY_GEN, settingsFingerprint, pageHashFromBitmap, packMask, isResumable, detFromPartial, detFromCacheEntry, cloudSplitFresh } from '../content/page-cache';
+import { cacheGet, cachePutMany, cacheDelete, cacheKey, pageKey, selectCachedPage, detFromCacheEntry, cacheEntryFresh, cacheMissReason, PAGE_KEY_GEN, INPAINT_PATCH_GEN, settingsFingerprint, pageHashFromBitmap, packMask } from '../content/page-cache';
 import { keepaliveOpen } from '../content/queue';
 import { initDebug, isDebug } from '../debug';
 import { chapterMessage, providerMessage, fetchSourceWithAlternate, type ChapterPage, type ChapterProgress, type Contribution, type PagePhase } from './model';
@@ -11,7 +12,9 @@ import { readRecord, writeRecord } from './store';
 import { artifactKey, chapterSignature, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
 import { identifyBitmap, signatureOf } from '../image-identity';
 import type { ContextState } from '../llm/core';
-import { shiftDetectionBoxY, type DetectResult, type DetBox } from '../content/detection';
+import { DEFAULT_PIPELINE_SETTINGS, inpaintMode } from '../llm/pipeline-settings';
+import { releaseIdleDetector, shiftDetectionBoxY, type DetectResult, type DetBox } from '../content/detection';
+import { computeAiPatches, type AiPatches } from '../content/inpaint';
 import type { TranslateOutcome } from '../content/ocr';
 import type { CachedPage } from '../content/page-cache';
 import type { ImageIdentity } from '../image-identity';
@@ -241,6 +244,9 @@ interface Prepared {
     out?: TranslationResult;         // cached translation: commit without an LLM call
     patches?: CachedPage['patches']; // reusable AI-cleanup patches (cached path only)
     patchesGen?: number;
+    // AI cleanup started when the group's OCR ended (LLM request in flight) — commit
+    // reuses it so the render never pays the model on the user's critical path.
+    warm?: Promise<AiPatches | null>;
 }
 
 // Everything before the LLM call: pixels, resume/cache checks, detection, cache decision.
@@ -285,37 +291,33 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
         if (force) {
             // Retranslation is "the same page again": fresh detection and a fresh answer, but
             // overlapping pages keep their contributions so the book stays in reading order.
-            const { cacheDelete } = await import('../content/page-cache');
             await cacheDelete(bytesKey, cacheEpoch);
             await cacheDelete(identityKey, cacheEpoch);
         }
-        let resolved;
+        const fp = settingsFingerprint(config.pipeline);
+        const byBytes = await cacheGet(bytesKey);
+        const byIdentity = config.pipeline.cacheEnabled && !cacheEntryFresh(byBytes, fp, bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud')
+            ? await cacheGet(identityKey) : undefined;
+        const selected = !force && config.pipeline.cacheEnabled ? selectCachedPage({ bytes: byBytes, identity: byIdentity,
+            hash, fp, w: bitmap.width, h: bitmap.height, isCloud: config.pipeline.inferEngine === 'cloud',
+            verifyIdentity: row => verifyCachedIdentity(bitmap!, row) }) : null;
+        let resolved: Awaited<ReturnType<typeof resolveHeadlessDet>>;
         try {
-            // Resume first: a detection checkpoint that already landed must not be re-paid,
-            // and it is what carries cloud OCR texts into the translate stage.
-            const hit = await cacheGet(bytesKey);
-            if (!force && isResumable(hit, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud')) {
-                recordChapterLog(trace([page.order + 1]), { kind: 'cache-hit', reason: 'checkpoint', cached: true, splitGen: hit.splitGen });
-                resolved = { det: detFromPartial(hit!, bitmap.width, bitmap.height), resumed: true };
-            } else {
-                const fp = settingsFingerprint(config.pipeline);
-                const reason = !config.pipeline.cacheEnabled ? 'disabled' : !hit ? 'absent' : hit.fp !== fp ? 'fingerprint'
-                    : hit.w !== bitmap.width || hit.h !== bitmap.height ? 'dims' : !hit.mask ? 'mask'
-                    : !cloudSplitFresh(hit, config.pipeline.inferEngine === 'cloud') ? 'splitgen' : hit.partial ? 'partial' : undefined;
-                if (reason) recordChapterLog(trace([page.order + 1]), { kind: 'cache-miss', reason, splitGen: hit?.splitGen, cached: false });
+            if (selected) resolved = { det: null, resumed: false, cached: selected.entry };
+            else {
                 step('detect', [page.order + 1]);
                 resolved = await resolveHeadlessDet(bitmap, hash, pageStatus([page.order + 1], valid), cacheEpoch, trace([page.order + 1]));
+                if (resolved.resumed) recordChapterLog(trace([page.order + 1]), { kind: 'cache-hit', reason: 'checkpoint', cached: true });
+                else if (resolved.det) recordChapterLog(trace([page.order + 1]), { kind: 'cache-miss',
+                    reason: !config.pipeline.cacheEnabled ? 'disabled' : cacheMissReason(byBytes, fp, bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud'),
+                    cached: false });
             }
         } catch (e) {
             note(`detect p${page.order} ${(e as Error).message}`.slice(0, 160));
             throw e;
         }
         if (!valid()) { bitmap.close(); return 'skip'; }
-        const byIdentity = await cacheGet(identityKey);
-        const decision = pageEntryDecision(byIdentity, hash, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height);
-        const cached = !resolved.det
-            ? (decision.usable ? byIdentity : await cacheGet(bytesKey))
-            : undefined;
+        const cached = resolved.cached;
         const boxes = resolved.det?.boxes.length ?? cached?.boxes.length ?? 0;
         // A page with no detected text has nothing to translate or paint; do not cache or fold it.
         if (!boxes) {
@@ -326,7 +328,7 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
             bitmap.close();
             return 'done';
         }
-        const det = resolved.det ?? (cached && detFromCacheEntry(cached, settingsFingerprint(config.pipeline), bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud'));
+        const det = resolved.det ?? selected?.det ?? detFromCacheEntry(cached, fp, bitmap.width, bitmap.height, config.pipeline.inferEngine === 'cloud');
         if (!det) throw new Error('Saved page data is incomplete');
         recordChapterLog(trace([page.order + 1]), { kind: cached ? 'cache-hit' : 'stage', stage: 'translationPrep',
             ...(cached ? { reason: 'full-cache' as const } : {}), boxes: det.boxes.length, splitGen: det.splitGen, cached: !!cached });
@@ -339,9 +341,9 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
             // AI-cleanup crops are erased pixels, so they are reusable only when the bytes
             // match: a translation keyed by page identity may come from a different encoder,
             // so mismatched-bytes patches are dropped and re-derived from these pixels.
-            const reusable = cached === byIdentity && !decision.dropPatches ? byIdentity?.patches : undefined;
+            const reusable = cached.patches;
             return { page, item, bitmap, hash, det, identity, bytesKey, identityKey, force,
-                out: cached, patches: reusable, patchesGen: reusable?.length ? byIdentity?.patchesGen : undefined };
+                out: cached, patches: reusable, patchesGen: reusable?.length ? cached.patchesGen : undefined };
         }
         return { page, item, bitmap, hash, det, identity, bytesKey, identityKey, force };
     } catch (e) {
@@ -373,10 +375,11 @@ async function commitPage(p: Prepared, out: TranslationResult, valid: () => bool
     const cacheEpoch = config.cacheEpoch ?? await cacheReady();
     stage(item, valid, 'rendering');
     step('render', [page.order + 1]);
+    let patches: CachedPage['patches'];
     const rendered = await renderPage({ kind: 'img', el: document.createElement('img') },
         { srcUrl: page.url, bitmap, det, hash, cacheEpoch,
             cached: { ...out, patches: p.patches, ...(p.patches?.length ? { patchesGen: p.patchesGen } : null) } },
-        pageStatus([page.order + 1], valid), false, { paintOnly: true, detached: true });
+        pageStatus([page.order + 1], valid), false, { paintOnly: true, detached: true, warm: p.warm, onPatches: value => { patches = value; } });
     let blob: Blob;
     try { blob = await (await fetch(rendered.translated)).blob(); }
     finally { URL.revokeObjectURL(rendered.translated); }
@@ -388,17 +391,18 @@ async function commitPage(p: Prepared, out: TranslationResult, valid: () => bool
         w: bitmap.width, h: bitmap.height, boxes: det.boxes, panels: det.panels ?? [],
         outputs: out.outputs, extras: out.extras, mentions: out.mentions,
         mask: packMask(det.mask), splitGen: det.splitGen ?? 0, ep: det.ep,
-        order: page.order, keyGen: PAGE_KEY_GEN };
+        order: page.order, keyGen: PAGE_KEY_GEN, sourceHash: hash,
+        idSig: signatureOf(p.identity), idGray: p.identity.gray, idRegions: p.identity.regions };
     // Bytes entry: the resume checkpoint's full form, home of the crops.
-    const bytesEntry: ChapterArtifact['entry'] = { ...entry, key: bytesKey };
+    const bytesEntry: ChapterArtifact['entry'] = { ...entry, key: bytesKey, idSig: undefined, idGray: undefined, idRegions: undefined,
+        ...(patches?.length ? { patches, patchesGen: INPAINT_PATCH_GEN } : null) };
     step('result', [page.order + 1]);
     await writeRecord(artifactKey(id, page.id), { blob, entry, identity: p.identity, hash, at: Date.now(), signature: signature() } satisfies ChapterArtifact);
     if (!valid()) return;
     if (config.pipeline.cacheEnabled) {
         step('cacheWrite', [page.order + 1]);
-        await cachePut(entry, config.pipeline.cacheMax, cacheEpoch);
-        await cachePut(bytesEntry, config.pipeline.cacheMax, cacheEpoch);
-    }
+        await cachePutMany([entry, bytesEntry], config.pipeline.cacheMax, cacheEpoch);
+    } else await cacheDelete(bytesKey, cacheEpoch);
     const contribution = { id: page.id, order: page.order, hash, outputs: out.outputs, mentions: out.mentions ?? [] };
     if (!valid()) return;
     await contextFor([contribution]);
@@ -466,7 +470,7 @@ async function workSingle(page: ChapterPage, snapshot: ContextState, generation:
 
 // Merge a group of prepared pages into one tall bitmap so the existing per-page request
 // pipeline runs ONCE: crops are cut at native pixels, box lists concatenate in page order,
-// and replies map back by box offsets. Page mode never gets here (see mergeSize()).
+// and replies map back by box offsets.
 async function combinePages(pages: Prepared[]): Promise<{ bitmap: ImageBitmap; det: DetectResult; total: number; segments: { y: number; h: number }[] }> {
     const width = Math.max(...pages.map(p => p.bitmap.width));
     const height = pages.reduce((a, p) => a + p.bitmap.height, 0);
@@ -508,6 +512,8 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         }
         prepared.push(p);
     }));
+    // Parallel preparation must not reorder the story seen by the merged request.
+    prepared.sort((a, b) => a.page.order - b.page.order);
     if (!prepared.length) return;
     if (!valid()) { for (const p of prepared) p.bitmap.close(); return; }
     if (prepared.length < 2) {
@@ -548,6 +554,11 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
             chapterTrace: trace(groupPages),
             // page mode: one annotated image per page, badges numbered globally across the group
             pageSegments: config.pipeline.textSource === 'page' ? combined.segments : undefined,
+            // OCR is done and the LLM request is about to leave: the GPU is idle for the whole
+            // network wait, so every page computes its cleanup patches now (single-page parity).
+            afterOcr: inpaintMode(config.pipeline) === 'local'
+                ? () => { for (const p of prepared) p.warm = computeAiPatches(p.bitmap, p.det, p.det.boxes, []).catch(() => null); }
+                : undefined,
         }).then(r => {
             if ('error' in r && r.error) throw Object.assign(new Error(r.error), { kind: r.errorKind });
             return r;
@@ -609,11 +620,11 @@ function pumpCheck(): void {
 // merges by sending every page's annotated image with globally-numbered badges.
 function mergeSize(): number {
     if (config.pipeline.useOcrModel) return 1;
-    return Math.max(1, Math.min(10, config.pipeline.mergePages || 1));
+    return Math.max(1, Math.min(10, config.pipeline.mergePages || DEFAULT_PIPELINE_SETTINGS.mergePages));
 }
 // Slots bound how many groups work at once — the user's "sets". 6 is a memory guard.
 function slotCount(): number {
-    return Math.max(1, Math.min(6, config.pipeline.parallelLlm || 3));
+    return Math.max(1, Math.min(6, config.pipeline.parallelLlm || DEFAULT_PIPELINE_SETTINGS.parallelLlm));
 }
 
 async function pump(): Promise<void> {
@@ -679,7 +690,12 @@ async function pump(): Promise<void> {
         }
         await publish();
     } catch (e) { stop('Translation paused — could not save chapter progress'); showFatal(e); }
-    finally { pumping = false; release(); if (status.phase === 'running') void pump(); }
+    finally {
+        pumping = false;
+        release();
+        if (status.phase === 'running') void pump();
+        else releaseIdleDetector();
+    }
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {

@@ -4,12 +4,13 @@
 import { chapterKey, contextChapter, resetContextIfNewChapter, pages, elStates, pipeline, loadPipeline, stateFor, overlayChoice, setOverlayOn, type PageRef } from './state';
 import { refKey, getPages, readPage, repaintByHash, healImgBinding, writePage } from './page-io';
 import { clearQueue, failMarks, queue, pageKeyOf, paintHas, claimPaint, releasePaint, activeKeyGet, viewportOverlap } from './queue';
-import { cacheGet, cacheKey, pageKey, pageEntryDecision, settingsFingerprint, pageHashFromBitmap, bytesCrops, detFromCacheEntry } from './page-cache';
+import { cacheGet, cacheKey, pageKey, selectCachedPage, cacheEntryFresh, settingsFingerprint, pageHashFromBitmap } from './page-cache';
 import { renderPage } from './render-page';
 import { sweepPageOrder, idlePageOrder, chapterOwnsRequest, resolveChapterRef } from './sweep';
 import { autoOn } from './auto';
 import { isDebug } from '../debug';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
+import { verifyCachedIdentity } from '../cache/identity';
 
 export function applyOverlays(): void {
     // SPA navigation watch: an SPA story change must not inherit the old run's
@@ -74,15 +75,18 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
     // both would run the cleanup model and overwrite each other's cache entry.
     if (!claimPaint(key)) return;
     arrivalBusy.add(el);
+    let bitmap: ImageBitmap | undefined;
     try {
         const cacheEpoch = await cacheReady();
         const chapterRef = await resolveChapterRef(ref);
         if (chapterOwnsRequest(ref, false)) return;
         await loadPipeline();
         const srcUrl = refKey(ref);
-        const { bitmap, bytes } = await readPage(ref, srcUrl);
+        const source = await readPage(ref, srcUrl);
+        bitmap = source.bitmap;
+        const { bytes } = source;
         const hash = pageHashFromBitmap(bitmap);
-        // Prefer the page-identity entry: the chapter wrote it under the page's slot, so it
+        // The page-identity entry is a fallback: the chapter wrote it under the page's slot, so it
         // matches whatever tier/host the reader is showing. The bytes entry is the fallback
         // for work done outside a chapter run. On a plain reopen there is no live run, so the
         // slot comes from the resolved chapter page — the durable page identity, not the window.
@@ -90,20 +94,13 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         // is the durable slot the chapter cache was written under.
         const order = sweepPageOrder(refKey(ref)) ?? chapterRef?.order ?? idlePageOrder();
         const fp = settingsFingerprint(pipeline);
-        const identityHit = pipeline.cacheEnabled && order != null ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
-        const decision = pageEntryDecision(identityHit, hash, fp, bitmap.width, bitmap.height);
         const byBytes = pipeline.cacheEnabled ? await cacheGet(cacheKey(chapterKey(), hash)) : undefined;
-        const hit = decision.usable
-            ? { ...identityHit!, ...(decision.dropPatches ? { patches: undefined, patchesGen: undefined } : null) }
-            : byBytes;
-        if (hit && decision.usable && decision.dropPatches) {
-            // The identity entry is rendition-independent and carries no crops; the bytes entry
-            // (fetched under the LIVE hash) holds them for exactly these pixels — reuse them or
-            // the cleanup model re-runs on every reopen of a chapter-translated page.
-            const crops = bytesCrops(byBytes, fp, bitmap.width, bitmap.height);
-            if (crops) { hit.patches = crops.patches; hit.patchesGen = crops.patchesGen; }
-        }
-        const det = hit ? detFromCacheEntry(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud') : null;
+        const identityHit = pipeline.cacheEnabled && order != null && !cacheEntryFresh(byBytes, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')
+            ? await cacheGet(pageKey(chapterKey(), order)) : undefined;
+        const selected = selectCachedPage({ bytes: byBytes, identity: identityHit, hash, fp, w: bitmap.width, h: bitmap.height,
+            isCloud: pipeline.inferEngine === 'cloud',
+            verifyIdentity: row => verifyCachedIdentity(bitmap!, row) });
+        const hit = selected?.entry, det = selected?.det;
         // A usable entry IS the authorization: the cache is durable proof the page was already
         // paid for. A miss stays a miss — a fresh detect + LLM call is not this lane's job.
         if (!det || !hit || stateFor(ref)) {
@@ -113,11 +110,11 @@ async function arrivalPaint(ref: PageRef): Promise<void> {
         }
         if (isDebug()) console.log('[mt] arrival paint (cache):', src.slice(-24));
         assertCacheCurrent(cacheEpoch);
-        await renderPage(ref, { srcUrl, bitmap, det, hash, cacheEpoch, cached: hit,
+        await renderPage(ref, { srcUrl, bitmap, det, hash, fp, cacheEpoch, cached: hit,
             origBytes: ref.kind === 'canvas' ? bytes : undefined }, () => {}, false);
         // first state in this document comes from arrival — flip the overlay here
         // (jobs flip at completion). An explicit "Show original" pin wins.
         if (overlayChoice === 'auto') setOverlayOn(true);
     } catch { /* transient — no miss mark, the minute-retry above re-arms */ }
-    finally { arrivalBusy.delete(el); releasePaint(key); }
+    finally { bitmap?.close(); arrivalBusy.delete(el); releasePaint(key); }
 }
