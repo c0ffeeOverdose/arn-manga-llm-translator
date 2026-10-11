@@ -17,6 +17,25 @@ test('defaults are balanced preset', () => {
   assert.equal(matchingPreset(DEFAULT_PIPELINE_SETTINGS), 'balanced');
 });
 
+test('batching defaults to one call with three pages for fresh and partial settings', () => {
+  for (const settings of [DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings(null),
+    loadPipelineSettings({}), loadPipelineSettings({ targetLang: 'English' }),
+    applyPreset('balanced'), applyPreset('fast'), applyPreset('best')]) {
+    assert.equal(settings.parallelLlm, 1);
+    assert.equal(settings.mergePages, 3);
+  }
+});
+
+test('batching defaults do not replace previously stored choices', () => {
+  for (const stored of [{ parallelLlm: 3, mergePages: 1 }, { parallelLlm: 2, mergePages: 5 }]) {
+    const loaded = loadPipelineSettings(stored);
+    assert.equal(loaded.parallelLlm, stored.parallelLlm);
+    assert.equal(loaded.mergePages, stored.mergePages);
+  }
+  assert.equal(loadPipelineSettings({ parallelLlm: 4 }).mergePages, 3);
+  assert.equal(loadPipelineSettings({ mergePages: 2 }).parallelLlm, 1);
+});
+
 test('fast preset changes tuning values', () => {
   const fast = applyPreset('fast');
   assert.equal(fast.cropSize, 360);
@@ -301,11 +320,12 @@ test('presets never touch the AI cleanup choice', () => {
 });
 
 test('mergePages is a batching knob with defensive bounds', () => {
-  assert.equal(DEFAULT_PIPELINE_SETTINGS.mergePages, 1);
+  assert.equal(DEFAULT_PIPELINE_SETTINGS.mergePages, 3);
+  assert.equal(loadPipelineSettings({ mergePages: 1 }).mergePages, 1);
   assert.equal(loadPipelineSettings({ mergePages: 3 }).mergePages, 3);
   assert.equal(loadPipelineSettings({ mergePages: 10 }).mergePages, 10);
-  assert.equal(loadPipelineSettings({ mergePages: 0 }).mergePages, 1);
-  assert.equal(loadPipelineSettings({ mergePages: 99 }).mergePages, 1);
+  assert.equal(loadPipelineSettings({ mergePages: 0 }).mergePages, 3);
+  assert.equal(loadPipelineSettings({ mergePages: 99 }).mergePages, 3);
   assert.equal(loadPipelineSettings({ mergePages: 2.6 }).mergePages, 3);
-  assert.equal(loadPipelineSettings({ mergePages: 'x' }).mergePages, 1);
+  assert.equal(loadPipelineSettings({ mergePages: 'x' }).mergePages, 3);
 });

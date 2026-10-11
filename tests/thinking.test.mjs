@@ -61,6 +61,30 @@ test('openai none is explicit; auto omits the param', async () => {
   assert.ok(!('reasoning_effort' in bodies[1]));
 });
 
+test('openai leaves output cap to the provider for translation and transcribe thinking', async () => {
+  stubFetch('openai');
+  for (const thinking of ['auto', 'low', 'high', 'none']) {
+    await callLLM(settings('openai'), 'p', undefined, thinking);
+    assert.ok(!('max_tokens' in bodies.at(-1)), `${thinking}: no application output cap`);
+    assert.ok(!('max_completion_tokens' in bodies.at(-1)), `${thinking}: no replacement cap`);
+    assert.equal(bodies.at(-1).reasoning_effort, thinking === 'auto' ? undefined : thinking);
+  }
+  await callLLM(settings('openai'), 'p', ['QUJD'], 'low', undefined, 0);
+  assert.ok(!('max_tokens' in bodies.at(-1)), 'transcribe also leaves the provider default');
+  assert.ok(!('max_completion_tokens' in bodies.at(-1)), 'transcribe has no replacement cap');
+  assert.equal(bodies.at(-1).reasoning_effort, 'low');
+  assert.equal(bodies.at(-1).temperature, 0);
+  stubFetch('openai');
+  queue = [{ status: 400, msg: 'reasoning_effort: unsupported value' }];
+  const retried = await callLLM(settings('openai'), 'p', undefined, 'low');
+  assert.equal(retried.thinkingDropped, true);
+  assert.equal(bodies.length, 2);
+  for (const body of bodies) {
+    assert.ok(!('max_tokens' in body), 'thinking fallback never adds an output cap');
+    assert.ok(!('max_completion_tokens' in body), 'thinking fallback has no replacement cap');
+  }
+});
+
 test('responses maps to reasoning.effort', async () => {
   stubFetch('responses');
   await callLLM(settings('responses'), 'p', undefined, 'xhigh');

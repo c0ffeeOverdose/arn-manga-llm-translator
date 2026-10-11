@@ -39,9 +39,7 @@ export async function callLLM(
     thinkingLevel: string = 'auto', // preset, custom text, or a numeric token budget
     cacheKey?: string, // stable per conversation (manga) — routes provider-side prompt caching
     temperature?: number | null, // pinned sampling temperature; null/undefined = provider default
-    maxTokens?: number, // output cap; undefined = adapter default. Transcribe calls pass a
-                        // small cap so a model that drifts past the format cannot generate a
-                        // very long response at a slow provider
+    maxTokens?: number, // explicit output cap; undefined leaves optional caps to the provider
 ): Promise<LlmResult> {
     if (!s.apiKey) throw new MtError('auth', 'No API key configured — open the extension options');
     if (!s.model) throw new MtError('auth', 'No model configured — open the extension options');
@@ -289,8 +287,8 @@ async function openaiChat(base: string, s: LLMSettings, prompt: BuiltPrompt, ima
     const body: Record<string, unknown> = {
         model: s.model,
         messages,
-        max_tokens: maxTokens ?? 4096,
     };
+    if (maxTokens != null) body.max_tokens = maxTokens;
     if (thinking) body.reasoning_effort = thinking; // GPT-5/o-series via chat; ignored by older
     if (temperature != null) body.temperature = temperature;
     if (cacheKey) body.prompt_cache_key = cacheKey; // OpenAI routing stickiness (60→87% hit in their docs); ignored by others
@@ -592,6 +590,8 @@ export interface TranslateRequestFingerprint {
     context: ContextState;
     vision: boolean; textOnly: boolean; ocr: boolean; split: boolean;
     requestNonce?: string;
+    pageCount?: number;
+    pageContent?: { x: number; y: number; w: number; h: number };
 }
 export interface TranslateFingerprintSettings {
     provider: string; model: string; baseUrl: string; ocrModel: string;
@@ -605,7 +605,7 @@ export function translateRequestParts(
     req: TranslateRequestFingerprint, st: TranslateFingerprintSettings,
 ): (string | number | boolean)[] {
     return [
-        'mt-tr-v1', req.cacheKey,
+        'mt-tr-v2', req.cacheKey,
         st.provider, st.model, st.baseUrl, st.ocrModel,
         st.thinkingLevel, st.ocrThinking,
         st.temperature ?? -1,
@@ -614,6 +614,7 @@ export function translateRequestParts(
         st.useCharacters, st.contextPairs, st.transcribeSrc, st.vlmAssisted,
         req.vision, req.textOnly, req.ocr, req.split,
         JSON.stringify(req.regions), JSON.stringify(req.context),
+        req.pageCount ?? 1, JSON.stringify(req.pageContent ?? null),
         ...(req.requestNonce && /^[0-9a-f-]{36}$/.test(req.requestNonce) ? ['intent', req.requestNonce] : []),
         ...req.imagesB64,
     ];

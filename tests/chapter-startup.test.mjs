@@ -14,18 +14,20 @@ const stubs = {
     '../content/ocr': `export const translateRegions = () => { throw Error('unexpected LLM'); }; export const abortLiveRpcs = () => {};`,
     '../content/render-page': `export const renderPage = () => { throw Error('unexpected render'); };`,
     '../content/page-cache': `
-        export const cacheGet = async () => undefined, cachePut = async () => {}, cacheDelete = async () => {};
-        export const cacheKey = () => 'bytes', pageKey = () => 'page', pageEntryDecision = () => ({ usable: false });
-        export const PAGE_KEY_GEN = 1, settingsFingerprint = () => 'fp', pageHashFromBitmap = () => 'hash';
+        export const cacheGet = async () => undefined, cachePut = async () => {}, cachePutMany = async () => {}, cacheDelete = async () => {};
+        export const cacheKey = () => 'bytes', pageKey = () => 'page', pageEntryDecision = () => ({ usable: false }), selectCachedPage = () => null;
+        export const PAGE_KEY_GEN = 1, INPAINT_PATCH_GEN = 4, settingsFingerprint = () => 'fp', pageHashFromBitmap = () => 'hash';
         export const packMask = x => x, isResumable = () => false, detFromPartial = () => null, detFromCacheEntry = () => null;
-        export const cloudSplitFresh = () => true;
+        export const cloudSplitFresh = () => true, cacheEntryFresh = () => false, cacheMissReason = () => 'absent';
     `,
     '../content/queue': `export const keepaliveOpen = () => () => {};`,
     '../debug': `export const initDebug = async () => {}, isDebug = () => false;`,
     './store': `export const readRecord = key => fixture.read(key); export const writeRecord = (key, value) => fixture.write(key, value);`,
     './protocol': `export const artifactKey = (id, page) => id + page, chapterSignature = () => 'signature';`,
-    '../image-identity': `export const identifyBitmap = () => ({}), signatureOf = x => x;`,
-    '../content/detection': `export const shiftDetectionBoxY = x => x;`,
+    '../cache/identity': `export const verifyCachedIdentity = () => false;`,
+    '../image-identity': `export const identifyBitmap = () => ({}), signatureOf = x => x, verifyGrayIdentity = () => false;`,
+    '../content/detection': `export const shiftDetectionBoxY = x => x; export const releaseIdleDetector = () => {};`,
+    '../content/inpaint': `export const computeAiPatches = () => null;`,
     './discovery': `export const nextDocument = () => null, chapterImages = () => [], guessNextDocument = () => null, sameChapterDocument = () => false, discoverEnded = () => true;`,
     '../cache-generation': `export const cacheReady = async () => '', cacheCurrent = () => true, assertCacheCurrent = () => {};`,
 };

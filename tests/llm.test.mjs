@@ -19,7 +19,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow, claimLegacyOverrides, overrideKey, bareKey, moveOverrides } =
+const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow, claimLegacyOverrides, overrideKey, bareKey, moveOverrides, subsetRegionImages } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
@@ -227,7 +227,7 @@ test('text-only vision mode: crops-only images section + no-guess spk rule; extr
   const q = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {
     vlmAssisted: true, pageW: 907, pageH: 1280,
   }));
-  assert.ok(q.includes('full page with red number badges'));
+  assert.ok(q.includes('full page with red region frames and numbered labels'));
   assert.ok(q.includes('<extra'));
 });
 
@@ -235,16 +235,54 @@ test('merged page request: every full page is named, badges stay global, speaker
   const p = all(buildPrompt([{ index: 1, source: '' }, { index: 2, source: '' }], EMPTY_CONTEXT, true, {
     pageCount: 3, chars: true,
   }));
-  assert.ok(p.includes('The first 3 images are full pages with red number badges'));
-  assert.ok(p.includes('a badge number is that region\'s number in the list below'));
+  assert.ok(p.includes('The first 3 images are full pages with red region frames and numbered labels'));
+  assert.ok(p.includes('Each row gives its crop/image position, page and marker'));
   assert.ok(p.includes('use the full pages for context'));
   assert.ok(p.includes('decide each region from the full pages, never from the crop alone'));
   assert.ok(p.includes('THE TAIL DECIDES'));
   // single-page wording is untouched (cacheable prompt stability)
   const one = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { chars: true }));
-  assert.ok(one.includes('First image = full page with red number badges'));
+  assert.ok(one.includes('First image = full page with red region frames and numbered labels'));
   assert.ok(one.includes('decide each region from the full page, never from the crop alone'));
   assert.ok(!one.includes('full pages'));
+});
+
+test('page prompt maps chunk-local outputs to stable page markers and positional crops', () => {
+  const prompt = buildPrompt([
+    { index: 1, source: '', page: 2, marker: 7 },
+    { index: 2, source: '', page: 3, marker: 12 },
+  ], EMPTY_CONTEXT, true, { pageCount: 3 });
+  assert.ok(prompt.user.includes('1 crop=1 image=4 page=2 marker=7'));
+  assert.ok(prompt.user.includes('2 crop=2 image=5 page=3 marker=12'));
+  assert.ok(prompt.system.includes('region-list order'));
+  assert.ok(prompt.system.includes('annotations, not manga text'));
+  assert.ok(prompt.system.includes('Use the row number for output n'));
+});
+
+test('missing-region prompts map sparse output IDs to the actual crop order', () => {
+  const regions = [{ index: 2, source: '', page: 1, marker: 8 },
+    { index: 5, source: '', page: 1, marker: 11 }];
+  const page = buildPrompt(regions, EMPTY_CONTEXT, true);
+  assert.ok(page.user.includes('2 crop=1 image=2 page=1 marker=8'));
+  assert.ok(page.user.includes('5 crop=2 image=3 page=1 marker=11'));
+  const crops = buildPrompt(regions, EMPTY_CONTEXT, true, { textOnly: true });
+  assert.ok(crops.user.includes('2 crop=1 image=1'));
+  assert.ok(crops.user.includes('5 crop=2 image=2'));
+  assert.ok(!crops.user.includes('marker='));
+  const transcribe = buildPrompt(regions, EMPTY_CONTEXT, true, { transcribeOnly: true });
+  assert.ok(transcribe.user.includes('2 crop=1 image=2 page=1 marker=8'));
+  assert.ok(transcribe.user.includes('5 crop=2 image=3 page=1 marker=11'));
+});
+
+test('image subsets retain page prefixes and match sparse region IDs by crop position', () => {
+  const regions = [{ index: 7, source: '' }, { index: 11, source: '' }, { index: 20, source: '' }];
+  const requested = [regions[2], regions[0]];
+  assert.deepEqual(subsetRegionImages(['page', 'a', 'b', 'c'], regions, requested, {}), ['page', 'c', 'a']);
+  assert.deepEqual(subsetRegionImages(['p1', 'p2', 'p3', 'a', 'b', 'c'], regions, requested,
+    { pageCount: 3 }), ['p1', 'p2', 'p3', 'c', 'a']);
+  assert.deepEqual(subsetRegionImages(['a', 'b', 'c'], regions, requested, { textOnly: true }), ['c', 'a']);
+  assert.throws(() => subsetRegionImages(['page', 'a'], regions, requested, {}), /text image is missing/);
+  assert.throws(() => subsetRegionImages([], regions, requested, {}), /full-page image is missing/);
 });
 
 test('OCR mode: no images section, source text inline, SFX + no-guess rules', () => {
@@ -669,7 +707,7 @@ test('callLLM: a rejected prompt_cache_key is retried without it, then kept off 
   }
 });
 
-test('maxTokens: transcribe caps reach every protocol, default stays 4096', async () => {
+test('maxTokens: explicit caps reach every protocol, OpenAI defaults to no application cap', async () => {
   assert.equal(cfBody('x', ['a']).max_tokens, 4096);
   assert.equal(cfBody('x', ['a'], null, 0, 512).max_tokens, 512);
   const realFetch = globalThis.fetch;
@@ -701,7 +739,8 @@ test('maxTokens: transcribe caps reach every protocol, default stays 4096', asyn
     await callLLM({ provider: 'responses', baseUrl: 'https://r.test/v1', model: 'm', apiKey: 'k' }, 'p', undefined, 'auto', undefined, null, 512);
     assert.equal(seen.at(-1).body.max_output_tokens, 512);
     await callLLM({ provider: 'openai', baseUrl: 'https://x.test/v1', model: 'm', apiKey: 'k' }, 'p');
-    assert.equal(seen.at(-1).body.max_tokens, 4096, 'no cap passed = previous default');
+    assert.ok(!('max_tokens' in seen.at(-1).body), 'no explicit cap leaves the provider default');
+    assert.ok(!('max_completion_tokens' in seen.at(-1).body), 'no replacement cap');
     assert.equal(seen.at(-1).headers['x-session-affinity'], undefined, 'affinity is a CF-only header');
   } finally {
     globalThis.fetch = realFetch;
@@ -1219,7 +1258,7 @@ test('transcribe split: instructions in system, only the region list in user (un
   const p = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { transcribeOnly: true, chars: false });
   assert.ok(p.system.includes('Transcribe the text') && p.system.includes('Do NOT translate'));
   assert.ok(!p.system.includes('<regions>'), 'regions are data, not instructions');
-  assert.equal(p.user, '<regions>\n1 (read from image)\n</regions>\n');
+  assert.equal(p.user, '<regions>\n1 crop=1 image=2 page=1 marker=1\n</regions>\n');
   assert.ok(!p.user.includes('<known_characters>') && !p.user.includes('<recent_translations>'));
 });
 
@@ -1301,6 +1340,9 @@ test('translateRequestId: stable 64-hex, sensitive to every output-shaping input
   const variants = [
     [{ ...ADOPT_REQ, imagesB64: ['d29ybGQ='] }, ADOPT_ST, 'pixels'],
     [{ ...ADOPT_REQ, regions: [{ index: 1, source: 'Bye' }] }, ADOPT_ST, 'regions'],
+    [{ ...ADOPT_REQ, regions: [{ index: 1, source: 'Hello', page: 2, marker: 7 }] }, ADOPT_ST, 'page marker mapping'],
+    [{ ...ADOPT_REQ, pageCount: 3 }, ADOPT_ST, 'full-page prefix count'],
+    [{ ...ADOPT_REQ, pageContent: { x: 20, y: 20, w: 600, h: 800 } }, ADOPT_ST, 'annotated content geometry'],
     [{ ...ADOPT_REQ, context: { pairs: [], characters: [] } }, ADOPT_ST, 'context'],
     [{ ...ADOPT_REQ, cacheKey: 'manga-2' }, ADOPT_ST, 'manga scope'],
     [ADOPT_REQ, { ...ADOPT_ST, model: 'm2' }, 'model'],

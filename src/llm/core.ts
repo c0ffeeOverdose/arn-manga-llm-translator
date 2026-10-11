@@ -55,7 +55,11 @@ export const MAX_CHARACTERS = 10;
 export interface RegionInput {
     index: number;       // 1-based
     source: string;      // OCR/VLM-read source text (may be empty for vision mode)
+    page?: number;       // 1-based full-page image position, independent of chunk indices
+    marker?: number;     // stable label on that page, independent of output/crop positions
 }
+
+export interface ImageContent { x: number; y: number; w: number; h: number }
 
 export interface ExtraRegion {
     // pixel coords on the page (validated against pageW/pageH by the caller)
@@ -70,6 +74,7 @@ export interface BuildOpts {
     targetLang?: string;    // translation target (default Thai)
     pageW?: number;
     pageH?: number;
+    pageContent?: ImageContent; // manga pixels inside the annotated image, excluding padding
     // merged request: the first `pageCount` images are full pages (badges stay global)
     pageCount?: number;
     textOnly?: boolean;     // crops mode: crops only, no full-page image
@@ -88,6 +93,40 @@ export interface BuildOpts {
 // Providers cache a stable prefix, and the book/pairs/regions change every page —
 // keeping them out of the system block keeps that segment reusable.
 export interface BuiltPrompt { system: string; user: string; }
+
+function imageGuide(opts: BuildOpts): string {
+    if (opts.textOnly) return '<images>Clean crops follow region-list order; crop/image positions are listed per row. Read only that crop. There is no full-page image: no surrounding artwork. Use the row number for output n.</images>\n';
+    const count = opts.pageCount ?? 1;
+    const prefix = count > 1 ? `The first ${count} images are full pages` : 'First image = full page';
+    const pages = count > 1 ? 'full pages' : 'full page';
+    return `<images>${prefix} with red region frames and numbered labels; these are annotations, not manga text. The following images are clean crops in region-list order, not marker-number order. Each row gives its crop/image position, page and marker. Read each region from its crop; use the ${pages} for context and speaker cues only. Exclude neighboring text in crop padding using that marker's frame. Use the row number for output n. Ignore labels not requested; never translate annotations or invent text from the scene.</images>\n`;
+}
+
+// Crops follow region-list positions, not numeric region IDs. Retries retain
+// the full-page prefix and must not silently drop a missing crop.
+export function subsetRegionImages(images: string[], regions: RegionInput[], requested: RegionInput[], opts: BuildOpts): string[] {
+    const pages = opts.textOnly ? 0 : opts.pageCount ?? 1;
+    const crops = new Map(regions.map((region, i) => [region.index, images[pages + i]]));
+    if (images.length < pages) throw new Error('The full-page image is missing — retry translation');
+    return [...images.slice(0, pages), ...requested.map(region => {
+        const crop = crops.get(region.index);
+        if (!crop) throw new Error('A text image is missing — retry translation');
+        return crop;
+    })];
+}
+
+function regionList(regions: RegionInput[], vision: boolean, opts: BuildOpts): string {
+    const pages = opts.textOnly ? 0 : opts.pageCount ?? 1;
+    return '<regions>\n' + regions.map((region, i) => {
+        let mapping = '';
+        if (vision && !opts.ocr) {
+            mapping = ` crop=${i + 1} image=${pages + i + 1}`;
+            if (!opts.textOnly) mapping += ` page=${region.page ?? 1} marker=${region.marker ?? region.index}`;
+        }
+        const source = region.source ? ` ${region.source}` : mapping ? '' : ' (read from image)';
+        return `${region.index}${mapping}${source}\n`;
+    }).join('') + '</regions>\n';
+}
 
 // Thai gets the full particle rule; every other language gets the generic gendered-speech rule.
 // Completeness wins (renderer shrink-fits), so no size numbers go into the prompt.
@@ -134,11 +173,7 @@ The second form (self-closing, keep="true", NO text inside) is ONLY for an image
             return { system, user: '<regions>\n1 (read from image)\n</regions>\n' };
         }
         let system = `<task>Transcribe the text in each numbered manga region EXACTLY as written. Do NOT translate.</task>\n`;
-        if (vision && opts.textOnly) {
-            system += `<images>Each image is the crop of region 1, 2, … in order — transcribe each region from its own crop. There is no full-page image.</images>\n`;
-        } else if (vision) {
-            system += `<images>First image = full page with red number badges; the following images are crops of region 1, 2, … in order. Transcribe each region from its crop; use the full page for context.</images>\n`;
-        }
+        if (vision) system += imageGuide(opts);
         system += `<output_format>Output EXACTLY this XML — one element per region, nothing else:
 <r n="REGION">exact transcription</r>
 <r n="REGION" keep="true"/>
@@ -150,19 +185,11 @@ The second form (self-closing, keep="true", NO text inside) is ONLY for regions 
 <r n="3" keep="true"/>
 </example></output_format>\n`;
         system += `<rules>\n- Copy character-for-character — no paraphrase, no cleanup, no guessing unreadable glyphs (those regions are keep). Never translate.\n</rules>\n`;
-        let user = '<regions>\n';
-        for (const r of regions) user += `${r.index} (read from image)\n`;
-        return { system, user: user + '</regions>\n' };
+        return { system, user: regionList(regions, vision, opts) };
     }
     // XML-structured prompt: explicit tags keep instructions apart from data; output is XML too.
     let p = `<task>Translate the numbered manga regions into ${lang}.</task>\n`;
-    if (vision && opts.textOnly) {
-        p += `<images>Each image is the crop of region 1, 2, … in order — read each region from its own crop. There is no full-page image: you see only the text boxes, not the surrounding artwork.</images>\n`;
-    } else if (vision && (opts.pageCount ?? 1) > 1) {
-        p += `<images>The first ${opts.pageCount} images are full pages with red number badges, in page order — a badge number is that region's number in the list below. The following images are crops of region 1, 2, … in order. Read each region from its crop; use the full pages for context.</images>\n`;
-    } else if (vision) {
-        p += `<images>First image = full page with red number badges; the following images are crops of region 1, 2, … in order. Read each region from its crop; use the full page for context.</images>\n`;
-    }
+    if (vision) p += imageGuide(opts);
     const srcAttr = opts.transcribeSrc && !opts.ocr ? ' src="this region\'s original text, copied EXACTLY as written"' : '';
     p += `<output_format>Output EXACTLY this XML — one element per region, nothing else:
 <r n="REGION"${srcAttr}${chars ? ' spk="c1|new" desc="short visual anchor (only with spk=new)" g="M|F|?" name="given name if the page states it"' : ''}>${lang} translation</r>
@@ -214,7 +241,7 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
     }
     if (chars) p += '- Named people: report only names actually written on the page — never guess a surname or a gender from a name. <known_characters> is canonical — use its exact names and spellings.\n';
     if (opts.vlmAssisted && opts.pageW && opts.pageH && !(vision && opts.textOnly)) {
-        p += `- Missed text (no badge): <extra n="new" x="x1,y1,x2,y2">${lang} translation</extra> (pixels on the ${opts.pageW}x${opts.pageH} first image). Dialogue only, no SFX.\n`;
+        p += `- Missed text (no marker): <extra n="new" x="x1,y1,x2,y2">${lang} translation</extra> (pixels on the first image, inside <manga_content> when given). Dialogue only, no SFX or annotations.\n`;
     }
     p += `</rules>\n`;
     // a book polluted with legacy junk rows must not be taught back; user rows stay, they are the user's call
@@ -240,13 +267,12 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
     if (opts.vlmAssisted && opts.pageW && opts.pageH && !(vision && opts.textOnly)) {
         // per-page dims live in the user message (the system block must stay cacheable)
         u += `<page w="${opts.pageW}" h="${opts.pageH}"/>\n`;
+        if (opts.pageContent) {
+            const { x, y, w, h } = opts.pageContent;
+            u += `<manga_content x="${x}" y="${y}" w="${w}" h="${h}"/>\n`;
+        }
     }
-    u += '<regions>\n';
-    for (const r of regions) {
-        // no size numbers by design (see COMPLETENESS) — renderer fits whatever comes back
-        u += r.source ? `${r.index} ${r.source}\n` : `${r.index} (read from image)\n`;
-    }
-    u += '</regions>\n';
+    u += regionList(regions, vision, opts);
     return { system: p, user: u };
 }
 
