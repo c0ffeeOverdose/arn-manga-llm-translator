@@ -243,6 +243,10 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
     }
     if (opts.ocr) {
         p += `- No images: sources are OCR text. Correct obvious OCR errors from context; keep empty/unreadable sources.${chars ? ' Use book/dialogue for speakers; omit spk and g rather than guess.' : ''}\n`;
+        // Text-only rows ride no image, so the region number in `n` is the only link back to
+        // the box: a compacted or renumbered answer silently shifts every later region.
+        // State the numbering contract explicitly on this path.
+        p += `- The region list keeps each region's own number: each row starts with its number, and the numbers may be non-contiguous (e.g. after 3 comes 7). n MUST be exactly that leading number — never renumber, compact, or reorder rows. Answer every row, including rows with no source text (those are <r n="the row's number" keep="true"/>).\n`;
         p += '- b is metadata, not source text: b=1 means detected balloon-like enclosure (favors speech, not proof of speech); b=? means unknown, not "no balloon". Neither forces translation/keep.\n';
         p += '- Translate speech, including spoken interjections/reactions, even short or unframed; keep genuine sound/action SFX, even enclosed. Decide by meaning and dialogue context, not capitalization or script alone.\n';
     }

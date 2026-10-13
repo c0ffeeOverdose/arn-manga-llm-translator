@@ -175,6 +175,75 @@ test('word spacing and single-line fragments never split a balloon', () => {
         'one-line fragments are not their own text blocks');
 });
 
+test('children of one detector cut are re-decided on their union: a fragment rejoins its lobe block', () => {
+    const { img, mask } = cloverFixture({ textRects: [
+        [45, 70, 95, 90], [99, 70, 120, 90], [45, 96, 115, 116],
+        [150, 70, 215, 90], [150, 96, 215, 116], [150, 122, 200, 142],
+    ] });
+    const base = { x1: 40, y1: 60, x2: 228, y2: 146, conf: 0.9 };
+    const members = [
+        { ...base, y2: 92, sib: 0, cutAxis: 'y', clip: { x1: 40, y1: 58, x2: 228, y2: 100 } },
+        { ...base, y1: 92, sib: 0, cutAxis: 'y', clip: { x1: 40, y1: 84, x2: 228, y2: 148 } },
+    ];
+    const out = splitBalloonSurfaces(img, members, mask);
+    assert.equal(out.length, 2, 'one region per lobe, not per fragment on the cut');
+    assert.equal(out[0].sib, out[1].sib);
+    const right = out.find(b => b.x1 >= 140), left = out.find(b => b.x1 < 140);
+    assert.ok(right && right.x1 <= 150 && right.x2 >= 215 && right.y1 <= 70 && right.y2 >= 142,
+        'the top fragment rejoins its lobe block');
+    assert.ok(left && left.x1 <= 45 && left.x2 >= 120 && left.y2 >= 116);
+    assert.equal(mergeParagraphLines(members.map(b => ({ ...b })), () => img, mask).length, 2,
+        'the pre-OCR chain adopts the re-decision');
+});
+
+test('cut families stay untouched without one enclosure and two text blocks', () => {
+    // separate enclosures: the union resolves two surfaces, so the cut's children stand
+    const { img, mask } = fixture({});
+    const boxed = (box, clip) => ({ ...box, sib: 7, cutAxis: 'x', clip });
+    const boxes = [
+        boxed({ x1: 43, y1: 38, x2: 85, y2: 60, conf: 0.9 }, { x1: 43, y1: 38, x2: 88, y2: 60 }),
+        boxed({ x1: 104, y1: 38, x2: 132, y2: 60, conf: 0.9 }, { x1: 100, y1: 38, x2: 132, y2: 60 }),
+    ];
+    assert.strictEqual(splitBalloonSurfaces(img, boxes, mask), boxes);
+    // one text block only: nothing to re-split, children stand
+    const one = cloverFixture({ textRects: [[150, 70, 215, 90], [150, 96, 215, 116]] });
+    const base = { x1: 140, y1: 60, x2: 228, y2: 146, conf: 0.9 };
+    const single = [
+        { ...base, y2: 92, sib: 3, cutAxis: 'y', clip: { x1: 140, y1: 58, x2: 228, y2: 100 } },
+        { ...base, y1: 92, sib: 3, cutAxis: 'y', clip: { x1: 140, y1: 84, x2: 228, y2: 148 } },
+    ];
+    assert.strictEqual(splitBalloonSurfaces(one.img, single, one.mask), single);
+    // ink the surface measurement cannot resolve also keeps the cut
+    const stray = cloverFixture({ textRects: [[45, 70, 95, 90], [99, 70, 120, 90], [150, 70, 215, 90], [150, 96, 215, 116]] });
+    const strayMask = new Uint8Array(stray.mask.data);
+    for (let y = 135; y < 139; y++) for (let x = 222; x < 226; x++) {
+        const i = (y * 260 + x) * 4;
+        stray.img.data[i] = stray.img.data[i + 1] = stray.img.data[i + 2] = 0;
+        strayMask[y * 260 + x] = 255;
+    }
+    const withStray = [
+        { ...base, y2: 92, sib: 3, cutAxis: 'y', clip: { x1: 40, y1: 58, x2: 228, y2: 100 } },
+        { ...base, y1: 92, sib: 3, cutAxis: 'y', clip: { x1: 40, y1: 84, x2: 228, y2: 148 } },
+    ];
+    assert.strictEqual(splitBalloonSurfaces(stray.img, withStray, { width: 260, height: 200, data: strayMask.buffer }), withStray);
+});
+
+test('lone oversized lettering splits off its own region; lone normal-size words never do', () => {
+    const W = 220, H = 260;
+    const dialog = [180, 208, 236].map(y => ({ x1: 30, y1: y, x2: 150, y2: y + 22, conf: 0.9 }));
+    const parent = { x1: 20, y1: 40, x2: 160, y2: 258, conf: 0.9 };
+    const sfx = { x1: 25, y1: 45, x2: 80, y2: 115, conf: 0.9 }; // 70 tall vs ~22px glyphs
+    const pieces = splitConnectedClusters([sfx, ...dialog], parent, W, H, 3);
+    assert.ok(pieces && pieces.length === 2, 'SFX-scale lettering becomes its own region');
+    const sfxPiece = pieces.find(p => p.y2 <= 130), dialogPiece = pieces.find(p => p.y1 >= 150);
+    assert.ok(sfxPiece && dialogPiece, 'one piece per block');
+    assert.ok(dialogPiece.y1 >= 170, 'the dialogue region no longer covers the lettering');
+    assert.ok(dialogPiece.clip && sfxPiece.clip, 'both children carry frames');
+    const small = { ...sfx, y2: 75 }; // 30 tall ≈ the block's glyph scale
+    assert.equal(splitConnectedClusters([small, ...dialog], parent, W, H, 3), null,
+        'a lone normal-size word still never becomes a region');
+});
+
 test('frame math: a sibling touching the frame edge stays safe; an interleaved pair refuses to split', () => {
     const W = 220, H = 180;
     const comps = [

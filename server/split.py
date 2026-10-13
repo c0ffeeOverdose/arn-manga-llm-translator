@@ -6,7 +6,7 @@ import math
 # ---- box splitting (ported 1:1 from src/content/detection.ts) ----
 # Preserve two JS-isms: Math.round halves UP on positives (use _r) and medians are the UPPER middle (use _med).
 # Boxes are dicts (x1/y1/x2/y2/conf, +clip/cutAxis on children); comps are plain rects (no count/psum).
-SPLIT_GEN = 14  # bump when this section's logic changes; /v1/page reports it
+SPLIT_GEN = 16  # bump when this section's logic changes; /v1/page reports it
 # and the client re-detects cache entries written by older servers.
 SPLIT_GAP_FACTOR = 2
 SPLIT_GAP_RATIO = 0.8
@@ -152,10 +152,13 @@ def split_merged_boxes(boxes, comps, same_block_gap, box_comps=None):
                 and (c["y1"] + c["y2"]) / 2 <= b["y2"])
 
     out = []
-    for b in boxes:
+    for bi, b in enumerate(boxes):
         cs = [c for c in comps if centered(c, b)]
         bs = cs if box_comps is comps else [c for c in box_comps if centered(c, b)]
         parts = _split_box(b, cs, same_block_gap, bs)
+        if parts is not None:
+            for p in parts:
+                p["sib"] = bi  # one parent -> one balloon family
         out.extend(parts if parts is not None else [b])
     return out
 

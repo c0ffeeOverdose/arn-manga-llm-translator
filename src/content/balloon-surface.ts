@@ -223,8 +223,12 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
         x2: Math.max(...cs.map(c => c.x2)), y2: Math.max(...cs.map(c => c.y2)), conf: parent.conf,
     }));
     // Each child must be a text block of its own: ≥2 components and at least about two
-    // lines tall. A lone word or an ink fragment never becomes its own region.
-    if (clusters.some((cs, i) => cs.length < 2 || boxes[i].y2 - boxes[i].y1 < 1.8 * medianH)) return null;
+    // lines tall. A lone word or an ink fragment never becomes its own region — but a
+    // single OVERSIZED component is display lettering (SFX scale, several times the block's
+    // glyphs): keeping it in the box would erase it with the neighbours' cleanup, so it
+    // becomes its own (keep-path) region instead.
+    const oversized = (cs: DetBox[]) => cs.length === 1 && cs[0].y2 - cs[0].y1 >= 2.5 * medianH;
+    if (clusters.some((cs, i) => cs.length < 2 ? !oversized(cs) : boxes[i].y2 - boxes[i].y1 < 1.8 * medianH)) return null;
     const frameFor = (b: DetBox, i: number): { x1: number; y1: number; x2: number; y2: number } | null => {
         const others = comps.filter(c => !clusters[i].includes(c));
         const bandY = others.filter(o => o.y1 < b.y2 && o.y2 > b.y1);
@@ -289,13 +293,55 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
     return boxes.map((b, i) => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2, conf: b.conf, clip: frames[i], sib }));
 }
 
+// A detector cut's children are re-decided from their union: the cut's seam evidence may not
+// survive the physical-surface measurement (one lobe's sentence can sit on both sides of the
+// cut). One measured enclosure that yields >=2 text blocks is the only green light; every
+// other outcome (unresolved ink, several enclosures, one block) keeps the cut's children.
+function splitCutFamily(img: Pixels, raw: Uint8Array, mask: Mask, boxes: DetBox[], family: number[]): DetBox[] | null {
+    const members = family.map(i => boxes[i]);
+    if (members.some(b => !b.clip)) return null;
+    const union: DetBox = {
+        x1: Math.min(...members.map(b => b.x1)), y1: Math.min(...members.map(b => b.y1)),
+        x2: Math.max(...members.map(b => b.x2)), y2: Math.max(...members.map(b => b.y2)),
+        conf: Math.min(...members.map(b => b.conf)),
+        // the members' clips share the cut's slack, so their union still owns the seam strip
+        clip: { x1: Math.min(...members.map(b => b.clip!.x1)), y1: Math.min(...members.map(b => b.clip!.y1)),
+            x2: Math.max(...members.map(b => b.clip!.x2)), y2: Math.max(...members.map(b => b.clip!.y2)) },
+    };
+    const comps = maskComponents(raw, img.width, img.height, union);
+    if (comps.length < 2) return null;
+    const surface = balloonSurface(img, comps[0], mask, union);
+    if (!surface) return null;
+    for (const comp of comps.slice(1)) if (balloonSurface(img, comp, mask, union) !== surface) return null;
+    return splitConnectedClusters(comps, union, img.width, img.height, family[0]);
+}
+
 // Split only when every supported ink component belongs to a measured enclosure.
 // A shared enclosure never merges distinct lobes merely because their backgrounds connect.
 export function splitBalloonSurfaces(img: Pixels, boxes: DetBox[], mask: Mask): DetBox[] {
     if (mask.width !== img.width || mask.height !== img.height || mask.data.byteLength !== img.width * img.height) return boxes;
     const raw = new Uint8Array(mask.data);
+    // Children of one detector cut (shared sib) are grouped first and decided as a unit.
+    const families = new Map<number, number[]>();
+    for (const [i, box] of boxes.entries()) if (box.sib != null) {
+        const family = families.get(box.sib) ?? [];
+        family.push(i);
+        families.set(box.sib, family);
+    }
+    const decided = new Map<number, DetBox[]>();
+    const dropped = new Set<number>();
+    for (const family of families.values()) {
+        if (family.length < 2) continue;
+        const pieces = splitCutFamily(img, raw, mask, boxes, family);
+        if (!pieces) continue;
+        decided.set(family[0], pieces);
+        for (const i of family.slice(1)) dropped.add(i);
+    }
     let changed = false;
     const result = boxes.flatMap((box, bi) => {
+        if (dropped.has(bi)) return [];
+        const familyPieces = decided.get(bi);
+        if (familyPieces) { changed = true; return familyPieces; }
         const comps = maskComponents(raw, img.width, img.height, box);
         if (comps.length < 2) return [box];
         const groups = new Map<BalloonSurface, DetBox[]>();

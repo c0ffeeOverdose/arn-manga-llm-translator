@@ -227,6 +227,16 @@ test('context accumulates pairs and characters, respects caps', () => {
   assert.equal(ctx.characters[0].gender, 'F');
 });
 
+test('no-image translate keeps the numbering contract: rows answer at their own number', () => {
+  const p = all(buildPrompt([{ index: 4, source: 'MY MOM IS THE MOST POPULAR ONE THERE!' }], EMPTY_CONTEXT, false, { ocr: true }));
+  assert.ok(p.includes('never renumber, compact, or reorder'), 'the model is told not to renumber/compact rows');
+  assert.ok(p.includes('rows with no source text'), 'empty rows are answered at their own number, not skipped');
+  assert.ok(p.includes('4 b=? MY MOM'), 'the row keeps its own number in the user block');
+  // vision prompts carried the contract through the images guide; text-only must not rely on it
+  const v = all(buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {}));
+  assert.ok(v.includes('Use the row number for output n'));
+});
+
 // ---- buildPrompt ----
 
 test('system/user split: rules live in system, page data in user; two pages share one system', () => {

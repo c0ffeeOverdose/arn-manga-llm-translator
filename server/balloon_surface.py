@@ -170,7 +170,15 @@ def split_connected_clusters(comps, parent, w, h):
         return None
     boxes = [{"x1": min(c["x1"] for c in cs), "y1": min(c["y1"] for c in cs),
               "x2": max(c["x2"] for c in cs), "y2": max(c["y2"] for c in cs), "conf": parent["conf"]} for cs in clusters]
-    if any(len(cs) < 2 or b["y2"] - b["y1"] < 1.8 * median_h for cs, b in zip(clusters, boxes)):
+
+    # A lone component never becomes its own region — unless it is OVERSIZED display lettering
+    # (SFX scale, several times the block's glyphs): keeping it in the box would erase it with
+    # the neighbours' cleanup, so it splits off as its own (keep-path) region. Mirrors TS.
+    def _oversized(cs):
+        return len(cs) == 1 and cs[0]["y2"] - cs[0]["y1"] >= 2.5 * median_h
+
+    if any((not _oversized(cs)) if len(cs) < 2 else (b["y2"] - b["y1"] < 1.8 * median_h)
+           for cs, b in zip(clusters, boxes)):
         return None
 
     def soft(clearance):
@@ -256,6 +264,43 @@ def split_connected_clusters(comps, parent, w, h):
     return [dict(b, clip=frames[i]) for i, b in enumerate(boxes)]
 
 
+def split_cut_family(rgb, mask, boxes, family, cache):
+    """A detector cut's children (shared sib) are re-decided from their union: the cut's seam
+    evidence may not survive the physical-surface measurement (one lobe's sentence can sit on
+    both sides of the cut). One measured enclosure that yields >=2 text blocks is the only
+    green light; every other outcome keeps the cut's children. Mirrors splitCutFamily() in TS.
+    """
+    members = [boxes[i] for i in family]
+    if any("clip" not in b for b in members):
+        return None
+    union = {"x1": min(b["x1"] for b in members), "y1": min(b["y1"] for b in members),
+             "x2": max(b["x2"] for b in members), "y2": max(b["y2"] for b in members),
+             "conf": min(b["conf"] for b in members),
+             # the members' clips share the cut's slack, so their union still owns the seam strip
+             "clip": {"x1": min(b["clip"]["x1"] for b in members), "y1": min(b["clip"]["y1"] for b in members),
+                      "x2": max(b["clip"]["x2"] for b in members), "y2": max(b["clip"]["y2"] for b in members)}}
+    h, w = rgb.shape[:2]
+    x0, y0 = max(0, math.floor(union["x1"])), max(0, math.floor(union["y1"]))
+    x2, y2 = min(w, math.ceil(union["x2"])), min(h, math.ceil(union["y2"]))
+    if x2 <= x0 or y2 <= y0:
+        return None
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mask[y0:y2, x0:x2].astype(np.uint8), connectivity=4)
+    comps = []
+    for lab in range(1, n):
+        x, y, cw, ch, count = (int(v) for v in stats[lab])
+        if count >= 4:
+            comps.append({"x1": x + x0, "y1": y + y0, "x2": x + x0 + cw, "y2": y + y0 + ch, "conf": union["conf"]})
+    if len(comps) < 2 or len(comps) > 400:
+        return None
+    surface = balloon_surface(rgb, comps[0], mask, cache, union)
+    if surface is None:
+        return None
+    for comp in comps[1:]:
+        if balloon_surface(rgb, comp, mask, cache, union) is not surface:
+            return None
+    return split_connected_clusters(comps, union, w, h)
+
+
 def refine_balloon_boxes(rgb, boxes, mask):
     """Preserve uncertain proposals; physical surfaces split boxes and corroborate line groups before OCR."""
     h, w = rgb.shape[:2]
@@ -263,7 +308,27 @@ def refine_balloon_boxes(rgb, boxes, mask):
         return boxes
     mask = mask.astype(bool)
     cache, split = [], []
-    for box in boxes:
+    # Children of one detector cut (shared sib) are grouped first and decided as a unit
+    # (mirror of the client's family pass in splitBalloonSurfaces).
+    families = {}
+    for i, b in enumerate(boxes):
+        if b.get("sib") is not None:
+            families.setdefault(b["sib"], []).append(i)
+    decided, dropped = {}, set()
+    for family in families.values():
+        if len(family) < 2:
+            continue
+        pieces = split_cut_family(rgb, mask, boxes, family, cache)
+        if pieces is None:
+            continue
+        decided[family[0]] = pieces
+        dropped.update(family[1:])
+    for i, box in enumerate(boxes):
+        if i in dropped:
+            continue
+        if i in decided:
+            split.extend(decided[i])
+            continue
         x0, y0 = max(0, math.floor(box["x1"])), max(0, math.floor(box["y1"]))
         x2, y2 = min(w, math.ceil(box["x2"])), min(h, math.ceil(box["y2"]))
         if x2 <= x0 or y2 <= y0:

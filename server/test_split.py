@@ -104,9 +104,9 @@ class ColumnSplits(unittest.TestCase):
                        [973, 972, 1015, 1003], [821, 1005, 968, 1064], [879, 1070, 919, 1116]])
         self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [
             {"x1": 809, "y1": 772, "x2": 969, "y2": 1116, "conf": 0.5,
-             "clip": {"x1": 809, "y1": 772, "x2": 974, "y2": 1116}, "cutAxis": "x"},
+             "clip": {"x1": 809, "y1": 772, "x2": 974, "y2": 1116}, "cutAxis": "x", "sib": 0},
             {"x1": 970, "y1": 811, "x2": 1088, "y2": 1003, "conf": 0.5,
-             "clip": {"x1": 966, "y1": 772, "x2": 1091, "y2": 1116}, "cutAxis": "x"},
+             "clip": {"x1": 966, "y1": 772, "x2": 1091, "y2": 1116}, "cutAxis": "x", "sib": 0},
         ])
 
     def test_narrow_punctuation_survives(self):
@@ -176,9 +176,9 @@ class SplitTest(unittest.TestCase):
                        [1074, 777, 1148, 826], [1161, 783, 1266, 827]])
         self.assertEqual(split_merged_boxes([parent], comps, GAP), [
             {"x1": 1312, "y1": 376, "x2": 1408, "y2": 535, "conf": 0.92,
-             "clip": {"x1": 1061, "y1": 362, "x2": 1413, "y2": 547}, "cutAxis": "y"},
+             "clip": {"x1": 1061, "y1": 362, "x2": 1413, "y2": 547}, "cutAxis": "y", "sib": 0},
             {"x1": 1062, "y1": 535, "x2": 1287, "y2": 825, "conf": 0.92,
-             "clip": {"x1": 1061, "y1": 523, "x2": 1413, "y2": 825}, "cutAxis": "y"},
+             "clip": {"x1": 1061, "y1": 523, "x2": 1413, "y2": 825}, "cutAxis": "y", "sib": 0},
         ])
 
     def test_lane1_guards_hold(self):
@@ -249,9 +249,9 @@ class SplitTest(unittest.TestCase):
                  box(1062, 534, 1287, 575), box(1062, 600, 1287, 640)]
         self.assertEqual(split_merged_boxes([parent], comps, GAP), [
             {"x1": 1305, "y1": 369, "x2": 1413, "y2": 519, "conf": 0.92,
-             "clip": {"x1": 1061, "y1": 362, "x2": 1413, "y2": 531}, "cutAxis": "y"},
+             "clip": {"x1": 1061, "y1": 362, "x2": 1413, "y2": 531}, "cutAxis": "y", "sib": 0},
             {"x1": 1062, "y1": 519, "x2": 1287, "y2": 640, "conf": 0.92,
-             "clip": {"x1": 1061, "y1": 507, "x2": 1413, "y2": 825}, "cutAxis": "y"},
+             "clip": {"x1": 1061, "y1": 507, "x2": 1413, "y2": 825}, "cutAxis": "y", "sib": 0},
         ])
 
     def test_yes_lobe_splits(self):
@@ -260,9 +260,9 @@ class SplitTest(unittest.TestCase):
                  box(117, 584, 165, 599), box(112, 603, 170, 618)]
         self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [
             {"x1": 180, "y1": 504, "x2": 211, "y2": 541, "conf": 0.9,
-             "clip": {"x1": 108, "y1": 500, "x2": 211, "y2": 553}, "cutAxis": "y"},
+             "clip": {"x1": 108, "y1": 500, "x2": 211, "y2": 553}, "cutAxis": "y", "sib": 0},
             {"x1": 112, "y1": 541, "x2": 170, "y2": 618, "conf": 0.9,
-             "clip": {"x1": 108, "y1": 529, "x2": 211, "y2": 621}, "cutAxis": "y"},
+             "clip": {"x1": 108, "y1": 529, "x2": 211, "y2": 621}, "cutAxis": "y", "sib": 0},
         ])
 
     def test_md4_twin_cut(self):
@@ -323,9 +323,9 @@ class SplitTest(unittest.TestCase):
         strict = [c for c in loose if c["x1"] != 596]
         self.assertEqual(split_merged_boxes([parent], loose, GAP, strict), [
             {"x1": 606, "y1": 312, "x2": 716, "y2": 449, "conf": 0.9,
-             "clip": {"x1": 606, "y1": 90, "x2": 725, "y2": 473}, "cutAxis": "x"},
+             "clip": {"x1": 606, "y1": 90, "x2": 725, "y2": 473}, "cutAxis": "x", "sib": 0},
             {"x1": 716, "y1": 93, "x2": 793, "y2": 310, "conf": 0.9,
-             "clip": {"x1": 707, "y1": 90, "x2": 797, "y2": 473}, "cutAxis": "x"},
+             "clip": {"x1": 707, "y1": 90, "x2": 797, "y2": 473}, "cutAxis": "x", "sib": 0},
         ])
 
     def test_weak_comp_outside_strict_core_stays_out_of_merge_evidence(self):
@@ -335,9 +335,9 @@ class SplitTest(unittest.TestCase):
         strict = [c for c in loose if c["y1"] >= 200]
         self.assertEqual(split_merged_boxes([parent], loose, GAP, strict), [
             {"x1": 40, "y1": 220, "x2": 120, "y2": 380, "conf": 0.9,
-             "clip": {"x1": 0, "y1": 0, "x2": 130, "y2": 400}, "cutAxis": "x"},
+             "clip": {"x1": 0, "y1": 0, "x2": 130, "y2": 400}, "cutAxis": "x", "sib": 0},
             {"x1": 120, "y1": 20, "x2": 200, "y2": 200, "conf": 0.9,
-             "clip": {"x1": 110, "y1": 0, "x2": 220, "y2": 400}, "cutAxis": "x"},
+             "clip": {"x1": 110, "y1": 0, "x2": 220, "y2": 400}, "cutAxis": "x", "sib": 0},
         ])
 
     def test_live_vertical_glyphs_square_comps_do_not_fake_twin(self):
@@ -371,9 +371,9 @@ class SplitTest(unittest.TestCase):
                        [1020, 568, 1044, 592], [994, 570, 1016, 589], [992, 592, 1012, 641]])
         self.assertEqual(split_merged_boxes([parent], comps, GAP, comps), [
             {"x1": 1050, "y1": 182, "x2": 1127, "y2": 462, "conf": 0.92,
-             "clip": {"x1": 985, "y1": 182, "x2": 1127, "y2": 466}, "cutAxis": "y"},
+             "clip": {"x1": 985, "y1": 182, "x2": 1127, "y2": 466}, "cutAxis": "y", "sib": 0},
             {"x1": 990, "y1": 462, "x2": 1046, "y2": 641, "conf": 0.92,
-             "clip": {"x1": 985, "y1": 458, "x2": 1127, "y2": 647}, "cutAxis": "y"},
+             "clip": {"x1": 985, "y1": 458, "x2": 1127, "y2": 647}, "cutAxis": "y", "sib": 0},
         ])
 
     def test_same_balloon_columns_with_sub_floor_gutters_stay_fused(self):

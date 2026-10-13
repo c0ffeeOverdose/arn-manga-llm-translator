@@ -41,6 +41,29 @@ def fixture(together=False, open_surface=False, tone=255, outside=None, scale=1,
     return rgb, mask, box
 
 
+def clover_fixture(text_rects):
+    """Union of two overlapping circles (mirror of the TS cloverFixture): one shared interior."""
+    w, h = 260, 200
+    rgb = np.full((h, w, 3), 255, dtype=np.uint8)
+    mask = np.zeros((h, w), dtype=bool)
+    c1, c2 = (80, 100, 52), (180, 100, 52)
+
+    def inside(x, y):
+        return ((x - c1[0]) ** 2 + (y - c1[1]) ** 2 <= c1[2] ** 2
+                or (x - c2[0]) ** 2 + (y - c2[1]) ** 2 <= c2[2] ** 2)
+
+    for y in range(h):
+        for x in range(w):
+            if inside(x, y) and (x == 0 or y == 0 or x == w - 1 or y == h - 1
+                                 or not inside(x - 1, y) or not inside(x + 1, y)
+                                 or not inside(x, y - 1) or not inside(x, y + 1)):
+                rgb[y, x] = 0
+    for (x1, y1, x2, y2) in text_rects:
+        rgb[y1:y2, x1:x2] = 0
+        mask[y1:y2, x1:x2] = True
+    return rgb, mask
+
+
 class BalloonGeometry(unittest.TestCase):
     def test_two_surfaces_split_without_losing_text(self):
         for scale in (0.5, 1, 2):
@@ -86,6 +109,69 @@ class BalloonGeometry(unittest.TestCase):
         self.assertIsNotNone(surface)
         self.assertEqual((surface["x1"], surface["x2"]), (22, 156))
         self.assertEqual(box["clip"]["x2"], 80)
+
+    def test_cut_family_redecides_on_its_union(self):
+        # one lobe's sentence sitting on both sides of a detector cut must reunite
+        rgb, mask = clover_fixture([
+            (45, 70, 95, 90), (99, 70, 120, 90), (45, 96, 115, 116),
+            (150, 70, 215, 90), (150, 96, 215, 116), (150, 122, 200, 142),
+        ])
+        base = {"x1": 40, "y1": 60, "x2": 228, "y2": 146, "conf": 0.9}
+        members = [
+            dict(base, y2=92, sib=0, cutAxis="y", clip={"x1": 40, "y1": 58, "x2": 228, "y2": 100}),
+            dict(base, y1=92, sib=0, cutAxis="y", clip={"x1": 40, "y1": 84, "x2": 228, "y2": 148}),
+        ]
+        out = refine_balloon_boxes(rgb, members, mask)
+        self.assertEqual(len(out), 2, "one region per lobe, not per fragment on the cut")
+        right = next((b for b in out if b["x1"] >= 140), None)
+        left = next((b for b in out if b["x1"] < 140), None)
+        self.assertIsNotNone(right)
+        self.assertIsNotNone(left)
+        self.assertLessEqual(right["x1"], 150)
+        self.assertGreaterEqual(right["x2"], 215)
+        self.assertLessEqual(right["y1"], 70)
+        self.assertGreaterEqual(right["y2"], 142)
+        self.assertLessEqual(left["x1"], 45)
+        self.assertGreaterEqual(left["x2"], 120)
+        self.assertGreaterEqual(left["y2"], 116)
+
+    def test_cut_families_stay_untouched_without_one_enclosure_and_two_blocks(self):
+        # separate enclosures: the union resolves two surfaces, so the cut's children stand
+        rgb, mask, box = fixture()
+        m1 = dict(box, x2=85, sib=7, cutAxis="x", clip={"x1": 43, "y1": 38, "x2": 88, "y2": 60})
+        m2 = dict(box, x1=104, sib=7, cutAxis="x", clip={"x1": 100, "y1": 38, "x2": 132, "y2": 60})
+        self.assertEqual(refine_balloon_boxes(rgb, [m1, m2], mask), [m1, m2])
+        # one text block only: nothing to re-split, children stand
+        rgb2, mask2 = clover_fixture([(150, 70, 215, 90), (150, 96, 215, 116)])
+        base = {"x1": 140, "y1": 60, "x2": 228, "y2": 146, "conf": 0.9}
+        single = [
+            dict(base, y2=92, sib=3, cutAxis="y", clip={"x1": 140, "y1": 58, "x2": 228, "y2": 100}),
+            dict(base, y1=92, sib=3, cutAxis="y", clip={"x1": 140, "y1": 84, "x2": 228, "y2": 148}),
+        ]
+        self.assertEqual(refine_balloon_boxes(rgb2, single, mask2), single)
+        # ink the surface measurement cannot resolve also keeps the cut
+        rgb3, mask3 = clover_fixture([(45, 70, 95, 90), (99, 70, 120, 90), (150, 70, 215, 90), (150, 96, 215, 116)])
+        rgb3[135:139, 222:226] = 0
+        mask3[135:139, 222:226] = True
+        stray = [
+            dict(base, x2=228, y2=92, sib=3, cutAxis="y", clip={"x1": 40, "y1": 58, "x2": 228, "y2": 100}),
+            dict(base, x1=40, y1=92, sib=3, cutAxis="y", clip={"x1": 40, "y1": 84, "x2": 228, "y2": 148}),
+        ]
+        self.assertEqual(refine_balloon_boxes(rgb3, stray, mask3), stray)
+
+    def test_lone_oversized_lettering_splits_but_normal_words_do_not(self):
+        from balloon_surface import split_connected_clusters
+
+        dialog = [{"x1": 30, "y1": y, "x2": 150, "y2": y + 22, "conf": 0.9} for y in (180, 208, 236)]
+        parent = {"x1": 20, "y1": 40, "x2": 160, "y2": 258, "conf": 0.9}
+        sfx = {"x1": 25, "y1": 45, "x2": 80, "y2": 115, "conf": 0.9}  # 70 tall vs ~22px glyphs
+        pieces = split_connected_clusters([sfx] + dialog, parent, 220, 260)
+        self.assertIsNotNone(pieces, "SFX-scale lettering becomes its own region")
+        self.assertEqual(len(pieces), 2)
+        self.assertGreaterEqual(min(p["y1"] for p in pieces if p["y1"] >= 150), 150)
+        small = dict(sfx, y2=75)  # 30 tall ≈ the block's glyph scale
+        self.assertIsNone(split_connected_clusters([small] + dialog, parent, 220, 260),
+                          "a lone normal-size word still never becomes a region")
 
     def test_frame_repair_absorbs_a_one_pixel_jitter_and_deep_overlap_still_refuses(self):
         from balloon_surface import split_connected_clusters

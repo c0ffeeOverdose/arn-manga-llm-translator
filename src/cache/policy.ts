@@ -34,7 +34,7 @@ export interface CachedPage {
 
 export const INPAINT_PATCH_GEN = 5;
 
-export const CLOUD_SPLIT_GEN = 14;
+export const CLOUD_SPLIT_GEN = 16;
 export function cloudSplitFresh(hit: { ep?: string; splitGen?: number } | undefined, isCloud: boolean): boolean {
     return !isCloud || (hit?.splitGen ?? 0) >= CLOUD_SPLIT_GEN;
 }
@@ -233,5 +233,5 @@ export function settingsFingerprint(o: FingerprintOpts): string {
         s.ocrPerRegion, s.temperature, s.ocrTemperature, s.inferEngine, s.ocrLangs,
         s.stylePrompt, s.vlmAssistedDetection, s.fullPageSize, s.cropSize, s.jpegQuality,
         s.grayscaleBw, s.useContext, s.useCharacters, s.crossChapter, s.contextPairs,
-        s.charLimit, s.thinkingLevel, s.ocrThinking, s.mergePages, 'tile35']);
+        s.charLimit, s.thinkingLevel, s.ocrThinking, s.mergePages, 'tile38']);
 }
