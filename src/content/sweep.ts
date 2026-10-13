@@ -12,7 +12,7 @@ import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, l
 import { remainingPages, sweepCount, type SweepCountReason, chapterMessage, type ChapterPage, type ChapterProgress, type ChapterStart } from '../chapter/model';
 import { blobDataUrl } from '../chapter/store';
 import { retainDetection, restoreDetection } from './retained-detection';
-import type { CachedPage } from './page-cache';
+import type { CachedPage, HashReaderRoutingSource } from './page-cache';
 import { chapterSignature } from '../chapter/protocol';
 import { identifyBitmap, imageCandidates, verifyBitmap, signatureOf, type ImageIdentity } from '../image-identity';
 import { readView, readViewLocal, savedOriginal, verifyView, verifyViewFresh, viewSource, viewToken, type PageSnapshot } from './page-identity';
@@ -285,7 +285,7 @@ export function chapterOwnsRequest(ref: PageRef, force: boolean): boolean {
     }
     return true;
 }
-async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; complete: boolean }> {
+async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; complete: boolean; sourceRouting?: HashReaderRoutingSource }> {
     const live = getPages();
     const current = visible();
     let urls = episodeManifestSrcs();
@@ -299,14 +299,15 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
         if (first) urls = galleryAllUrls(await galleryManifestJson(), original(first)).urls;
     }
     let altLists: (string[] | undefined)[] = [];
+    let sourceRouting: HashReaderRoutingSource | undefined;
     if (!urls?.length) {
-        // A hash-paged single-image reader publishes the whole chapter on its CDN; page-io
-        // builds the full URLs from the displayed page + that manifest and returns the
-        // shard-number alternate per page (the manifest cannot name it).
+        // Page hashes and optional routing produce one source/alternate per page.
+        // Keep the routing descriptor so the runner can recover one build rotation.
         const manifest = await hashReaderManifest();
         if (manifest?.urls.length) {
             urls = manifest.urls;
             altLists = manifest.alts.map(a => a ? [a] : []);
+            sourceRouting = manifest.sourceRouting;
         }
     }
     if (urls?.length) {
@@ -315,7 +316,7 @@ async function enumerate(): Promise<{ pages: ChapterPage[]; anchor: number; comp
         const alts = altLists.length ? altLists : pagedTierAlternates();
         const pages = urls.map((url, order) => ({ id: `page:${order}`, url, order, descramble, ...(alts[order]?.[0] ? { alt: alts[order][0] } : null) }));
         const anchor = await anchorInList(urls, live, current);
-        if (anchor >= 0) return { pages, anchor, complete: true };
+        if (anchor >= 0) return { pages, anchor, complete: true, ...(sourceRouting ? { sourceRouting } : {}) };
         unresolvedManifest = true;
     }
     descramble = false;
@@ -525,6 +526,7 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
             pipeline: structuredClone(pipeline), context: structuredClone(context), bookKey: bookKey(), shareContext, seeds,
             nextDocument: found.complete ? undefined : nextDocument(document, location.href, chapter)
                 ?? guessNextDocument(location.href, chapter),
+            ...(found.sourceRouting ? { sourceRouting: found.sourceRouting } : {}),
             imageFilter: readerImageFilter(),
         } }, { timeoutMs: 90_000, label: 'chapter start' });
         assertCacheCurrent(cacheEpoch);

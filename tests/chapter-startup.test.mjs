@@ -19,6 +19,7 @@ const stubs = {
         export const PAGE_KEY_GEN = 1, INPAINT_PATCH_GEN = 4, settingsFingerprint = () => 'fp', pageHashFromBitmap = () => 'hash';
         export const packMask = x => x, isResumable = () => false, detFromPartial = () => null, detFromCacheEntry = () => null;
         export const cloudSplitFresh = () => true, cacheEntryFresh = () => false, cacheMissReason = () => 'absent';
+        export const hashReaderRouting = () => null, hashReaderRoutingUrl = () => undefined, hashReaderUrls = () => null;
     `,
     '../content/queue': `export const keepaliveOpen = () => () => {};`,
     '../debug': `export const initDebug = async () => {}, isDebug = () => false;`,
@@ -26,7 +27,7 @@ const stubs = {
     './protocol': `export const artifactKey = (id, page) => id + page, chapterSignature = () => 'signature';`,
     '../cache/identity': `export const verifyCachedIdentity = () => false;`,
     '../image-identity': `export const identifyBitmap = () => ({}), signatureOf = x => x, verifyGrayIdentity = () => false;`,
-    '../content/detection': `export const shiftDetectionBoxY = x => x; export const releaseIdleDetector = () => {};`,
+    '../content/detection': `export const shiftDetectionBoxY = x => x; export const releaseIdleDetector = () => {}; export const holdInferenceHost = () => () => {};`,
     '../content/inpaint': `export const computeAiPatches = () => null;`,
     './discovery': `export const nextDocument = () => null, chapterImages = () => [], guessNextDocument = () => null, sameChapterDocument = () => false, discoverEnded = () => true;`,
     '../cache-generation': `export const cacheReady = async () => '', cacheCurrent = () => true, assertCacheCurrent = () => {};`,
@@ -128,7 +129,9 @@ test('Stop during setup prevents page work when setup later completes', async ()
 });
 
 test('startup reads the existing checkpoint before publishing and preserves ready pages', async () => {
-    const checkpoint = { config: { id: 'run' }, progress: { id: 'run', chapter: 'https://reader.test/chapter/123456',
+    const sourceRouting = { url: 'https://static.img.gallery.example.org/gg.js', sample: 'https://w2.img.gallery.example.org/source.webp',
+        refreshed: true, routing: { build: '7654322', shards: '1'.repeat(4096) } };
+    const checkpoint = { config: { id: 'run', sourceRouting }, progress: { id: 'run', chapter: 'https://reader.test/chapter/123456',
         phase: 'running', done: 1, total: 1, errors: 0, inflight: 0, completeManifest: true,
         pages: [{ id: 'p0', url: 'https://reader.test/page.png', order: 0, phase: 'ready' }] } };
     const f = runnerFixture(checkpoint);
@@ -138,5 +141,6 @@ test('startup reads the existing checkpoint before publishing and preserves read
         assert.equal(f.publishes[0].done, 1, 'initial publication must not erase the checkpoint');
         assert.equal(f.publishes.at(-1).done, 1);
         assert.equal(f.detects, 0, 'a recovered ready page must not repay inference');
+        assert.deepEqual(f.records.get('checkpoint:run').config.sourceRouting, sourceRouting, 'startup preserves the spent routing budget and table');
     } finally { f.command('stop'); f.det.resolve(); }
 });

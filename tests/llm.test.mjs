@@ -19,7 +19,7 @@ await build({
   bundle: true, format: 'esm', outfile: '.test-build/ocr-models.mjs', sourcemap: 'inline',
 });
 
-const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow, claimLegacyOverrides, overrideKey, bareKey, moveOverrides, subsetRegionImages } =
+const { buildPrompt, parseResponse, mergeRegions, mergeCharacter, updateContext, applyBookOps, EMPTY_CONTEXT, splitUserForCache, normalizeBook, transcriptionMatches, joinTranscription, coalesceBook, charKey, mergeBookRows, splitBookRow, claimLegacyOverrides, overrideKey, bareKey, moveOverrides, subsetRegionImages, transcribeCropImages } =
   await import(new URL('../.test-build/core.mjs', import.meta.url).href);
 const { toMtError, LlmHttpError, MtError, translateRequestParts, translateRequestId, callLLM, cfRunUrl, cfBody, cfParse, cfError, cfImageCapHint, isImageCapError, sessionKey } =
   await import(new URL('../.test-build/adapters.mjs', import.meta.url).href);
@@ -76,6 +76,44 @@ test('parse XML: unclosed tag tolerantly reads to end of line', () => {
   assert.equal(r.regions.length, 2);
   assert.equal(r.regions[0].translation, 'สวัสดีครับ');
   assert.equal(r.regions[1].translation, 'keep');
+});
+
+test('parse XML: self-closing region tags retain adjacent translations and metadata', () => {
+    const translations = ['สวัสดีค่ะ', 'ไปกันเถอะ', 'วันนี้อากาศดี', 'เห็นแล้วค่ะ', 'รอเดี๋ยว', 'ขอบคุณนะ', 'กลับบ้านกัน'];
+    const raw = translations.map((text, i) => `<r n="${i + 1}" g="?"/>${text}`).join('\n');
+    const r = parseResponse(raw, 7);
+    assert.deepEqual(r.regions.map(o => o.index), [1, 2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(r.regions.map(o => o.translation), translations);
+    const attributed = parseResponse('<r n="1" src="HELLO" spk="c2" g="F"/>  สวัสดีค่ะ  ', 1).regions[0];
+    assert.equal(attributed.source, 'HELLO');
+    assert.deepEqual(attributed.spk, { id: 'c2', desc: '', gender: 'F', name: undefined });
+    assert.equal(attributed.translation, 'สวัสดีค่ะ');
+});
+
+test('parse XML: explicit keeps still win and empty regions cannot steal the following region', () => {
+    const r = parseResponse('<r n="1" keep="true"/>ignored SFX description\n' +
+        '<r n="2"/>\n<r n="3">ข้อความ\nหลายบรรทัด</r><r n="4"/>ท้ายบรรทัด', 4);
+    assert.deepEqual(r.regions.map(o => o.translation), ['keep', 'keep', 'ข้อความ\nหลายบรรทัด', 'ท้ายบรรทัด']);
+});
+
+test('parse XML: adjacent self-closing translations stop at the next tag and preserve extras and names', () => {
+    const r = parseResponse('<r n="1"/>ข้อความแรก<r n="2">ข้อความที่สอง</r>' +
+        '<r n="99"/>out of range<r n="3" keep="true"/><extra x="10,20,30,40">ป้าย</extra>' +
+        '<names><m id="c2" name="ตัวอย่าง"/></names>', 3);
+    assert.deepEqual(r.regions.map(o => o.translation), ['ข้อความแรก', 'ข้อความที่สอง', 'keep']);
+    assert.deepEqual(r.regions.map(o => o.index), [1, 2, 3]);
+    assert.equal(r.extras[0].translation, 'ป้าย');
+    assert.equal(r.mentions[0].name, 'ตัวอย่าง');
+});
+
+test('parse XML: recovered empty, keep and meta content retains existing keep semantics', () => {
+    const r = parseResponse('<r n="1"/>keep\n<r n="2"/>=>\n<r n="3"/>(ไม่มีข้อความ)\n<r n="4"/>...', 4);
+    assert.deepEqual(r.regions.map(o => o.translation), ['keep', 'keep', 'keep', '...']);
+});
+
+test('per-region transcription joins text recovered after self-closing tags', () => {
+    assert.equal(joinTranscription('<r n="1"/>HELLO\n<r n="2"/>WORLD'), 'HELLO WORLD');
+    assert.equal(joinTranscription('<r n="1" keep="true"/>ignored text'), '');
 });
 
 test('parse XML: empty element and literal keep content are both keep', () => {
@@ -285,16 +323,82 @@ test('image subsets retain page prefixes and match sparse region IDs by crop pos
   assert.throws(() => subsetRegionImages([], regions, requested, {}), /full-page image is missing/);
 });
 
+test('the per-region transcribe fallback skips the WHOLE page prefix of a merged request', () => {
+  // merged page mode: one annotated page per page, then the crops
+  assert.deepEqual(transcribeCropImages(['p1', 'p2', 'p3', 'c1', 'c2', 'c3'], false, 3),
+    ['c1', 'c2', 'c3'], 'a merged group must not leak page 2/3 images into crop slots');
+  assert.deepEqual(transcribeCropImages(['p1', 'c1', 'c2'], false, 1), ['c1', 'c2'], 'single page keeps the old shape');
+  assert.deepEqual(transcribeCropImages(['p1', 'c1'], false, undefined), ['c1'], 'missing pageCount means one page');
+  assert.deepEqual(transcribeCropImages(['c1', 'c2'], true, 3), ['c1', 'c2'], 'crops mode carries no page prefix');
+  assert.deepEqual(transcribeCropImages(undefined, false, 2), []);
+});
+
 test('OCR mode: no images section, source text inline, SFX + no-guess rules', () => {
   const p = all(buildPrompt(
     [{ index: 1, source: 'こんにちは、先輩！' }, { index: 2, source: 'ドン' }],
     EMPTY_CONTEXT, false, { ocr: true },
   ));
   assert.ok(!p.includes('<images>'));
-  assert.ok(p.includes('read by local OCR'));
+  assert.ok(p.includes('sources are OCR text'));
   assert.ok(p.includes('こんにちは、先輩！'));
-  assert.ok(p.includes('katakana-heavy'));
+  assert.ok(p.includes('not capitalization or script alone'));
   assert.ok(p.includes('omit spk and g rather than guess'));
+});
+
+test('OCR rows carry independent balloon evidence; absent or invalid evidence is unknown', () => {
+    const regions = [
+        { index: 2, source: 'WHAT?', balloonHint: 'detected' },
+        { index: 5, source: 'RUSTLE', balloonHint: 'unknown' },
+        { index: 7, source: 'Come here.' },
+        { index: 9, source: 'Hello.', balloonHint: 'false' },
+    ];
+    const prompt = buildPrompt(regions, EMPTY_CONTEXT, false, { ocr: true });
+    assert.match(prompt.user, /^2 b=1 WHAT\?$/m);
+    assert.match(prompt.user, /^5 b=\? RUSTLE$/m);
+    assert.match(prompt.user, /^7 b=\? Come here\.$/m);
+    assert.match(prompt.user, /^9 b=\? Hello\.$/m);
+    assert.doesNotMatch(prompt.user, /balloon_hint=/);
+    assert.doesNotMatch(prompt.system, /WHAT\?|RUSTLE/);
+    const other = buildPrompt([{ index: 1, source: 'Other text.', balloonHint: 'unknown' }], EMPTY_CONTEXT, false, { ocr: true });
+    assert.equal(other.system, prompt.system, 'region evidence remains in the volatile user message');
+});
+
+test('OCR instructions weigh enclosure without treating interjections, case or missing balloons as SFX', () => {
+    const prompt = buildPrompt([{ index: 1, source: 'OH!', balloonHint: 'detected' }], EMPTY_CONTEXT, false, { ocr: true, chars: false });
+    assert.match(prompt.system, /b=1.*favors speech, not proof of speech/);
+    assert.match(prompt.system, /b=\? means unknown, not "no balloon"/);
+    assert.ok(prompt.system.includes('metadata, not source text'));
+    assert.ok(prompt.system.includes('Neither forces translation/keep'));
+    assert.ok(prompt.system.includes('Translate speech'));
+    assert.ok(prompt.system.includes('spoken interjections'));
+    assert.ok(prompt.system.includes('even short or unframed'));
+    assert.ok(prompt.system.includes('keep genuine sound/action SFX, even enclosed'));
+    assert.ok(prompt.system.includes('meaning and dialogue context, not capitalization or script alone'));
+    assert.doesNotMatch(prompt.system, /it is SFX — make it a keep region/);
+    assert.doesNotMatch(prompt.system, /<images>/);
+});
+
+test('compact OCR instructions retain empty-source and conditional speaker safeguards', () => {
+    const regions = [{ index: 1, source: '', balloonHint: 'detected' }, { index: 2, source: '' }];
+    for (const chars of [false, true]) {
+        const prompt = buildPrompt(regions, EMPTY_CONTEXT, false, { ocr: true, chars });
+        assert.match(prompt.user, /^1 b=1$/m);
+        assert.match(prompt.user, /^2 b=\?$/m);
+        assert.doesNotMatch(prompt.user, /read from image/);
+        assert.ok(prompt.system.includes('Correct obvious OCR errors from context'));
+        assert.ok(prompt.system.includes('keep empty/unreadable sources'));
+        assert.equal(prompt.system.includes('omit spk and g rather than guess'), chars);
+        assert.ok(prompt.system.includes('Translate the COMPLETE meaning'));
+        assert.ok(prompt.system.includes('<r n="REGION" keep="true"/>'));
+    }
+});
+
+test('balloon evidence does not alter vision or pure transcription prompts', () => {
+    const regions = [{ index: 1, source: 'OH!', page: 2, marker: 7 }];
+    const hinted = regions.map(region => ({ ...region, balloonHint: 'detected' }));
+    for (const opts of [{}, { textOnly: true }, { transcribeOnly: true }, { transcribeOnly: true, textOnly: true }]) {
+        assert.deepEqual(buildPrompt(hinted, EMPTY_CONTEXT, true, opts), buildPrompt(regions, EMPTY_CONTEXT, true, opts));
+    }
 });
 
 test('prompt includes regions, book, honorific rule — and no size numbers', () => {
@@ -1341,6 +1445,7 @@ test('translateRequestId: stable 64-hex, sensitive to every output-shaping input
     [{ ...ADOPT_REQ, imagesB64: ['d29ybGQ='] }, ADOPT_ST, 'pixels'],
     [{ ...ADOPT_REQ, regions: [{ index: 1, source: 'Bye' }] }, ADOPT_ST, 'regions'],
     [{ ...ADOPT_REQ, regions: [{ index: 1, source: 'Hello', page: 2, marker: 7 }] }, ADOPT_ST, 'page marker mapping'],
+    [{ ...ADOPT_REQ, regions: [{ index: 1, source: 'Hello', balloonHint: 'detected' }] }, ADOPT_ST, 'balloon evidence'],
     [{ ...ADOPT_REQ, pageCount: 3 }, ADOPT_ST, 'full-page prefix count'],
     [{ ...ADOPT_REQ, pageContent: { x: 20, y: 20, w: 600, h: 800 } }, ADOPT_ST, 'annotated content geometry'],
     [{ ...ADOPT_REQ, context: { pairs: [], characters: [] } }, ADOPT_ST, 'context'],
@@ -1356,6 +1461,14 @@ test('translateRequestId: stable 64-hex, sensitive to every output-shaping input
   for (const [r, s, why] of variants) {
     assert.notEqual(await translateRequestId(translateRequestParts(r, s)), id, `must re-key on ${why}`);
   }
+});
+
+test('same OCR text with different balloon evidence cannot adopt the same response', async () => {
+    const request = balloonHint => ({ ...ADOPT_REQ, imagesB64: [], regions: [{ index: 1, source: 'OH!', balloonHint }] });
+    const detected = await translateRequestId(translateRequestParts(request('detected'), ADOPT_ST));
+    const unknown = await translateRequestId(translateRequestParts(request('unknown'), ADOPT_ST));
+    assert.notEqual(detected, unknown);
+    assert.equal(await translateRequestId(translateRequestParts(structuredClone(request('detected')), ADOPT_ST)), detected);
 });
 
 test('fresh translation intents separate completed answers but transport retries still adopt', async () => {

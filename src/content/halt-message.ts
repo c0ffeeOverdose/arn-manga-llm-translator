@@ -6,6 +6,7 @@ export interface AutoHalt { kind: string; until: number }
 export function haltMessage(halted: AutoHalt, now = Date.now()): string {
     if (halted.kind === 'chapter') return 'Chapter translation paused — start chapter translation to continue';
     if (halted.kind === 'cache') return 'Cache cleared — press Translate to translate again';
+    if (halted.kind === 'inference') return 'Graphics processing stopped responding — restart your browser, then press Translate';
     if (halted.kind === 'ratelimit') {
         const left = halted.until > now ? ` (${Math.ceil((halted.until - now) / 1000)}s)` : '';
         return `Rate limited${left} — stopped; press Translate to resume`;

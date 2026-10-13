@@ -7,8 +7,8 @@ import assert from 'node:assert/strict';
 
 const source = ts.createSourceFile('page.ts', readFileSync('src/chapter/page.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const functions = source.statements.filter(node => ts.isFunctionDeclaration(node)
-    && ['runGroup', 'combinePages', 'commitPage'].includes(node.name?.text));
-assert.equal(functions.length, 3);
+    && ['runGroup', 'combinePages', 'commitPage', 'warmPrepared'].includes(node.name?.text));
+assert.equal(functions.length, 4);
 const compiled = await transform(functions.map(node => node.getText(source)).join('\n'), { loader: 'ts' });
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 
@@ -21,14 +21,14 @@ function deferred() {
 function fixture(cached = [], opts = {}) {
     const pages = Array.from({ length: 4 }, (_, order) => ({ id: `p${order}`, order }));
     const pending = pages.map(() => deferred());
-    const requests = [], warms = [], renders = [], cachedCommits = [];
+    const requests = [], warms = [], renders = [], cachedCommits = [], failures = [];
     const prepared = pages.map(page => ({ page, item: { id: page.id }, force: false,
         bitmap: { width: 600, height: 800, order: page.order, close() {} },
         det: { boxes: [0, 1].map(i => ({ x1: 10, y1: 20 + i * 40, x2: 100, y2: 50 + i * 40,
             source: `PAGE ${page.order} LINE ${i}` })) },
         identity: {}, hash: `hash-${page.order}`, bytesKey: `bytes-${page.order}`, identityKey: `identity-${page.order}`,
         ...(cached.includes(page.order) ? { out: { outputs: [], extras: [], mentions: [] } } : null) }));
-    const scope = { epoch: 1, status: { pages: prepared.map(p => p.item) },
+    const scope = { epoch: 1, status: { phase: 'running', pages: prepared.map(p => p.item) },
         config: { pipeline: { textSource: 'ocr', cacheEnabled: false }, cacheEpoch: '', force: undefined },
         cacheCurrent: () => true, cacheReady: async () => '',
         PAGE_LEASE_MS: 300_000, attempts: new Set(),
@@ -36,7 +36,7 @@ function fixture(cached = [], opts = {}) {
         preparePage: page => pending[page.order].promise,
         withPageLease: (_page, _item, valid, run) => run(valid),
         settlePrepared: async (p) => { assert.ok(p.out, 'this fixture must not enter a per-page fallback'); cachedCommits.push({ order: p.page.order, cached: true }); },
-        markFailed: async (_page, _item, error) => { throw error; },
+        markFailed: async (page, _item, error) => { if (!opts.failure) throw error; failures.push({ order: page.order, kind: error.kind }); },
         step() {}, note() {}, trace: () => undefined, pageStatus: () => () => {}, starveNotice() {},
         recordChapterLog() {}, shiftDetectionBoxY: (box, y) => ({ ...box, y1: box.y1 + y, y2: box.y2 + y }),
         stage: () => {}, publish: async () => {}, contextFor: async () => ({}),
@@ -44,6 +44,7 @@ function fixture(cached = [], opts = {}) {
         createImageBitmap: async canvas => ({ pages: canvas.pages, close() {} }),
         translateRegions: async (bitmap, det, _onStatus, translateOpts) => {
             requests.push({ pages: bitmap.pages, sources: det.boxes.map(box => box.source) });
+            if (opts.failure) return { error: 'Graphics processing stopped responding', errorKind: 'inference' };
             // The real call fires afterOcr exactly here: OCR done, LLM request about to start.
             translateOpts?.afterOcr?.();
             return { outputs: det.boxes.map((box, i) => ({ index: i + 1, source: box.source, translation: box.source })),
@@ -70,7 +71,8 @@ function fixture(cached = [], opts = {}) {
     };
     runInNewContext(compiled.code, scope);
     const done = scope.runGroup(pages, { pairs: [], characters: [] }, 1, 'epoch');
-    return { requests, warms, renders, cachedCommits, done,
+    return { requests, warms, renders, cachedCommits, failures, done,
+        pause() { scope.status.phase = 'error'; },
         async finish(order) { pending[order].resolve(prepared[order]); await tick(); } };
 }
 
@@ -117,4 +119,21 @@ test('built-in fill skips the cleanup warm entirely', async () => {
     await f.done;
     assert.deepEqual(f.warms, [], 'fill mode must not run the cleanup model');
     assert.ok(f.renders.every(render => render.warm === false));
+});
+
+test('a shared GPU failure never retries the merged pages individually', async () => {
+    const f = fixture([], { failure: true });
+    for (const order of [3, 2, 1, 0]) await f.finish(order);
+    await f.done;
+    assert.equal(f.requests.length, 1);
+    assert.deepEqual(f.failures, [0, 1, 2, 3].map(order => ({ order, kind: 'inference' })));
+    assert.deepEqual(f.renders, []);
+    assert.deepEqual(f.cachedCommits, []);
+});
+
+test('a slot finishing preparation after another slot paused the run cannot start an LLM request', async () => {
+    const f = fixture(); f.pause();
+    for (const order of [3, 2, 1, 0]) await f.finish(order);
+    await f.done;
+    assert.deepEqual(f.requests, []); assert.deepEqual(f.renders, []); assert.deepEqual(f.warms, []);
 });

@@ -23,6 +23,7 @@ test('chapter events whitelist metadata and drop credentials, URLs, replies and 
 test('chapter errors retain a fixed reason and HTTP status, never the provider body', () => {
     assert.deepEqual(chapterLogError({ name: 'BackgroundTimeoutError', message: 'PRIVATE_TOKEN https://reader.test/key' }), { reason: 'background-timeout' });
     assert.deepEqual(chapterLogError({ kind: 'cloud', message: 'Cloud detect failed: cloud HTTP 503: PRIVATE_SOURCE' }), { reason: 'cloud', status: 503 });
+    assert.deepEqual(chapterLogError({ kind: 'inference', message: 'PRIVATE_SOURCE' }), { reason: 'inference' });
     assert.doesNotMatch(JSON.stringify(chapterLogError({ kind: 'PRIVATE_KIND', message: 'PRIVATE_REPLY' })), /PRIVATE_/);
 });
 

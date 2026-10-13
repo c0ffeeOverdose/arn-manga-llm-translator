@@ -10,6 +10,7 @@ import { sendToBackground } from '../bg-rpc';
 import { recordChapterLog } from '../chapter/log-store';
 import { chapterLogError, type ChapterTrace } from '../chapter/log';
 import { IdleResource } from './idle-resource';
+import { InferenceRpcTimeoutError, diagnoseInferenceError } from './inference-health';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
@@ -23,9 +24,8 @@ export interface DetBox {
     // clamps the clip on this axis only; the cross axis stays free so the flood can still reach
     // the bubble's own walls — clamping both traps children inside the parent's box.
     cutAxis?: 'x' | 'y';
-    // Split children only: siblings of one parent share this id. They are one balloon, so the
-    // reading-order pass treats them as a single unit (a tall lower block must not band away
-    // from its upper block past a neighbouring bubble).
+    // Split children share a detector-parent id, not a proven balloon identity.
+    // Reading order may keep close sibling blocks together; geometry must still verify grouping.
     sib?: number;
 }
 
@@ -1166,6 +1166,11 @@ function resetInferenceHost(error: Error): void {
 
 export function releaseIdleDetector(): void { inferenceHost.release(); }
 
+// A long-running owner (a chapter run) holds the host for its whole active span: the 60s idle
+// dispose firing between a long LLM wait and the next page forced cold model/shader loads on
+// every page — the worst amplifier of a degraded GPU. Released when the run pauses or ends.
+export function holdInferenceHost(): () => void { return inferenceHost.retain(); }
+
 async function usingInference<T>(work: () => Promise<T>): Promise<T> {
     const release = inferenceHost.retain();
     try { return await work(); }
@@ -1300,8 +1305,9 @@ export async function detect(
         const png = await withEncodeLock(async () => {
             const c = new OffscreenCanvas(w, h);
             c.getContext('2d')!.drawImage(img, 0, 0);
-            const blob = await c.convertToBlob({ type: 'image/png' });
-            return blob.arrayBuffer();
+            // Sync encode: convertToBlob is idle-scheduled and measured ~1s+ per full page in
+            // the runner (LESSONS "canvas encoding"); every fresh page pays this before the RPC.
+            return await (await canvasPngBlob(c)).arrayBuffer();
         });
 
         onStatus?.('Detecting text…', 'detect');
@@ -1357,8 +1363,7 @@ export async function panelsDetect(img: ImageBitmap, thr: number = PANEL_CONF_TH
         await ensureIframe();
         const c = new OffscreenCanvas(img.width, img.height);
         c.getContext('2d')!.drawImage(img, 0, 0);
-        const blob = await c.convertToBlob({ type: 'image/png' });
-        const png = await blob.arrayBuffer();
+        const png = await (await canvasPngBlob(c)).arrayBuffer(); // sync encode — see detect()
         const resp = await iframeRpc({ type: 'mt:panels', png, thr }, [png]) as
             { ok: boolean; panels?: DetBox[]; dropped?: DetBox[]; ms?: number; lockWait?: number; error?: string };
         if (!resp?.ok) throw new Error(resp?.error ?? 'panel detection failed');
@@ -1656,7 +1661,7 @@ async function iframeRpc(msg: object, transfer?: Transferable[]): Promise<unknow
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 if (pending.has(id)) {
-                    resetInferenceHost(new Error('iframe rpc timeout'));
+                    resetInferenceHost(new InferenceRpcTimeoutError());
                 }
             }, 180000);
             pending.set(id, { resolve: resolve as (r: DetectResult) => void, reject, timer });
@@ -1667,5 +1672,5 @@ async function iframeRpc(msg: object, transfer?: Transferable[]): Promise<unknow
                 reject(e);
             }
         });
-    });
+    }).catch(diagnoseInferenceError);
 }

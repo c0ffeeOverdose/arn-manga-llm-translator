@@ -1,13 +1,14 @@
 // Page discovery + pixel I/O: getPages/refKey, fetch/read/descramble, write-back,
 // hash-lane repaint + binding healing.
 
-import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, hotlinkRetryable, hashReaderId, hashReaderFiles, hashReaderUrls, type EpisodeManifest } from './page-cache';
+import { pageHashFromBitmap, cropPixels, puzzleTileMap, episodeManifest, uniformPixels, srcAssignBlocked, pagedChapterUuid, buildPagedUrls, unloadedPageUrls, readerChapterFiles, hotlinkRetryable, hashReaderId, hashReaderFiles, hashReaderUrls, hashReaderRoutingUrl, type HashReaderRoutingSource, type EpisodeManifest } from './page-cache';
 import { isDebug } from '../debug';
 import { pages, elStates, verifying, verifyFailed, hashStates, hashMiss, hashPending, retiredBlobs, overlayOn, debugOn, type PageRef, type PageState } from './state';
 import { identifyBitmap, verifyBitmap } from '../image-identity';
 import { cacheGeneration, cacheCurrent } from '../cache-generation';
 import { canvasPngBlob } from './encode';
 import { sendToBackground } from '../bg-rpc';
+import { fetchHashReaderRouting } from '../chapter/source';
 
 // page identity: img = its original src (translated blobs alias via pages.get), canvas =
 // the manifest image URL when the reader embeds one (stable across canvas recreation),
@@ -125,7 +126,8 @@ export async function galleryManifestJson(): Promise<string | null> {
 // host's domain family (tried in order, no host literals); the result is cached per gallery so
 // the 1s sweep never re-fetches it, failures included (the DOM branches take over). Direct
 // fetch is CORS-open on these CDNs. Returns full page URLs + per-page shard alternates.
-let hashReaderCache: { key: string; task: Promise<{ urls: string[]; alts: string[] } | null> } | null = null;
+interface HashReaderManifest { urls: string[]; alts: string[]; sourceRouting?: HashReaderRoutingSource }
+let hashReaderCache: { id: string; key: string; task: Promise<HashReaderManifest | null> } | null = null;
 function hashReaderManifestOrigins(sample: string): string[] {
     let host: string;
     try { host = new URL(sample).hostname; } catch { return []; }
@@ -142,10 +144,9 @@ function hashReaderManifestOrigins(sample: string): string[] {
     }
     return out;
 }
-export function hashReaderManifest(): Promise<{ urls: string[]; alts: string[] } | null> {
+export function hashReaderManifest(): Promise<HashReaderManifest | null> {
     const id = hashReaderId(location.pathname);
     if (!id) return Promise.resolve(null);
-    if (hashReaderCache?.key === id) return hashReaderCache.task;
     // The displayed rendition may be a data: URL (a reader's save conversion swaps the
     // <picture><source>), while the element still names its CDN file — any https URL the
     // element carries teaches the scheme equally well, so take the first one.
@@ -158,19 +159,27 @@ export function hashReaderManifest(): Promise<{ urls: string[]; alts: string[] }
     }
     // No addressable page image yet: nothing to learn the scheme from. NOT cached — the next
     // call (the user's click) must retry once the reader has shown its page.
-    if (!sample) return Promise.resolve(null);
+    if (!sample) return hashReaderCache?.id === id ? hashReaderCache.task : Promise.resolve(null);
+    if (!hashReaderUrls([], sample)) return Promise.resolve(null);
+    const sampleUrl = new URL(sample);
+    const key = `${id}:${sampleUrl.hostname.split('.').slice(1).join('.')}:${sampleUrl.port}:${sampleUrl.pathname.split('/')[1]}`;
+    if (hashReaderCache?.key === key) return hashReaderCache.task;
+    const routingUrl = hashReaderRoutingUrl([...document.scripts].map(el => el.src), sample);
+    const sourceRouting = routingUrl ? { url: routingUrl, sample } : undefined;
     const task = (async () => {
+        const routing = sourceRouting ? fetchHashReaderRouting(sourceRouting) : Promise.resolve(null);
         for (const origin of hashReaderManifestOrigins(sample)) {
             try {
                 const r = await fetch(`${origin}/galleries/${id}.js`, { signal: AbortSignal.timeout(15000) });
                 if (!r.ok) continue;
-                const value = hashReaderUrls(hashReaderFiles(await r.text()), sample);
-                if (value?.urls.length) return value;
+                const files = hashReaderFiles(await r.text());
+                const value = hashReaderUrls(files, sample, { routing: await routing });
+                if (value?.urls.length) return { ...value, ...(sourceRouting ? { sourceRouting } : {}) };
             } catch { /* try the next origin */ }
         }
         return null;
     })();
-    hashReaderCache = { key: id, task };
+    hashReaderCache = { id, key, task };
     return task;
 }
 

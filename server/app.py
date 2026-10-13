@@ -397,6 +397,8 @@ def run_detect(pil, conf_thr, min_size):
              for piece in (split_speck_cluster(b, texty_comps, tiny_blobs) or [b])]
     # packed is 0/1 — packMask mirrors the client byte mask; the bool mask rides along for the merged inpaint pass
     mask_img = packed.astype(bool)
+    from balloon_surface import refine_balloon_boxes
+    boxes = refine_balloon_boxes(np.asarray(pil.convert("RGB")), boxes, mask_img)
     mw, mh, mbytes = pack_mask(w, h, (packed * 255).ravel())
     return boxes, infer_ms, {"w": mw, "h": mh,
                              "b64": base64.b64encode(mbytes).decode("ascii")}, mask_img
@@ -488,13 +490,28 @@ def cleanup_mask(raw, boxes, w, h):
     edges and the gaps between strokes outside it, and the model paints ghost
     glyphs back over the window."""
     mask = np.zeros_like(raw, dtype=bool)
+    allowed = np.zeros_like(raw, dtype=bool) if any(b.get("clip") for b in boxes) else None
+    radius = inpaint_dilate_radius(w, h)
     for b in boxes:
+        clip = b.get("clip")
+        sx = 12 if b.get("cutAxis") == "y" else 0
+        sy = 12 if b.get("cutAxis") == "x" else 0
+        cx1 = max(0, int(np.ceil(clip["x1"] - sx))) if clip else 0
+        cy1 = max(0, int(np.ceil(clip["y1"] - sy))) if clip else 0
+        cx2 = min(w, int(np.ceil(clip["x2"] + sx))) if clip else w
+        cy2 = min(h, int(np.ceil(clip["y2"] + sy))) if clip else h
         x1 = max(0, min(w, int(np.floor(b["x1"])))); y1 = max(0, min(h, int(np.floor(b["y1"]))))
         x2 = max(0, min(w, int(np.ceil(b["x2"])))); y2 = max(0, min(h, int(np.ceil(b["y2"]))))
+        x1, y1, x2, y2 = max(x1, cx1), max(y1, cy1), min(x2, cx2), min(y2, cy2)
+        if allowed is not None:
+            ax1, ay1 = max(cx1, x1 - radius), max(cy1, y1 - radius)
+            ax2, ay2 = min(cx2, x2 + radius + 1), min(cy2, y2 + radius + 1)
+            if ax2 > ax1 and ay2 > ay1:
+                allowed[ay1:ay2, ax1:ax2] = True
         if x2 > x1 and y2 > y1:
             mask[y1:y2, x1:x2] = raw[y1:y2, x1:x2]
-    return cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8),
-                      iterations=inpaint_dilate_radius(w, h)) > 0
+    grown = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=radius) > 0
+    return grown & allowed if allowed is not None else grown
 
 
 def run_inpaint(pil, boxes, pad_ratio, mask=None):

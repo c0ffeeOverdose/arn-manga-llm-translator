@@ -3,6 +3,8 @@
 
 import { SPLIT_CLIP_SLACK, type DetBox } from './detection';
 import { THAI_SPLIT_WORDS, THAI_TAIL_TRIGGERS, THAI_TAIL_UNSAFE } from './thai-words';
+import type { BalloonHint } from '../llm/core';
+import { interiorSeed, seedLike, balloonSurface, splitBalloonSurfaces, mergeBalloonLines } from './balloon-surface';
 
 const FONT = 'Sriracha';           // Thai handwriting font (bundled)
 const TRACKING = 0.1;      // letter spacing as fraction of font size
@@ -17,7 +19,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 37;
+export const RENDER_GEN = 40;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -321,41 +323,6 @@ export function inkStats(img: ImageData, box: DetBox): { frac: number; x1: numbe
     return { frac: n ? ink / n : 0, x1: ix1, y1: iy1, x2: ix2, y2: iy2 };
 }
 
-// Flood seed = the box's most common color, NOT the center pixel (center may land on a glyph).
-// Colors quantized to 4 bits/channel and averaged so anti-aliased noise doesn't split the vote.
-function interiorSeed(data: Uint8ClampedArray, W: number, H: number, box: DetBox, mask?: Uint8Array): [number, number, number] {
-    const x1 = Math.max(0, Math.floor(box.x1)), y1 = Math.max(0, Math.floor(box.y1));
-    const x2 = Math.min(W - 1, Math.ceil(box.x2)), y2 = Math.min(H - 1, Math.ceil(box.y2));
-    const stepX = Math.max(1, Math.floor((x2 - x1) / 24));
-    const stepY = Math.max(1, Math.floor((y2 - y1) / 24));
-    const buckets = new Map<number, { n: number; r: number; g: number; b: number }>();
-    let best: { n: number; r: number; g: number; b: number } | null = null;
-    for (let y = y1; y <= y2; y += stepY) {
-        for (let x = x1; x <= x2; x += stepX) {
-            if (mask?.[y * W + x]) continue;
-            const i = (y * W + x) * 4;
-            const r = data[i], g = data[i + 1], b = data[i + 2];
-            const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
-            let bkt = buckets.get(key);
-            if (!bkt) { bkt = { n: 0, r: 0, g: 0, b: 0 }; buckets.set(key, bkt); }
-            bkt.n++; bkt.r += r; bkt.g += g; bkt.b += b;
-            if (!best || bkt.n > best.n) best = bkt;
-        }
-    }
-    const cx = Math.max(0, Math.min(W - 1, Math.floor((box.x1 + box.x2) / 2)));
-    const cy = Math.max(0, Math.min(H - 1, Math.floor((box.y1 + box.y2) / 2)));
-    if (!best) {
-        const i = (cy * W + cx) * 4;
-        return [data[i], data[i + 1], data[i + 2]];
-    }
-    return [Math.round(best.r / best.n), Math.round(best.g / best.n), Math.round(best.b / best.n)];
-}
-
-// Interior test (the flood fill's own tolerance): pixels this close to the seed are the same surface.
-function seedLike(data: Uint8ClampedArray, i: number, seed: [number, number, number]): boolean {
-    return Math.abs(data[i] - seed[0]) + Math.abs(data[i + 1] - seed[1]) + Math.abs(data[i + 2] - seed[2]) < 60;
-}
-
 export interface InteriorFill {
     seed: [number, number, number];
     minX: number; minY: number; maxX: number; maxY: number;
@@ -546,6 +513,12 @@ function interiorFill(img: ImageData, box: DetBox, growX: number, grow: number, 
 // Pixel reads are lazy; missing evidence, separate balloons and offset lobes keep their cuts.
 export function mergeParagraphLines(boxes: DetBox[], readPixels: () => ImageData, mask?: TextMask): DetBox[] {
     if (!mask) return boxes;
+    let frame: ImageData | undefined;
+    if (new Uint8Array(mask.data).some(v => v > 127)) {
+        try { frame = readPixels(); } catch { return boxes; }
+        if (mask.width !== frame.width || mask.height !== frame.height || mask.data.byteLength !== frame.width * frame.height) return boxes;
+        boxes = mergeBalloonLines(frame, splitBalloonSurfaces(frame, boxes, mask), mask);
+    }
     const families = new Map<number, DetBox[]>();
     for (const b of boxes) if (b.sib != null) {
         const family = families.get(b.sib) ?? [];
@@ -553,7 +526,6 @@ export function mergeParagraphLines(boxes: DetBox[], readPixels: () => ImageData
         families.set(b.sib, family);
     }
     const merged = new Map<DetBox, DetBox>(), removed = new Set<DetBox>();
-    let frame: ImageData | undefined;
     for (const family of families.values()) {
         if (family.length < 3 || family.some(b => b.cutAxis !== 'y' || !b.clip
             || b.clip.x1 !== family[0].clip?.x1 || b.clip.x2 !== family[0].clip?.x2)) continue;
@@ -1005,10 +977,26 @@ export function runInterval(prof: RunProfile, p0: number, p1: number): [number, 
 // Enclosed-bubble path: profile measurement, or the legacy rectangle when no bubble encloses the box.
 function fitArea(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask): LayoutRect {
     const rect = (why: string, prof?: RunProfile): LayoutRect => {
+        const surface = !vertical ? balloonSurface(img, box, mask) : null;
+        if (surface) {
+            const i1 = surface.left.slice(), i2 = surface.right.slice();
+            for (let k = 0; k < i1.length; k++) {
+                if (i2[k] <= i1[k]) continue;
+                const margin = (i2[k] - i1[k]) * 0.08;
+                i1[k] = Math.ceil(i1[k] + margin); i2[k] = Math.floor(i2[k] - margin);
+                if (k + surface.y1 >= box.y1 && k + surface.y1 < box.y2) {
+                    i1[k] = Math.min(i1[k], Math.floor(box.x1)); i2[k] = Math.max(i2[k], Math.ceil(box.x2));
+                }
+            }
+            const runs: RunProfile = { vertical: false, p0: surface.y1, p1: surface.y2 - 1, i1, i2,
+                enclosed: 1, e0: surface.y1, e1: surface.y2 - 1, leakL: 0, leakR: 0 };
+            return { x: surface.x1, y: surface.y1, w: surface.x2 - surface.x1, h: surface.y2 - surface.y1,
+                runs, why: 'enclosed-surface' };
+        }
         const area = bubbleArea(img, box, mask);
-        const surface = surfaceProfile(img, sourceBoxForLayout(img, box, vertical, mask), area, vertical, mask);
-        const stack = surface ? (vertical ? { x: surface.p0, w: surface.p1 - surface.p0 + 1 } : { y: surface.p0, h: surface.p1 - surface.p0 + 1 }) : {};
-        return { ...area, ...stack, why: surface ? 'surface' : why, ...(surface ? { runs: surface } : null),
+        const bounded = surfaceProfile(img, sourceBoxForLayout(img, box, vertical, mask), area, vertical, mask);
+        const stack = bounded ? (vertical ? { x: bounded.p0, w: bounded.p1 - bounded.p0 + 1 } : { y: bounded.p0, h: bounded.p1 - bounded.p0 + 1 }) : {};
+        return { ...area, ...stack, why: bounded ? 'surface' : why, ...(bounded ? { runs: bounded } : null),
             ...(prof ? { leakL: prof.leakL, leakR: prof.leakR } : null) };
     };
     // Per-axis leash: stacking axis 0.6/side (≤2.2x), run axis 1.2/side (≤3.4x).
@@ -1304,6 +1292,25 @@ export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxI
     return { ...clamped, runs: found.runs, why: found.why, leakL: found.leakL, leakR: found.leakR };
 }
 
+// Query original pixels without changing geometry. A trusted enclosed surface is
+// evidence only; a missing profile cannot prove that speech or a balloon is absent.
+export function balloonHint(img: ImageData, box: DetBox, mask?: TextMask): BalloonHint {
+    if (!inkStats(img, box).frac) return 'unknown';
+    box = sourceBoxForLayout(img, box, false, mask);
+    const w = box.x2 - box.x1;
+    const win = {
+        loX: Math.max(0, Math.floor(box.x1 - w)), hiX: Math.min(img.width - 1, Math.ceil(box.x2 + w)),
+        loY: Math.max(0, Math.floor(box.y1)), hiY: Math.min(img.height - 1, Math.ceil(box.y2)),
+    };
+    if (box.clip) {
+        if (box.cutAxis !== 'y') { win.loX = Math.max(win.loX, Math.ceil(box.clip.x1)); win.hiX = Math.min(win.hiX, Math.floor(box.clip.x2)); }
+        if (box.cutAxis !== 'x') { win.loY = Math.max(win.loY, Math.ceil(box.clip.y1)); win.hiY = Math.min(win.hiY, Math.floor(box.clip.y2)); }
+    }
+    const profile = widthProfile(img, box, false, interiorSeed(img.data, img.width, img.height, box),
+        { x1: win.loX, y1: win.loY, x2: win.hiX, y2: win.hiY }, win, mask);
+    return profile && profile.enclosed >= ENCLOSED_MIN && profile.e1 > profile.e0 ? 'detected' : 'unknown';
+}
+
 // Pick text color by contrast vs the placement background. Modal tone, not mean.
 // Leaked rows/interior art drag a mean across the boundary; the largest bucket is the text's surface.
 function textColorFor(img: ImageData, area: { x: number; y: number; w: number; h: number }, mask?: TextMask): string {
@@ -1360,7 +1367,9 @@ export function renderRegion(
 ): Placed | null {
     if (!text.trim()) return null;
     if (chosenOrientation(ctx, img, box, text, mask)) return renderVertical(ctx, img, box, text, mask);
-    return renderHorizontal(ctx, img, box, text, mask);
+    const plan = prepareRegion(ctx, img, box, text, mask);
+    plan?.paint();
+    return plan?.placed ?? null;
 }
 
 // This region always lays out horizontal: every target here reads left-to-right, never rotate.
@@ -1373,6 +1382,8 @@ export function chosenOrientation(
 }
 
 export interface Placed { fontSize: number; lines: string[]; overflow?: boolean; color?: string; block?: [number, number]; grown?: 1 }
+
+export interface PreparedRender { placed: Placed; paint(): void }
 
 interface Area { x: number; y: number; w: number; h: number }
 
@@ -1508,21 +1519,26 @@ export function layoutTextFit(
             const boxTop = Math.min(Math.max(boxC - span / 2, stack0), Math.max(stack0, stack0 + stackLen - span));
             if (Math.abs(boxTop - areaTop) > 0.5) tops.unshift(boxTop);
         }
-        const slack = size * (renderTuning.letterSpacing * 0.5 + renderTuning.textStroke) + 1;
-        const fitsAt = (top: number) => lines.every((line, j) => {
-            const b0 = prof.vertical ? top - (j + 1) * lh : top + j * lh;
-            const iv = midIv(b0, b0 + lh);
-            return !iv || ctx.measureText(line).width <= iv[1] - iv[0] + slack;
-        });
+        const centerAt = (top: number): number | null => {
+            let lo = -Infinity, hi = Infinity;
+            for (let j = 0; j < lines.length; j++) {
+                const b0 = prof.vertical ? top - (j + 1) * lh : top + j * lh;
+                const iv = midIv(b0, b0 + lh);
+                if (!iv) return null;
+                const metric = ctx.measureText(lines[j]);
+                const actual = metric.actualBoundingBoxLeft + metric.actualBoundingBoxRight;
+                const width = Number.isFinite(actual) ? actual + (renderTuning.textStroke > 0 ? Math.max(1, size * renderTuning.textStroke) : 0) + 1 : metric.width;
+                lo = Math.max(lo, iv[0] + width / 2 - 0.5);
+                hi = Math.min(hi, iv[1] - width / 2 + 0.5);
+            }
+            return lo <= hi ? Math.max(lo, Math.min(hi, midCross)) : null;
+        };
         let out: LaidOutFit | null = null;
         let wonBoxC = false;
         for (const top of tops) {
-            if (!fitsAt(top)) continue;
-            const centers = lines.map((_, j) => {
-                const b0 = prof.vertical ? top - (j + 1) * lh : top + j * lh;
-                const iv = midIv(b0, b0 + lh);
-                return iv ? (iv[0] + iv[1]) / 2 : midCross;
-            });
+            const center = centerAt(top);
+            if (center == null) continue;
+            const centers = lines.map(() => center);
             out = { lines, fontSize: size, lineHeight: lh, top, centers };
             wonBoxC = tops.length > 1 && top === tops[0];
             break;
@@ -1571,56 +1587,88 @@ export function horizontalFits(
     return laid.lines.every(l => ctx.measureText(l).width <= area.w + slack);
 }
 
-function renderHorizontal(
+interface GlyphBounds { left: number; right: number; ascent: number; descent: number }
+
+function glyphBounds(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, line: string, size: number): GlyphBounds {
+    const m = ctx.measureText(line);
+    return { left: Number.isFinite(m.actualBoundingBoxLeft) ? m.actualBoundingBoxLeft : 0,
+        right: Number.isFinite(m.actualBoundingBoxRight) ? m.actualBoundingBoxRight : m.width,
+        ascent: Number.isFinite(m.actualBoundingBoxAscent) ? m.actualBoundingBoxAscent : size,
+        descent: Number.isFinite(m.actualBoundingBoxDescent) ? m.actualBoundingBoxDescent : size * 0.3 };
+}
+
+// Plan horizontal lettering without touching pixels. A complete glyph/stroke fit is required
+// before the caller may erase its source; paint reuses exactly the measured plan.
+export function prepareRegion(
     ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
     img: ImageData,
     box: DetBox,
     text: string,
     mask?: TextMask,
-): Placed | null {
+): PreparedRender | null {
     if (!text.trim()) return null;
     const area = pageArea(ctx, img, box, false, mask);
     if (!area) return null;
     const { color, stroke } = resolveColors(img, area, box, mask);
     const sourceBox = sourceBoxForLayout(img, box, false, mask);
-    const cap = Math.min(hCap(area), sizeCapFrom(img, sourceBox, false) ?? MAX_FONT);
+    let cap = Math.min(hCap(area), sizeCapFrom(img, sourceBox, false) ?? MAX_FONT);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    const positions = (laid: LaidOutFit, target: LayoutRect): { x: number; y: number }[] | null => {
+        setFont(ctx, laid.fontSize);
+        const glyphs = laid.lines.map(line => glyphBounds(ctx, line, laid.fontSize));
+        const ascent = Math.max(...glyphs.map(m => m.ascent)), descent = Math.max(...glyphs.map(m => m.descent));
+        const strokePad = (renderTuning.textStroke > 0 ? Math.max(1, laid.fontSize * renderTuning.textStroke) / 2 : 0) + 0.5;
+        const result: { x: number; y: number }[] = [];
+        for (let j = 0; j < glyphs.length; j++) {
+            const m = glyphs[j], y = laid.top + j * laid.lineHeight + laid.lineHeight / 2 + (ascent - descent) / 2;
+            const x = laid.centers[j] - (m.right - m.left) / 2;
+            const top = y - m.ascent - strokePad, bottom = y + m.descent + strokePad;
+            if (top < target.y - 0.5 || bottom > target.y + target.h + 0.5) return null;
+            const iv = target.runs ? runInterval(target.runs, top, bottom) : [target.x, target.x + target.w];
+            if (!iv || x - m.left - strokePad < Math.max(target.x, iv[0]) - 0.5
+                || x + m.right + strokePad > Math.min(target.x + target.w, iv[1]) + 0.5) return null;
+            result.push({ x, y });
+        }
+        return result;
+    };
+    const painter = (laid: LaidOutFit, target: LayoutRect, points: { x: number; y: number }[], grown?: 1): PreparedRender => ({
+        placed: { fontSize: laid.fontSize, lines: laid.lines, color, block: [laid.top, laid.top + laid.lines.length * laid.lineHeight], ...(grown ? { grown } : {}) },
+        paint() {
+            ctx.save();
+            setFont(ctx, laid.fontSize);
+            ctx.beginPath(); ctx.rect(target.x, target.y, target.w, target.h); ctx.clip();
+            if (target.runs) {
+                ctx.beginPath();
+                const prof = target.runs;
+                for (let p = prof.p0; p <= prof.p1; p++) {
+                    const k = p - prof.p0;
+                    if (prof.i2[k] > prof.i1[k]) ctx.rect(prof.i1[k], p, prof.i2[k] - prof.i1[k], 1);
+                }
+                ctx.clip();
+            }
+            ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = color;
+            laid.lines.forEach((line, j) => {
+                if (renderTuning.textStroke > 0) {
+                    ctx.strokeStyle = stroke; ctx.lineWidth = Math.max(1, laid.fontSize * renderTuning.textStroke); ctx.lineJoin = 'round';
+                    ctx.strokeText(line, points[j].x, points[j].y);
+                }
+                ctx.fillText(line, points[j].x, points[j].y);
+            });
+            ctx.restore();
+        },
+    });
 
-    // Enclosed bubble: each line fitted to its own measured band, centered on its own run.
     if (area.runs) {
         const boxC = (sourceBox.y1 + sourceBox.y2) / 2;
-        const laid = layoutTextFit(ctx, text, area, cap, Math.round((box.y2 - box.y1) * Math.max(1.15, renderTuning.textScale)), boxC);
-        if (!laid || !laid.lines.length) return null;
-        // The paint must use the size the wrap MEASURED: the loop leaves ctx font at the last size tried.
-        setFont(ctx, laid.fontSize);
-        const overflow = laid.top + laid.lines.length * laid.lineHeight > area.y + area.h + 0.5 || laid.top < area.y - 0.5;
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(area.x, area.y, area.w, area.h);
-        ctx.clip();
-        ctx.beginPath();
-        const prof = area.runs;
-        for (let p = prof.p0; p <= prof.p1; p++) {
-            const k = p - prof.p0;
-            if (prof.i2[k] > prof.i1[k]) ctx.rect(prof.i1[k], p, prof.i2[k] - prof.i1[k], 1);
+        while (cap >= HARD_MIN_FONT) {
+            const laid = layoutTextFit(ctx, text, area, cap, undefined, boxC);
+            if (!laid || !laid.lines.length) return null;
+            const points = positions(laid, area);
+            if (points) return painter(laid, area, points);
+            cap = Math.min(cap - 2, laid.fontSize - 2);
         }
-        ctx.clip();
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = color;
-        laid.lines.forEach((line, j) => {
-            const cx = laid.centers[j] + halfTrack() * laid.fontSize; // trailing-spacing compensation
-            const y = laid.top + j * laid.lineHeight + laid.lineHeight / 2;
-            if (renderTuning.textStroke > 0) {
-                ctx.strokeStyle = stroke;
-                ctx.lineWidth = Math.max(1, laid.fontSize * renderTuning.textStroke);
-                ctx.lineJoin = 'round';
-                ctx.strokeText(line, cx, y);
-            }
-            ctx.fillText(line, cx, y);
-        });
-        ctx.restore();
-        const b0 = laid.top, b1 = laid.top + laid.lines.length * laid.lineHeight;
-        return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color, block: [b0, b1] };
+        return null;
     }
 
     let laid = layoutText(ctx, text, area.w, area.h, cap);
@@ -1640,41 +1688,21 @@ function renderHorizontal(
         }
     }
 
-    setFont(ctx, laid.fontSize);
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = color;
-
-    // Overflow policy: text NEVER leaves the region (clipped); on overflow top-align so the start stays readable.
-    const totalH = laid.lines.length * laid.lineHeight;
-    const overflow = totalH > paintArea.h + 0.5;
-    // A fitting block parks on the source box, not the area middle (same boxC rule as the profile path).
     const boxC = (sourceBox.y1 + sourceBox.y2) / 2;
-    let y = overflow
-        ? paintArea.y + laid.lineHeight / 2
-        : Math.min(Math.max(boxC, paintArea.y + totalH / 2), paintArea.y + paintArea.h - totalH / 2)
-        - totalH / 2 + laid.lineHeight / 2;
-
-    const y0 = y; // first line's center — the block runs [y0 - lh/2, y0 - lh/2 + totalH]
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(paintArea.x, paintArea.y, paintArea.w, paintArea.h);
-    ctx.clip();
-    const lineWidth = Math.max(...laid.lines.map(line => ctx.measureText(line).width));
-    const sourceC = Math.min(Math.max((sourceBox.x1 + sourceBox.x2) / 2, paintArea.x + lineWidth / 2), paintArea.x + paintArea.w - lineWidth / 2);
-    const cx = (sourceBox === box ? paintArea.x + paintArea.w / 2 : sourceC) + halfTrack() * laid.fontSize;
-    for (const line of laid.lines) {
-        if (renderTuning.textStroke > 0) {
-            ctx.strokeStyle = stroke;
-            ctx.lineWidth = Math.max(1, laid.fontSize * renderTuning.textStroke);
-            ctx.lineJoin = 'round';
-            ctx.strokeText(line, cx, y);
-        }
-        ctx.fillText(line, cx, y);
-        y += laid.lineHeight;
+    while (cap >= HARD_MIN_FONT) {
+        setFont(ctx, laid.fontSize);
+        const totalH = laid.lines.length * laid.lineHeight;
+        const top = Math.max(paintArea.y, Math.min(paintArea.y + paintArea.h - totalH, boxC - totalH / 2));
+        const lineWidth = Math.max(...laid.lines.map(line => ctx.measureText(line).width));
+        const sourceC = Math.min(Math.max((sourceBox.x1 + sourceBox.x2) / 2, paintArea.x + lineWidth / 2), paintArea.x + paintArea.w - lineWidth / 2);
+        const cx = sourceBox === box ? paintArea.x + paintArea.w / 2 : sourceC;
+        const fit = { ...laid, top, centers: laid.lines.map(() => cx) };
+        const points = positions(fit, paintArea);
+        if (totalH <= paintArea.h + 0.5 && points) return painter(fit, paintArea, points, grown ? 1 : undefined);
+        cap = Math.min(cap - 2, laid.fontSize - 2);
+        laid = layoutText(ctx, text, paintArea.w, paintArea.h, cap);
     }
-    ctx.restore();
-    return { fontSize: laid.fontSize, lines: laid.lines, overflow: overflow || undefined, color, block: [y0 - laid.lineHeight / 2, y0 - laid.lineHeight / 2 + totalH], ...(grown ? { grown: 1 as const } : null) };
+    return null;
 }
 
 // Left edge of the first (rightmost) column; columns extend LEFTWARD.

@@ -497,12 +497,46 @@ export function galleryLookaheadUrls(manifestJson: string | null, origSrc: strin
     return galleryAheadUrls(manifestJson, m[1], m[2], max);
 }
 
-// ---- hash-listed single-image readers: one page image on screen, the whole chapter published
-// as a JS assignment (`var <name> = {...}` from the reader's CDN) whose files[] name every page
-// by content hash. Full art sits on numbered CDN shards chosen per file, so the displayed
-// page's own URL teaches the build prefix and shard family; a file's shard NUMBER is not in the
-// manifest and rides as an alternate for the existing one-shot sibling retry. Pure — unit-tested.
+// Hash-listed readers publish page hashes separately from their shard table.
+// The displayed image supplies the CDN family and a verified fallback when routing is unavailable.
 export interface HashReaderFile { hash: string; avif: boolean }
+export interface HashReaderRouting { build: string; shards: string }
+export interface HashReaderRoutingSource {
+    url: string;
+    sample: string;
+    refreshed?: boolean;
+    routing?: HashReaderRouting;
+}
+
+// Parse only the known binary switch and hash-slot grammar as data. Unsupported
+// scripts yield null; never execute reader/CDN code in an extension context.
+export function hashReaderRouting(script: string | null): HashReaderRouting | null {
+    if (!script || script.length > 131_072) return null;
+    const compact = script.replace(/\s+/g, '');
+    const m = /^(?:(?:'usestrict'|"usestrict");)?(?:(?:var|let|const))?[A-Za-z_$][\w$]*=\{m:function\(g\)\{varo=([01]);switch\(g\)\{((?:case\d{1,4}:)+)o=([01]);break;\}returno;\},s:function\(h\)\{varm=\/\(\.\.\)\(\.\)\$\/\.exec\(h\);returnparseInt\(m\[2\]\+m\[1\],16\)\.toString\(10\);\},b:(['"])(\d{1,20})\/\4\};?$/.exec(compact);
+    if (!m || m[1] === m[3]) return null;
+    const shards = Array<string>(4096).fill(String(1 + Number(m[1])));
+    const seen = new Set<number>();
+    for (const row of m[2].matchAll(/case(\d+):/g)) {
+        const slot = Number(row[1]);
+        if (slot >= shards.length || seen.has(slot)) return null;
+        seen.add(slot);
+        shards[slot] = String(1 + Number(m[3]));
+    }
+    return { build: m[5], shards: shards.join('') };
+}
+
+export function hashReaderRoutingUrl(scripts: string[], sample: string): string | undefined {
+    if (!hashReaderUrls([], sample)) return;
+    const suffix = new URL(sample).hostname.split('.').slice(1).join('.');
+    for (const script of scripts) {
+        try {
+            const u = new URL(script);
+            if (u.protocol === 'https:' && !u.username && !u.password && u.pathname.endsWith('/gg.js')
+                && (u.hostname === suffix || u.hostname.endsWith('.' + suffix))) return u.href;
+        } catch { /* not an addressable routing script */ }
+    }
+}
 
 // Reader route shape `/reader/<id>.html` names the id the manifest is fetched by. A route gate
 // only — the manifest must still parse before anything is enumerated.
@@ -532,19 +566,17 @@ export function hashReaderFiles(manifestJs: string | null): HashReaderFile[] {
     } catch { return []; }
 }
 
-// Full-size page URLs derived from one DISPLAYED image. The sample path must be
-// `/<build>/<tail-swap>/<hash>.<ext>` on a `<letter><number>.<domain>` host whose letter
-// matches the extension family (avif→a, webp→w): that shape teaches the build prefix and the
-// sample's shard number; each file's URL differs only in hash, its computed path slot and its
-// (unknown) shard number. Returns one primary URL per file plus the number alternate; null on
-// any shape mismatch — the caller keeps the DOM branches rather than fetch invented URLs.
-export function hashReaderUrls(files: HashReaderFile[], sample: string): { urls: string[]; alts: string[] } | null {
+// Preserve one full-size URL/alternate per file. Initial routing must agree with the
+// displayed sample; explicit recovery may use a new build after the original sources fail.
+export function hashReaderUrls(files: HashReaderFile[], sample: string,
+    opts: { routing?: HashReaderRouting | null; refresh?: boolean } = {},
+): { urls: string[]; alts: string[] } | null {
     let u: URL;
     try { u = new URL(sample); } catch { return null; }
     if (u.protocol !== 'https:') return null;
     const segs = u.pathname.split('/').filter(Boolean);
     if (segs.length !== 3) return null;
-    const build = segs[0];
+    let build = segs[0];
     const last = segs[2].match(/^([0-9a-f]{16,})\.(avif|webp)$/i);
     if (!build || !/^[A-Za-z0-9][A-Za-z0-9._~-]*$/.test(build) || !last) return null;
     const ext = last[2].toLowerCase();
@@ -554,13 +586,16 @@ export function hashReaderUrls(files: HashReaderFile[], sample: string): { urls:
     if (!shard || suffix.split('.').length < 2) return null;
     if ((shard[1] === 'a') !== (ext === 'avif')) return null;
     const num = Number(shard[2]);
-    const altNum = num === 1 ? 2 : 1;
     const port = u.port ? ':' + u.port : '';
     const slot = (hash: string): string | null => {
         const tail = hash.slice(-3);
         if (!/^[0-9a-f]{3}$/i.test(tail)) return null;
         return String(parseInt(tail[2] + tail.slice(0, 2), 16));
     };
+    const r = opts.routing, sampleSlot = slot(last[1]);
+    const trusted = r && /^\d{1,20}$/.test(r.build) && typeof r.shards === 'string' && /^[12]{4096}$/.test(r.shards)
+        && (opts.refresh || (r.build === build && sampleSlot !== null && Number(r.shards[Number(sampleSlot)]) === num));
+    if (trusted) build = r.build;
     const urls: string[] = [], alts: string[] = [];
     for (const f of files) {
         const s = slot(f.hash);
@@ -568,8 +603,9 @@ export function hashReaderUrls(files: HashReaderFile[], sample: string): { urls:
         const letter = f.avif ? 'a' : 'w';
         const extFor = f.avif ? 'avif' : 'webp';
         const mk = (n: number): string => `https://${letter}${n}.${suffix}${port}/${build}/${s}/${f.hash}.${extFor}`;
-        urls.push(mk(num));
-        alts.push(mk(altNum));
+        const primary = trusted ? Number(r.shards[Number(s)]) : num;
+        urls.push(mk(primary));
+        alts.push(mk(primary === 1 ? 2 : 1));
     }
     return { urls, alts };
 }

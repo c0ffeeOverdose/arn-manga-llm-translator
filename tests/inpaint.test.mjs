@@ -104,7 +104,7 @@ test('erasePlan: translated boxes erase, keep + contained dups stay, missing -> 
   ];
   const p = erasePlan(det, outputs);
   assert.deepEqual(p.boxesToErase.map(b => b.conf), [0.9]);
-  assert.deepEqual(p.keepBoxes.map(b => b.conf), [0.5, 0.8]);
+  assert.deepEqual(p.keepBoxes.map(b => b.conf), [0.5, 0.8, 0.7]);
   assert.deepEqual([...p.dupIdx], [2]);
   assert.deepEqual([...p.keepIdx], [3]);
   assert.deepEqual(p.missedIdx, [4]);
@@ -122,6 +122,25 @@ test('erasePlan: a near-identical double detection erases/paints only once', () 
   assert.deepEqual(p.boxesToErase, [a, b]); // both areas erase (union covers the line)
   assert.deepEqual(p.keepBoxes, []); // the loser is not a keep region — it gets erased
   assert.deepEqual([...p.dupIdx], [1]); // and it is never painted
+});
+
+test('missing translations protect their source against a neighbour cleanup', () => {
+    const boxes = [{ x1: 10, y1: 10, x2: 30, y2: 30, conf: 0.9 }, { x1: 32, y1: 10, x2: 50, y2: 30, conf: 0.9 }];
+    const det = { boxes, mask: { width: 60, height: 40, data: mask(60, 40, [[29, 20], [33, 20]]).buffer } };
+    const plan = erasePlan(det, [{ index: 1, translation: 'translated' }]);
+    assert.deepEqual(plan.keepBoxes, [boxes[1]]);
+    const cleaned = aiCleanupMask(det, [boxes[0]], plan.keepBoxes);
+    assert.equal(cleaned.data[20 * 60 + 33], 0);
+});
+
+test('erase expansion and AI dilation cannot cross a split ownership clip', () => {
+    const W = 80, H = 60, raw = mask(W, H, [[29, 20], [30, 20], [32, 20], [34, 20]]);
+    const owned = { ...box, conf: 0.9, cutAxis: 'x', clip: { x1: 0, y1: 0, x2: 31, y2: H } };
+    const expanded = eraseBox(raw, W, H, owned, 12);
+    assert.ok(expanded.x2 <= 31);
+    const cleaned = aiCleanupMask({ boxes: [owned], mask: { width: W, height: H, data: raw.buffer } }, [expanded], []);
+    assert.equal(cleaned.data[20 * W + 32], 0);
+    assert.ok(cleaned.data[20 * W + 29] > 127);
 });
 
 // ---- aiCleanupMask: what the manga-LaMa windows actually see ---------------

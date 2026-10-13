@@ -7,13 +7,15 @@ import { renderPage } from '../content/render-page';
 import { cacheGet, cachePutMany, cacheDelete, cacheKey, pageKey, selectCachedPage, detFromCacheEntry, cacheEntryFresh, cacheMissReason, PAGE_KEY_GEN, INPAINT_PATCH_GEN, settingsFingerprint, pageHashFromBitmap, packMask } from '../content/page-cache';
 import { keepaliveOpen } from '../content/queue';
 import { initDebug, isDebug } from '../debug';
-import { chapterMessage, providerMessage, fetchSourceWithAlternate, type ChapterPage, type ChapterProgress, type Contribution, type PagePhase } from './model';
+import { chapterMessage, providerMessage, pickRetryPages, type ChapterPage, type ChapterProgress, type Contribution, type PagePhase } from './model';
+import { HashReaderSourceLoader, fetchHashReaderRouting } from './source';
 import { readRecord, writeRecord } from './store';
 import { artifactKey, chapterSignature, type HostConfig, type HostCheckpoint, type ChapterArtifact } from './protocol';
 import { identifyBitmap, signatureOf } from '../image-identity';
 import type { ContextState } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, inpaintMode } from '../llm/pipeline-settings';
-import { releaseIdleDetector, shiftDetectionBoxY, type DetectResult, type DetBox } from '../content/detection';
+import { releaseIdleDetector, holdInferenceHost, shiftDetectionBoxY, type DetectResult, type DetBox } from '../content/detection';
+import { InferenceRpcTimeoutError } from '../content/inference-health';
 import { computeAiPatches, type AiPatches } from '../content/inpaint';
 import type { TranslateOutcome } from '../content/ocr';
 import type { CachedPage } from '../content/page-cache';
@@ -49,7 +51,13 @@ const note = (m: string): void => {
     diagnostics.push(m);
     if (diagnostics.length > 200) diagnostics.shift();
 };
+// Pages whose failure was a timeout-class fault (RPC deadline / lease expiry) — candidates for
+// the single automatic retry pass — and the pages that already spent that retry. Cleared when
+// a run (re)starts; a page never earns two automatic retries inside one run.
+const autoRetry = new Set<string>();
+const retried = new Set<string>();
 let config: HostConfig;
+let sourceLoader: HashReaderSourceLoader;
 let status: ChapterProgress;
 let epoch = 0;
 let pumping = false;
@@ -181,14 +189,14 @@ async function contextFor(entries?: Contribution[], beforeOrder?: number): Promi
     if (!r?.ok) throw new Error(r?.error || 'Could not update character context');
     return r.context!;
 }
-async function source(page: ChapterPage): Promise<ImageBitmap> {
+async function source(page: ChapterPage, valid: () => boolean): Promise<ImageBitmap> {
     if (page.source) return createImageBitmap(await (await fetch(page.source)).blob());
     if (/^https?:/.test(page.url)) {
         // The preferred encoding may be evicted on this CDN edge; the sibling tier of the SAME
         // page is a separate file, so try it once before failing the page.
-        const f = await fetchSourceWithAlternate(page.url, page.alt, fetchBitmap,
+        const f = await sourceLoader.load(page.url, page.alt, fetchBitmap,
             why => { note(`source p${page.order} primary failed (${why}); trying sibling encoding`);
-                recordChapterLog(trace([page.order + 1]), { kind: 'source-alternate' }); });
+                recordChapterLog(trace([page.order + 1]), { kind: 'source-alternate' }); }, valid);
         if (!page.descramble) return f.bitmap;
         try {
             const fixed = await unscrambleTiles(f.bitmap);
@@ -208,8 +216,8 @@ function stage(item: ProgressItem, valid: () => boolean, phase: ProgressItem['ph
     if (valid()) { item.phase = phase; void publish().catch(showFatal); }
 }
 
-// A failed page is failed alone: one page's error must not end the run. 429/auth halt the
-// queue instead — the provider is refusing, so retrying only burns budget.
+// Page-local failures do not end the run. Provider refusals and confirmed browser-wide
+// graphics stalls pause it: another page cannot repair a shared unavailable resource.
 async function markFailed(page: ChapterPage, item: ProgressItem, e: unknown, valid: () => boolean): Promise<void> {
     note(`work p${page.order} FAIL ${(e as Error).name}: ${(e as Error).message}`.slice(0, 200));
     if (!valid()) return;
@@ -218,9 +226,12 @@ async function markFailed(page: ChapterPage, item: ProgressItem, e: unknown, val
     // A page that already reached 'ready' in this run is done; a late publish failure must
     // not demote it and re-queue an infinite retry.
     if (item.phase !== 'ready') item.phase = err.kind === 'source' ? 'waiting' : 'failed';
+    // An RPC deadline that still left the browser's GPU responsive is a transient stall, not a
+    // bad page: mark it for the one automatic retry the pump runs at the end of the walk.
+    if (item.phase === 'failed' && e instanceof InferenceRpcTimeoutError) autoRetry.add(page.id);
     console.warn('[mt] chapter page failed', page.order, err);
-    if (err.kind === 'ratelimit' || err.kind === 'auth') {
-        status.message = providerMessage(err.kind);
+    if (err.kind === 'ratelimit' || err.kind === 'auth' || err.kind === 'inference') {
+        status.message = err.kind === 'inference' ? `Translation paused — ${err.message}` : providerMessage(err.kind);
         status.phase = 'error';
     }
     await publish();
@@ -244,8 +255,8 @@ interface Prepared {
     out?: TranslationResult;         // cached translation: commit without an LLM call
     patches?: CachedPage['patches']; // reusable AI-cleanup patches (cached path only)
     patchesGen?: number;
-    // AI cleanup started when the group's OCR ended (LLM request in flight) — commit
-    // reuses it so the render never pays the model on the user's critical path.
+    // AI cleanup starts after OCR during the LLM wait; single, merged and fallback
+    // commits reuse the same promise rather than starting another model pass.
     warm?: Promise<AiPatches | null>;
 }
 
@@ -274,7 +285,7 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
             return 'done';
         }
         step('image', [page.order + 1]);
-        bitmap = await source(page).catch(e => { note(`source p${page.order} ${(e as Error).message}`); throw e; });
+        bitmap = await source(page, valid).catch(e => { note(`source p${page.order} ${(e as Error).message}`); throw e; });
         if (!valid()) { bitmap.close(); return 'skip'; }
         step('hash', [page.order + 1]);
         const hash = pageHashFromBitmap(bitmap);
@@ -353,12 +364,18 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
     }
 }
 
-async function translateOrThrow(p: Prepared, snapshot: ContextState, cacheEpoch: string): Promise<TranslateOutcome> {
+function warmPrepared(p: Prepared, valid: () => boolean): void {
+    if (valid() && status.phase === 'running' && !p.warm) p.warm = computeAiPatches(p.bitmap, p.det, p.det.boxes, []).catch(() => null);
+}
+
+async function translateOrThrow(p: Prepared, snapshot: ContextState, cacheEpoch: string, live: () => boolean): Promise<TranslateOutcome> {
     try {
         step('translationPrep', [p.page.order + 1]);
-        const out = await translateRegions(p.bitmap, p.det, pageStatus([p.page.order + 1]), {
+        const out = await translateRegions(p.bitmap, p.det, pageStatus([p.page.order + 1], live), {
             fold: false, lo: true, context: snapshot, fresh: p.force, cacheEpoch, onStarve: starveNotice,
             chapterTrace: trace([p.page.order + 1]),
+            valid: () => live() && status.phase === 'running',
+            afterOcr: inpaintMode(config.pipeline) === 'local' ? () => warmPrepared(p, live) : undefined,
         });
         if ('error' in out && out.error) throw Object.assign(new Error(out.error), { kind: out.errorKind });
         return out;
@@ -428,6 +445,9 @@ async function withPageLease<T>(page: ChapterPage, item: ProgressItem, valid: ()
             recordChapterLog(trace([page.order + 1]), { kind: 'page-failed', reason: 'timeout' });
             const stuck = `p${page.order} stuck in ${phase} for ${Math.round(elapsedMs / 1000)}s`;
             note(stuck);
+            // A lease expiry is a stalled stage, not a broken page — eligible for the one
+            // automatic retry pass (same bound: `retried` admits a page only once).
+            autoRetry.add(page.id);
             if (isDebug()) console.warn('[mt] chapter', stuck);
             void publish().catch(showFatal);
         },
@@ -448,7 +468,8 @@ async function settlePrepared(p: Prepared, snapshot: ContextState, cacheEpoch: s
     try {
         // A revoked attempt (Stop, retry, cache reset) must not start new provider work.
         if (!live()) return;
-        const out = p.out ?? await translateOrThrow(p, snapshot, cacheEpoch);
+        if (status.phase !== 'running') { p.item.phase = 'queued'; return; }
+        const out = p.out ?? await translateOrThrow(p, snapshot, cacheEpoch, live);
         if (!live()) return;
         await commitPage(p, out, live);
     } catch (e) {
@@ -496,7 +517,7 @@ async function combinePages(pages: Prepared[]): Promise<{ bitmap: ImageBitmap; d
 
 // A worker slot with mergePages>1: pages are prepared together, translated in ONE request
 // (so they can see each other), then committed page by page. Cached pages commit the moment
-// they are ready. Group failure or lease expiry falls back to per-page calls, so one stuck
+// they are ready. Page-local group failure or lease expiry falls back to per-page calls, so one stuck
 // page still costs one page.
 async function runGroup(group: ChapterPage[], snapshot: ContextState, generation: number, cacheEpoch: string): Promise<void> {
     const valid = () => generation === epoch && cacheCurrent(cacheEpoch);
@@ -515,13 +536,21 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
     // Parallel preparation must not reorder the story seen by the merged request.
     prepared.sort((a, b) => a.page.order - b.page.order);
     if (!prepared.length) return;
-    if (!valid()) { for (const p of prepared) p.bitmap.close(); return; }
+    if (!valid() || status.phase !== 'running') {
+        for (const p of prepared) {
+            if (valid()) p.item.phase = 'queued';
+            p.bitmap.close();
+        }
+        if (valid()) await publish();
+        return;
+    }
     if (prepared.length < 2) {
         // Only one page actually needs the LLM: a normal per-page call under its own lease.
         await Promise.all(prepared.map(p => withPageLease(p.page, p.item, valid, live => settlePrepared(p, snapshot, cacheEpoch, live))));
         return;
     }
     let out: TranslateOutcome | null = null;
+    let sharedFailure: unknown;
     // A group too large for one canvas (or a failed combine) must degrade to per-page calls,
     // never kill the run.
     step('merge', prepared.map(p => p.page.order + 1));
@@ -552,12 +581,13 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
             fold: false, lo: true, context: snapshot, fresh: prepared.some(p => p.force),
             cacheEpoch, onStarve: starveNotice, regionCap: combined.total, checkpoint: false,
             chapterTrace: trace(groupPages),
+            valid: () => valid() && status.phase === 'running',
             // page mode: one annotated image per page, badges numbered globally across the group
             pageSegments: config.pipeline.textSource === 'page' ? combined.segments : undefined,
             // OCR is done and the LLM request is about to leave: the GPU is idle for the whole
             // network wait, so every page computes its cleanup patches now (single-page parity).
             afterOcr: inpaintMode(config.pipeline) === 'local'
-                ? () => { for (const p of prepared) p.warm = computeAiPatches(p.bitmap, p.det, p.det.boxes, []).catch(() => null); }
+                ? () => { for (const p of prepared) warmPrepared(p, valid); }
                 : undefined,
         }).then(r => {
             if ('error' in r && r.error) throw Object.assign(new Error(r.error), { kind: r.errorKind });
@@ -567,6 +597,7 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         out = await Promise.race([call, attempt.cancelled.then(() => null)]);
     } catch (e) {
         note(`group ${group.map(p => `p${p.order}`).join(',')} llm ${(e as Error).message}`.slice(0, 200));
+        if ((e as Error & { kind?: string }).kind === 'inference') sharedFailure = e;
         out = null;
     } finally {
         attempt.finish();
@@ -574,6 +605,13 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         combined.bitmap.close();
     }
     if (!valid()) { for (const p of prepared) p.bitmap.close(); return; }
+    if (sharedFailure) {
+        for (const p of prepared) {
+            try { await markFailed(p.page, p.item, sharedFailure, valid); }
+            finally { p.bitmap.close(); }
+        }
+        return;
+    }
     if (!out) {
         // Per-page fallback: each page gets its own lease, so a stuck page costs itself.
         await Promise.all(prepared.map(p => withPageLease(p.page, p.item, valid, live => settlePrepared(p, snapshot, cacheEpoch, live))));
@@ -616,10 +654,11 @@ function pumpCheck(): void {
 }
 // pumpCheck is the only re-entry: pump() must never call itself while `pumping` is true.
 
-// Chapter batching knobs. The split pipeline transcribes per page, so it keeps 1; page mode
-// merges by sending every page's annotated image with globally-numbered badges.
+// Chapter batching knobs. mergePages sends several pages in one request — crops stack into one
+// tall bitmap, page mode leads with every page's annotated image (badges numbered globally).
+// The split reading stage batches with the group too: one transcribe call for all its regions
+// (per-region fallback instead when the model caps image count), then one text translate call.
 function mergeSize(): number {
-    if (config.pipeline.useOcrModel) return 1;
     return Math.max(1, Math.min(10, config.pipeline.mergePages || DEFAULT_PIPELINE_SETTINGS.mergePages));
 }
 // Slots bound how many groups work at once — the user's "sets". 6 is a memory guard.
@@ -632,6 +671,10 @@ async function pump(): Promise<void> {
     pumping = true;
     const generation = epoch;
     const release = keepaliveOpen();
+    // Keep the inference worker (and every loaded model) alive for the whole active run: the
+    // idle dispose between a long LLM wait and the next page used to force cold model/shader
+    // loads page after page. When the run pauses or ends, the hold drops and the dispose runs.
+    const releaseHost = holdInferenceHost();
     const slots = new Map<number, Promise<void>>();
     let seq = 0;
     let discovery: Promise<boolean> | null = null;
@@ -665,6 +708,25 @@ async function pump(): Promise<void> {
                 // pixel-waiting pages remain (not a completion — the reader may still
                 // materialize them).
                 if (await discover(generation)) continue;
+                // End-of-walk retry pass: timeout-class failures (RPC deadline, lease expiry)
+                // are usually a transient GPU stall, and re-queueing here is exactly the work a
+                // manual retry does. A paused run (shared fault) or a page that already spent
+                // its retry never re-enters, so this cannot loop.
+                if (generation === epoch && status.phase === 'running') {
+                    const retry = pickRetryPages(status.pages, autoRetry, retried);
+                    if (retry.length) {
+                        for (const p of retry) { retried.add(p.id); p.phase = 'queued'; }
+                        note(`auto-retry ${retry.length} timed-out ${retry.length === 1 ? 'page' : 'pages'}`);
+                        recordChapterLog(trace(retry.flatMap(p => p.order === undefined ? [] : [p.order + 1])),
+                            { kind: 'retry', reason: 'auto-timeout' });
+                        status.notice = `Retrying ${retry.length} timed-out ${retry.length === 1 ? 'page' : 'pages'}`;
+                        setTimeout(() => {
+                            if (status?.notice) { status.notice = undefined; void publish().catch(() => {}); }
+                        }, 8000);
+                        await publish();
+                        continue;
+                    }
+                }
                 break;
             }
             // Walk the reader ahead while pages translate, so a freed slot never waits on
@@ -693,6 +755,7 @@ async function pump(): Promise<void> {
     finally {
         pumping = false;
         release();
+        releaseHost();
         if (status.phase === 'running') void pump();
         else releaseIdleDetector();
     }
@@ -766,12 +829,20 @@ async function attach(runnerId: string): Promise<void> {
     step('checkpoint');
     const checkpoint = await readRecord<HostCheckpoint>(`checkpoint:${id}`);
     if (checkpoint) config = { ...config, ...checkpoint.config };
+    sourceLoader = new HashReaderSourceLoader(config.sourceRouting, source => {
+        note('source routing: refreshing once');
+        recordChapterLog(trace(), { kind: 'retry', reason: 'source' });
+        return fetchHashReaderRouting(source);
+    }, publish);
     assertCacheCurrent(config.cacheEpoch ?? '');
     // Restore before the first write; setup progress must not overwrite completed work.
     status = checkpoint?.progress ?? { id, logId, chapter: config.chapter, phase: 'running', done: 0, total: config.pages.length,
         inflight: 0, errors: 0, completeManifest: config.completeManifest,
         pages: config.pages.map(p => ({ id: p.id, url: p.url, order: p.order, phase: 'queued' })) };
     status.notice = undefined;
+    // Fresh run: retry bookkeeping must not inherit a previous run's pages or spends.
+    autoRetry.clear();
+    retried.clear();
     for (const p of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)) p.phase = 'queued';
     await publish();
     // The run uses the reader's captured settings; only fonts need asynchronous setup.

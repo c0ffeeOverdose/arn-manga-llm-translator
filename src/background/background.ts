@@ -3,7 +3,7 @@ import './cache-broker';
 // content script's iframe — this worker owns LLM calls only.
 
 import { callLLM, toMtError, MtError, checkThinking, thinkingSmell, LlmHttpError, DEFAULT_BASES, DEFAULT_SETTINGS, translateRequestParts, translateRequestId, isImageCapError, sessionKey, type LLMSettings, type LlmUsage } from '../llm/adapters';
-import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, subsetRegionImages, EMPTY_CONTEXT, type ContextState, type CharOverride, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt, type ImageContent } from '../llm/core';
+import { buildPrompt, parseResponse, mergeRegions, joinTranscription, transcriptionMatches, updateContext, applyOverrides, subsetRegionImages, transcribeCropImages, EMPTY_CONTEXT, type ContextState, type CharOverride, type RegionInput, type RegionOutput, type Mention, type BuiltPrompt, type ImageContent } from '../llm/core';
 import { DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { chapterReaderUrl, isChapterRunnerSender } from './chapter-broker';
 import { cacheReady, cacheCurrent, onCacheReset } from '../cache-generation';
@@ -147,7 +147,7 @@ async function transcribeBatched(ocr: LLMSettings, msg: TranslateMsg, pipeline: 
 // A single region failing leaves its source empty; ALL regions failing
 // rethrows the first error. A refusal (429/auth) stops the remaining regions.
 async function transcribePerRegion(ocr: LLMSettings, msg: TranslateMsg, pipeline: PipelineSettings, call: LlmCaller, temperature: number | null): Promise<TranscribeResult> {
-    const crops = msg.textOnly ? (msg.imagesB64 ?? []) : (msg.imagesB64 ?? []).slice(1);
+    const crops = transcribeCropImages(msg.imagesB64, !!msg.textOnly, msg.pageCount);
     const prompt = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true, transcribeOnly: true, transcribeOne: true, chars: false });
     const sources = new Map<number, string>();
     const raws: string[] = [];
@@ -766,7 +766,7 @@ function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: 
                 usage = { ...t.usage };
                 llmCalls = t.calls;
                 llmMs = t.ms;
-                regions2 = msg.regions.map(r => ({ index: r.index, source: t.sources.get(r.index) ?? '' }));
+                regions2 = msg.regions.map(r => ({ ...r, source: t.sources.get(r.index) ?? '' }));
                 ocrStatus = regions2.map(r => r.source ? 'ok' : 'empty');
                 ocrMs = t.ms;
                 // hand the transcripts over before the translate call: the content

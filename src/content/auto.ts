@@ -10,7 +10,7 @@ import { fetchBitmap, getPages, unscrambleTiles, episodeManifestSrcs, galleryMan
 import { resolveHeadlessDet } from './pipeline';
 import { sweepHas, sweepActive, bookAdd } from './sweep';
 import { translateRegions, warmPatches, type TranslateOutcome } from './ocr';
-import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, resumeAuto, keepaliveOpen } from './queue';
+import { queue, failMarks, enqueue, viewportOverlap, pageKeyOf, activeRefGet, dropAutoQueued, paintHas, autoHalted, haltAuto, resumeAuto, keepaliveOpen } from './queue';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { cooldownMark, cooldownParked } from './page-cache';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, starveNotice, registerAutoTranslateFlag } from './status-ui';
@@ -214,6 +214,9 @@ async function prefetchAhead(): Promise<void> {
                 if (!firstErr) firstErr = msg;
                 cooldownMark(failMarks, url, Date.now());
                 console.warn('[mt] prefetch failed:', msg); // always-visible: silent parks are why "nothing works" is undebuggable
+                if ((e as Error & { kind?: string }).kind === 'inference') {
+                    haltAuto('inference'); dropAutoQueued(); break;
+                }
             }
         }
     } finally {

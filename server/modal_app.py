@@ -30,6 +30,7 @@ image = (
     # single file, not add_local_dir: deploy sources can hold mutating files that abort the build
     .add_local_file("app.py", remote_path="/pkg/app.py")
     .add_local_file("split.py", remote_path="/pkg/split.py")
+    .add_local_file("balloon_surface.py", remote_path="/pkg/balloon_surface.py")
     # the container re-imports modal_app.py, which imports this
     .add_local_file("models_manifest.py", remote_path="/pkg/models_manifest.py")
 )

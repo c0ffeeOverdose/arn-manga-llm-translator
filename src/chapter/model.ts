@@ -1,6 +1,7 @@
 import type { ContextState, RegionOutput, Mention } from '../llm/core';
 import type { PipelineSettings } from '../llm/pipeline-settings';
 import type { ImageIdentity, ImageSignature } from '../image-identity';
+import type { HashReaderRoutingSource } from '../content/page-cache';
 
 export interface ChapterPage {
     id: string;
@@ -47,6 +48,7 @@ export interface ChapterStart {
     bookKey: string;
     shareContext: boolean;
     nextDocument?: string;
+    sourceRouting?: HashReaderRoutingSource;
     // Page-image shape floor, learned from the images already loaded in the reader. The
     // runner needs it to tell page art from ads/spacers in a document it only parsed.
     imageFilter?: { minW?: number; minH?: number };
@@ -99,6 +101,15 @@ export function sweepCountMessage(reason: SweepCountReason): string {
         case 'last-page': return 'You are on the last page of this chapter';
         default: return '';
     }
+}
+
+// Pages that failed with a timeout-class fault (RPC deadline, lease expiry) are candidates for
+// ONE automatic retry — intermittent GPU stalls recover within a run and re-queueing is exactly
+// what a manual retry does. Kept pure so the bounded, never-twice contract is unit-tested.
+export function pickRetryPages<T extends { id: string; phase: string }>(
+    pages: T[], retryable: ReadonlySet<string>, retried: ReadonlySet<string>,
+): T[] {
+    return pages.filter(p => p.phase === 'failed' && retryable.has(p.id) && !retried.has(p.id));
 }
 
 export function chapterMessage(s: ChapterProgress): string {

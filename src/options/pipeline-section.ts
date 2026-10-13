@@ -277,7 +277,7 @@ for (const id of Object.keys(RANGE_ABS)) wireRange(id, id, RANGE_ABS[id]);
 function syncChapterBatchHint(): void {
     const el = $('chapterBatch');
     if (!el) return;
-    const per = pipeline.useOcrModel ? 1 : pipeline.mergePages;
+    const per = pipeline.mergePages;
     const slots = pipeline.parallelLlm;
     el.textContent = `Translate to end of chapter: ${per} page${per === 1 ? '' : 's'} per request · ${slots} request${slots === 1 ? '' : 's'} at a time.`;
 }

@@ -360,9 +360,9 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         if ((e as Error)?.name === 'AbortError') return;
         const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         cooldownMark(failMarks, job.key, Date.now());
-        // a refusal stops the chapter's background work: retrying pages cannot succeed
-        // while the provider refuses (see haltAuto)
-        if (err.kind === 'ratelimit' || err.kind === 'auth') {
+        // Shared failures pause background work: another page cannot repair a provider
+        // refusal or an unresponsive graphics processor.
+        if (err.kind === 'ratelimit' || err.kind === 'auth' || err.kind === 'inference') {
             haltAuto(err.kind, err.retryAfterMs ?? 0);
             dropAutoQueued();
         }

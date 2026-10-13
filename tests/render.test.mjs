@@ -12,7 +12,7 @@ await build({
 });
 
 const {
-  bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, isLight, layoutText, horizontalFits,
+  bubbleArea, firstColX, clampToBorders, inkStats, layoutArea, balloonHint, isLight, layoutText, horizontalFits,
   widthProfile, surfaceProfile, sourceBoxForLayout, runInterval, sourcePitch, sizeCapFrom, layoutTextFit, boxIsVertical, setRenderTuning, renderTuning, ENCLOSED_MIN,
   smoothRowPinches,
   clampRunEnd, RUN_JUMP,
@@ -588,6 +588,38 @@ test('layoutArea: no-frame box (white page) stays on the legacy rectangle', () =
   assert.ok(a.w <= 40 * 1.6 + 1, `legacy box+30%/1.5x behavior, got w=${a.w}`);
 });
 
+test('balloon hints reuse enclosed surface evidence without changing pixels, boxes or layout', () => {
+    const W = 200, H = 200;
+    const img = barsInto(ringPage(W, H, 100, 100, 45), W, 90, 30, [92, 102], 4);
+    const box = { x1: 85, y1: 88, x2: 125, y2: 112, conf: 0.9 };
+    const pixels = img.data.slice(), beforeBox = structuredClone(box), area = layoutArea(img, box, false);
+    assert.equal(balloonHint(img, box), 'detected');
+    assert.deepEqual(img.data, pixels);
+    assert.deepEqual(box, beforeBox);
+    assert.deepEqual(layoutArea(img, box, false), area);
+});
+
+test('balloon hints leave unframed, empty and out-of-reach surfaces unknown, not absent', () => {
+    const W = 200, H = 200, box = { x1: 85, y1: 88, x2: 125, y2: 112, conf: 0.9 };
+    const open = barsInto(page(W, H), W, 90, 30, [92, 102], 4);
+    const roomy = barsInto(ringPage(W, H, 100, 100, 90), W, 90, 30, [92, 102], 4);
+    assert.equal(balloonHint(open, box), 'unknown', 'unframed speech must not become a forced effect');
+    assert.equal(balloonHint(page(W, H), box), 'unknown');
+    assert.equal(balloonHint(roomy, box), 'unknown', 'a real balloon can lie beyond the measurement leash');
+});
+
+test('balloon evidence rejects thick artwork boundaries and never looks through a split clip', () => {
+    const W = 200, H = 200;
+    const img = barsInto(page(W, H), W, 80, 40, [92, 102], 4);
+    for (let y = 0; y < H; y++) for (const [x1, x2] of [[50, 70], [130, 150]]) for (let x = x1; x <= x2; x++) {
+        const i = (y * W + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 0;
+    }
+    assert.equal(balloonHint(img, { x1: 80, y1: 88, x2: 120, y2: 112, conf: 0.9 }), 'unknown');
+    const enclosed = barsInto(ringPage(W, H, 100, 100, 45), W, 90, 30, [92, 102], 4);
+    const box = { x1: 85, y1: 88, x2: 125, y2: 112, conf: 0.9, cutAxis: 'x', clip: { x1: 85, y1: 0, x2: 125, y2: H } };
+    assert.equal(balloonHint(enclosed, box), 'unknown', 'a sibling wall beyond the owned clip is not enclosure evidence');
+});
+
 test('surface profile follows a stroke-free curved background and bridges masked glyphs', () => {
   const W = 240, H = 240;
   const img = page(W, H);
@@ -688,6 +720,22 @@ test('layoutTextFit: lines use their own band width (narrow top, wide middle)', 
     assert.ok(fakeCtxMeasure(line, fit.fontSize) <= iv[1] - iv[0] + 0.51, `line ${j} fits its band`);
     assert.ok(fit.centers[j] > iv[0] && fit.centers[j] < iv[1], `line ${j} centers on its run`);
   });
+});
+
+test('a paragraph keeps a common center in a sideways-drifting profile', () => {
+    const rows = 140, i1 = new Int32Array(rows), i2 = new Int32Array(rows);
+    for (let y = 0; y < rows; y++) { i1[y] = Math.round(y * 0.3); i2[y] = i1[y] + 160; }
+    const runs = { vertical: false, p0: 0, p1: rows - 1, i1, i2, enclosed: 1 };
+    const fit = layoutTextFit(fakeCtx(), 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu',
+        { x: 0, y: 0, w: 202, h: rows, runs }, 20);
+    assert.ok(fit && fit.lines.length > 1);
+    assert.equal(new Set(fit.centers).size, 1);
+    fit.lines.forEach((line, j) => {
+        const interval = runInterval(runs, fit.top + j * fit.lineHeight, fit.top + (j + 1) * fit.lineHeight);
+        const half = fakeCtxMeasure(line, fit.fontSize) / 2;
+        assert.ok(fit.centers[j] - half >= interval[0] - 0.51);
+        assert.ok(fit.centers[j] + half <= interval[1] + 0.51);
+    });
 });
 
 test('runInterval: edge sliver/hole rows are trimmed, an interior hole still nulls', () => {

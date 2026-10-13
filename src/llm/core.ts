@@ -52,11 +52,14 @@ export const EMPTY_CONTEXT: ContextState = { pairs: [], characters: [] };
 export const MAX_PAIRS = 40;
 export const MAX_CHARACTERS = 10;
 
+export type BalloonHint = 'detected' | 'unknown';
+
 export interface RegionInput {
     index: number;       // 1-based
     source: string;      // OCR/VLM-read source text (may be empty for vision mode)
     page?: number;       // 1-based full-page image position, independent of chunk indices
     marker?: number;     // stable label on that page, independent of output/crop positions
+    balloonHint?: BalloonHint; // positive enclosure evidence, not a speech/SFX classification
 }
 
 export interface ImageContent { x: number; y: number; w: number; h: number }
@@ -115,6 +118,15 @@ export function subsetRegionImages(images: string[], regions: RegionInput[], req
     })];
 }
 
+// The per-region transcribe fallback sends ONE crop per request: imagesB64 leads with one
+// annotated full page per PAGE in a merged request, so skip that whole prefix — never just one
+// image. Crops-mode requests carry no page prefix (textOnly). Pure — unit-tested.
+export function transcribeCropImages(images: string[] | undefined, textOnly: boolean, pageCount?: number): string[] {
+    const all = images ?? [];
+    if (textOnly) return all;
+    return all.slice(Math.max(1, pageCount ?? 1));
+}
+
 function regionList(regions: RegionInput[], vision: boolean, opts: BuildOpts): string {
     const pages = opts.textOnly ? 0 : opts.pageCount ?? 1;
     return '<regions>\n' + regions.map((region, i) => {
@@ -123,6 +135,7 @@ function regionList(regions: RegionInput[], vision: boolean, opts: BuildOpts): s
             mapping = ` crop=${i + 1} image=${pages + i + 1}`;
             if (!opts.textOnly) mapping += ` page=${region.page ?? 1} marker=${region.marker ?? region.index}`;
         }
+        if (opts.ocr && !opts.transcribeOnly) mapping += ` b=${region.balloonHint === 'detected' ? '1' : '?'}`;
         const source = region.source ? ` ${region.source}` : mapping ? '' : ' (read from image)';
         return `${region.index}${mapping}${source}\n`;
     }).join('') + '</regions>\n';
@@ -229,7 +242,9 @@ Book ops — no quote, no change; never touch "confirmed by user" rows: <m id="c
         p += '- You see ONLY text crops, never faces or artwork: identify the speaker from the character book or the dialogue itself. If you cannot tell, omit spk and g rather than guess.\n';
     }
     if (opts.ocr) {
-        p += `- No images are provided: each region's source text was read by local OCR and is given in the region list. OCR on stylized manga fonts is imperfect — fix obvious character confusions from context, and treat unreadable garbage as a keep region. ${chars ? 'Identify the speaker from the character book or the dialogue itself; if you cannot tell, omit spk and g rather than guess. ' : ''}If the source text is katakana-heavy onomatopoeia (ドン、ドキッ) or ALL-CAPS sound words (BOOM, DING DONG), it is SFX — make it a keep region.\n`;
+        p += `- No images: sources are OCR text. Correct obvious OCR errors from context; keep empty/unreadable sources.${chars ? ' Use book/dialogue for speakers; omit spk and g rather than guess.' : ''}\n`;
+        p += '- b is metadata, not source text: b=1 means detected balloon-like enclosure (favors speech, not proof of speech); b=? means unknown, not "no balloon". Neither forces translation/keep.\n';
+        p += '- Translate speech, including spoken interjections/reactions, even short or unframed; keep genuine sound/action SFX, even enclosed. Decide by meaning and dialogue context, not capitalization or script alone.\n';
     }
     // user tone instruction — ADDS to the rules above, never replaces them
     if (opts.stylePrompt?.trim()) {
@@ -315,13 +330,15 @@ function parseXml(text: string, expected: number): ParsedResponse | null {
     if (!/<r[\s>]/i.test(text)) return null; // not XML at all → old-format path
     const regions: RegionOutput[] = [];
     const extras: ExtraRegion[] = [];
-    const consume = /<r\b([^>]*?)\/>|<r\b([^>]*?)>([\s\S]*?)<\/r>|<r\b([^>]*?)>([^\n<]*)/gi;
+    // Adjacent text after a self-closing region belongs to that region, bounded by
+    // the next tag or newline. An explicit keep attribute still overrides the text.
+    const consume = /<r\b([^>]*?)\/>([^\n<]*)|<r\b([^>]*?)>([\s\S]*?)<\/r>|<r\b([^>]*?)>([^\n<]*)/gi;
     let m: RegExpExecArray | null;
     let any = false;
     while ((m = consume.exec(text))) {
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const attrStr = m[1] ?? m[2] ?? m[4];
-        const content = (m[3] ?? m[5] ?? '').trim();
+        const attrStr = m[1] ?? m[3] ?? m[5];
+        const content = (m[2] ?? m[4] ?? m[6] ?? '').trim();
         const attrs = parseAttrs(attrStr);
         const n = parseInt(attrs.n ?? '', 10);
         if (!Number.isFinite(n) || n < 1 || n > expected) continue;

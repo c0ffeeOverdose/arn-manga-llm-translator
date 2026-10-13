@@ -37,6 +37,15 @@ class CleanupMask(unittest.TestCase):
         self.assertTrue(mask.any())
         self.assertFalse(cleanup_mask(raw, [{"x1": 60, "y1": 60, "x2": 80, "y2": 80}], 50, 50).any())
 
+    def test_dilation_respects_a_split_clip(self):
+        raw = np.zeros((60, 80), dtype=bool)
+        raw[20, 29:35] = True
+        box = {"x1": 10, "y1": 10, "x2": 40, "y2": 30,
+               "clip": {"x1": 0, "y1": 0, "x2": 31, "y2": 60}, "cutAxis": "x"}
+        mask = cleanup_mask(raw, [box], 80, 60)
+        self.assertTrue(mask[20, 29])
+        self.assertFalse(mask[:, 31:].any())
+
 
 class MergedInpaint(unittest.IsolatedAsyncioTestCase):
     async def test_page_merged_inpaint_uses_the_prepared_mask(self):

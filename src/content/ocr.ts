@@ -10,7 +10,7 @@ import { pipeline, context, setContext, shareContext, loadContext, saveContext, 
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, nextChunkSize, requestImages, INPAINT_PATCH_GEN } from './page-cache';
-import { chosenOrientation, pageArea, expandCropToInk, type TextMask } from './render';
+import { chosenOrientation, pageArea, expandCropToInk, balloonHint, type TextMask } from './render';
 import { erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
 import { inpaintMode } from '../llm/pipeline-settings';
@@ -437,13 +437,18 @@ export async function translateRegions(
     // caller corroboration so a dead call never inflates the counter.
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; context?: ContextState; fresh?: boolean; cacheEpoch?: string; cacheFingerprint?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer; chapterTrace?: ChapterTrace },
+    // valid: paused/cancelled chapter work must not dispatch another request or fold a reply.
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; valid?: () => boolean; context?: ContextState; fresh?: boolean; cacheEpoch?: string; cacheFingerprint?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer; chapterTrace?: ChapterTrace },
 ): Promise<TranslateOutcome> {
     const timing = opts?.timing ?? new PageTimer();
     const notify = onStatus;
     onStatus = (s, stage) => { timing.setStage(s); notify(s, stage); };
     const cacheEpoch = opts?.cacheEpoch ?? await cacheReady();
-    assertCacheCurrent(cacheEpoch);
+    const ensureCurrent = (): void => {
+        assertCacheCurrent(cacheEpoch);
+        if (opts?.valid && !opts.valid()) throw Object.assign(new Error('Translation stopped'), { kind: 'abort' });
+    };
+    ensureCurrent();
     // A fresh user intent (Re-translate) re-probes the whole page — one-off starvation must not
     // keep every later request small for the rest of the script instance. A reload resets too.
     if (opts?.fresh) llmChunkSize = null;
@@ -491,6 +496,9 @@ export async function translateRegions(
         let badgeR: number | undefined; // drawn badge radius in annW/annH px (undefined: no annotated page sent)
         // OCR crops grow past edge-cut glyphs — one shared readback, not one per region.
         const pageImg = await timing.measureAsync('pixelRead', () => pageImageData(bitmap));
+        if (ocr || pipeline.useOcrModel) {
+            regions.forEach((region, i) => { region.balloonHint = balloonHint(pageImg, det.boxes[i], det.mask); });
+        }
         if (ocr) {
             const tOcr = performance.now();
             onStatus('OCR…', 'ocr');
@@ -572,6 +580,7 @@ export async function translateRegions(
         };
         // live status during the LLM call — it can take tens of seconds and the
         // previous status would otherwise look stuck.
+        ensureCurrent();
         onStatus('LLM translating…', 'llm');
         const tLlm = performance.now();
         let llmSeconds = 0;
@@ -692,7 +701,7 @@ export async function translateRegions(
         try {
             while (work.length) {
                 const chunk = work.shift()!;
-                assertCacheCurrent(cacheEpoch);
+                ensureCurrent();
                 const one = chunkPayload(chunk);
                 try {
                     resp = await portSend(one);
@@ -703,7 +712,7 @@ export async function translateRegions(
                     let lastErr: unknown = e;
                     for (const wait of [5000, 20000, 60000]) {
                         await new Promise(r => setTimeout(r, wait));
-                        assertCacheCurrent(cacheEpoch);
+                        ensureCurrent();
                         try {
                             // transcripts already paid for: the re-send is the same text-only
                             // translate stage, not a re-transcription (images dropped too).
@@ -720,7 +729,7 @@ export async function translateRegions(
                     }
                     if (lastErr) throw lastErr;
                 }
-                assertCacheCurrent(cacheEpoch);
+                ensureCurrent();
                 if (!resp?.ok) {
                     const err = new Error(resp?.error ?? 'translate RPC failed') as Error & { kind?: string; hint?: string; retryAfterMs?: number };
                     err.kind = resp?.kind; err.hint = resp?.hint; err.retryAfterMs = resp?.retryAfterMs;
@@ -774,7 +783,7 @@ export async function translateRegions(
                 e.x2 <= bitmap.width * 1.05 && e.y2 <= bitmap.height * 1.05 &&
                 (e.x2 - e.x1) > 12 && (e.y2 - e.y1) > 12);
         if (opts?.fold !== false && shareContext) {
-            assertCacheCurrent(cacheEpoch);
+            ensureCurrent();
             const c = resp.context as ContextState | undefined;
             setContext((c && Array.isArray(c.characters) && Array.isArray(c.pairs)) ? c : context);
             await saveContext();

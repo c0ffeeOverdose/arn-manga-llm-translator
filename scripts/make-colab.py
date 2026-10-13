@@ -124,6 +124,7 @@ modal_nb = {"nbformat": 4, "nbformat_minor": 5,
     writefile_cell("modal_app.py", read("modal_app.py")),
     writefile_cell("app.py", read("app.py")),
     writefile_cell("split.py", read("split.py")),
+    writefile_cell("balloon_surface.py", read("balloon_surface.py")),
     writefile_cell("models_manifest.py", read("models_manifest.py")),
     md([
         "## 4. Deploy\n",
@@ -283,6 +284,7 @@ colab_nb = {"nbformat": 4, "nbformat_minor": 5,
     """),
     writefile_cell("app.py", read("app.py")),
     writefile_cell("split.py", read("split.py")),
+    writefile_cell("balloon_surface.py", read("balloon_surface.py")),
     writefile_cell("serve.py", read("serve.py")),
     md_text("""
         ## 3. Download the models (~230MB)

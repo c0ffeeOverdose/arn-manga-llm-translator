@@ -1,6 +1,6 @@
 // Inpaint: erase original text using CTD's text mask (dilated — the raw mask
 // leaves anti-aliased glyph edges). Fill = per-box median background from a ring outside the box.
-import type { DetBox, DetectResult } from './detection';
+import { SPLIT_CLIP_SLACK, type DetBox, type DetectResult } from './detection';
 import { inpaintPage, type InpaintPatch } from './detection';
 import { dropContainedBoxes, dropDuplicateBoxes } from './page-cache';
 import type { RegionOutput } from '../llm/core';
@@ -30,7 +30,16 @@ function dilate(mask: Uint8Array, w: number, h: number, passes = DILATE_PASSES):
 // Erase box for one region: the CTD box plus mask ink touching it from
 // outside (CTD boxes can stop short of the glyphs). Gap allowance covers
 // inter-row gaps, up to `pad`. Pure-ish (mask reads only) — exported for tests.
-export function eraseBox(m: Uint8Array, W: number, H: number, box: { x1: number; y1: number; x2: number; y2: number }, pad: number): { x1: number; y1: number; x2: number; y2: number } {
+type EraseRect = Pick<DetBox, 'x1' | 'y1' | 'x2' | 'y2' | 'clip' | 'cutAxis'>;
+
+function cleanupBounds(box: EraseRect, W: number, H: number): { x1: number; y1: number; x2: number; y2: number } {
+    const clip = box.clip;
+    const sx = box.cutAxis === 'y' ? SPLIT_CLIP_SLACK : 0, sy = box.cutAxis === 'x' ? SPLIT_CLIP_SLACK : 0;
+    return { x1: Math.max(0, clip ? Math.ceil(clip.x1 - sx) : 0), y1: Math.max(0, clip ? Math.ceil(clip.y1 - sy) : 0),
+        x2: Math.min(W - 1, clip ? Math.ceil(clip.x2 + sx) - 1 : W - 1), y2: Math.min(H - 1, clip ? Math.ceil(clip.y2 + sy) - 1 : H - 1) };
+}
+
+export function eraseBox(m: Uint8Array, W: number, H: number, box: EraseRect, pad: number): EraseRect {
     const x1 = Math.max(0, Math.floor(box.x1)), y1 = Math.max(0, Math.floor(box.y1));
     const x2 = Math.min(W - 1, Math.ceil(box.x2)), y2 = Math.min(H - 1, Math.ceil(box.y2));
     const gapOK = 3; // consecutive empty rows/cols a glyph gap may span
@@ -43,11 +52,13 @@ export function eraseBox(m: Uint8Array, W: number, H: number, box: { x1: number;
         }
         return best;
     };
+    const bounds = cleanupBounds(box, W, H);
     return {
-        x1: walk(x1, Math.max(0, x1 - pad), -1, colInk),
-        x2: walk(x2, Math.min(W - 1, x2 + pad), 1, colInk),
-        y1: walk(y1, Math.max(0, y1 - pad), -1, rowInk),
-        y2: walk(y2, Math.min(H - 1, y2 + pad), 1, rowInk),
+        x1: Math.max(bounds.x1, walk(x1, Math.max(bounds.x1, x1 - pad), -1, colInk)),
+        x2: Math.min(bounds.x2, walk(x2, Math.min(bounds.x2, x2 + pad), 1, colInk)),
+        y1: Math.max(bounds.y1, walk(y1, Math.max(bounds.y1, y1 - pad), -1, rowInk)),
+        y2: Math.min(bounds.y2, walk(y2, Math.min(bounds.y2, y2 + pad), 1, rowInk)),
+        ...(box.clip ? { clip: box.clip, ...(box.cutAxis ? { cutAxis: box.cutAxis } : {}) } : {}),
     };
 }
 
@@ -60,7 +71,7 @@ export function aiCleanupDilate(w: number, h: number): number {
 
 export function aiCleanupMask(
     det: DetectResult,
-    boxes: { x1: number; y1: number; x2: number; y2: number }[],
+    boxes: EraseRect[],
     keep: { x1: number; y1: number; x2: number; y2: number }[],
 ): { width: number; height: number; data: Uint8Array } {
     const W = det.mask.width, H = det.mask.height;
@@ -81,15 +92,24 @@ export function aiCleanupMask(
     }
     const bw = x2 - x1 + 1, bh = y2 - y1 + 1;
     const sub = new Uint8Array(bw * bh);
+    const allowed = boxes.some(b => b.clip) ? new Uint8Array(bw * bh) : null;
     for (const b of boxes) {
-        const bx1 = Math.max(x1, Math.floor(b.x1)), by1 = Math.max(y1, Math.floor(b.y1));
-        const bx2 = Math.min(x2, Math.ceil(b.x2)), by2 = Math.min(y2, Math.ceil(b.y2));
+        const bounds = cleanupBounds(b, W, H);
+        if (allowed) {
+            const ax1 = Math.max(x1, bounds.x1, Math.floor(b.x1) - r), ax2 = Math.min(x2, bounds.x2, Math.ceil(b.x2) + r);
+            for (let y = Math.max(y1, bounds.y1, Math.floor(b.y1) - r); y <= Math.min(y2, bounds.y2, Math.ceil(b.y2) + r); y++) {
+                allowed.fill(255, (y - y1) * bw + ax1 - x1, (y - y1) * bw + ax2 - x1 + 1);
+            }
+        }
+        const bx1 = Math.max(x1, bounds.x1, Math.floor(b.x1)), by1 = Math.max(y1, bounds.y1, Math.floor(b.y1));
+        const bx2 = Math.min(x2, bounds.x2, Math.ceil(b.x2)), by2 = Math.min(y2, bounds.y2, Math.ceil(b.y2));
         for (let y = by1; y <= by2; y++) {
             const row = y * W;
             for (let x = bx1; x <= bx2; x++) if (raw[row + x] > 127) sub[(y - y1) * bw + (x - x1)] = 255;
         }
     }
     const gro = dilate(sub, bw, bh, r);
+    if (allowed) for (let i = 0; i < gro.length; i++) if (!allowed[i]) gro[i] = 0;
     for (let y = y1; y <= y2; y++) out.set(gro.subarray((y - y1) * bw, (y - y1) * bw + bw), y * W + x1);
     for (const k of keep) {
         const kx1 = Math.max(0, Math.floor(k.x1) - 2), ky1 = Math.max(0, Math.floor(k.y1) - 2);
@@ -110,9 +130,9 @@ export interface AiPatches { patches: InpaintPatch[]; windows: number; ms: numbe
 export function eraseBoxesAndMask(
     bitmap: { width: number; height: number },
     det: DetectResult,
-    erase: { x1: number; y1: number; x2: number; y2: number }[],
+    erase: EraseRect[],
     keep: { x1: number; y1: number; x2: number; y2: number }[],
-): { boxes: { x1: number; y1: number; x2: number; y2: number }[]; mask: { width: number; height: number; data: Uint8Array }; maskMs: number } {
+): { boxes: EraseRect[]; mask: { width: number; height: number; data: Uint8Array }; maskMs: number } {
     const t0 = performance.now();
     const rawMask = new Uint8Array(det.mask.data);
     const boxes = erase.map(b => eraseBox(rawMask, bitmap.width, bitmap.height, b,
@@ -124,10 +144,10 @@ export function eraseBoxesAndMask(
 // One in-flight patch computation per distinct erase plan. Two paths routinely race for the
 // same page (the arrival paint and a queued job), and without this both pay the model and
 // then overwrite each other's cache entry — the user sees "cleaning" twice for one page.
-const inflightPatches = new Map<string, Promise<AiPatches | null>>();
-function planKey(bitmap: { width: number; height: number }, erase: { x1: number; y1: number; x2: number; y2: number }[], keep: { x1: number; y1: number; x2: number; y2: number }[]): string {
-    const rect = (r: { x1: number; y1: number; x2: number; y2: number }) =>
-        `${Math.round(r.x1)},${Math.round(r.y1)},${Math.round(r.x2)},${Math.round(r.y2)}`;
+const inflightPatches = new WeakMap<ImageBitmap, { mask: ArrayBuffer; tasks: Map<string, Promise<AiPatches | null>> }>();
+function planKey(bitmap: { width: number; height: number }, erase: EraseRect[], keep: EraseRect[]): string {
+    const rect = (r: EraseRect) =>
+        `${r.x1},${r.y1},${r.x2},${r.y2}|${r.cutAxis ?? ''}|${r.clip ? `${r.clip.x1},${r.clip.y1},${r.clip.x2},${r.clip.y2}` : ''}`;
     return `${bitmap.width}x${bitmap.height}|${erase.map(rect).join(';')}|${keep.map(rect).join(';')}`;
 }
 
@@ -137,13 +157,19 @@ function planKey(bitmap: { width: number; height: number }, erase: { x1: number;
 export async function computeAiPatches(
     bitmap: ImageBitmap,
     det: DetectResult,
-    erase: { x1: number; y1: number; x2: number; y2: number }[],
+    erase: EraseRect[],
     keep: { x1: number; y1: number; x2: number; y2: number }[],
     opts?: { lo?: boolean; noDownload?: boolean },
 ): Promise<AiPatches | null> {
     if (!erase.length) return null;
+    let flight = inflightPatches.get(bitmap);
+    if (!flight || flight.mask !== det.mask.data) {
+        flight = { mask: det.mask.data, tasks: new Map() };
+        inflightPatches.set(bitmap, flight);
+    }
+    const tasks = flight.tasks;
     const key = planKey(bitmap, erase, keep);
-    const running = inflightPatches.get(key);
+    const running = tasks.get(key);
     if (running) return running;
     const task = (async (): Promise<AiPatches | null> => {
         const { boxes, mask, maskMs } = eraseBoxesAndMask(bitmap, det, erase, keep);
@@ -151,12 +177,12 @@ export async function computeAiPatches(
         if (!r.patches.length) return null;
         return { patches: r.patches, windows: r.windows, ms: r.ms, maskMs, lockWaitMs: r.lockWaitMs, encodeMs: r.encodeMs };
     })();
-    inflightPatches.set(key, task);
+    tasks.set(key, task);
     try {
         return await task;
     } finally {
         // Drop the entry only after it settles, so a caller arriving mid-flight shares it.
-        inflightPatches.delete(key);
+        tasks.delete(key);
     }
 }
 
@@ -404,7 +430,8 @@ export function erasePlan(det: DetectResult, outputs: RegionOutput[]): {
     const dupOverlap = new Set(det.boxes.map((b, i) => (containedSet.has(b) && !keptAll.has(b)) ? i + 1 : -1).filter(i => i > 0));
     const dupIdx = new Set([...containedDup, ...dupOverlap]);
     const boxesToErase = det.boxes.filter((_, i) => translatedIdx.has(i + 1) && (!dupIdx.has(i + 1) || dupOverlap.has(i + 1)));
-    const keepBoxes = det.boxes.filter((_, i) => keepIdx.has(i + 1) || containedDup.has(i + 1));
     const missedIdx = det.boxes.map((_, i) => i + 1).filter(i => !translatedIdx.has(i) && !keepIdx.has(i));
+    const missed = new Set(missedIdx);
+    const keepBoxes = det.boxes.filter((_, i) => keepIdx.has(i + 1) || containedDup.has(i + 1) || (missed.has(i + 1) && !dupIdx.has(i + 1)));
     return { boxesToErase, keepBoxes, keepIdx, dupIdx, missedIdx };
 }

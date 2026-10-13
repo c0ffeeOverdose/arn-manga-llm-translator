@@ -25,9 +25,9 @@ export const CHAPTER_LOG_EVENTS = [
 export type ChapterLogEventKind = typeof CHAPTER_LOG_EVENTS[number];
 export const CHAPTER_LOG_REASONS = [
     'unknown', 'background-timeout', 'disconnected', 'network', 'http', 'timeout', 'abort', 'storage',
-    'auth', 'ratelimit', 'cloud', 'parse', 'source', 'ocr', 'server',
+    'auth', 'ratelimit', 'cloud', 'parse', 'source', 'ocr', 'server', 'inference',
     'artifact', 'full-cache', 'checkpoint', 'absent', 'fingerprint', 'dims', 'mask', 'splitgen', 'partial', 'disabled',
-    'empty-reply', 'smaller-batches', 'per-page-fallback', 'no-text', 'binding-missing', 'binding-present', 'cached-reply', 'shared-request',
+    'empty-reply', 'smaller-batches', 'per-page-fallback', 'auto-timeout', 'no-text', 'binding-missing', 'binding-present', 'cached-reply', 'shared-request',
 ] as const;
 export type ChapterLogReason = typeof CHAPTER_LOG_REASONS[number];
 export type ChapterLogPhase = 'preparing' | 'running' | 'stopping' | 'stopped' | 'complete' | 'waiting' | 'error';

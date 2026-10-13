@@ -2,8 +2,8 @@
 // banding), preparePage (read + cache gate), paintRegions/paintExtras.
 
 import { detect, sortReadingOrder, orderByPanels, panelsDetect, panelsUsable, cloudDetect, type DetectResult, type DetBox, type InpaintPatch, type MtOnStatus } from './detection';
-import { inpaint, inpaintBoxRegion, erasePlan } from './inpaint';
-import { boxIsVertical, renderRegion, sizeCapFrom, effBoxesForAreas, mergeParagraphLines } from './render';
+import { inpaint, inpaintBoxRegion, erasePlan, eraseBoxesAndMask } from './inpaint';
+import { boxIsVertical, renderRegion, prepareRegion, sizeCapFrom, effBoxesForAreas, mergeParagraphLines } from './render';
 import { type RegionOutput, type ExtraRegion } from '../llm/core';
 import type { LLMSettings } from '../llm/adapters';
 import { isDebug } from '../debug';
@@ -322,32 +322,61 @@ export function paintRegions(
     patches?: PaintPatch[] | null,
 ): { i: number; f: number; n: number; o?: 1; g?: 1 }[] {
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-    const { boxesToErase, keepBoxes, keepIdx, dupIdx, missedIdx } = erasePlan(det, outputs);
+    const originalPlan = erasePlan(det, outputs);
+    const textFor = (k: number) => {
+        const out = outputs.find(o => o.index === k);
+        return out?.translation && out.translation !== 'keep' ? out.translation : '';
+    };
+    const effBoxes = effBoxesForAreas(ctx, frame, det.boxes, textFor, det.mask);
+    const plans = new Map<number, NonNullable<ReturnType<typeof prepareRegion>>>();
+    det.boxes.forEach((_, i) => {
+        if (originalPlan.keepIdx.has(i + 1) || originalPlan.dupIdx.has(i + 1)) return;
+        const plan = prepareRegion(ctx, frame, effBoxes[i], textFor(i + 1), det.mask);
+        if (plan) plans.set(i + 1, plan);
+    });
+    const overlapsPlaced = (index: number) => {
+        const b = det.boxes[index - 1];
+        return [...plans.keys()].some(k => {
+            const p = det.boxes[k - 1];
+            const intersection = Math.max(0, Math.min(b.x2, p.x2) - Math.max(b.x1, p.x1))
+                * Math.max(0, Math.min(b.y2, p.y2) - Math.max(b.y1, p.y1));
+            return intersection >= 0.5 * Math.min((b.x2 - b.x1) * (b.y2 - b.y1), (p.x2 - p.x1) * (p.y2 - p.y1));
+        });
+    };
+    const safeOutputs = outputs.filter(o => o.translation === 'keep' || plans.has(o.index)
+        || (originalPlan.dupIdx.has(o.index) && overlapsPlaced(o.index)));
+    const { boxesToErase, keepBoxes, dupIdx, missedIdx } = erasePlan(det, safeOutputs);
     if (missedIdx.length) console.warn(`[mt] regions with no translation kept as-is: ${missedIdx.join(',')}`);
+    const unplaced = outputs.filter(o => o.translation && o.translation !== 'keep' && !originalPlan.dupIdx.has(o.index) && !plans.has(o.index));
+    if (unplaced.length) console.warn(`[mt] ${unplaced.length} translated text groups could not fit safely; original text was kept`);
     if (dupIdx.size && isDebug()) console.log('[mt] duplicate boxes kept as-is:', [...dupIdx].join(','));
     if (patches?.length) {
         // AI cleanup ran on the original page: paint the patches instead of the built-in fill.
         // Drawn into the full rect (not 1:1): capped-upload cloud patches come back smaller —
         // drawImage scales them up; full-res patches make this a no-op.
         for (const p of patches) ctx.drawImage(p.bmp, p.x1, p.y1, p.x2 - p.x1, p.y2 - p.y1);
+        // Warm/cloud/cached patches can cover a neighbour not accepted for painting.
+        // Only the final owned erase mask authorizes pixel changes, including after scaling.
+        const { mask } = eraseBoxesAndMask(canvas, det, boxesToErase, keepBoxes);
+        const cleaned = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        for (let p = 0; p < mask.data.length; p++) if (!mask.data[p]) {
+            const i = p * 4;
+            cleaned.data[i] = frame.data[i]; cleaned.data[i + 1] = frame.data[i + 1];
+            cleaned.data[i + 2] = frame.data[i + 2]; cleaned.data[i + 3] = frame.data[i + 3];
+        }
+        ctx.putImageData(cleaned, 0, 0);
     } else {
         inpaint(canvas, { ...det, boxes: boxesToErase, keepBoxes });
     }
 
     // chosen layout per rendered region (diagnoses shrink/clip issues)
     const layouts: { i: number; f: number; n: number }[] = [];
-    // divider-clipped layout boxes (see effBoxesForAreas): boxes overlapping a disjoint
-    // neighbor each keep their side of the midline. Erase above ran on ORIGINAL boxes.
-    const textFor = (k: number) => {
-        const out = outputs.find(o => o.index === k);
-        return out?.translation && out.translation !== 'keep' ? out.translation : '';
-    };
-    const effBoxes = effBoxesForAreas(ctx, frame, det.boxes, textFor, det.mask);
     det.boxes.forEach((box, i) => {
-        if (keepIdx.has(i + 1) || dupIdx.has(i + 1)) return; // untouched
-        const text = textFor(i + 1);
-        const placed = renderRegion(ctx, frame, effBoxes[i], text, det.mask);
-        if (placed) layouts.push({
+        const plan = plans.get(i + 1);
+        if (!plan) return;
+        plan.paint();
+        const placed = plan.placed;
+        layouts.push({
             i: i + 1, f: placed.fontSize, n: placed.lines.length,
             ...(placed.overflow ? { o: 1 as const } : {}),
             ...(placed.grown ? { g: 1 as const } : {}), // dark-caption area grew past the box cap to hold the text

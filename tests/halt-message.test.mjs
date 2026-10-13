@@ -21,6 +21,9 @@ test('every halt kind gets its own human message — cache never borrows auth', 
 
   assert.match(haltMessage({ kind: 'chapter', until: 0 }), /Chapter translation paused/);
   assert.match(haltMessage({ kind: 'auth', until: 0 }), /Auth\/quota error/);
+  const inference = haltMessage({ kind: 'inference', until: 0 });
+  assert.match(inference, /restart your browser/i);
+  assert.doesNotMatch(inference, /Auth|quota|key/i);
 });
 
 test('rate limit shows the remaining time only while the window is open', () => {

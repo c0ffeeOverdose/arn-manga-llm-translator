@@ -46,3 +46,18 @@ test('the runner expires one page, never the whole run', () => {
     // A merged group that outlives its lease must say so and degrade to per-page calls.
     assert.match(src, /trying per-page/, 'a stalled group must name what held it');
 });
+
+test('timeout-failed pages get ONE bounded automatic retry and the host stays warm per run', () => {
+    const src = readFileSync(new URL('../src/chapter/page.ts', import.meta.url), 'utf8');
+    // The retry pass runs at the end of the walk, only while the run is alive, and re-queueing
+    // spends the page's retry so it can never loop.
+    assert.match(src, /pickRetryPages\(status\.pages, autoRetry, retried\)/, 'the bounded picker must gate the pass');
+    assert.match(src, /retried\.add\(p\.id\)/, 're-queueing must spend the retry');
+    assert.match(src, /reason: 'auto-timeout'/, 'the retry is named in the saved log');
+    assert.match(src, /e instanceof InferenceRpcTimeoutError/, 'only deadline faults earn the retry');
+    assert.match(src, /autoRetry\.add\(page\.id\)/, 'lease expiry is a timeout-class fault too');
+    assert.match(src, /status\.phase === 'running'/, 'a paused run must not retry into a dead GPU');
+    // The inference worker is held for the whole active run and dropped when it pauses/ends.
+    assert.match(src, /const releaseHost = holdInferenceHost\(\)/);
+    assert.match(src, /releaseHost\(\)/);
+});

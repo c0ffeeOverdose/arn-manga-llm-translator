@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
   && rm -rf /var/lib/apt/lists/* \
   && pip install --no-cache-dir fastapi "uvicorn[standard]" onnxruntime numpy pillow opencv-python-headless
 WORKDIR /app
-COPY app.py split.py ./
+COPY app.py split.py balloon_surface.py ./
 RUN mkdir -p /models \
   && curl -fL -o /models/ctd.onnx \
     "https://huggingface.co/lemondouble/lemon-manga-translator/resolve/main/onnx/comic-text-detector/ctd.onnx?download=true" \

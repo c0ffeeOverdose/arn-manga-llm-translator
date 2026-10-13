@@ -1,0 +1,377 @@
+import type { DetBox } from './detection';
+
+interface Pixels { width: number; height: number; data: Uint8ClampedArray }
+interface Mask { width: number; height: number; data: ArrayBuffer }
+type Tone = [number, number, number];
+
+export interface BalloonSurface {
+    x1: number; y1: number; x2: number; y2: number;
+    left: Int32Array; right: Int32Array;
+    seed: Tone;
+    count: number;
+}
+
+// Modal non-text tone; quantized votes keep antialiasing from splitting the background.
+export function interiorSeed(data: Uint8ClampedArray, W: number, H: number, box: DetBox, mask?: Uint8Array): Tone {
+    const x1 = Math.max(0, Math.floor(box.x1)), y1 = Math.max(0, Math.floor(box.y1));
+    const x2 = Math.min(W - 1, Math.ceil(box.x2)), y2 = Math.min(H - 1, Math.ceil(box.y2));
+    const sx = Math.max(1, Math.floor((x2 - x1) / 24)), sy = Math.max(1, Math.floor((y2 - y1) / 24));
+    const buckets = new Map<number, { n: number; r: number; g: number; b: number }>();
+    let best: { n: number; r: number; g: number; b: number } | undefined;
+    for (let y = y1; y <= y2; y += sy) for (let x = x1; x <= x2; x += sx) {
+        if (mask?.[y * W + x]) continue;
+        const i = (y * W + x) * 4, r = data[i], g = data[i + 1], b = data[i + 2];
+        const key = (r >> 4 << 8) | (g >> 4 << 4) | (b >> 4);
+        const vote = buckets.get(key) ?? { n: 0, r: 0, g: 0, b: 0 };
+        vote.n++; vote.r += r; vote.g += g; vote.b += b; buckets.set(key, vote);
+        if (!best || vote.n > best.n) best = vote;
+    }
+    if (best) return [Math.round(best.r / best.n), Math.round(best.g / best.n), Math.round(best.b / best.n)];
+    const cx = Math.max(0, Math.min(W - 1, Math.floor((box.x1 + box.x2) / 2)));
+    const cy = Math.max(0, Math.min(H - 1, Math.floor((box.y1 + box.y2) / 2)));
+    const i = (cy * W + cx) * 4;
+    return [data[i], data[i + 1], data[i + 2]];
+}
+
+export function seedLike(data: Uint8ClampedArray, i: number, seed: Tone): boolean {
+    return Math.abs(data[i] - seed[0]) + Math.abs(data[i + 1] - seed[1]) + Math.abs(data[i + 2] - seed[2]) < 60;
+}
+
+export function surfaceContains(surface: BalloonSurface, box: DetBox): boolean {
+    if (box.y1 < surface.y1 || box.y2 > surface.y2) return false;
+    for (let y = Math.floor(box.y1); y < Math.ceil(box.y2); y++) {
+        const k = y - surface.y1;
+        if (k < 0 || k >= surface.left.length || box.x1 < surface.left[k] || box.x2 > surface.right[k]) return false;
+    }
+    return true;
+}
+
+const surfaces = new WeakMap<Pixels, BalloonSurface[]>();
+
+function internalDivider(img: Pixels, surface: BalloonSurface, box: DetBox, mask?: Uint8Array): boolean {
+    const y0 = surface.y1, y2 = surface.y2;
+    for (let x = surface.x1; x < surface.x2; x++) {
+        if (x >= box.x1 && x < box.x2) continue;
+        let ink = 0;
+        for (let y = y0; y < y2; y++) {
+            const k = y - surface.y1, p = y * img.width + x;
+            if (x < surface.left[k] || x >= surface.right[k] || mask?.[p]) continue;
+            if (!seedLike(img.data, p * 4, surface.seed)) ink++;
+        }
+        if (ink >= (y2 - y0) * 0.4) return true;
+    }
+    return false;
+}
+
+// Measure a closed background component independently of artificial split clips.
+// Text is not a bridge through walls; callers apply ownership clips only after measurement.
+export function balloonSurface(img: Pixels, box: DetBox, mask?: Mask, search: DetBox = box): BalloonSurface | null {
+    const { width: W, height: H, data } = img;
+    if (!(box.x2 > box.x1 && box.y2 > box.y1)) return null;
+    const mk = mask?.width === W && mask.height === H && mask.data.byteLength === W * H ? new Uint8Array(mask.data) : undefined;
+    const cached = surfaces.get(img) ?? [];
+    const known = cached.find(s => surfaceContains(s, box) && !internalDivider(img, s, box, mk));
+    if (known) return known;
+    const bw = search.x2 - search.x1, bh = search.y2 - search.y1;
+    const gx = Math.max(24, bw * 1.2, bh * 0.7), gy = Math.max(24, bh * 0.6, bw * 0.7);
+    const loX = Math.max(0, Math.floor(search.x1 - gx)), hiX = Math.min(W - 1, Math.ceil(search.x2 + gx));
+    const loY = Math.max(0, Math.floor(search.y1 - gy)), hiY = Math.min(H - 1, Math.ceil(search.y2 + gy));
+    const rw = hiX - loX + 1, rh = hiY - loY + 1;
+    if (rw <= 0 || rh <= 0 || rw * rh > 1_500_000) return null;
+    const cx = Math.floor((box.x1 + box.x2) / 2), cy = Math.floor((box.y1 + box.y2) / 2);
+    const probes: [number, number][] = [
+        [Math.floor(box.x1) - 3, cy], [Math.ceil(box.x2) + 3, cy],
+        [cx, Math.floor(box.y1) - 3], [cx, Math.ceil(box.y2) + 3],
+        [Math.floor(box.x1), Math.floor(box.y1)], [Math.ceil(box.x2), Math.ceil(box.y2)], [cx, cy],
+    ];
+    const visited = new Uint8Array(rw * rh);
+    const queue: number[] = [];
+    const seenTones = new Set<number>();
+    for (const [sx, sy] of probes) {
+        if (sx <= loX || sx >= hiX || sy <= loY || sy >= hiY || mk?.[sy * W + sx]) continue;
+        const at = (sy * W + sx) * 4, seed: Tone = [data[at], data[at + 1], data[at + 2]];
+        const key = (seed[0] >> 4 << 8) | (seed[1] >> 4 << 4) | (seed[2] >> 4);
+        if (seenTones.has(key)) continue;
+        seenTones.add(key);
+        visited.fill(0); queue.length = 0;
+        const start = (sy - loY) * rw + sx - loX;
+        visited[start] = 1; queue.push(start);
+        let minX = sx, maxX = sx, minY = sy, maxY = sy, leaked = false;
+        const left = new Int32Array(rh).fill(W), right = new Int32Array(rh).fill(-1);
+        for (let head = 0; head < queue.length; head++) {
+            const p = queue[head], x = loX + p % rw, y = loY + Math.floor(p / rw);
+            if (x === loX || x === hiX || y === loY || y === hiY) { leaked = true; break; }
+            minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+            left[y - loY] = Math.min(left[y - loY], x); right[y - loY] = Math.max(right[y - loY], x + 1);
+            for (const q of [p - 1, p + 1, p - rw, p + rw]) {
+                if (visited[q]) continue;
+                const xx = loX + q % rw, yy = loY + Math.floor(q / rw);
+                if (!seedLike(data, (yy * W + xx) * 4, seed)) continue;
+                visited[q] = 1; queue.push(q);
+            }
+        }
+        if (leaked || queue.length < Math.max(64, (box.x2 - box.x1) * (box.y2 - box.y1) * 0.25)) continue;
+        const surface: BalloonSurface = { x1: minX, y1: minY, x2: maxX + 1, y2: maxY + 1,
+            left: left.slice(minY - loY, maxY - loY + 1), right: right.slice(minY - loY, maxY - loY + 1), seed, count: queue.length };
+        if (!surfaceContains(surface, box) || internalDivider(img, surface, box, mk)) continue;
+        const outlined = (x: number, y: number, dir: -1 | 1) => {
+            let n = 0;
+            const light = 0.299 * seed[0] + 0.587 * seed[1] + 0.114 * seed[2] >= 128;
+            for (let k = 0; k < 16; k++, x += dir) {
+                if (x < 0 || x >= W) return false;
+                const i = (y * W + x) * 4, lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+                if (!seedLike(data, i, seed) && (light ? lum < 100 : lum > 155)) n++;
+                else if (n > 0 || k >= 2) return n > 0;
+            }
+            return false;
+        };
+        let rows = 0, enclosed = 0;
+        for (let y = Math.floor(box.y1); y < Math.ceil(box.y2); y++) {
+            const k = y - surface.y1;
+            if (surface.right[k] <= surface.left[k]) continue;
+            rows++;
+            if (outlined(surface.left[k] - 1, y, -1) && outlined(surface.right[k], y, 1)) enclosed++;
+        }
+        if (!rows || enclosed < rows * 0.5) continue;
+        if (cached.length < 64) { cached.push(surface); surfaces.set(img, cached); }
+        return surface;
+    }
+    return null;
+}
+
+function maskComponents(mask: Uint8Array, W: number, H: number, box: DetBox): DetBox[] {
+    const x0 = Math.max(0, Math.floor(box.x1)), y0 = Math.max(0, Math.floor(box.y1));
+    const x2 = Math.min(W, Math.ceil(box.x2)), y2 = Math.min(H, Math.ceil(box.y2));
+    const rw = x2 - x0, rh = y2 - y0;
+    if (rw <= 0 || rh <= 0) return [];
+    const seen = new Uint8Array(rw * rh), out: DetBox[] = [], queue: number[] = [];
+    for (let p = 0; p < seen.length; p++) {
+        if (seen[p] || !mask[(y0 + Math.floor(p / rw)) * W + x0 + p % rw]) continue;
+        seen[p] = 1; queue.length = 0; queue.push(p);
+        let ax = W, ay = H, bx = 0, by = 0;
+        for (let head = 0; head < queue.length; head++) {
+            const q = queue[head], x = q % rw, y = Math.floor(q / rw);
+            ax = Math.min(ax, x + x0); bx = Math.max(bx, x + x0 + 1); ay = Math.min(ay, y + y0); by = Math.max(by, y + y0 + 1);
+            for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+                const xx = x + dx, yy = y + dy, i = yy * rw + xx;
+                if (xx < 0 || xx >= rw || yy < 0 || yy >= rh || seen[i] || !mask[(yy + y0) * W + xx + x0]) continue;
+                seen[i] = 1; queue.push(i);
+            }
+        }
+        if (queue.length >= 4) out.push({ x1: ax, y1: ay, x2: bx, y2: by, conf: box.conf });
+        if (out.length > 400) return [];
+    }
+    return out;
+}
+
+// ---- connected lobes: one physical surface, several text columns -----------------
+// A balloon can be drawn as interlocking lobes sharing one interior (no wall between them).
+// Their comps all resolve to one surface, so the surface split cannot fire; cut at the
+// text-block seams instead: words on one row and lines stacked with real cross overlap
+// belong to one block, while a corridor between side-by-side blocks is a lobe boundary.
+export function clusterTextComponents(comps: DetBox[]): DetBox[][] {
+    const parent = comps.map((_, i) => i);
+    const find = (i: number): number => parent[i] === i ? i : (parent[i] = find(parent[i]));
+    for (let i = 0; i < comps.length; i++) for (let j = i + 1; j < comps.length; j++) {
+        const a = comps[i], b = comps[j];
+        const ha = a.y2 - a.y1, hb = b.y2 - b.y1, unit = Math.min(ha, hb);
+        const xGap = Math.max(a.x1 - b.x2, b.x1 - a.x2, 0);
+        const yGap = Math.max(a.y1 - b.y2, b.y1 - a.y2, 0);
+        const xOverlap = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
+        const sameRow = Math.abs((a.y1 + a.y2) - (b.y1 + b.y2)) <= 1.2 * unit && xGap <= 0.9 * unit;
+        const stacked = xGap === 0 && xOverlap >= 0.5 * Math.min(a.x2 - a.x1, b.x2 - b.x1) && yGap <= 0.6 * unit;
+        if (sameRow || stacked) parent[find(j)] = find(i);
+    }
+    const groups = new Map<number, DetBox[]>();
+    comps.forEach((comp, i) => { const k = find(i); const group = groups.get(k) ?? []; group.push(comp); groups.set(k, group); });
+    return [...groups.values()];
+}
+
+// A stray sub-glyph fragment (an ink speck, a descender piece) must not veto a split or
+// become its own region: attach lone components to the nearest real cluster when close.
+function attachOrphans(clusters: DetBox[][], medianH: number): DetBox[][] {
+    const out = clusters.filter(cs => cs.length > 1);
+    for (const cs of clusters.filter(cs => cs.length === 1)) {
+        const c = cs[0];
+        let best: DetBox[] | null = null, bestD = Infinity;
+        for (const target of out) {
+            let d = Infinity;
+            for (const o of target) {
+                const dx = Math.max(0, Math.max(c.x1 - o.x2, o.x1 - c.x2));
+                const dy = Math.max(0, Math.max(c.y1 - o.y2, o.y1 - c.y2));
+                d = Math.min(d, Math.hypot(dx, dy));
+            }
+            if (d < bestD) { bestD = d; best = target; }
+        }
+        if (best && bestD <= 1.2 * medianH) best.push(c);
+        else out.push(cs);
+    }
+    return out;
+}
+
+// Frame-clamped children: each child owns its text block plus a margin that stops short of
+// every sibling's ink. Erase/crop/layout clamp to that frame, so a shared physical surface
+// can never leak a sibling glyph into this child's cleanup. null = not safely splittable.
+export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: number, H: number, sib: number): DetBox[] | null {
+    if (comps.length < 2) return null;
+    const heights = comps.map(c => c.y2 - c.y1).sort((a, b) => a - b);
+    const medianH = heights[heights.length >> 1];
+    const clusters = attachOrphans(clusterTextComponents(comps), medianH);
+    if (clusters.length < 2 || clusters.length > 8) return null;
+    const boxes = clusters.map(cs => ({
+        x1: Math.min(...cs.map(c => c.x1)), y1: Math.min(...cs.map(c => c.y1)),
+        x2: Math.max(...cs.map(c => c.x2)), y2: Math.max(...cs.map(c => c.y2)), conf: parent.conf,
+    }));
+    // Each child must be a text block of its own: ≥2 components and at least about two
+    // lines tall. A lone word or an ink fragment never becomes its own region.
+    if (clusters.some((cs, i) => cs.length < 2 || boxes[i].y2 - boxes[i].y1 < 1.8 * medianH)) return null;
+    const frameFor = (b: DetBox, i: number): { x1: number; y1: number; x2: number; y2: number } | null => {
+        const others = comps.filter(c => !clusters[i].includes(c));
+        const bandY = others.filter(o => o.y1 < b.y2 && o.y2 > b.y1);
+        const bandX = others.filter(o => o.x1 < b.x2 && o.x2 > b.x1);
+        const soft = (clearance: number) => clearance === Infinity ? 14 : Math.max(0, Math.min(14, Math.floor((clearance - 2) / 2)));
+        const l = bandY.length ? b.x1 - Math.max(...bandY.map(o => o.x2)) : Infinity;
+        const r = bandY.length ? Math.min(...bandY.map(o => o.x1)) - b.x2 : Infinity;
+        const t = bandX.length ? b.y1 - Math.max(...bandX.map(o => o.y2)) : Infinity;
+        const d = bandX.length ? Math.min(...bandX.map(o => o.y1)) - b.y2 : Infinity;
+        return { x1: Math.max(0, b.x1 - soft(l)), y1: Math.max(0, b.y1 - soft(t)),
+            x2: Math.min(W, b.x2 + soft(r)), y2: Math.min(H, b.y2 + soft(d)) };
+    };
+    // Frames are repaired, not vetoed: a sibling component that intrudes into a child's
+    // erase reach shrinks that side of the frame (never below its own ink, 1px leash for
+    // exclusive edges and float worker clips) instead of aborting the whole split — a ±2px
+    // detection jitter must not resurrect the merged region. No repair possible = keep the box.
+    const withinCoverage = (f: { x1: number; y1: number; x2: number; y2: number }, b: DetBox) =>
+        Math.ceil(f.x1) <= b.x1 + 1 && Math.ceil(f.y1) <= b.y1 + 1
+        && Math.ceil(f.x2) >= b.x2 - 1 && Math.ceil(f.y2) >= b.y2 - 1;
+    const intrudes = (f: { x1: number; y1: number; x2: number; y2: number }, c: DetBox) =>
+        Math.min(c.x2 - 1, f.x2 - 1) >= Math.max(c.x1, f.x1)
+        && Math.min(c.y2 - 1, f.y2 - 1) >= Math.max(c.y1, f.y1);
+    const repairFrames = (start: { x1: number; y1: number; x2: number; y2: number }[]): { x1: number; y1: number; x2: number; y2: number }[] | null => {
+        let frames = start.map(f => ({ ...f }));
+        if (parent.clip) {
+            const clip = parent.clip;
+            frames = frames.map(f => ({ x1: Math.max(f.x1, clip.x1), y1: Math.max(f.y1, clip.y1),
+                x2: Math.min(f.x2, clip.x2), y2: Math.min(f.y2, clip.y2) }));
+        }
+        if (boxes.some((b, i) => !withinCoverage(frames[i], b))) return null;
+        for (let guard = 0; guard < 128; guard++) {
+            let moved = false;
+            scan: for (let i = 0; i < frames.length; i++) {
+                const b = boxes[i];
+                for (const c of comps) {
+                    const f = frames[i];
+                    if (clusters[i].includes(c) || !intrudes(f, c)) continue;
+                    const ix1 = Math.max(c.x1, f.x1), ix2 = Math.min(c.x2 - 1, f.x2 - 1);
+                    const iy1 = Math.max(c.y1, f.y1), iy2 = Math.min(c.y2 - 1, f.y2 - 1);
+                    const options: ['x1' | 'x2' | 'y1' | 'y2', number][] =
+                        [['x1', ix2 + 1], ['x2', ix1], ['y1', iy2 + 1], ['y2', iy1]];
+                    let bestF: typeof f | null = null, bestD = Infinity;
+                    for (const [k, v] of options) {
+                        if (v === f[k]) continue;
+                        const nf = { ...f, [k]: v };
+                        if (nf.x1 >= nf.x2 || nf.y1 >= nf.y2 || !withinCoverage(nf, b)) continue;
+                        const d = Math.abs(v - f[k]);
+                        if (d < bestD) { bestD = d; bestF = nf; }
+                    }
+                    if (!bestF) return null;
+                    frames[i] = bestF; moved = true;
+                    break scan;
+                }
+            }
+            if (!moved) return frames;
+        }
+        return null;
+    };
+    const frames = repairFrames(boxes.map((b, i) => frameFor(b, i) ?? { x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 }))
+        ?? repairFrames(boxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 })));
+    if (!frames) return null;
+    return boxes.map((b, i) => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2, conf: b.conf, clip: frames[i], sib }));
+}
+
+// Split only when every supported ink component belongs to a measured enclosure.
+// A shared enclosure never merges distinct lobes merely because their backgrounds connect.
+export function splitBalloonSurfaces(img: Pixels, boxes: DetBox[], mask: Mask): DetBox[] {
+    if (mask.width !== img.width || mask.height !== img.height || mask.data.byteLength !== img.width * img.height) return boxes;
+    const raw = new Uint8Array(mask.data);
+    let changed = false;
+    const result = boxes.flatMap((box, bi) => {
+        const comps = maskComponents(raw, img.width, img.height, box);
+        if (comps.length < 2) return [box];
+        const groups = new Map<BalloonSurface, DetBox[]>();
+        let unresolved = false;
+        for (const comp of comps) {
+            const surface = balloonSurface(img, comp, mask, box);
+            if (!surface) { unresolved = true; continue; }
+            const group = groups.get(surface) ?? [];
+            group.push(comp); groups.set(surface, group);
+        }
+        if (groups.size >= 2 && !unresolved) {
+            const pieces: DetBox[] = [];
+            for (const [surface, cs] of groups) {
+                const x1 = Math.min(...cs.map(c => c.x1)), y1 = Math.min(...cs.map(c => c.y1));
+                const x2 = Math.max(...cs.map(c => c.x2)), y2 = Math.max(...cs.map(c => c.y2));
+                if (x2 - x1 < 8 || y2 - y1 < 8) return [box];
+                const pad = Math.max(2, Math.min(6, Math.min(x2 - x1, y2 - y1) * 0.15));
+                const clip = { x1: Math.max(surface.x1, box.clip?.x1 ?? 0), y1: Math.max(surface.y1, box.clip?.y1 ?? 0),
+                    x2: Math.min(surface.x2, box.clip?.x2 ?? img.width), y2: Math.min(surface.y2, box.clip?.y2 ?? img.height) };
+                if (x1 < clip.x1 || y1 < clip.y1 || x2 > clip.x2 || y2 > clip.y2) return [box];
+                pieces.push({ x1: Math.max(box.x1, clip.x1, x1 - pad), y1: Math.max(box.y1, clip.y1, y1 - pad),
+                    x2: Math.min(box.x2, clip.x2, x2 + pad), y2: Math.min(box.y2, clip.y2, y2 + pad), conf: box.conf, clip });
+            }
+            changed = true;
+            return pieces;
+        }
+        // A shared interior, or ink the surface measurement could not resolve (fragments near a
+        // lobe edge): frame-clamped seam splitting needs no per-component surface and is safe.
+        const pieces = splitConnectedClusters(comps, box, img.width, img.height, bi);
+        if (!pieces) return [box];
+        changed = true;
+        return pieces;
+    });
+    return changed ? result : boxes;
+}
+
+// Regular aligned horizontal lines merge only after one physical surface contains the group.
+// Geometry nominates neighbours; shared enclosure alone never establishes a paragraph.
+export function mergeBalloonLines(img: Pixels, boxes: DetBox[], mask: Mask): DetBox[] {
+    if (mask.width !== img.width || mask.height !== img.height || mask.data.byteLength !== img.width * img.height) return boxes;
+    const raw = new Uint8Array(mask.data);
+    const supported = (box: DetBox) => {
+        let count = 0;
+        for (let y = Math.max(0, Math.floor(box.y1)); y < Math.min(img.height, Math.ceil(box.y2)); y++) {
+            for (let x = Math.max(0, Math.floor(box.x1)); x < Math.min(img.width, Math.ceil(box.x2)); x++) {
+                if (raw[y * img.width + x] && ++count >= 4) return true;
+            }
+        }
+        return false;
+    };
+    const parent = boxes.map((_, i) => i);
+    const find = (i: number): number => parent[i] === i ? i : (parent[i] = find(parent[i]));
+    const line = (b: DetBox) => b.x2 - b.x1 >= 1.5 * (b.y2 - b.y1);
+    for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i], b = boxes[j], ah = a.y2 - a.y1, bh = b.y2 - b.y1;
+        if (a.clip || b.clip) continue; // frame-owned children never re-merge
+        if (!line(a) || !line(b) || Math.max(ah, bh) > 1.5 * Math.min(ah, bh)) continue;
+        const gap = Math.max(a.y1, b.y1) - Math.min(a.y2, b.y2);
+        const span = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
+        if (gap < 0 || gap > 0.6 * Math.min(ah, bh) || span < 0.8 * Math.min(a.x2 - a.x1, b.x2 - b.x1)) continue;
+        parent[find(j)] = find(i);
+    }
+    const groups = new Map<number, number[]>();
+    boxes.forEach((_, i) => { const k = find(i), group = groups.get(k) ?? []; group.push(i); groups.set(k, group); });
+    const replacements = new Map<number, DetBox>(), removed = new Set<number>();
+    for (const indices of groups.values()) {
+        if (indices.length < 2) continue;
+        const rows = indices.map(i => boxes[i]).sort((a, b) => a.y1 - b.y1);
+        if (!rows.every(supported)) continue;
+        const pitches = rows.slice(1).map((b, i) => (b.y1 + b.y2 - rows[i].y1 - rows[i].y2) / 2);
+        if (Math.max(...pitches) > 1.2 * Math.min(...pitches)) continue;
+        const union = { x1: Math.min(...rows.map(b => b.x1)), y1: Math.min(...rows.map(b => b.y1)),
+            x2: Math.max(...rows.map(b => b.x2)), y2: Math.max(...rows.map(b => b.y2)), conf: Math.min(...rows.map(b => b.conf)) };
+        if (!balloonSurface(img, union, mask)) continue;
+        replacements.set(indices[0], union);
+        indices.slice(1).forEach(i => removed.add(i));
+    }
+    return replacements.size ? boxes.flatMap((b, i) => removed.has(i) ? [] : [replacements.get(i) ?? b]) : boxes;
+}
