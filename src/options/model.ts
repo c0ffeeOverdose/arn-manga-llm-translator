@@ -3,8 +3,10 @@
 import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type LLMSettings } from '../llm/adapters';
 import { inpaintMode, mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
 import { detModelsInstalled, detDownload, inpaintInstalled, inpaintDownload } from '../llm/ocr-models';
+import { koharuInstalled, importKoharuFile } from '../llm/layout-models';
+import { KOHARU_MODEL } from '../layout-model';
 import { $, setDirty, setStatus, dlProgress } from './shell';
-import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI } from './pipeline-section';
+import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI, syncDetectionTuning } from './pipeline-section';
 import { hostOriginPatterns, requestHostAccess } from './host-access';
 
 const MODEL_HINTS: Record<string, string> = {
@@ -280,6 +282,12 @@ $('setupGo').onclick = () => {
 // ---- inference engine: local vs cloud. Behavior knob — dirty-tracked but never marks Custom.
 export function syncInferUI(): void {
     const cloud = pipeline.inferEngine === 'cloud';
+    ($('layoutModel') as HTMLSelectElement).value = pipeline.layoutModel;
+    $('layoutModelHint').textContent = pipeline.layoutModel === 'koharu'
+        ? cloud ? 'Koharu FP32 runs on-device. Select On-device above to use this model.'
+            : 'One model finds text, sound effects, balloons and panels. OCR and text cleanup use your existing settings.'
+        : 'CTD detects text; a separate model finds panels for reading order.';
+    syncDetectionTuning();
     for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
         const on = (b.dataset.inferVal === 'cloud') === cloud;
         b.classList.toggle('on', on);
@@ -350,11 +358,24 @@ $('aiCleanupBtn').onclick = async () => {
 
 // pre-download so the first on-device page doesn't pay it mid-chapter. Download-only, no Delete.
 async function renderDetRow(): Promise<void> {
+    const selected = pipeline.layoutModel;
+    ($('detBtn') as HTMLButtonElement).textContent = selected === 'koharu' ? 'Import model file' : 'Download';
+    $('detInstallHint').textContent = selected === 'koharu'
+        ? 'Import the supported Koharu FP32 ONNX file once, then use it offline. Development builds can include it automatically.'
+        : 'Downloads once, then works offline. Otherwise fetched automatically on the first on-device page.';
+    if (selected === 'koharu') {
+        const status = await koharuInstalled().catch(() => 'missing');
+        if (pipeline.layoutModel !== selected) return;
+        $('detLabel').textContent = `Koharu FP32 (149.8 MB) · ${status === 'missing' ? 'Not installed' : 'Ready'}`;
+        return;
+    }
     const det = await detModelsInstalled().catch(() => ({ ctd: false, panel: false }));
+    if (pipeline.layoutModel !== selected) return;
     ($('detLabel') as HTMLSpanElement).innerHTML =
         `Detection models (CTD 40MB + panel 10MB)${det.ctd && det.panel ? ' <span class="ok-mark">✓</span>' : ''}`;
 }
 $('detBtn').onclick = async () => {
+    if (pipeline.layoutModel === 'koharu') { ($('layoutFile') as HTMLInputElement).click(); return; }
     const btn = $('detBtn') as HTMLButtonElement;
     const bar = $('detBar') as HTMLElement;
     const row = bar.parentElement!;
@@ -374,6 +395,27 @@ $('detBtn').onclick = async () => {
         btn.disabled = false;
     }
 };
+
+($('layoutFile') as HTMLInputElement).onchange = async () => {
+    const input = $('layoutFile') as HTMLInputElement, file = input.files?.[0];
+    if (!file) return;
+    const button = $('detBtn') as HTMLButtonElement, status = $('layoutFileStatus');
+    button.disabled = true; status.textContent = 'Checking model file…';
+    try {
+        if (file.size !== KOHARU_MODEL.bytes) throw new Error('Choose the Koharu FP32 ONNX file (149.8 MB)');
+        await importKoharuFile(await file.arrayBuffer());
+        status.textContent = 'Koharu FP32 is installed and ready.';
+        await renderDetRow();
+    } catch (e) { status.textContent = (e as Error).message; }
+    finally { button.disabled = false; input.value = ''; }
+};
+
+($('layoutModel') as HTMLSelectElement).onchange = () => {
+    pipeline.layoutModel = ($('layoutModel') as HTMLSelectElement).value === 'koharu' ? 'koharu' : 'ctd';
+    $('layoutFileStatus').textContent = '';
+    syncInferUI(); setDirty(true);
+};
+for (const id of ['preset', 'resetAdv']) $(id).addEventListener(id === 'preset' ? 'change' : 'click', syncInferUI);
 
 for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
     b.onclick = () => {

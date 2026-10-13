@@ -5,6 +5,7 @@ import { SPLIT_CLIP_SLACK, type DetBox } from './detection';
 import { THAI_SPLIT_WORDS, THAI_TAIL_TRIGGERS, THAI_TAIL_UNSAFE } from './thai-words';
 import type { BalloonHint } from '../llm/core';
 import { interiorSeed, seedLike, balloonSurface, splitBalloonSurfaces, mergeBalloonLines } from './balloon-surface';
+import { modelBalloonSurface } from './model-balloon';
 
 const FONT = 'Sriracha';           // Thai handwriting font (bundled)
 const TRACKING = 0.1;      // letter spacing as fraction of font size
@@ -19,7 +20,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 42;
+export const RENDER_GEN = 43;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -974,6 +975,25 @@ export function runInterval(prof: RunProfile, p0: number, p1: number): [number, 
     return x2 > x1 ? [x1, x2] : null;
 }
 
+function modelBalloonArea(img: ImageData, box: DetBox, mask?: TextMask): LayoutRect | null {
+    const modeled = modelBalloonSurface(img, box, mask);
+    if (!modeled) return null;
+    const i1 = modeled.left.slice(), i2 = modeled.right.slice();
+    for (let k = 0; k < i1.length; k++) {
+        if (i2[k] <= i1[k]) continue;
+        const margin = Math.max(2, (i2[k] - i1[k]) * 0.08);
+        i1[k] = Math.ceil(i1[k] + margin); i2[k] = Math.floor(i2[k] - margin);
+        if (k + modeled.y1 >= box.y1 && k + modeled.y1 < box.y2) {
+            i1[k] = Math.max(modeled.left[k], Math.min(i1[k], Math.floor(box.x1)));
+            i2[k] = Math.min(modeled.right[k], Math.max(i2[k], Math.ceil(box.x2)));
+        }
+    }
+    const runs: RunProfile = { vertical: false, p0: modeled.y1, p1: modeled.y2 - 1, i1, i2,
+        enclosed: 1, e0: modeled.y1, e1: modeled.y2 - 1, leakL: 0, leakR: 0 };
+    return { x: modeled.x1, y: modeled.y1, w: modeled.x2 - modeled.x1, h: modeled.y2 - modeled.y1,
+        runs, why: 'model-balloon' };
+}
+
 // Enclosed-bubble path: profile measurement, or the legacy rectangle when no bubble encloses the box.
 function fitArea(img: ImageData, box: DetBox, vertical: boolean, mask?: TextMask): LayoutRect {
     const rect = (why: string, prof?: RunProfile): LayoutRect => {
@@ -1261,11 +1281,12 @@ export function dividerClips(boxes: DetBox[], areas: (LayoutRect | null)[]): Div
 }
 
 // Layout area the renderer uses: enclosed bubbles get the per-line profile.
-// A big box with almost no ink lays out on the ink bbox instead; null = zero ink.
+// Sparse ink uses its bbox unless a model balloon supplies a usable surface; null = zero ink.
 export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxIsVertical(box), mask?: TextMask): LayoutRect | null {
     const ink = inkStats(img, box);
     if (ink.x2 <= ink.x1 || ink.y2 <= ink.y1) return null;
-    if (ink.frac < 0.03) {
+    const modeled = !vertical ? modelBalloonArea(img, box, mask) : null;
+    if (ink.frac < 0.03 && !modeled) {
         const pad = 6;
         return {
             ...clipArea({
@@ -1275,7 +1296,7 @@ export function layoutArea(img: ImageData, box: DetBox, vertical: boolean = boxI
             why: 'ink-bbox',
         };
     }
-    const found = fitArea(img, sourceBoxForLayout(img, box, vertical, mask), vertical, mask);
+    const found = modeled ?? fitArea(img, sourceBoxForLayout(img, box, vertical, mask), vertical, mask);
     const clamped = clipArea(found, box.clip);
     // The clip shrinks the AREA but the profile still describes runs past the cut.
     // Wrap width, line centres, and paint clip must agree with the returned area, so trim the runs.

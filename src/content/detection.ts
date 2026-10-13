@@ -11,10 +11,13 @@ import { recordChapterLog } from '../chapter/log-store';
 import { chapterLogError, type ChapterTrace } from '../chapter/log';
 import { IdleResource } from './idle-resource';
 import { InferenceRpcTimeoutError, diagnoseInferenceError } from './inference-health';
+import type { LayoutModel, KoharuThresholds } from '../layout-model';
+import type { ModelBalloon } from './model-balloon';
 
 export interface DetBox {
     x1: number; y1: number; x2: number; y2: number;
     conf: number;
+    balloon?: ModelBalloon;
     // Split children only: the side of the cut this child owns. The render's flood-fill area
     // finder can cross into a sibling region through an outline hole — the area bbox then spans
     // both regions and the text lays out across them. The renderer clamps its fill
@@ -30,6 +33,8 @@ export interface DetBox {
 }
 
 export interface DetectResult {
+    layoutModel?: LayoutModel;
+    balloons?: ModelBalloon[];
     boxes: DetBox[];
     // { width, height, data: ArrayBuffer } — 1 byte/pixel mask, 255 = text
     mask: { width: number; height: number; data: ArrayBuffer };
@@ -175,6 +180,7 @@ export interface SplitComp { x1: number; y1: number; x2: number; y2: number }
 // with its text rectangle, while the original per-page detection stays unchanged.
 export function shiftDetectionBoxY<T extends DetBox>(box: T, offset: number): T {
     return { ...box, y1: box.y1 + offset, y2: box.y2 + offset,
+        ...(offset && box.balloon ? { balloon: undefined } : null),
         ...(box.clip ? { clip: { ...box.clip, y1: box.clip.y1 + offset, y2: box.clip.y2 + offset } } : null) };
 }
 
@@ -1285,7 +1291,7 @@ export function withEncodeLock<T>(fn: () => Promise<T>): Promise<T> {
 export async function detect(
     img: ImageBitmap | HTMLImageElement,
     onStatus?: MtOnStatus,
-    thresholds?: { confThr?: number; minSize?: number; forceWasm?: boolean; lo?: boolean },
+    thresholds?: { confThr?: number; minSize?: number; forceWasm?: boolean; lo?: boolean; layoutModel?: LayoutModel; koharu?: KoharuThresholds },
     attempt = 0, // page can tear the iframe down on every mt:ready — cap rebuilds
 ): Promise<DetectResult> {
     return usingInference(async () => {
@@ -1316,7 +1322,8 @@ export async function detect(
             return detect(img, onStatus, thresholds, attempt + 1); // rebuild + bounded retry
         }
         return await iframeRpc(
-            { type: 'mt:detect', png, confThr: thresholds?.confThr, minSize: thresholds?.minSize, forceWasm: thresholds?.forceWasm === true, lo: thresholds?.lo === true },
+            { type: 'mt:detect', png, confThr: thresholds?.confThr, minSize: thresholds?.minSize, forceWasm: thresholds?.forceWasm === true, lo: thresholds?.lo === true,
+                layoutModel: thresholds?.layoutModel ?? 'ctd', koharu: thresholds?.koharu },
             [png],
         ) as DetectResult;
     });

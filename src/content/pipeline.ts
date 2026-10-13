@@ -16,6 +16,7 @@ import { refKey, readPage, bitmapBlank, blankVerdicts } from './page-io';
 import { pageIsGrayscale } from './ocr';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { PageTimer } from '../page-timing';
+import { attachModelBalloons } from './model-balloon';
 import { recordChapterLog } from '../chapter/log-store';
 import type { ChapterTrace } from '../chapter/log';
 
@@ -64,6 +65,7 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
     const endpoint = String((mtSettings as LLMSettings | undefined)?.cloudEndpoint ?? '').trim();
     const key = String((mtSettings as LLMSettings | undefined)?.cloudKey ?? '').trim();
     if (pipeline.inferEngine === 'cloud') {
+        if (pipeline.layoutModel === 'koharu') throw Object.assign(new Error('Koharu FP32 currently runs on-device. Select On-device in Options → Model.'), { kind: 'cloud' });
         recordChapterLog(opts?.chapterTrace, { kind: 'stage', stage: 'detect', execution: 'cloud' });
         if (!endpoint || !key) {
             throw Object.assign(
@@ -94,7 +96,9 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
         }
     }
     recordChapterLog(opts?.chapterTrace, { kind: 'stage', stage: 'detect', execution: 'local' });
-    return detect(bitmap, onStatus, { confThr: pipeline.detConf, minSize: pipeline.detMinSize, forceWasm: pipeline.detEp === 'wasm', lo: opts?.lo === true });
+    return detect(bitmap, onStatus, { confThr: pipeline.detConf, minSize: pipeline.detMinSize, forceWasm: pipeline.detEp === 'wasm', lo: opts?.lo === true,
+        layoutModel: pipeline.layoutModel, koharu: { text: pipeline.koharuTextConf, sfx: pipeline.koharuSfxConf,
+            bubble: 0.50, panel: pipeline.koharuPanelConf } });
 }
 
 // Box ordering for one detection (panel-guided, strip-banding, or cloud banding) —
@@ -126,6 +130,10 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
     // keeps cloud-only installs from downloading/running YOLO.
     if (det.ep === 'cloud') {
         det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
+    } else if (det.layoutModel === 'koharu') {
+        const panels = det.panels ?? [];
+        if (!panelsUsable(panels, page.w, page.h)) det.panelSkipped ??= 'No usable Koharu panels';
+        det.boxes = orderByPanels(det.boxes, panels, pipeline.readingDir, page, defer);
     } else if (page.h / page.w > 3 || page.w / page.h > 3) {
         det.panels = [];
         det.panelSkipped = `strip aspect ${page.w}x${page.h}`;
@@ -147,6 +155,7 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
     // survives IoU and would paint double text. Marginal only (conf < 0.5). Dropped boxes
     // vanish from cloudTexts with them (identity reattach below).
     det.boxes = dropContainedBoxes(det.boxes, 0.9, 0.5);
+    if (det.balloons?.length) det.boxes = attachModelBalloons(det.boxes, det.balloons, det.mask);
     if (cloudTextByBox) det.cloudTexts = det.boxes.map(b => cloudTextByBox.get(b) ?? '');
     if (cloudPatchByBox) {
         det.cloudPatches = [];

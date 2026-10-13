@@ -48,7 +48,7 @@ export function surfaceContains(surface: BalloonSurface, box: DetBox): boolean {
 
 const surfaces = new WeakMap<Pixels, BalloonSurface[]>();
 
-function internalDivider(img: Pixels, surface: BalloonSurface, box: DetBox, mask?: Uint8Array): boolean {
+export function internalDivider(img: Pixels, surface: BalloonSurface, box: DetBox, mask?: Uint8Array): boolean {
     const y0 = surface.y1, y2 = surface.y2;
     for (let x = surface.x1; x < surface.x2; x++) {
         if (x >= box.x1 && x < box.x2) continue;

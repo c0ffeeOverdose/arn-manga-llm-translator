@@ -1,11 +1,15 @@
 arn-manga-llm-translator
 Copyright 2026 c0ffeeOverdose
 
-This product is licensed under GPL-3.0-only (see LICENSE). The models below
+This product is licensed under GPL-3.0-only (see LICENSE). The default models below
 are downloaded at runtime by the user (never bundled in this repository) from
 the mirror c0ffeeOverdose/arn-manga-models and cached in the browser's
-IndexedDB. They keep their own licenses; all of them permit this use
+IndexedDB. They keep their own licenses; the default models permit this use
 (Apache-2.0 components are one-way compatible into GPL-3.0).
+
+The optional KoharuLayout model is imported locally by the user. It is not
+downloaded from the above mirror or included in store releases. Its custom
+license and training-data terms are separate from the extension's license.
 
 This product includes the following developed by third parties:
 
@@ -25,6 +29,13 @@ This product includes the following developed by third parties:
 
   Baberu OCR (genshiai-daichi/baberu-ocr)
     License: Apache-2.0
+
+  Optional KoharuLayout RF-DETR Seg 2XL (local FP32 ONNX export)
+    Model: mayocream/koharu-layout-rfdetr-seg-2xl-1152
+           https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152
+    Model license: custom/other; see the model card and Manga109 terms.
+    Architecture: RF-DETR 1.7.0 (Apache-2.0)
+    Export and installation: docs/koharu-layout.md
 
   Tesseract language data (tesseract-ocr/tessdata_fast)
     License: Apache-2.0

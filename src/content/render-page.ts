@@ -275,7 +275,7 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
         gen: RENDER_GEN, // render-logic generation — stale extension shows an older number
         detConf: pipeline.detConf, // threshold that let these boxes through — low values explain junk regions
         usedLLM,
-        det: { ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null, splitGen: det.splitGen ?? null, ...(det.cloudMs ? { cloud: det.cloudMs } : null) },
+        det: { model: pipeline.layoutModel, ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null, splitGen: det.splitGen ?? null, ...(det.cloudMs ? { cloud: det.cloudMs } : null) },
         llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
         ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
         boxes: det.boxes.map(b => ({

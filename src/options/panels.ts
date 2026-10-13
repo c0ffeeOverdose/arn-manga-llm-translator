@@ -3,6 +3,7 @@
 import { autoSiteList, autoSiteRemove } from '../llm/pipeline-settings';
 import { sessGet, sessRemove } from '../storage-session';
 import { baberuInstalled, ocrInstalled, detModelsInstalled } from '../llm/ocr-models';
+import { koharuInstalled } from '../llm/layout-models';
 import { FONT_PRESETS, fontList, fontDownload, fontDelete, fontAddCustom, fontName, fontIdFromUrl, fontRead } from '../llm/font-store';
 import { charKey, overrideKey, claimLegacyOverrides, type CharOverride } from '../llm/core';
 import { $ } from './shell';
@@ -470,6 +471,7 @@ const DIAG_FILES: [string, string][] = [
         const [baberu, langs, fonts, det] = await Promise.all([baberuInstalled(), ocrInstalled(), fontList(), detModelsInstalled()]);
         // detection weights live in IDB (downloaded on first on-device use), not the bundle
         lines.push(`CTD model: ${det.ctd ? 'cached' : 'not downloaded (fetches on first on-device page)'}`);
+        lines.push(`Koharu FP32: ${await koharuInstalled()}`);
         lines.push(`Panel model: ${det.panel ? 'cached' : 'not downloaded (fetches on first page)'}`);
         lines.push(`Baberu OCR: ${baberu ? 'downloaded' : 'not downloaded'}`);
         lines.push(`Tesseract langs: ${langs.length ? langs.join(', ') : 'none'}`);

@@ -341,6 +341,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             });
             const clip = (b: DetBox): DetBox => ({
                 ...b, y1: Math.max(b.y1, my0) - my0, y2: Math.min(b.y2, my0 + mh) - my0,
+                ...(b.balloon ? { balloon: undefined } : null),
             });
             const boxes: DetBox[] = [];
             det.boxes.forEach((b, bi) => { if (remap.has(bi + 1)) boxes.push(clip(b)); });
@@ -370,9 +371,9 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 if (isDebug() && state.origOwn) console.log('[mt] orig copy (seam)', JSON.stringify({ src: m.srcUrl.slice(-14) }));
             }
             if (debugOn && boxes.length) {
-                state.debugOrig = await renderDebugView(m.bitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask);
+                state.debugOrig = await renderDebugView(m.bitmap, boxes, memberPanels, panelRanks(memberPanels), [], [], memberOutputs, localDet.mask);
                 const debugBitmap = await createImageBitmap(sc);
-                try { state.debug = await renderDebugView(debugBitmap, boxes, memberPanels, panelRanks(memberPanels), det.dropped ?? [], det.panelDropped ?? [], [], det.mask); }
+                try { state.debug = await renderDebugView(debugBitmap, boxes, memberPanels, panelRanks(memberPanels), [], [], memberOutputs, localDet.mask, m.bitmap); }
                 finally { debugBitmap.close(); }
             }
             const existing = pages.get(m.key);

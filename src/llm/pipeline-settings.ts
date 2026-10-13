@@ -1,8 +1,14 @@
 // Central pipeline settings: schema, defaults, presets, defensive load/merge. Pure logic.
 
+import type { LayoutModel } from '../layout-model';
+
 export interface PipelineSettings {
     preset: string;            // 'balanced' | 'fast' | 'best' | 'custom'
     // detection
+    layoutModel: LayoutModel;
+    koharuTextConf: number;
+    koharuSfxConf: number;
+    koharuPanelConf: number;
     detConf: number;           // CTD confidence threshold
     detMinSize: number;        // min region side in px (kills texture false positives)
     panelConf: number;         // YOLO panel confidence (bleed panels need ~0.2)
@@ -58,6 +64,10 @@ export interface PipelineSettings {
 
 export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     preset: 'balanced',
+    layoutModel: 'ctd',
+    koharuTextConf: 0.25,
+    koharuSfxConf: 0.20,
+    koharuPanelConf: 0.50,
     detConf: 0.35,
     detMinSize: 12,
     panelConf: 0.20,
@@ -173,8 +183,10 @@ export const PRESETS: Record<string, Partial<PipelineSettings>> = {
 // Preset thinking levels (custom text/numbers pass through untouched).
 const KNOWN_THINKING = ['auto', 'none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
-export function applyPreset(name: string): PipelineSettings {
-    return { ...DEFAULT_PIPELINE_SETTINGS, ...(PRESETS[name] ?? {}), preset: name };
+export function applyPreset(name: string, current?: Pick<PipelineSettings, 'layoutModel' | 'inferEngine' | 'detEp'>): PipelineSettings {
+    return { ...DEFAULT_PIPELINE_SETTINGS, ...(PRESETS[name] ?? {}), ...(current ? {
+        layoutModel: current.layoutModel, inferEngine: current.inferEngine, detEp: current.detEp,
+    } : {}), preset: name };
 }
 
 // Merge stored settings over defaults; old-format keys migrate onto textSource.
@@ -216,6 +228,10 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         else if (s.visionMode != null || s.useVision != null || s.ocrModel != null) out.textSource = 'page';
     }
     if (out.readingDir !== 'rtl' && out.readingDir !== 'ltr') out.readingDir = 'rtl';
+    if (out.layoutModel !== 'ctd' && out.layoutModel !== 'koharu') out.layoutModel = 'ctd';
+    for (const k of ['koharuTextConf', 'koharuSfxConf', 'koharuPanelConf'] as const) {
+        if (typeof out[k] !== 'number' || !(Number(out[k]) >= 0.05 && Number(out[k]) <= 1)) out[k] = DEFAULT_PIPELINE_SETTINGS[k];
+    }
     if (typeof out.detConf !== 'number' || !(out.detConf >= 0 && out.detConf <= 1)) out.detConf = 0.35;
     if (typeof out.detMinSize !== 'number' || !(out.detMinSize >= 1 && out.detMinSize <= 200)) out.detMinSize = 12;
     else out.detMinSize = Math.round(out.detMinSize);
@@ -275,6 +291,7 @@ export function matchingPreset(s: PipelineSettings): string {
         const full = applyPreset(name);
         let same = true;
         for (const k of Object.keys(DEFAULT_PIPELINE_SETTINGS)) {
+            if (k === 'layoutModel' || k.startsWith('koharu')) continue;
             if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts' || k === 'useOcrModel' || k === 'ocrThinking' || k === 'inpaint') continue; // behavior knobs, not quality
             if ((full as any)[k] !== (s as any)[k]) { same = false; break; }
         }

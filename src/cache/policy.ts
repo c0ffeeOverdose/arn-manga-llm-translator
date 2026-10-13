@@ -2,6 +2,7 @@ import type { DetBox, DetectResult, InpaintPatch } from '../content/detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
 import type { ImageSignature, ImageRegion } from '../image-identity';
 import { DEFAULT_PIPELINE_SETTINGS, type PipelineSettings } from '../llm/pipeline-settings';
+import { KOHARU_MODEL } from '../layout-model';
 
 export const CACHE_MAX = 200;
 
@@ -233,5 +234,7 @@ export function settingsFingerprint(o: FingerprintOpts): string {
         s.ocrPerRegion, s.temperature, s.ocrTemperature, s.inferEngine, s.ocrLangs,
         s.stylePrompt, s.vlmAssistedDetection, s.fullPageSize, s.cropSize, s.jpegQuality,
         s.grayscaleBw, s.useContext, s.useCharacters, s.crossChapter, s.contextPairs,
-        s.charLimit, s.thinkingLevel, s.ocrThinking, s.mergePages, 'tile38']);
+        s.charLimit, s.thinkingLevel, s.ocrThinking, s.mergePages, 'tile38',
+        ...(s.layoutModel === 'koharu' ? [KOHARU_MODEL.recipe, KOHARU_MODEL.sha256,
+            s.koharuTextConf, s.koharuSfxConf, s.koharuPanelConf] : [])]);
 }

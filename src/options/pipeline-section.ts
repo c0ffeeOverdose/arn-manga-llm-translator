@@ -1,6 +1,6 @@
 // Pipeline tab: presets, advanced sliders/toggles, tone, target language, OCR manager, cache row.
 
-import { applyPreset, filterTargetLangs, matchingPreset, mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
+import { applyPreset, filterTargetLangs, matchingPreset, mergePipeline, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { OCR_LANGUAGES, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuDownload, baberuDelete } from '../llm/ocr-models';
 import { $, setDirty, dlProgress } from './shell';
 
@@ -9,9 +9,7 @@ export let pipeline: PipelineSettings = applyPreset('balanced');
 export let presetsPristine = true; // false once user edits advanced fields → show Custom
 
 export function loadStoredPipeline(stored: PipelineSettings | undefined): void {
-    pipeline = stored
-        ? { ...applyPreset('balanced'), ...stored }
-        : applyPreset('balanced');
+    pipeline = loadPipelineSettings(stored);
     presetsPristine = stored == null;
 }
 
@@ -52,7 +50,8 @@ function syncColorUI(): void {
 
 export function syncAdvancedUI(): void {
     ($('preset') as HTMLSelectElement).value = presetsPristine ? matchingPreset(pipeline) : 'custom';
-    for (const id of ['detConf', 'detMinSize', 'panelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'mergePages', 'minFont', 'textScale', 'cacheMax']) syncRange(id, id);
+    for (const id of ['detConf', 'detMinSize', 'panelConf', 'koharuTextConf', 'koharuSfxConf', 'koharuPanelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'mergePages', 'minFont', 'textScale', 'cacheMax']) syncRange(id, id);
+    syncDetectionTuning();
     syncColorUI();
     ($('deferLabels') as HTMLInputElement).checked = pipeline.deferLabels;
     ($('vlmAssisted') as HTMLInputElement).checked = pipeline.vlmAssistedDetection;
@@ -71,6 +70,12 @@ export function syncAdvancedUI(): void {
     syncOcrManager();
     syncOcrSeparateUI();
 }
+export function syncDetectionTuning(): void {
+    const koharu = pipeline.layoutModel === 'koharu';
+    $('legacyDetectionTuning').hidden = koharu;
+    $('koharuDetectionTuning').hidden = !koharu;
+}
+
 ($<HTMLSelectElement>('textSource')).onchange = () => {
     pipeline.textSource = ($<HTMLSelectElement>('textSource')).value as 'page' | 'crops' | 'ocr';
     syncOcrManager();
@@ -221,7 +226,7 @@ async function renderOcrLangs(): Promise<void> {
 ($('preset') as HTMLSelectElement).onchange = () => {
     const v = ($('preset') as HTMLSelectElement).value;
     if (v === 'custom') return; // selected by editing advanced fields
-    pipeline = applyPreset(v);
+    pipeline = applyPreset(v, pipeline);
     presetsPristine = true;
     syncAdvancedUI();
     setDirty(true);
@@ -261,6 +266,9 @@ const RANGE_ABS: Record<string, { min?: number; max?: number }> = {
     detConf: { min: 0, max: 1 },
     detMinSize: { min: 1, max: 200 },
     panelConf: { min: 0.05, max: 1 },
+    koharuTextConf: { min: 0.05, max: 1 },
+    koharuSfxConf: { min: 0.05, max: 1 },
+    koharuPanelConf: { min: 0.05, max: 1 },
     cropSize: { min: 100, max: 1200 },
     fullPageSize: { min: 400, max: 2560 },
     contextPairs: { min: 0, max: 200 },

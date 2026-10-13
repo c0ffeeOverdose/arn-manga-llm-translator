@@ -10,7 +10,7 @@ import { pipeline, context, setContext, shareContext, loadContext, saveContext, 
 import type { PageState } from './state';
 import { fetchBitmap } from './page-io';
 import { readProgressT0, writeProgressT0, cacheKey, settingsFingerprint, cachePut, partialEntry, pageHashFromBitmap, annotFont, withSources, regionChunks, nextChunkSize, requestImages, INPAINT_PATCH_GEN } from './page-cache';
-import { chosenOrientation, pageArea, expandCropToInk, balloonHint, type TextMask } from './render';
+import { chosenOrientation, pageArea, effBoxesForAreas, expandCropToInk, balloonHint, type TextMask } from './render';
 import { erasePlan, computeAiPatches, type AiPatches } from './inpaint';
 import { type InpaintPatch } from './detection';
 import { inpaintMode } from '../llm/pipeline-settings';
@@ -263,12 +263,16 @@ function confPill(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContex
     ctx.fillText(text, x + 4, y + 2);
 }
 
-// full-res debug view: translated image + CTD boxes/badges/conf, YOLO panels
-// (cyan, numbered in reading order), dashed green = the placement area.
-// Below-threshold near-misses draw dimmed gray with conf and NO badge.
-export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = [], mask?: TextMask): Promise<string> {
+// Measure placement from the original pixels before drawing any overlays.
+// Red owns source regions; green bounds the area; orange follows its per-row runs.
+export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], panels: DetBox[] = [], panelNums: number[] = [], dropped: DetBox[] = [], panelDropped: DetBox[] = [], outputs: RegionOutput[] = [], mask?: TextMask, original: ImageBitmap = bitmap): Promise<string> {
     const c = new OffscreenCanvas(bitmap.width, bitmap.height);
     const ctx = c.getContext('2d')!;
+    ctx.drawImage(original, 0, 0, c.width, c.height);
+    const frame = ctx.getImageData(0, 0, c.width, c.height);
+    const textFor = (index: number) => outputs.find(o => o.index === index)?.translation ?? '';
+    const effBoxes = effBoxesForAreas(ctx, frame, boxes, textFor, mask);
+    const areas = effBoxes.map((b, i) => pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i + 1), mask), mask));
     ctx.drawImage(bitmap, 0, 0);
     const font = Math.max(16, Math.round(Math.max(bitmap.width, bitmap.height) / 60));
     ctx.lineWidth = Math.max(2, font * 0.12);
@@ -288,23 +292,17 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
         confPill(ctx, d.x1, d.y1, d.conf.toFixed(2), '#888888', font);
     }
     ctx.restore();
-    // placement area the layout actually got, dashed green under the red boxes.
-    const frame = ctx.getImageData(0, 0, c.width, c.height);
-    // the orientation the layout will choose for this region's own text, not the box aspect.
-    const textFor = (i: number) => outputs.find(o => o.index === i + 1)?.translation ?? '';
     ctx.save();
     ctx.setLineDash([font, font * 0.6]);
     ctx.strokeStyle = '#2bff88';
-    boxes.forEach((b, i) => {
-        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i), mask), mask);
+    areas.forEach(a => {
         if (a) ctx.strokeRect(a.x, a.y, a.w, a.h);
     });
     // measured per-line runs (enclosed bubbles): orange outline of the shape
     // the layout actually follows. Not drawn for the no-frame fallback.
     ctx.setLineDash([font * 0.5, font * 0.4]);
     ctx.strokeStyle = '#ffa02b';
-    boxes.forEach((b, i) => {
-        const a = pageArea(ctx, frame, b, chosenOrientation(ctx, frame, b, textFor(i), mask), mask);
+    areas.forEach(a => {
         const prof = a?.runs;
         if (!prof) return; // forEach: skip boxes without a measured profile
         const left: [number, number][] = [], right: [number, number][] = [];
@@ -328,8 +326,10 @@ export async function renderDebugView(bitmap: ImageBitmap, boxes: DetBox[], pane
         const ly = Math.min(b.y2 + 2, bitmap.height - font);
         confPill(ctx, b.x1, ly, b.conf.toFixed(2), '#fff', font);
     });
-    const blob = await c.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
-    return URL.createObjectURL(blob);
+    try {
+        const blob = await c.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
+        return URL.createObjectURL(blob);
+    } finally { c.width = c.height = 0; }
 }
 
 // 1-based reading-order rank per panel index, for debug numbers
@@ -355,23 +355,29 @@ export async function ensurePageDebugViews(state: PageState, original?: ImageBit
     const token = state.cacheEpoch ?? cacheGeneration();
     const det = restoreDetection(state.det), ranks = panelRanks(det.panels ?? []);
     const task = (async () => {
-        for (const side of ['debugOrig', 'debug'] as const) {
-            if (state[side] || !cacheCurrent(token)) continue;
-            let bitmap: ImageBitmap | undefined, owned = false;
-            try {
-                bitmap = side === 'debugOrig' ? original : translated ?? state.translatedBmp;
-                if (!bitmap) {
-                    bitmap = side === 'debugOrig' ? await savedOriginal(state) : (await fetchBitmap(state.translated)).bitmap;
-                    owned = true;
-                }
-                const url = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, state.outputs, det.mask);
-                if (!cacheCurrent(token)) { URL.revokeObjectURL(url); continue; }
-                state[side] = url;
-                if (pages.get(state.orig) === state) pages.set(url, state);
-            } catch (e) {
-                if (isDebug()) console.warn('[mt] debug view failed:', e);
-            } finally { if (owned) bitmap?.close(); }
-        }
+        let source = original;
+        try {
+            source ??= await savedOriginal(state);
+            for (const side of ['debugOrig', 'debug'] as const) {
+                if (state[side] || !cacheCurrent(token)) continue;
+                let bitmap: ImageBitmap | undefined, owned = false;
+                try {
+                    bitmap = side === 'debugOrig' ? source : translated ?? state.translatedBmp;
+                    if (!bitmap) {
+                        bitmap = (await fetchBitmap(state.translated)).bitmap;
+                        owned = true;
+                    }
+                    const url = await renderDebugView(bitmap, det.boxes, det.panels, ranks, det.dropped, det.panelDropped, state.outputs, det.mask, source);
+                    if (!cacheCurrent(token)) { URL.revokeObjectURL(url); continue; }
+                    state[side] = url;
+                    if (pages.get(state.orig) === state) pages.set(url, state);
+                } catch (e) {
+                    if (isDebug()) console.warn('[mt] debug view failed:', e);
+                } finally { if (owned) bitmap?.close(); }
+            }
+        } catch (e) {
+            if (isDebug()) console.warn('[mt] debug original unavailable:', e);
+        } finally { if (!original) source?.close(); }
     })().finally(() => { debugWork.delete(state); });
     debugWork.set(state, task);
     return task;

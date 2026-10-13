@@ -6,6 +6,10 @@ export interface DetBox {
     conf: number;
 }
 
+import { loadKoharuFile } from '../llm/layout-models';
+import { KOHARU_INPUT, koharuInput, decodeKoharu, type KoharuOutput } from './koharu';
+import type { KoharuThresholds } from '../layout-model';
+
 const INPUT = 1024;
 const CONF_THR = 0.35;
 const NMS_THR = 0.35;
@@ -571,6 +575,97 @@ async function runPanels(png: ArrayBuffer, thr: number): Promise<{ panels: DetBo
     return { panels, dropped, inferMs };
 }
 
+const layoutQ: Omit<InferTask, 't0'>[] = [];
+let layoutBusy = false;
+let koharuSession: any = null;
+let koharuEp = '';
+
+// Model switches cannot release a session borrowed by another page or tile.
+function withLayoutLock<T>(fn: () => Promise<T>, prio: InferPrio = 0): Promise<T> {
+    return new Promise<T>((resolve, fail) => {
+        layoutQ.push({ fn, prio, ok: value => resolve(value as T), fail });
+        pumpLayout();
+    });
+}
+
+function pumpLayout(): void {
+    if (layoutBusy || !layoutQ.length) return;
+    layoutBusy = true;
+    const task = layoutQ.splice(pickInferIndex(layoutQ), 1)[0];
+    task.fn().then(task.ok, task.fail).finally(() => { layoutBusy = false; pumpLayout(); });
+}
+
+async function releaseKoharu(): Promise<void> {
+    if (!koharuSession) return;
+    const old = koharuSession; koharuSession = null; koharuEp = '';
+    await withInferLock(() => old.release());
+}
+
+async function runKoharu(png: ArrayBuffer, thresholds: Partial<KoharuThresholds> | undefined, minSize: number, forceWasm: boolean, prio: InferPrio) {
+    let initMs = 0;
+    if (koharuSession && forceWasm && koharuEp !== 'wasm') await releaseKoharu();
+    if (!koharuSession) {
+        const started = performance.now();
+        await creating; await panelCreating;
+        const old = [session, panelSession];
+        session = null; panelSession = null; sessionEp = ''; sessionInitMs = 0;
+        for (const sess of old) if (sess) await withInferLock(() => sess.release());
+        const bytes = await loadKoharuFile();
+        if (!forceWasm) {
+            try {
+                koharuSession = await withInferLock(() => ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'] }));
+                koharuEp = 'webgpu';
+            } catch { /* the CPU provider handles devices without WebGPU */ }
+        }
+        if (!koharuSession) {
+            koharuSession = await withInferLock(() => ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] }));
+            koharuEp = 'wasm';
+        }
+        initMs = Math.round(performance.now() - started);
+    }
+    const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
+    const w = bitmap.width, h = bitmap.height;
+    const tiles = splitTiles(w, h);
+    let inferMs = 0;
+    const infer = async (image: ImageBitmap) => {
+        const canvas = new OffscreenCanvas(image.width, image.height);
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+        let x: Float32Array;
+        try {
+            ctx.drawImage(image, 0, 0);
+            x = koharuInput(ctx.getImageData(0, 0, image.width, image.height).data, image.width, image.height);
+        } finally { canvas.width = canvas.height = 0; }
+        const input = new ort.Tensor('float32', x, [1, 3, KOHARU_INPUT, KOHARU_INPUT]);
+        let output: any;
+        try {
+            const start = performance.now();
+            output = await withInferLock(() => koharuSession.run({ input }), prio);
+            inferMs += performance.now() - start;
+            return decodeKoharu(output as KoharuOutput, image.width, image.height, thresholds, minSize);
+        } finally {
+            input.dispose();
+            for (const tensor of Object.values(output ?? {}) as any[]) tensor.dispose();
+        }
+    };
+    try {
+        if (!tiles.length) return { ...await infer(bitmap), layoutModel: 'koharu', ep: koharuEp, initMs, inferMs };
+        const mask = new Uint8Array(w * h), per: { tile: Tile; boxes: DetBox[] }[] = [];
+        for (const tile of tiles) {
+            const image = await createImageBitmap(bitmap, tile.x0, tile.y0, Math.min(tile.w, w - tile.x0), Math.min(tile.h, h - tile.y0));
+            try {
+                const result = await infer(image);
+                per.push({ tile, boxes: result.boxes });
+                const data = new Uint8Array(result.mask.data);
+                for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
+                    if (data[y * image.width + x]) mask[(tile.y0 + y) * w + tile.x0 + x] = 255;
+                }
+            } finally { image.close(); }
+        }
+        return { boxes: mergeTileBoxes(per), panels: [], panelSkipped: 'Tiled page: reading order follows text positions',
+            mask: { width: w, height: h, data: mask.buffer }, layoutModel: 'koharu', ep: koharuEp, initMs, inferMs };
+    } finally { bitmap.close(); }
+}
+
 // ---- OCR: Tesseract (engine BUNDLED in dist/tesseract — MV3 forbids remote
 // scripts; only the language data is downloaded on demand and cached in IDB).
 import { ocrRead, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuRead, fetchWithProgress, DET_URL, INPAINT_KEY, INPAINT_FILE } from '../llm/ocr-models';
@@ -997,7 +1092,10 @@ window.addEventListener('message', async (ev: MessageEvent) => {
             const text = await runOcr(msg.png, msg.langs ?? ['jpn', 'eng']);
             reply({ ok: true, text });
         } else if (msg.type === 'mt:panels') {
-            const { v: r, lockWait } = await metered(() => runPanels(msg.png, typeof msg.thr === 'number' ? msg.thr : PANEL_CONF_THR));
+            const { v: r, lockWait } = await metered(() => withLayoutLock(async () => {
+                await releaseKoharu();
+                return runPanels(msg.png, typeof msg.thr === 'number' ? msg.thr : PANEL_CONF_THR);
+            }, prio));
             reply({ ok: true, panels: r.panels, dropped: r.dropped, ms: Math.round(r.inferMs), lockWait });
         } else if (msg.type === 'mt:inpaint') {
             const { v: r, lockWait } = await metered(() => runInpaint(
@@ -1007,7 +1105,12 @@ window.addEventListener('message', async (ev: MessageEvent) => {
             reply({ ok: true, patches: r.patches, windows: r.windows, ms: Math.round(r.inferMs), lockWait },
                 r.patches.map(p => p.png));
         } else {
-            const { v: result, lockWait } = await metered(() => runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true, prio));
+            const { v: result, lockWait } = await metered(() => withLayoutLock(async () => {
+                if (msg.layoutModel === 'koharu') return runKoharu(msg.png, msg.koharu, msg.minSize ?? MIN_SIZE, msg.forceWasm === true, prio);
+                if (msg.layoutModel != null && msg.layoutModel !== 'ctd') throw new Error('Unknown layout model');
+                await releaseKoharu();
+                return runDetect(msg.png, msg.confThr ?? CONF_THR, msg.minSize ?? MIN_SIZE, msg.forceWasm === true, prio);
+            }, prio));
             (result as any).lockWaitMs = lockWait;
             (ev.source as Window | null)?.postMessage(
                 { type: 'mt:detect-result', id: msg.id, ok: true, result },

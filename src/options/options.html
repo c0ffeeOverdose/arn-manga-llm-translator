@@ -293,6 +293,10 @@
   .dl-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
   .dl-row:last-child { border-bottom: 0; }
   .dl-row .name { flex: 1; }
+  #detRow .dl-row { flex-wrap: wrap; }
+  #detRow .name { min-width: 150px; }
+  #detRow .btn { white-space: nowrap; }
+  #detRow .dl-row:not(.busy) .dl-bar, #detRow .dl-row:not(.busy) .dl-text { display: none; }
   .dl-row .name .ok-mark { color: var(--ok); font-weight: 600; }
   .dl-bar { width: 90px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; flex: none; }
   /* empty bars/text stay hidden until a download actually runs — otherwise
@@ -476,19 +480,30 @@
         <div class="hint">On-device is private and works offline. Cloud runs detection + OCR on your own endpoint — faster on slow phones, needs internet.</div>
       </div>
 
+      <div class="field">
+        <label for="layoutModel">Layout model</label>
+        <select id="layoutModel" aria-describedby="layoutModelHint">
+          <option value="ctd">CTD + Panel</option>
+          <option value="koharu">KoharuLayout FP32</option>
+        </select>
+        <div class="hint" id="layoutModelHint"></div>
+      </div>
+
       <div class="field" id="detEpField" style="display:none">
         <label class="check"><input type="checkbox" id="forceWasm"> Force CPU (wasm)</label>
-        <div class="hint">Auto uses the GPU. Tick this only if Auto gives detection errors or blank results — CPU is ~10x slower.</div>
+        <div class="hint">Auto uses the GPU. Tick this if Auto gives detection errors or blank results — CPU can be much slower.</div>
       </div>
 
       <div id="detRow" style="display:none">
+        <input type="file" id="layoutFile" accept=".onnx" hidden>
         <div class="dl-row">
           <span class="name" id="detLabel">Detection models (CTD 40MB + panel 10MB)</span>
           <span class="dl-text"></span>
           <span class="dl-bar" id="detBar"><span class="fill"></span></span>
           <button id="detBtn" type="button" class="btn ghost sm">Download</button>
         </div>
-        <div class="hint" style="margin-top:8px">Downloads once, then works offline. Otherwise fetched automatically on the first on-device page.</div>
+        <div class="hint" id="detInstallHint" style="margin-top:8px">Downloads once, then works offline. Otherwise fetched automatically on the first on-device page.</div>
+        <div class="hint" id="layoutFileStatus" role="status" aria-live="polite" style="margin-top:8px;overflow-wrap:anywhere"></div>
       </div>
 
       <fieldset id="cloudFields" style="display:none">
@@ -705,19 +720,36 @@
       <div class="adv-cols">
         <div>
           <div class="group-label">Detection</div>
+          <div id="legacyDetectionTuning">
           <div class="field">
             <div class="range-head"><label for="detConf">Confidence</label><input type="number" id="detConfNum" class="val-input" min="0" max="1" step="0.05"></div>
             <input type="range" id="detConf" min="0.10" max="0.60" step="0.05">
             <div class="hint">Lower catches more small text, with more false positives.</div>
           </div>
           <div class="field">
-            <div class="range-head"><label for="detMinSize">Min region size</label><span class="unit-wrap"><input type="number" id="detMinSizeNum" class="val-input" min="1" max="200" step="1"><span class="unit">px</span></span></div>
-            <input type="range" id="detMinSize" min="6" max="30" step="1">
-          </div>
-          <div class="field">
             <div class="range-head"><label for="panelConf">Panel confidence</label><input type="number" id="panelConfNum" class="val-input" min="0.05" max="1" step="0.01"></div>
             <input type="range" id="panelConf" min="0.05" max="0.50" step="0.05">
             <div class="hint">Lower catches faint panels (bleed), with more false boxes.</div>
+          </div>
+          </div>
+          <div id="koharuDetectionTuning" hidden>
+            <div class="field">
+              <div class="range-head"><label for="koharuTextConf">Koharu text confidence</label><input type="number" id="koharuTextConfNum" class="val-input" min="0.05" max="1" step="0.01"></div>
+              <input type="range" id="koharuTextConf" min="0.05" max="1" step="0.01">
+            </div>
+            <div class="field">
+              <div class="range-head"><label for="koharuSfxConf">Koharu sound-effect confidence</label><input type="number" id="koharuSfxConfNum" class="val-input" min="0.05" max="1" step="0.01"></div>
+              <input type="range" id="koharuSfxConf" min="0.05" max="1" step="0.01">
+            </div>
+            <div class="field">
+              <div class="range-head"><label for="koharuPanelConf">Koharu panel confidence</label><input type="number" id="koharuPanelConfNum" class="val-input" min="0.05" max="1" step="0.01"></div>
+              <input type="range" id="koharuPanelConf" min="0.05" max="1" step="0.01">
+            </div>
+            <div class="hint">Defaults: text 0.25, sound effects 0.20, panels 0.50. Lower values may include artwork.</div>
+          </div>
+          <div class="field">
+            <div class="range-head"><label for="detMinSize">Min region size</label><span class="unit-wrap"><input type="number" id="detMinSizeNum" class="val-input" min="1" max="200" step="1"><span class="unit">px</span></span></div>
+            <input type="range" id="detMinSize" min="6" max="30" step="1">
           </div>
           <label class="check"><input type="checkbox" id="deferLabels"> Small labels read after balloon dialogue</label>
           <label class="check"><input type="checkbox" id="vlmAssisted"> Model reports missed text (hand-written signs, SFX)</label>

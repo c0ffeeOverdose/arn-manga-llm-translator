@@ -464,6 +464,9 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         }
         log({ kind: 'stage', stage: 'settings' });
         await loadPipeline();
+        if (pipeline.inferEngine === 'cloud' && pipeline.layoutModel === 'koharu') {
+            throw Object.assign(new Error('Koharu FP32 currently runs on-device. Select On-device in Options → Model.'), { kind: 'cloud' });
+        }
         await loadContext();
         // Cloud engine: pay the container wake ONCE here — otherwise the first pages race a
         // cold boot inside their own request caps (worst on mobile uplinks). A failed warm is
