@@ -169,41 +169,52 @@ function maskComponents(mask: Uint8Array, W: number, H: number, box: DetBox): De
 // Their comps all resolve to one surface, so the surface split cannot fire; cut at the
 // text-block seams instead: words on one row and lines stacked with real cross overlap
 // belong to one block, while a corridor between side-by-side blocks is a lobe boundary.
+// The predicate is shared with the lettering extraction (which needs the raw neighbourhood).
+function textCompLinked(a: DetBox, b: DetBox): boolean {
+    const ha = a.y2 - a.y1, hb = b.y2 - b.y1, unit = Math.min(ha, hb);
+    const xGap = Math.max(a.x1 - b.x2, b.x1 - a.x2, 0);
+    const yGap = Math.max(a.y1 - b.y2, b.y1 - a.y2, 0);
+    const xOverlap = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
+    const sameRow = Math.abs((a.y1 + a.y2) - (b.y1 + b.y2)) <= 1.2 * unit && xGap <= 0.9 * unit;
+    const stacked = xGap === 0 && xOverlap >= 0.5 * Math.min(a.x2 - a.x1, b.x2 - b.x1) && yGap <= 0.6 * unit;
+    return sameRow || stacked;
+}
 export function clusterTextComponents(comps: DetBox[]): DetBox[][] {
     const parent = comps.map((_, i) => i);
     const find = (i: number): number => parent[i] === i ? i : (parent[i] = find(parent[i]));
     for (let i = 0; i < comps.length; i++) for (let j = i + 1; j < comps.length; j++) {
-        const a = comps[i], b = comps[j];
-        const ha = a.y2 - a.y1, hb = b.y2 - b.y1, unit = Math.min(ha, hb);
-        const xGap = Math.max(a.x1 - b.x2, b.x1 - a.x2, 0);
-        const yGap = Math.max(a.y1 - b.y2, b.y1 - a.y2, 0);
-        const xOverlap = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
-        const sameRow = Math.abs((a.y1 + a.y2) - (b.y1 + b.y2)) <= 1.2 * unit && xGap <= 0.9 * unit;
-        const stacked = xGap === 0 && xOverlap >= 0.5 * Math.min(a.x2 - a.x1, b.x2 - b.x1) && yGap <= 0.6 * unit;
-        if (sameRow || stacked) parent[find(j)] = find(i);
+        if (textCompLinked(comps[i], comps[j])) parent[find(j)] = find(i);
     }
     const groups = new Map<number, DetBox[]>();
     comps.forEach((comp, i) => { const k = find(i); const group = groups.get(k) ?? []; group.push(comp); groups.set(k, group); });
     return [...groups.values()];
 }
 
-// A stray sub-glyph fragment (an ink speck, a descender piece) must not veto a split or
-// become its own region: attach lone components to the nearest real cluster when close.
+// Stray fragments and short dot runs must not veto a split or become their own region:
+// blocks that cannot stand alone (a single component, or a cluster under the block floor)
+// attach to the nearest full block when close. Display-lettering scale components stand
+// alone by design — they are the SFX the split is meant to separate.
 function attachOrphans(clusters: DetBox[][], medianH: number): DetBox[][] {
-    const out = clusters.filter(cs => cs.length > 1);
-    for (const cs of clusters.filter(cs => cs.length === 1)) {
-        const c = cs[0];
+    const height = (cs: DetBox[]) => Math.max(...cs.map(c => c.y2)) - Math.min(...cs.map(c => c.y1));
+    const out = clusters.filter(cs => cs.length > 1 && height(cs) >= 1.8 * medianH);
+    for (const cs of clusters) {
+        if (out.includes(cs)) continue;
+        if (cs.length === 1 && cs[0].y2 - cs[0].y1 >= 2.5 * medianH) { out.push(cs); continue; }
+        // Dust (a sliver far below glyph scale) attaches from farther out: a 4px speck
+        // floating between blocks must not veto the split.
+        const dusty = cs.some(c => c.y2 - c.y1 <= 0.5 * medianH);
+        const bound = (dusty ? 3 : 1.2) * medianH;
         let best: DetBox[] | null = null, bestD = Infinity;
         for (const target of out) {
             let d = Infinity;
-            for (const o of target) {
+            for (const c of cs) for (const o of target) {
                 const dx = Math.max(0, Math.max(c.x1 - o.x2, o.x1 - c.x2));
                 const dy = Math.max(0, Math.max(c.y1 - o.y2, o.y1 - c.y2));
                 d = Math.min(d, Math.hypot(dx, dy));
             }
             if (d < bestD) { bestD = d; best = target; }
         }
-        if (best && bestD <= 1.2 * medianH) best.push(c);
+        if (best && bestD <= bound) best.push(...cs);
         else out.push(cs);
     }
     return out;
@@ -212,13 +223,37 @@ function attachOrphans(clusters: DetBox[][], medianH: number): DetBox[][] {
 // Frame-clamped children: each child owns its text block plus a margin that stops short of
 // every sibling's ink. Erase/crop/layout clamp to that frame, so a shared physical surface
 // can never leak a sibling glyph into this child's cleanup. null = not safely splittable.
-export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: number, H: number, sib: number): DetBox[] | null {
+export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: number, H: number, sib: number,
+    accept?: (clusters: DetBox[][]) => boolean): DetBox[] | null {
     if (comps.length < 2) return null;
     const heights = comps.map(c => c.y2 - c.y1).sort((a, b) => a - b);
     const medianH = heights[heights.length >> 1];
     const clusters = attachOrphans(clusterTextComponents(comps), medianH);
-    if (clusters.length < 2 || clusters.length > 8) return null;
-    const boxes = clusters.map(cs => ({
+    // Display lettering (SFX scale) glued to a dialogue block is its own region: the big
+    // components split out whenever the rest still holds a real block, taking ornament
+    // components that hang off the lettering alone (a heart under an "Ah!", whose only
+    // grammar neighbour is the lettering component itself).
+    const split: DetBox[][] = [];
+    for (const cs of clusters) {
+        const big = cs.filter(c => c.y2 - c.y1 >= 2.5 * medianH);
+        if (!big.length || cs.length - big.length < 2) { split.push(cs); continue; }
+        const rest = cs.filter(c => !big.includes(c));
+        const nearBig = (c: DetBox) => big.some(b => {
+            const dx = Math.max(0, Math.max(c.x1 - b.x2, b.x1 - c.x2));
+            const dy = Math.max(0, Math.max(c.y1 - b.y2, b.y1 - c.y2));
+            return Math.hypot(dx, dy) <= 0.5 * medianH;
+        });
+        const stray = rest.filter(c => rest.every(o => o === c || !textCompLinked(o, c))
+            && (big.some(b => textCompLinked(b, c)) || nearBig(c)));
+        if (stray.length) {
+            big.push(...stray);
+            for (const c of stray) rest.splice(rest.indexOf(c), 1);
+        }
+        split.push(big, rest);
+    }
+    if (split.length < 2 || split.length > 8) return null;
+    if (accept && !accept(split)) return null;
+    const boxes = split.map(cs => ({
         x1: Math.min(...cs.map(c => c.x1)), y1: Math.min(...cs.map(c => c.y1)),
         x2: Math.max(...cs.map(c => c.x2)), y2: Math.max(...cs.map(c => c.y2)), conf: parent.conf,
     }));
@@ -228,9 +263,9 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
     // glyphs): keeping it in the box would erase it with the neighbours' cleanup, so it
     // becomes its own (keep-path) region instead.
     const oversized = (cs: DetBox[]) => cs.length === 1 && cs[0].y2 - cs[0].y1 >= 2.5 * medianH;
-    if (clusters.some((cs, i) => cs.length < 2 ? !oversized(cs) : boxes[i].y2 - boxes[i].y1 < 1.8 * medianH)) return null;
+    if (split.some((cs, i) => cs.length < 2 ? !oversized(cs) : boxes[i].y2 - boxes[i].y1 < 1.8 * medianH)) return null;
     const frameFor = (b: DetBox, i: number): { x1: number; y1: number; x2: number; y2: number } | null => {
-        const others = comps.filter(c => !clusters[i].includes(c));
+        const others = comps.filter(c => !split[i].includes(c));
         const bandY = others.filter(o => o.y1 < b.y2 && o.y2 > b.y1);
         const bandX = others.filter(o => o.x1 < b.x2 && o.x2 > b.x1);
         const soft = (clearance: number) => clearance === Infinity ? 14 : Math.max(0, Math.min(14, Math.floor((clearance - 2) / 2)));
@@ -244,14 +279,20 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
     // Frames are repaired, not vetoed: a sibling component that intrudes into a child's
     // erase reach shrinks that side of the frame (never below its own ink, 1px leash for
     // exclusive edges and float worker clips) instead of aborting the whole split — a ±2px
-    // detection jitter must not resurrect the merged region. No repair possible = keep the box.
+    // detection jitter must not resurrect the merged region. As a last resort a sliver
+    // budget lets two blocks whose boxes interlock by a few pixels still split: the reach
+    // may graze that corner rather than keep one fused region over two blocks.
     const withinCoverage = (f: { x1: number; y1: number; x2: number; y2: number }, b: DetBox) =>
         Math.ceil(f.x1) <= b.x1 + 1 && Math.ceil(f.y1) <= b.y1 + 1
         && Math.ceil(f.x2) >= b.x2 - 1 && Math.ceil(f.y2) >= b.y2 - 1;
-    const intrudes = (f: { x1: number; y1: number; x2: number; y2: number }, c: DetBox) =>
-        Math.min(c.x2 - 1, f.x2 - 1) >= Math.max(c.x1, f.x1)
-        && Math.min(c.y2 - 1, f.y2 - 1) >= Math.max(c.y1, f.y1);
-    const repairFrames = (start: { x1: number; y1: number; x2: number; y2: number }[]): { x1: number; y1: number; x2: number; y2: number }[] | null => {
+    const intrudes = (f: { x1: number; y1: number; x2: number; y2: number }, c: DetBox, slack: number) => {
+        const ix1 = Math.max(c.x1, f.x1), ix2 = Math.min(c.x2 - 1, f.x2 - 1);
+        const iy1 = Math.max(c.y1, f.y1), iy2 = Math.min(c.y2 - 1, f.y2 - 1);
+        if (ix2 < ix1 || iy2 < iy1) return false;
+        return (ix2 - ix1 + 1) * (iy2 - iy1 + 1) > slack;
+    };
+    const SLIVER_REACH = 384; // px² of interlock the sliver fallback tolerates
+    const repairFrames = (start: { x1: number; y1: number; x2: number; y2: number }[], slack: number): { x1: number; y1: number; x2: number; y2: number }[] | null => {
         let frames = start.map(f => ({ ...f }));
         if (parent.clip) {
             const clip = parent.clip;
@@ -265,7 +306,7 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
                 const b = boxes[i];
                 for (const c of comps) {
                     const f = frames[i];
-                    if (clusters[i].includes(c) || !intrudes(f, c)) continue;
+                    if (split[i].includes(c) || !intrudes(f, c, slack)) continue;
                     const ix1 = Math.max(c.x1, f.x1), ix2 = Math.min(c.x2 - 1, f.x2 - 1);
                     const iy1 = Math.max(c.y1, f.y1), iy2 = Math.min(c.y2 - 1, f.y2 - 1);
                     const options: ['x1' | 'x2' | 'y1' | 'y2', number][] =
@@ -287,8 +328,10 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
         }
         return null;
     };
-    const frames = repairFrames(boxes.map((b, i) => frameFor(b, i) ?? { x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 }))
-        ?? repairFrames(boxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 })));
+    const soft = boxes.map((b, i) => frameFor(b, i) ?? { x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 });
+    const bare = boxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 }));
+    const frames = repairFrames(soft, 0) ?? repairFrames(bare, 0)
+        ?? repairFrames(soft, SLIVER_REACH) ?? repairFrames(bare, SLIVER_REACH);
     if (!frames) return null;
     return boxes.map((b, i) => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2, conf: b.conf, clip: frames[i], sib }));
 }
@@ -313,7 +356,29 @@ function splitCutFamily(img: Pixels, raw: Uint8Array, mask: Mask, boxes: DetBox[
     const surface = balloonSurface(img, comps[0], mask, union);
     if (!surface) return null;
     for (const comp of comps.slice(1)) if (balloonSurface(img, comp, mask, union) !== surface) return null;
-    return splitConnectedClusters(comps, union, img.width, img.height, family[0]);
+    // A member carrying a full multi-line block (>= 6 components) is a settled block: the
+    // cut's seam is real for it, and no union cluster may merge two such members — that is
+    // how two touching balloons separated by a gutter come back fused. Fragment-like members
+    // (an outlier line or two) may still join another member's block.
+    const major = family.map(i => maskComponents(raw, img.width, img.height, boxes[i]).length >= 6);
+    const of = new Map<DetBox, number>();
+    for (const c of comps) {
+        const cx = (c.x1 + c.x2) / 2, cy = (c.y1 + c.y2) / 2;
+        const k = family.findIndex(i => {
+            const m = boxes[i];
+            return cx >= m.x1 && cx <= m.x2 && cy >= m.y1 && cy <= m.y2;
+        });
+        if (k >= 0) of.set(c, k);
+    }
+    const accept = (clusters: DetBox[][]): boolean => clusters.every(cs => {
+        const involved = new Set<number>();
+        for (const c of cs) {
+            const k = of.get(c);
+            if (k != null && major[k]) involved.add(k);
+        }
+        return involved.size <= 1;
+    });
+    return splitConnectedClusters(comps, union, img.width, img.height, family[0], accept);
 }
 
 // Split only when every supported ink component belongs to a measured enclosure.

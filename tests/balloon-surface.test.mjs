@@ -244,6 +244,42 @@ test('lone oversized lettering splits off its own region; lone normal-size words
         'a lone normal-size word still never becomes a region');
 });
 
+test('display lettering glued to a dialogue block splits out as its own region', () => {
+    const W = 240, H = 320;
+    const lettering = { x1: 30, y1: 40, x2: 110, y2: 150, conf: 0.9 }; // 110 tall vs 22px glyphs
+    const rows = [146, 174, 202].map(y => ({ x1: 60, y1: y, x2: 200, y2: y + 22, conf: 0.9 }));
+    const parent = { x1: 20, y1: 30, x2: 210, y2: 224, conf: 0.9 };
+    const pieces = splitConnectedClusters([lettering, ...rows], parent, W, H, 3);
+    assert.ok(pieces && pieces.length === 2, 'lettering becomes its own region');
+    const big = pieces.find(p => p.y2 <= 160), dialog = pieces.find(p => p !== big);
+    assert.ok(big && big.y1 <= 45 && big.x2 <= 115, 'the lettering piece hugs the lettering');
+    assert.ok(dialog && dialog.y1 >= 140, 'the dialogue piece starts at its own text');
+});
+
+test('interlocking blocks split with the sliver fallback instead of fusing', () => {
+    const W = 260, H = 400;
+    const a = [[100, 40, 220, 63], [110, 68, 210, 91], [105, 96, 215, 119], [100, 124, 220, 147], [100, 152, 220, 175], [100, 180, 220, 205]]
+        .map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2, conf: 0.9 }));
+    const b = [[46, 192, 78, 214], [26, 217, 99, 241], [18, 242, 67, 265], [75, 242, 105, 265], [10, 270, 115, 293], [11, 294, 72, 318], [79, 295, 113, 318], [24, 322, 101, 345]]
+        .map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2, conf: 0.9 }));
+    const parent = { x1: 5, y1: 30, x2: 225, y2: 350, conf: 0.9 };
+    const pieces = splitConnectedClusters([...a, ...b], parent, W, H, 3);
+    assert.ok(pieces && pieces.length === 2, 'a 15x13px interlock still splits');
+    const right = pieces.find(p => p.x1 >= 90), left = pieces.find(p => p.x1 < 90);
+    assert.ok(right && right.x1 <= 105 && left && left.x2 >= 110, 'each piece hugs its own block');
+});
+
+test('a short dot run joins the nearest block instead of vetoing the split', () => {
+    const W = 240, H = 300;
+    const block = (y0) => [0, 28, 56].map(k => ({ x1: 40, y1: y0 + k, x2: 150, y2: y0 + k + 22, conf: 0.9 }));
+    const dots = [[60, 126, 64, 132], [64, 126, 68, 132], [68, 126, 72, 132]].map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2, conf: 0.9 }));
+    const parent = { x1: 30, y1: 30, x2: 160, y2: 260, conf: 0.9 };
+    const pieces = splitConnectedClusters([...block(40), ...dots, ...block(180)], parent, W, H, 3);
+    assert.ok(pieces && pieces.length === 2, 'the dots ride the upper block, the two blocks split');
+    const upper = pieces.find(p => p.y1 < 100);
+    assert.ok(upper && upper.y2 >= 132, 'the dot run joined the upper block');
+});
+
 test('frame math: a sibling touching the frame edge stays safe; an interleaved pair refuses to split', () => {
     const W = 220, H = 180;
     const comps = [

@@ -106,6 +106,17 @@ def balloon_surface(rgb, box, mask, cache, search=None):
     return None
 
 
+def _text_comp_linked(a, b):
+    """Shared neighbourhood predicate (cluster grammar + lettering extraction). Mirrors TS."""
+    unit = min(a["y2"] - a["y1"], b["y2"] - b["y1"])
+    x_gap = max(a["x1"] - b["x2"], b["x1"] - a["x2"], 0)
+    y_gap = max(a["y1"] - b["y2"], b["y1"] - a["y2"], 0)
+    x_overlap = min(a["x2"], b["x2"]) - max(a["x1"], b["x1"])
+    same_row = abs((a["y1"] + a["y2"]) - (b["y1"] + b["y2"])) <= 1.2 * unit and x_gap <= 0.9 * unit
+    stacked = x_gap == 0 and x_overlap >= 0.5 * min(a["x2"] - a["x1"], b["x2"] - b["x1"]) and y_gap <= 0.6 * unit
+    return same_row or stacked
+
+
 def _cluster_text_components(comps):
     """Words on one row and lines stacked with real cross overlap join; a corridor between
     side-by-side blocks (a lobe neck) never does. Mirrors clusterTextComponents() in TS."""
@@ -119,14 +130,7 @@ def _cluster_text_components(comps):
 
     for i in range(len(comps)):
         for j in range(i + 1, len(comps)):
-            a, b = comps[i], comps[j]
-            unit = min(a["y2"] - a["y1"], b["y2"] - b["y1"])
-            x_gap = max(a["x1"] - b["x2"], b["x1"] - a["x2"], 0)
-            y_gap = max(a["y1"] - b["y2"], b["y1"] - a["y2"], 0)
-            x_overlap = min(a["x2"], b["x2"]) - max(a["x1"], b["x1"])
-            same_row = abs((a["y1"] + a["y2"]) - (b["y1"] + b["y2"])) <= 1.2 * unit and x_gap <= 0.9 * unit
-            stacked = x_gap == 0 and x_overlap >= 0.5 * min(a["x2"] - a["x1"], b["x2"] - b["x1"]) and y_gap <= 0.6 * unit
-            if same_row or stacked:
+            if _text_comp_linked(comps[i], comps[j]):
                 parent[find(j)] = find(i)
     groups = {}
     for i, comp in enumerate(comps):
@@ -135,28 +139,41 @@ def _cluster_text_components(comps):
 
 
 def _attach_orphans(clusters, median_h):
-    """A stray sub-glyph fragment must not veto a split or become its own region: attach lone
-    components to the nearest real cluster when close. Mirrors attachOrphans() in TS."""
-    out = [cs for cs in clusters if len(cs) > 1]
-    for cs in [cs for cs in clusters if len(cs) == 1]:
-        c = cs[0]
+    """A stray fragment or short dot run must not veto a split or become its own region:
+    blocks that cannot stand alone attach to the nearest full block when close;
+    display-lettering scale components stand alone. Mirrors attachOrphans() in TS."""
+    def height(cs):
+        return max(c["y2"] for c in cs) - min(c["y1"] for c in cs)
+
+    out = [cs for cs in clusters if len(cs) > 1 and height(cs) >= 1.8 * median_h]
+    for cs in clusters:
+        if any(cs is t for t in out):
+            continue
+        if len(cs) == 1 and cs[0]["y2"] - cs[0]["y1"] >= 2.5 * median_h:
+            out.append(cs)
+            continue
+        # Dust (a sliver far below glyph scale) attaches from farther out: a 4px speck
+        # floating between blocks must not veto the split.
+        dusty = any(c["y2"] - c["y1"] <= 0.5 * median_h for c in cs)
+        bound = (3 if dusty else 1.2) * median_h
         best, best_d = None, math.inf
         for target in out:
             d = math.inf
-            for o in target:
-                dx = max(0, max(c["x1"] - o["x2"], o["x1"] - c["x2"]))
-                dy = max(0, max(c["y1"] - o["y2"], o["y1"] - c["y2"]))
-                d = min(d, math.hypot(dx, dy))
+            for c in cs:
+                for o in target:
+                    dx = max(0, max(c["x1"] - o["x2"], o["x1"] - c["x2"]))
+                    dy = max(0, max(c["y1"] - o["y2"], o["y1"] - c["y2"]))
+                    d = min(d, math.hypot(dx, dy))
             if d < best_d:
                 best_d, best = d, target
-        if best is not None and best_d <= 1.2 * median_h:
-            best.append(c)
+        if best is not None and best_d <= bound:
+            best.extend(cs)
         else:
             out.append(cs)
     return out
 
 
-def split_connected_clusters(comps, parent, w, h):
+def split_connected_clusters(comps, parent, w, h, accept=None):
     """Connected multi-lobe balloon: several text blocks share one interior. Cut the box at
     the block seams with frame-clamped children (clip without cutAxis clamps every side), so
     a shared surface can never leak a sibling glyph into this child. None = not splittable.
@@ -166,10 +183,39 @@ def split_connected_clusters(comps, parent, w, h):
     heights = sorted(c["y2"] - c["y1"] for c in comps)
     median_h = heights[len(heights) // 2]
     clusters = _attach_orphans(_cluster_text_components(comps), median_h)
-    if len(clusters) < 2 or len(clusters) > 8:
+
+    # Display lettering (SFX scale) glued to a dialogue block is its own region: the big
+    # components split out whenever the rest still holds a real block, taking ornament
+    # components that hang off the lettering alone. Mirrors TS.
+    split = []
+    for cs in clusters:
+        big = [c for c in cs if c["y2"] - c["y1"] >= 2.5 * median_h]
+        if not big or len(cs) - len(big) < 2:
+            split.append(cs)
+            continue
+        rest = [c for c in cs if not any(c is b for b in big)]
+
+        def near_big(c):
+            def d(b):
+                dx = max(0, max(c["x1"] - b["x2"], b["x1"] - c["x2"]))
+                dy = max(0, max(c["y1"] - b["y2"], b["y1"] - c["y2"]))
+                return math.hypot(dx, dy)
+            return any(d(b) <= 0.5 * median_h for b in big)
+
+        stray = [c for c in rest
+                 if all(o is c or not _text_comp_linked(o, c) for o in rest)
+                 and (any(_text_comp_linked(b, c) for b in big) or near_big(c))]
+        for c in stray:
+            big.append(c)
+            rest.remove(c)
+        split.append(big)
+        split.append(rest)
+    if len(split) < 2 or len(split) > 8:
+        return None
+    if accept is not None and not accept(split):
         return None
     boxes = [{"x1": min(c["x1"] for c in cs), "y1": min(c["y1"] for c in cs),
-              "x2": max(c["x2"] for c in cs), "y2": max(c["y2"] for c in cs), "conf": parent["conf"]} for cs in clusters]
+              "x2": max(c["x2"] for c in cs), "y2": max(c["y2"] for c in cs), "conf": parent["conf"]} for cs in split]
 
     # A lone component never becomes its own region — unless it is OVERSIZED display lettering
     # (SFX scale, several times the block's glyphs): keeping it in the box would erase it with
@@ -178,7 +224,7 @@ def split_connected_clusters(comps, parent, w, h):
         return len(cs) == 1 and cs[0]["y2"] - cs[0]["y1"] >= 2.5 * median_h
 
     if any((not _oversized(cs)) if len(cs) < 2 else (b["y2"] - b["y1"] < 1.8 * median_h)
-           for cs, b in zip(clusters, boxes)):
+           for cs, b in zip(split, boxes)):
         return None
 
     def soft(clearance):
@@ -186,7 +232,7 @@ def split_connected_clusters(comps, parent, w, h):
 
     def frame_for(i):
         b = boxes[i]
-        others = [c for j, cs in enumerate(clusters) if j != i for c in cs]
+        others = [c for j, cs in enumerate(split) if j != i for c in cs]
         band_y = [o for o in others if o["y1"] < b["y2"] and o["y2"] > b["y1"]]
         band_x = [o for o in others if o["x1"] < b["x2"] and o["x2"] > b["x1"]]
         left = b["x1"] - max(o["x2"] for o in band_y) if band_y else math.inf
@@ -198,16 +244,22 @@ def split_connected_clusters(comps, parent, w, h):
 
     # Frames are repaired, not vetoed: a sibling component that intrudes into a child's
     # erase reach shrinks that side of the frame (never below its own ink, 1px leash for
-    # exclusive edges and float worker clips) instead of aborting the whole split.
+    # exclusive edges and float worker clips) instead of aborting the whole split. As a
+    # last resort a sliver budget lets interlocking blocks still split. Mirrors TS.
     def within_coverage(f, b):
         return math.ceil(f["x1"]) <= b["x1"] + 1 and math.ceil(f["y1"]) <= b["y1"] + 1 \
             and math.ceil(f["x2"]) >= b["x2"] - 1 and math.ceil(f["y2"]) >= b["y2"] - 1
 
-    def intrudes(f, c):
-        return min(c["x2"] - 1, f["x2"] - 1) >= max(c["x1"], f["x1"]) \
-            and min(c["y2"] - 1, f["y2"] - 1) >= max(c["y1"], f["y1"])
+    def intrudes(f, c, slack):
+        ix1, ix2 = max(c["x1"], f["x1"]), min(c["x2"] - 1, f["x2"] - 1)
+        iy1, iy2 = max(c["y1"], f["y1"]), min(c["y2"] - 1, f["y2"] - 1)
+        if ix2 < ix1 or iy2 < iy1:
+            return False
+        return (ix2 - ix1 + 1) * (iy2 - iy1 + 1) > slack
 
-    def repair_frames(start):
+    SLIVER_REACH = 384  # px² of interlock the sliver fallback tolerates
+
+    def repair_frames(start, slack):
         frames = [dict(f) for f in start]
         if parent.get("clip"):
             clip = parent["clip"]
@@ -219,12 +271,12 @@ def split_connected_clusters(comps, parent, w, h):
             moved = False
             for i, _b in enumerate(frames):
                 b = boxes[i]
-                for j, cs in enumerate(clusters):
+                for j, cs in enumerate(split):
                     if j == i:
                         continue
                     for c in cs:
                         f = frames[i]
-                        if not intrudes(f, c):
+                        if not intrudes(f, c, slack):
                             continue
                         ix1, ix2 = max(c["x1"], f["x1"]), min(c["x2"] - 1, f["x2"] - 1)
                         iy1, iy2 = max(c["y1"], f["y1"]), min(c["y2"] - 1, f["y2"] - 1)
@@ -256,9 +308,14 @@ def split_connected_clusters(comps, parent, w, h):
     for i, b in enumerate(boxes):
         f = frame_for(i)
         soft_frames.append(f if f is not None else {"x1": b["x1"], "y1": b["y1"], "x2": b["x2"], "y2": b["y2"]})
-    frames = repair_frames(soft_frames)
+    bare_frames = [{"x1": b["x1"], "y1": b["y1"], "x2": b["x2"], "y2": b["y2"]} for b in boxes]
+    frames = repair_frames(soft_frames, 0)
     if frames is None:
-        frames = repair_frames([{"x1": b["x1"], "y1": b["y1"], "x2": b["x2"], "y2": b["y2"]} for b in boxes])
+        frames = repair_frames(bare_frames, 0)
+    if frames is None:
+        frames = repair_frames(soft_frames, SLIVER_REACH)
+    if frames is None:
+        frames = repair_frames(bare_frames, SLIVER_REACH)
     if frames is None:
         return None
     return [dict(b, clip=frames[i]) for i, b in enumerate(boxes)]
@@ -298,7 +355,35 @@ def split_cut_family(rgb, mask, boxes, family, cache):
     for comp in comps[1:]:
         if balloon_surface(rgb, comp, mask, cache, union) is not surface:
             return None
-    return split_connected_clusters(comps, union, w, h)
+    # A member carrying a full multi-line block (>= 6 components) is a settled block: the
+    # cut's seam is real for it, and no union cluster may merge two such members — that is
+    # how two touching balloons separated by a gutter come back fused. Fragment-like members
+    # (an outlier line or two) may still join another member's block.
+    def member_comp_count(member):
+        x0, y0 = max(0, math.floor(member["x1"])), max(0, math.floor(member["y1"]))
+        x2, y2 = min(w, math.ceil(member["x2"])), min(h, math.ceil(member["y2"]))
+        if x2 <= x0 or y2 <= y0:
+            return 0
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask[y0:y2, x0:x2].astype(np.uint8), connectivity=4)
+        return sum(1 for lab in range(1, n) if int(stats[lab][4]) >= 4)
+
+    major = [member_comp_count(member) >= 6 for member in members]
+    owner_of = {}
+    for c in comps:
+        cx, cy = (c["x1"] + c["x2"]) / 2, (c["y1"] + c["y2"]) / 2
+        for k, member in enumerate(members):
+            if member["x1"] <= cx <= member["x2"] and member["y1"] <= cy <= member["y2"]:
+                owner_of[id(c)] = k
+                break
+
+    def accept(clusters):
+        for cs in clusters:
+            involved = {owner_of[id(c)] for c in cs if id(c) in owner_of and major[owner_of[id(c)]]}
+            if len(involved) > 1:
+                return False
+        return True
+
+    return split_connected_clusters(comps, union, w, h, accept)
 
 
 def refine_balloon_boxes(rgb, boxes, mask):

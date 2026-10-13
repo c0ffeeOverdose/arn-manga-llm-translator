@@ -173,6 +173,42 @@ class BalloonGeometry(unittest.TestCase):
         self.assertIsNone(split_connected_clusters([small] + dialog, parent, 220, 260),
                           "a lone normal-size word still never becomes a region")
 
+    def test_display_lettering_glued_to_dialogue_splits_out(self):
+        from balloon_surface import split_connected_clusters
+
+        lettering = {"x1": 30, "y1": 40, "x2": 110, "y2": 150, "conf": 0.9}
+        rows = [{"x1": 60, "y1": y, "x2": 200, "y2": y + 22, "conf": 0.9} for y in (146, 174, 202)]
+        parent = {"x1": 20, "y1": 30, "x2": 210, "y2": 224, "conf": 0.9}
+        pieces = split_connected_clusters([lettering] + rows, parent, 240, 320)
+        self.assertIsNotNone(pieces, "lettering becomes its own region")
+        self.assertEqual(len(pieces), 2)
+        big = next(p for p in pieces if p["y2"] <= 160)
+        self.assertLessEqual(big["y1"], 45)
+
+    def test_interlocking_blocks_split_with_the_sliver_fallback(self):
+        from balloon_surface import split_connected_clusters
+
+        a = [[100, 40, 220, 63], [110, 68, 210, 91], [105, 96, 215, 119], [100, 124, 220, 147], [100, 152, 220, 175], [100, 180, 220, 205]]
+        b = [[46, 192, 78, 214], [26, 217, 99, 241], [18, 242, 67, 265], [75, 242, 105, 265], [10, 270, 115, 293], [11, 294, 72, 318], [79, 295, 113, 318], [24, 322, 101, 345]]
+        comps = [{"x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": 0.9} for (x1, y1, x2, y2) in a + b]
+        parent = {"x1": 5, "y1": 30, "x2": 225, "y2": 350, "conf": 0.9}
+        pieces = split_connected_clusters(comps, parent, 260, 400)
+        self.assertIsNotNone(pieces, "a 15x13px interlock still splits")
+        self.assertEqual(len(pieces), 2)
+
+    def test_short_dot_run_joins_the_nearest_block(self):
+        from balloon_surface import split_connected_clusters
+
+        def block(y0):
+            return [{"x1": 40, "y1": y0 + k, "x2": 150, "y2": y0 + k + 22, "conf": 0.9} for k in (0, 28, 56)]
+        dots = [{"x1": x1, "y1": 126, "x2": x2, "y2": 132, "conf": 0.9} for (x1, x2) in ((60, 64), (64, 68), (68, 72))]
+        parent = {"x1": 30, "y1": 30, "x2": 160, "y2": 260, "conf": 0.9}
+        pieces = split_connected_clusters(block(40) + dots + block(180), parent, 240, 300)
+        self.assertIsNotNone(pieces, "the dots ride the upper block, the two blocks split")
+        self.assertEqual(len(pieces), 2)
+        upper = next(p for p in pieces if p["y1"] < 100)
+        self.assertGreaterEqual(upper["y2"], 132)
+
     def test_frame_repair_absorbs_a_one_pixel_jitter_and_deep_overlap_still_refuses(self):
         from balloon_surface import split_connected_clusters
 
