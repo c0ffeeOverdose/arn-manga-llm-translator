@@ -280,6 +280,18 @@ test('a short dot run joins the nearest block instead of vetoing the split', () 
     assert.ok(upper && upper.y2 >= 132, 'the dot run joined the upper block');
 });
 
+test('a mid-column seam never splits one column of text in half', () => {
+    const W = 300, H = 320;
+    // One centered column of rows; one short middle row breaks the row-link by a few px.
+    const rows = [
+        [163, 26, 192, 58], [106, 62, 229, 96], [228, 62, 248, 94], [97, 99, 173, 131], [181, 100, 257, 133],
+        [150, 135, 204, 168], [181, 172, 244, 206], [111, 173, 182, 206], [134, 210, 220, 243],
+    ].map(([x1, y1, x2, y2]) => ({ x1, y1, x2, y2, conf: 0.9 }));
+    const parent = { x1: 90, y1: 20, x2: 265, y2: 250, conf: 0.9 };
+    assert.equal(splitConnectedClusters(rows, parent, W, H, 3), null,
+        'a stacked seam inside one column of text is not a block boundary');
+});
+
 test('frame math: a sibling touching the frame edge stays safe; an interleaved pair refuses to split', () => {
     const W = 220, H = 180;
     const comps = [

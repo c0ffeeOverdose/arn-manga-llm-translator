@@ -264,6 +264,17 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
     // becomes its own (keep-path) region instead.
     const oversized = (cs: DetBox[]) => cs.length === 1 && cs[0].y2 - cs[0].y1 >= 2.5 * medianH;
     if (split.some((cs, i) => cs.length < 2 ? !oversized(cs) : boxes[i].y2 - boxes[i].y1 < 1.8 * medianH)) return null;
+    // A mid-column seam is not a block boundary: two substantial blocks that share almost the
+    // same x-range and sit only about a line apart are rows of one column of text (a single
+    // missing row link must not cut a paragraph in half). Lettering pieces exempt themselves
+    // by being small, real block stacks by their gap.
+    for (let i = 0; i < split.length; i++) for (let j = i + 1; j < split.length; j++) {
+        if (split[i].length < 3 || split[j].length < 3) continue;
+        const overlap = Math.min(boxes[i].x2, boxes[j].x2) - Math.max(boxes[i].x1, boxes[j].x1);
+        const gap = Math.max(boxes[i].y1 - boxes[j].y2, boxes[j].y1 - boxes[i].y2, 0);
+        if (overlap > 0.6 * Math.min(boxes[i].x2 - boxes[i].x1, boxes[j].x2 - boxes[j].x1)
+            && gap <= 1.2 * medianH) return null;
+    }
     const frameFor = (b: DetBox, i: number): { x1: number; y1: number; x2: number; y2: number } | null => {
         const others = comps.filter(c => !split[i].includes(c));
         const bandY = others.filter(o => o.y1 < b.y2 && o.y2 > b.y1);

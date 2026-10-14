@@ -209,6 +209,16 @@ class BalloonGeometry(unittest.TestCase):
         upper = next(p for p in pieces if p["y1"] < 100)
         self.assertGreaterEqual(upper["y2"], 132)
 
+    def test_a_mid_column_seam_never_splits_one_column_in_half(self):
+        from balloon_surface import split_connected_clusters
+
+        rows = [[163, 26, 192, 58], [106, 62, 229, 96], [228, 62, 248, 94], [97, 99, 173, 131], [181, 100, 257, 133],
+                [150, 135, 204, 168], [181, 172, 244, 206], [111, 173, 182, 206], [134, 210, 220, 243]]
+        comps = [{"x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": 0.9} for (x1, y1, x2, y2) in rows]
+        parent = {"x1": 90, "y1": 20, "x2": 265, "y2": 250, "conf": 0.9}
+        self.assertIsNone(split_connected_clusters(comps, parent, 300, 320),
+                          "a stacked seam inside one column of text is not a block boundary")
+
     def test_frame_repair_absorbs_a_one_pixel_jitter_and_deep_overlap_still_refuses(self):
         from balloon_surface import split_connected_clusters
 

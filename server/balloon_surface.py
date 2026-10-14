@@ -226,6 +226,18 @@ def split_connected_clusters(comps, parent, w, h, accept=None):
     if any((not _oversized(cs)) if len(cs) < 2 else (b["y2"] - b["y1"] < 1.8 * median_h)
            for cs, b in zip(split, boxes)):
         return None
+    # A mid-column seam is not a block boundary: two substantial blocks that share almost the
+    # same x-range and sit about a line apart are rows of one column of text. Lettering pieces
+    # exempt themselves by size, real block stacks by their gap.
+    for i in range(len(split)):
+        for j in range(i + 1, len(split)):
+            if len(split[i]) < 3 or len(split[j]) < 3:
+                continue
+            overlap = min(boxes[i]["x2"], boxes[j]["x2"]) - max(boxes[i]["x1"], boxes[j]["x1"])
+            gap = max(boxes[i]["y1"] - boxes[j]["y2"], boxes[j]["y1"] - boxes[i]["y2"], 0)
+            if (overlap > 0.6 * min(boxes[i]["x2"] - boxes[i]["x1"], boxes[j]["x2"] - boxes[j]["x1"])
+                    and gap <= 1.2 * median_h):
+                return None
 
     def soft(clearance):
         return 14 if clearance == math.inf else max(0, min(14, int((clearance - 2) // 2)))
