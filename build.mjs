@@ -109,7 +109,7 @@ if (!release) {
 for (const [file, hint] of [
   ['models/ctd-int8.onnx', 'run: sh scripts/fetch-models.sh  (dev/E2E only — users download on first use)'],
   ['models/panel-yolo26n.onnx', 'run: scripts/export-panel-onnx.sh  (dev/E2E only — users download on first use)'],
-  ['models/koharu-fp32-chunked.onnx', 'optional: see docs/koharu-layout.md for the FP32 export and import'],
+  ['models/koharu-fp32-chunked.onnx', 'optional: see docs/koharu-layout.md (users download on first use)'],
   ['models/lama-manga-512-fp16w.onnx', 'run: python3 scripts/export-inpaint-onnx.py --ckpt lama_large_512px.ckpt  (dev/E2E only — users download on first use)'],
 ]) {
   try {
@@ -178,8 +178,10 @@ cpSync(join(root, 'src/fonts/Sriracha-Regular.ttf'), join(dist, 'fonts/Sriracha-
 mkdirSync(join(dist, 'icons'), { recursive: true });
 cpSync(join(root, 'src/icons'), join(dist, 'icons'), { recursive: true });
 
-// license: GPL-3.0 (CTD bundle) — distributed zips must carry both files
+// Distributed builds include the project license and third-party notices.
 for (const f of ['LICENSE', 'NOTICE']) cpSync(join(root, f), join(dist, f));
+cpSync(join(root, 'licenses'), join(dist, 'licenses'), { recursive: true });
+for (const f of ['LICENSE', 'NOTICE']) cpSync(join(root, f), join(dist, 'licenses', `${f}.txt`));
 
 if (release) {
   // store upload artifact: <name>-<version>-{chrome,firefox}.zip next to dist

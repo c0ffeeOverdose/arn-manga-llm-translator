@@ -1,6 +1,6 @@
 #!/bin/sh
 # One-shot: fetch every gitignored model so a fresh clone can build. Idempotent — re-run safely.
-# CTD fp32 (GPL-3.0) → int8 via quantize-ctd.py; panel (.pt, Apache-2.0) via export-panel-onnx.sh.
+# CTD fp32 (GPL-3.0) → int8 via quantize-ctd.py; panel (.pt, AGPL-3.0) via export-panel-onnx.sh.
 set -e
 cd "$(dirname "$0")/.."
 mkdir -p models

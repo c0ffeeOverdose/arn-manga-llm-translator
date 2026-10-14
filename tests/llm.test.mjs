@@ -656,7 +656,7 @@ test('toMtError: 400 data-URI/base64 rejection gets the OCR hint', () => {
     '"message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] ' +
     'invalid base64 in data URI at input[0].content[1]: Data URIs must use valid base64 encoding."}}'));
   assert.equal(m.kind, 'parse');
-  assert.match(m.hint ?? '', /Local OCR/);
+  assert.match(m.hint ?? '', /Recognized text \(OCR\)/);
 });
 
 test('toMtError: plain 400 without image keywords gets no hint', () => {
@@ -682,9 +682,9 @@ test('toMtError: CF license 403 gets the agree hint, other 403s keep the key hin
     'By submitting \'agree\', you hereby agree to the llama-3.2-11b-vision-instruct Community License …"}]}'));
   assert.equal(license.kind, 'auth');
   assert.match(license.hint ?? '', /agree/);
-  assert.doesNotMatch(license.hint ?? '', /API key is wrong/);
+  assert.doesNotMatch(license.hint ?? '', /Check your API key/);
   const plain = toMtError(new LlmHttpError(403, 'LLM API 403: {"errors":[{"message":"Authentication error"}]}'));
-  assert.match(plain.hint ?? '', /API key is wrong/);
+  assert.match(plain.hint ?? '', /Check your API key/);
 });
 
 // ---- Cloudflare Workers AI native run (live-probed shapes) ----

@@ -21,6 +21,7 @@ import { sendToBackground } from '../bg-rpc';
 import { recordChapterLog } from '../chapter/log-store';
 import type { ChapterTrace } from '../chapter/log';
 import { planAnnotations, drawAnnotations, sourceExtras } from './vlm-annotations';
+import { checkCancelled, cancellable } from './cancellation';
 
 // Warm-path AI cleanup: compute cleanup patches for a freshly translated page
 // and hand them to the caller's cache entry. Gated on cache-on + local mode;
@@ -411,6 +412,7 @@ async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, 
 }
 
 export interface TranslateOutcome {
+    context?: ContextState;
     outputs: RegionOutput[];
     extras: ExtraRegion[];
     mentions: Mention[]; // named people (book input — cached + replayed with outputs)
@@ -444,13 +446,14 @@ export async function translateRegions(
     // afterOcr: OCR finished and the ORT queue just drained — lets the caller
     // start infer-lock work while the LLM is in flight.
     // valid: paused/cancelled chapter work must not dispatch another request or fold a reply.
-    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; valid?: () => boolean; context?: ContextState; fresh?: boolean; cacheEpoch?: string; cacheFingerprint?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer; chapterTrace?: ChapterTrace },
+    opts?: { fold?: boolean; progressKey?: string; continued?: boolean; lo?: boolean; afterOcr?: () => void; valid?: () => boolean; signal?: AbortSignal; shareContext?: boolean; context?: ContextState; fresh?: boolean; cacheEpoch?: string; cacheFingerprint?: string; onStarve?: () => void; regionCap?: number; checkpoint?: boolean; pageSegments?: { y: number; h: number }[]; timing?: PageTimer; chapterTrace?: ChapterTrace },
 ): Promise<TranslateOutcome> {
     const timing = opts?.timing ?? new PageTimer();
     const notify = onStatus;
     onStatus = (s, stage) => { timing.setStage(s); notify(s, stage); };
     const cacheEpoch = opts?.cacheEpoch ?? await cacheReady();
     const ensureCurrent = (): void => {
+        checkCancelled(opts?.signal);
         assertCacheCurrent(cacheEpoch);
         if (opts?.valid && !opts.valid()) throw Object.assign(new Error('Translation stopped'), { kind: 'abort' });
     };
@@ -474,6 +477,7 @@ export async function translateRegions(
     // detect wrote, so a reload/retry resumes at translation instead of
     // re-paying the OCR. Written even with the cache off (in-flight work).
     const checkpointOcr = (texts: string[]) => {
+        if (opts?.signal?.aborted) return;
         if (opts?.cacheFingerprint && opts.cacheFingerprint !== settingsFingerprint(pipeline)) return;
         if (opts?.checkpoint === false || det.cloudTexts || !texts.some(t => t)) return;
         const boxes = det.boxes.length === texts.length ? det.boxes : det.boxes.slice(0, texts.length);
@@ -507,7 +511,7 @@ export async function translateRegions(
         }
         if (ocr) {
             const tOcr = performance.now();
-            onStatus('OCR…', 'ocr');
+            onStatus('Reading text…', 'ocr');
             if (det.cloudTexts) {
                 // cloud path: texts arrived with detection — no local OCR models needed.
                 det.cloudTexts.forEach((t, i) => { if (regions[i]) regions[i].source = t; });
@@ -515,11 +519,11 @@ export async function translateRegions(
                 if (!(await baberuInstalled())) {
                     throw Object.assign(
                         new Error('Baberu OCR model not installed'),
-                        { kind: 'ocr', hint: 'Download the model first — Settings → Model → Text source → OCR engine → Download' },
+                        { kind: 'ocr', hint: 'Open Settings → Model → Text sent for translation. Select Recognized text (OCR), then download the OCR model.' },
                     );
                 }
                 const { texts, lockWaitMs } = await baberuOcrAll(bitmap, det.boxes, pageImg, (done, total) => {
-                    if (done % 4 === 0 || done === total) onStatus(`OCR ${done}/${total}…`, 'ocr');
+                    if (done % 4 === 0 || done === total) onStatus(`Reading text… ${done} of ${total}`, 'ocr');
                 }, { lo: opts?.lo });
                 ocrLockWaitMs = lockWaitMs;
                 texts.forEach((t, i) => { regions[i].source = t; });
@@ -529,7 +533,7 @@ export async function translateRegions(
                 if (missing.length) {
                     throw Object.assign(
                         new Error(`OCR language model not installed (${missing.join(', ')})`),
-                        { kind: 'ocr', hint: 'Download the model first — Settings → Text source → OCR → Download' },
+                        { kind: 'ocr', hint: 'Open Settings → Model → Text sent for translation. Select Recognized text (OCR), then download the OCR model.' },
                     );
                 }
                 for (const [i, b] of det.boxes.entries()) {
@@ -578,7 +582,7 @@ export async function translateRegions(
         // toggles strip pairs / characters independently (also ablation arms)
         let ctxToSend: ContextState;
         const snapshot = opts?.context ?? context;
-        if (!shareContext) ctxToSend = EMPTY_CONTEXT;
+        if (!(opts?.shareContext ?? shareContext)) ctxToSend = EMPTY_CONTEXT;
         else if (pipeline.useContext && pipeline.useCharacters) ctxToSend = snapshot;
         else ctxToSend = {
             pairs: pipeline.useContext ? snapshot.pairs : [],
@@ -587,7 +591,7 @@ export async function translateRegions(
         // live status during the LLM call — it can take tens of seconds and the
         // previous status would otherwise look stuck.
         ensureCurrent();
-        onStatus('LLM translating…', 'llm');
+        onStatus('Translating…', 'llm');
         const tLlm = performance.now();
         let llmSeconds = 0;
         const t0local = Date.now();
@@ -598,7 +602,7 @@ export async function translateRegions(
         const tickBase = handedT0 != null && handedT0 <= t0local ? handedT0 : t0local;
         const llmTick = setInterval(() => {
             llmSeconds = Math.max(llmSeconds + 1, Math.round((Date.now() - tickBase) / 1000));
-            onStatus(`LLM translating… ${llmSeconds}s`, 'llm');
+            onStatus(`Translating… ${llmSeconds}s`, 'llm');
         }, 1000);
         opts?.afterOcr?.();
         // No fixed per-request cap: try the whole page first. A reply that comes back empty or
@@ -670,7 +674,8 @@ export async function translateRegions(
             const stop: LiveRpc = { abort: undefined };
             let aborted = false;
             liveRpcs.add(stop);
-            const cleanup = () => { liveRpcs.delete(stop); };
+            const cleanup = () => { liveRpcs.delete(stop); opts?.signal?.removeEventListener('abort', onAbort); };
+            const onAbort = () => stop.abort?.();
             const to = setTimeout(() => { cleanup(); try { port.disconnect(); } catch { /* gone */ } console.warn(`[mt:trace] translateRegions RPC TIMEOUT after ${Date.now() - tRpc}ms`); reject(new Error('translate RPC timeout')); }, 260000);
             stop.abort = () => {
                 aborted = true;
@@ -678,8 +683,10 @@ export async function translateRegions(
                 cleanup();
                 console.warn(`[mt:trace] translateRegions RPC ABORTED by user after ${Date.now() - tRpc}ms`);
                 try { port.disconnect(); } catch { /* gone */ }
-                reject(new Error('translate aborted by user'));
+                reject(new DOMException('Translation stopped', 'AbortError'));
             };
+            opts?.signal?.addEventListener('abort', onAbort, { once: true });
+            if (opts?.signal?.aborted) { onAbort(); return; }
             port.onMessage.addListener((r: unknown) => {
                 // interim: the split pipeline's transcribe finished while the translate
                 // call runs — checkpoint the transcripts now (the final reply settles
@@ -717,7 +724,7 @@ export async function translateRegions(
                     // backoff before giving up entirely.
                     let lastErr: unknown = e;
                     for (const wait of [5000, 20000, 60000]) {
-                        await new Promise(r => setTimeout(r, wait));
+                        await cancellable(new Promise(r => setTimeout(r, wait)), opts?.signal);
                         ensureCurrent();
                         try {
                             // transcripts already paid for: the re-send is the same text-only
@@ -725,7 +732,7 @@ export async function translateRegions(
                             const retryPayload = interimTexts
                                 ? { ...one, imagesB64: undefined, regions: withSources(one.regions as RegionInput[], interimTexts), vision: false, textOnly: true, ocr: true }
                                 : one;
-                            resp = await sendToBackground(retryPayload, { timeoutMs: 260_000, label: 'translate retry' });
+                            resp = await cancellable(sendToBackground(retryPayload, { timeoutMs: 260_000, label: 'translate retry' }), opts?.signal);
                             lastErr = null;
                             break;
                         } catch (e2) {
@@ -788,13 +795,15 @@ export async function translateRegions(
                 e.x2 > e.x1 && e.y2 > e.y1 &&
                 e.x2 <= bitmap.width * 1.05 && e.y2 <= bitmap.height * 1.05 &&
                 (e.x2 - e.x1) > 12 && (e.y2 - e.y1) > 12);
-        if (opts?.fold !== false && shareContext) {
+        ensureCurrent();
+        if (opts?.fold !== false && (opts?.shareContext ?? shareContext)) {
             ensureCurrent();
             const c = resp.context as ContextState | undefined;
             setContext((c && Array.isArray(c.characters) && Array.isArray(c.pairs)) ? c : context);
             await saveContext();
         }
         return {
+            context: resp.context as ContextState | undefined,
             outputs: resp.outputs as RegionOutput[], extras, usedLLM: true, annW, annH,
             ...(badgeR != null ? { badgeR } : null),
             mentions: (resp.mentions ?? []) as Mention[],
@@ -806,6 +815,7 @@ export async function translateRegions(
             ocrLockWaitMs,
         };
     } catch (e) {
+        checkCancelled(opts?.signal);
         assertCacheCurrent(cacheEpoch);
         const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         const error = String(err.message ?? e).slice(0, 160);

@@ -22,7 +22,7 @@ const stubs = {
         export const hashReaderRouting = () => null, hashReaderRoutingUrl = () => undefined, hashReaderUrls = () => null;
     `,
     '../content/queue': `export const keepaliveOpen = () => () => {};`,
-    '../debug': `export const initDebug = async () => {}, isDebug = () => false;`,
+    '../debug': `export const initDebug = async () => {}, isDebug = () => fixture.debug === true;`,
     './store': `export const readRecord = key => fixture.read(key); export const writeRecord = (key, value) => fixture.write(key, value);`,
     './protocol': `export const artifactKey = (id, page) => id + page, chapterSignature = () => 'signature';`,
     '../cache/identity': `export const verifyCachedIdentity = () => false;`,
@@ -39,9 +39,9 @@ const compiled = await build({ entryPoints: ['src/chapter/page.ts'], bundle: tru
     } }], logLevel: 'silent' });
 
 function deferred() {
-    let resolve;
-    const promise = new Promise(r => { resolve = r; });
-    return { promise, resolve };
+    let resolve, reject;
+    const promise = new Promise((r, j) => { resolve = r; reject = j; });
+    return { promise, resolve, reject };
 }
 async function until(fn) {
     for (let i = 0; i < 100; i++) {
@@ -51,7 +51,7 @@ async function until(fn) {
     assert.fail('runner did not reach the expected state');
 }
 function runnerFixture(checkpoint) {
-    const load = deferred(), det = deferred(), records = new Map(), publishes = [];
+    const load = deferred(), det = deferred(), records = new Map(), publishes = [], contextRequests = [];
     if (checkpoint) records.set('checkpoint:run', checkpoint);
     let listener, configured = false, detects = 0, earlyDetects = 0, ready = 0, loadedSettings;
     const config = { id: 'run', chapter: 'https://reader.test/chapter/123456', readerTab: 1, bookKey: 'book', cacheEpoch: '',
@@ -76,13 +76,17 @@ function runnerFixture(checkpoint) {
             if (msg.type === 'mt:chapter-host-init') return { ok: true, config: structuredClone(config) };
             if (msg.type === 'mt:chapter-runner-ready') { ready++; return { ok: true }; }
             if (msg.type === 'mt:chapter-publish') { publishes.push(structuredClone(msg.status)); return { ok: true }; }
+            if (msg.type === 'mt:chapter-context') { contextRequests.push(msg); return { ok: true, context: { pairs: [], characters: [] } }; }
             throw new Error(`unexpected RPC ${msg.type}`);
         } }, storage: { onChanged: { addListener() {} } } };
-    runInNewContext(compiled.outputFiles[0].text, { fixture, chrome, console, structuredClone, DOMException,
-        setTimeout, clearTimeout, setInterval, clearInterval, Date, URL, AbortSignal, ArrayBuffer });
-    return { load, det, config, records, publishes,
+    const environment = { fixture, chrome, console, structuredClone, DOMException,
+        setTimeout, clearTimeout, setInterval, clearInterval, Date, URL, AbortSignal, AbortController, ArrayBuffer };
+    runInNewContext(compiled.outputFiles[0].text, environment);
+    return { load, det, config, records, publishes, contextRequests,
         get detects() { return detects; }, get earlyDetects() { return earlyDetects; }, get ready() { return ready; },
         get loadedSettings() { return loadedSettings; },
+        get diagnostics() { return environment.__mtLog; },
+        enableDebug() { fixture.debug = true; },
         command(command, extra = {}) {
             let response;
             listener({ type: 'mt:chapter-command', id: 'run', command, ...extra }, { id: 'extension' }, r => { response = r; });
@@ -114,6 +118,87 @@ test('priority during slow setup cannot start inference or echo unchanged progre
         await until(() => f.publishes.at(-1)?.phase === 'complete');
         assert.equal(f.publishes.at(-1).done, 1);
     } finally { f.command('stop'); f.load.resolve(); f.det.resolve(); }
+});
+
+test('retranslate after Stop processes only the requested page; Resume continues the remaining chapter', async () => {
+    const pages = Array.from({ length: 3 }, (_, order) => ({ id: `p${order}`, order, url: `https://reader.test/page-${order}.png`, descramble: false }));
+    const progress = { id: 'run', chapter: 'https://reader.test/chapter/123456', phase: 'stopped', done: 1, total: 3,
+        errors: 0, inflight: 0, completeManifest: true, pages: pages.map((p, i) => ({ ...p, phase: i === 0 ? 'ready' : 'queued' })) };
+    const f = runnerFixture({ config: { pages }, progress });
+    try {
+        f.load.resolve(); await until(() => f.ready === 1);
+        assert.equal(f.detects, 0);
+        assert.equal(f.command('retry', { page: 'p0' }).ok, true);
+        f.det.resolve();
+        await until(() => f.publishes.at(-1)?.phase === 'stopped' && f.detects === 1);
+        assert.deepEqual(f.publishes.at(-1).pages.map(p => p.phase), ['ready', 'queued', 'queued']);
+        assert.equal(f.records.get('checkpoint:run').config.requestedPages[0], 'p0');
+        f.command('resume');
+        await until(() => f.publishes.at(-1)?.phase === 'complete');
+        assert.equal(f.detects, 3);
+        assert.equal(f.publishes.at(-1).done, 3);
+    } finally { f.command('stop'); f.load.resolve(); f.det.resolve(); }
+});
+
+test('stopping one active page leaves it paused while the other chapter pages finish', async () => {
+    const pages = Array.from({ length: 3 }, (_, order) => ({ id: `p${order}`, order, url: `https://reader.test/page-${order}.png`, descramble: false }));
+    const progress = { id: 'run', chapter: 'https://reader.test/chapter/123456', phase: 'running', done: 0, total: 3,
+        errors: 0, inflight: 0, completeManifest: true, pages: pages.map(p => ({ ...p, phase: 'queued' })) };
+    const f = runnerFixture({ config: { pages }, progress });
+    try {
+        f.load.resolve(); await until(() => f.detects === 1);
+        f.command('stop-page', { page: 'p0' });
+        await until(() => f.detects === 2);
+        f.det.resolve();
+        await until(() => f.publishes.at(-1)?.phase === 'stopped');
+        assert.deepEqual(f.publishes.at(-1).pages.map(p => p.phase), ['paused', 'ready', 'ready']);
+        f.command('resume');
+        await until(() => f.publishes.at(-1)?.phase === 'complete');
+        assert.equal(f.publishes.at(-1).done, 3);
+    } finally { f.command('stop'); f.det.resolve(); }
+});
+
+test('a settings change relayed by the broker pauses work and rejects a stale Resume', async () => {
+    const f = runnerFixture();
+    try {
+        f.load.resolve(); await until(() => f.detects === 1);
+        f.command('settings-changed');
+        await until(() => f.publishes.at(-1)?.phase === 'error');
+        assert.equal(f.command('resume').ok, false);
+        assert.equal(f.command('retry', { page: 'p0' }).ok, false);
+        assert.equal(f.publishes.at(-1).settingsStale, true);
+    } finally { f.command('stop'); f.det.resolve(); }
+});
+
+test('a late cancellation error after Stop does not report a page failure', async () => {
+    const f = runnerFixture();
+    try {
+        f.load.resolve(); await until(() => f.detects === 1);
+        f.enableDebug();
+        f.command('stop');
+        await until(() => f.publishes.at(-1)?.phase === 'stopped');
+        f.det.reject(new DOMException('Translation stopped', 'AbortError'));
+        await new Promise(r => setTimeout(r, 10));
+        assert.equal(f.publishes.at(-1).errors, 0);
+        assert.doesNotMatch(f.diagnostics.join(' | '), /FAIL|AbortError/);
+    } finally { f.command('stop'); f.det.resolve(); }
+});
+
+test('Context toggles reach the runner and apply to the next work set', async () => {
+    const pages = Array.from({ length: 2 }, (_, order) => ({ id: `p${order}`, order, url: `https://reader.test/page-${order}.png`, descramble: false }));
+    const progress = { id: 'run', chapter: 'https://reader.test/chapter/123456', phase: 'stopped', done: 0, total: 2,
+        errors: 0, inflight: 0, completeManifest: true, pages: pages.map(p => ({ ...p, phase: 'queued' })) };
+    const f = runnerFixture({ config: { pages }, progress });
+    try {
+        f.load.resolve(); await until(() => f.ready === 1);
+        f.command('context', { shareContext: true });
+        f.command('resume'); await until(() => f.detects === 1);
+        assert.equal(f.contextRequests.length, 1);
+        f.command('context', { shareContext: false });
+        f.det.resolve(); await until(() => f.publishes.at(-1)?.phase === 'complete');
+        assert.equal(f.detects, 2); assert.equal(f.contextRequests.length, 1);
+        assert.equal(f.records.get('checkpoint:run').config.shareContext, false);
+    } finally { f.command('stop'); f.det.resolve(); }
 });
 
 test('Stop during setup prevents page work when setup later completes', async () => {

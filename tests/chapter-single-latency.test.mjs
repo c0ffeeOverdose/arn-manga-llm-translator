@@ -27,6 +27,8 @@ function fixture(opts = {}) {
     const status = { phase: 'running', pages: [item, { id: 'page:1', phase: 'ready' }, { id: 'page:2', phase: 'queued' }] };
     const scope = {
         epoch: 1, config: { pipeline: {} }, status, cacheCurrent: () => true,
+        pageEpochs: new Map(), contextSharing: new WeakMap(), leaseSignals: new WeakMap(),
+        releasePrepared: p => { if (p.warm) void p.warm.finally(() => p.bitmap.close()); else p.bitmap.close(); },
         preparePage: async () => { item.phase = 'translating'; if (opts.pauseAtPrepare) status.phase = 'error'; return p; },
         withPageLease: (_page, _item, _valid, run) => run(() => live),
         translateRegions: async (_bitmap, _det, _onStatus, options) => {

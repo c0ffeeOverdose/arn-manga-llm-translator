@@ -1,6 +1,6 @@
 // Pipeline tab: presets, advanced sliders/toggles, tone, target language, OCR manager, cache row.
 
-import { applyPreset, filterTargetLangs, matchingPreset, mergePipeline, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
+import { applyPreset, filterTargetLangs, matchingPreset, loadPipelineSettings, type PipelineSettings } from '../llm/pipeline-settings';
 import { OCR_LANGUAGES, ocrInstalled, ocrDownload, ocrDelete, baberuInstalled, baberuDownload, baberuDelete } from '../llm/ocr-models';
 import { $, setDirty, dlProgress } from './shell';
 
@@ -13,13 +13,13 @@ export function loadStoredPipeline(stored: PipelineSettings | undefined): void {
     presetsPristine = stored == null;
 }
 
-export function savePipeline(): void {
-    chrome.storage.local.get('mtPipeline')
-        .then(({ mtPipeline: stored }) => {
-            Object.assign(pipeline, mergePipeline(stored, pipeline));
-            return chrome.storage.local.set({ mtPipeline: pipeline });
-        })
-        .catch(() => {});
+export async function forgetSelectedFont(id: string): Promise<void> {
+    const { mtPipeline: stored } = await chrome.storage.local.get('mtPipeline');
+    const saved = loadPipelineSettings(stored);
+    if (saved.renderFont === id) {
+        await chrome.storage.local.set({ mtPipeline: { ...saved, renderFont: 'default' } });
+    }
+    if (pipeline.renderFont === id) pipeline.renderFont = 'default';
 }
 
 export function markCustom(): void {
@@ -50,7 +50,7 @@ function syncColorUI(): void {
 
 export function syncAdvancedUI(): void {
     ($('preset') as HTMLSelectElement).value = presetsPristine ? matchingPreset(pipeline) : 'custom';
-    for (const id of ['detConf', 'detMinSize', 'panelConf', 'koharuTextConf', 'koharuSfxConf', 'koharuPanelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'mergePages', 'minFont', 'textScale', 'cacheMax']) syncRange(id, id);
+    for (const id of ['detConf', 'detMinSize', 'panelConf', 'koharuTextConf', 'koharuSfxConf', 'koharuPanelConf', 'cropSize', 'fullPageSize', 'contextPairs', 'parallelLlm', 'mergePages', 'minFont', 'textScale', 'textStroke', 'cacheMax']) syncRange(id, id);
     syncDetectionTuning();
     syncColorUI();
     ($('deferLabels') as HTMLInputElement).checked = pipeline.deferLabels;
@@ -287,7 +287,7 @@ function syncChapterBatchHint(): void {
     if (!el) return;
     const per = pipeline.mergePages;
     const slots = pipeline.parallelLlm;
-    el.textContent = `Translate to end of chapter: ${per} page${per === 1 ? '' : 's'} per request · ${slots} request${slots === 1 ? '' : 's'} at a time.`;
+    el.textContent = `Chapter translation: ${per} page${per === 1 ? '' : 's'} per request · ${slots} request${slots === 1 ? '' : 's'} at a time.`;
 }
 for (const id of ['parallelLlm', 'mergePages'] as const) {
     for (const el of [$<HTMLInputElement>(id), $<HTMLInputElement>(id + 'Num')]) {
@@ -467,8 +467,8 @@ document.addEventListener('click', (e) => {
 });
 
 ($('resetAdv') as HTMLButtonElement).onclick = () => {
-    if (!confirm('Restore default tuning? Your custom values will be lost.')) return;
-    pipeline = applyPreset('balanced');
+    if (!confirm('Restore Balanced detection, image and dialogue settings? Select Save changes to keep them.')) return;
+    pipeline = applyPreset('balanced', pipeline);
     presetsPristine = true;
     syncAdvancedUI();
     setDirty(true);
@@ -491,7 +491,7 @@ async function refreshCacheCount(): Promise<void> {
     // no manga tab → hide the row (options is often opened standalone)
     if (!resp?.ok) { row.style.display = 'none'; return; }
     row.style.display = '';
-    el.textContent = `${resp.mine ?? resp.count} here · ${resp.count} total`;
+    el.textContent = `${resp.mine ?? resp.count} on this site · ${resp.count} total`;
 }
 ($('cacheClear') as HTMLButtonElement).onclick = async () => {
     const btn = $('cacheClear') as HTMLButtonElement;
@@ -500,10 +500,10 @@ async function refreshCacheCount(): Promise<void> {
     try {
         const resp = await chrome.runtime.sendMessage({ type: 'mt:translation-cache-clear' });
         if (!resp?.ok) throw new Error(resp?.error ?? 'Could not clear translations');
-        ($('cacheCount') as HTMLElement).textContent = '0 here · 0 total';
-        btn.textContent = 'Translations cleared';
+        ($('cacheCount') as HTMLElement).textContent = '0 on this site · 0 total';
+        btn.textContent = 'Saved translations cleared';
     } catch (e) {
-        btn.textContent = 'Clear translation cache';
+        btn.textContent = 'Clear saved translations on all sites';
         alert((e as Error).message);
     } finally { btn.disabled = false; }
 };

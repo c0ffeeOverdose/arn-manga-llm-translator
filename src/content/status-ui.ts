@@ -7,7 +7,7 @@ import { initDebug, isDebug } from '../debug';
 import { haltMessage } from './halt-message';
 import { pipeline, ui, mtPal, mtDot, stateFor, setDebugOn, type MtState } from './state';
 import { getPages } from './page-io';
-import { queue, failMarks, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap, paintFind, paintHas, paintQueued, autoHalted } from './queue';
+import { queue, failMarks, activeJobExists, activeKeyGet, activeRefGet, pageKeyOf, viewportOverlap, paintFind, paintHas, paintQueued, autoHalted } from './queue';
 import { ensureDebugViews } from './ocr';
 import { applyOverlays } from './overlays';
 import { lookaheadActive } from './auto';
@@ -30,7 +30,7 @@ export function pillUnDismiss(): void { pillDismissed = false; }
 // dropped preps (dequeue/cancel/twin-splice) keep resolving and would
 // otherwise resurrect as ghost pill entries
 function jobLive(key: string): boolean {
-    return key === activeKeyGet() || queue.some(j => j.key === key) || paintHas(key);
+    return activeJobExists(key) || queue.some(j => j.key === key) || paintHas(key);
 }
 export function setActivity(key: string, text: string, kind: Activity['kind'], stage: MtStage | undefined): void {
     // background work (lookahead, sweep) owns no queue entry — exempt from the liveness gate
@@ -66,6 +66,7 @@ export function idleStatus(): string {
     // a provider/cache halt outranks the counts: nothing else runs until the user acts (see haltAuto)
     const halted = autoHalted();
     if (halted) {
+        if (halted.kind === 'user' && !autoTranslateFlag()) return 'Translation stopped. Select Translate this page to start again.';
         // A chapter halt keeps the runner's own message (why it stopped) instead of only the
         // call-to-action: "start chapter translation to continue" alone reads as "the button
         // is broken" and hides the real failure.
@@ -87,7 +88,7 @@ export function idleStatus(): string {
     // complete and quiet → empty: the counts only earn the pixels when work remains
     if (translated >= loaded && !queued && !parked) return '';
     if (!translated) return parked ? `${parked} paused after errors` : '';
-    return (queued ? `${translated}/${loaded} pages · ${queued} queued` : `${translated}/${loaded} pages`) + pause;
+    return (queued ? `${translated} of ${loaded} pages ready · ${queued} queued` : `${translated} of ${loaded} pages ready`) + pause;
 }
 
 // stage stepper: 5 dots (read → detect → ocr → llm → render). Hidden outside busy-with-stage.
@@ -203,8 +204,10 @@ interface ErrLogEntry { t: number; msg: string; hint?: string; kind?: string }
 
 // last 20 errors, readable from the popup long after the toast faded
 export async function logError(msg: string, hint?: string, kind?: string): Promise<void> {
+    if (!isDebug()) return;
     const { sessGet, sessSet } = await import('../storage-session');
     const { mtErrLog } = await sessGet('mtErrLog');
+    if (!isDebug()) return;
     const log = (mtErrLog as ErrLogEntry[] | undefined) ?? [];
     log.unshift({ t: Date.now(), msg, hint, kind });
     await sessSet({ mtErrLog: log.slice(0, 20) });

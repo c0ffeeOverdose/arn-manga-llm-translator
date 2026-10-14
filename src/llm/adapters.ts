@@ -41,13 +41,13 @@ export async function callLLM(
     temperature?: number | null, // pinned sampling temperature; null/undefined = provider default
     maxTokens?: number, // explicit output cap; undefined leaves optional caps to the provider
 ): Promise<LlmResult> {
-    if (!s.apiKey) throw new MtError('auth', 'No API key configured — open the extension options');
-    if (!s.model) throw new MtError('auth', 'No model configured — open the extension options');
+    if (!s.apiKey) throw new MtError('auth', 'Add your API key in Settings → Model.');
+    if (!s.model) throw new MtError('auth', 'Choose a model ID in Settings → Model.');
     // provider still in its refusal window: refuse locally, no request sent
     const limited = rateLimitLeft(s);
     if (limited) throw new MtError('ratelimit',
-        `Rate limited — ${Math.ceil(limited / 1000)}s left for this provider`,
-        'Auto-translate is stopped while the provider cools down; press Translate on a page to retry, or switch model/provider',
+        `Provider request limit reached. Try again in ${Math.ceil(limited / 1000)}s.`,
+        'Auto-translate is paused. Wait, then select Translate this page to try again.',
         undefined, limited);
     const base = (s.baseUrl || DEFAULT_BASES[s.provider]).replace(/\/$/, '');
     const t = thinkingLevel.trim();
@@ -224,18 +224,18 @@ export function toMtError(e: unknown): MtError {
             // Some CF models gate behind a one-time license agreement — point at the agree call.
             if (/model agreement|[Cc]ommunity [Ll]icense|submit the prompt/i.test(e.message))
                 return new MtError('auth', e.message, 'Model license not accepted — send {"prompt":"agree"} once to the model\'s /ai/run URL (Cloudflare), then Test again');
-            return new MtError('auth', e.message, 'API key is wrong or expired — check the key in Settings');
+            return new MtError('auth', e.message, 'Check your API key and access to this model in Settings.');
         }
-        if (e.status === 402) return new MtError('auth', e.message, 'Out of credits/quota — top up or switch provider');
-        if (e.status === 404) return new MtError('auth', e.message, 'Wrong model name — check the model in Settings');
+        if (e.status === 402) return new MtError('auth', e.message, 'Check your provider balance or choose another provider.');
+        if (e.status === 404) return new MtError('auth', e.message, 'Check the model ID in Settings → Model.');
         if (e.status === 429) return new MtError('ratelimit', e.message,
-            'Rate limited by the provider — auto-translate is stopped. Wait for the cooldown, then press Translate on a page (or lower Parallel LLM / check the model quota)',
+            'Auto-translate is paused. Wait, then try again. To send fewer requests at once, lower Requests at a time in Advanced settings.',
             undefined, e.retryAfterMs);
         if (e.status === 400 && /image|base64|data uri|input_image|multimodal|media_type|content\[/i.test(e.message))
-            return new MtError('parse', e.message, "This model can't read images — switch to Local OCR or pick another model");
-        if (e.status >= 500) return new MtError('server', e.message, 'Provider is temporarily down — you can retry');
+            return new MtError('parse', e.message, "This model can't read images. Select Recognized text (OCR) in Settings → Model, or choose a model with image support.");
+        if (e.status >= 500) return new MtError('server', e.message, 'The provider has a temporary problem. Try again later.');
     }
-    if (e instanceof TypeError) return new MtError('network', String(e), 'Cannot reach the provider — check your network/baseUrl');
+    if (e instanceof TypeError) return new MtError('network', String(e), 'Cannot reach the provider. Check your connection and API URL.');
     const m = new MtError('parse', String(e));
     return m;
 }
@@ -253,13 +253,13 @@ export const THINKING_LEVELS: Record<LLMSettings['provider'], ThinkingPreset[]> 
     cloudflare: ['auto', 'none', 'low', 'medium', 'high'],
 };
 export const THINKING_HINTS: Record<ThinkingPreset, string> = {
-    auto: 'Leave it to the model.',
-    none: 'No reasoning — fastest and cheapest.',
-    low: 'Light reasoning, low latency.',
-    medium: 'Balanced — a good default.',
-    high: 'Deep reasoning for hard pages — slower, pricier.',
-    xhigh: 'Very deep — only when it measurably helps.',
-    max: 'Unconstrained — most capable, most expensive.',
+    auto: 'Uses the model default.',
+    none: 'Disables extra thinking if the model supports it.',
+    low: 'Requests a small amount of thinking.',
+    medium: 'Requests a moderate amount of thinking.',
+    high: 'Requests more thinking. May take longer and use more tokens.',
+    xhigh: 'Requests extra thinking, if supported. May take longer and use more tokens.',
+    max: 'Requests the highest thinking level supported by the model.',
 };
 
 const isNumericLevel = (s: string) => /^\d+$/.test(s);
@@ -548,8 +548,8 @@ export function cfImageCapHint(providerCode: number | undefined, imageCount: num
 }
 async function cloudflareChat(base: string, s: LLMSettings, prompt: BuiltPrompt, images?: string[], thinking: string | null = null, cacheKey?: string, temperature?: number | null, maxTokens?: number): Promise<{ text: string; usage?: LlmUsage; finishReason?: string }> {
     if (/<ACCOUNT_ID>/.test(base))
-        throw new MtError('auth', 'Cloudflare Base URL still contains <ACCOUNT_ID>',
-            'Replace <ACCOUNT_ID> with your Cloudflare account id (Settings → Model → Base URL)');
+        throw new MtError('auth', 'Cloudflare API URL still contains <ACCOUNT_ID>',
+            'Replace <ACCOUNT_ID> with your Cloudflare account ID in Settings → Model → API URL.');
     const resp = await fetch(cfRunUrl(base, s.model), {
         method: 'POST',
         headers: {

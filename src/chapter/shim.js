@@ -33,8 +33,7 @@
                     if (r && r.ok === false) throw new Error(r.error || 'storage clear failed');
                 });
             },
-            // Storage-change events cannot cross contexts. The runner re-reads on demand and
-            // stops on a settings change, so a no-op event keeps every caller working.
+            // The background broker relays relevant settings changes to the runner.
             onChanged: NOOP_EVENT,
         };
     }

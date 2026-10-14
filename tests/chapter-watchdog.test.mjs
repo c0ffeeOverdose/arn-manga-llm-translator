@@ -51,7 +51,7 @@ test('timeout-failed pages get ONE bounded automatic retry and the host stays wa
     const src = readFileSync(new URL('../src/chapter/page.ts', import.meta.url), 'utf8');
     // The retry pass runs at the end of the walk, only while the run is alive, and re-queueing
     // spends the page's retry so it can never loop.
-    assert.match(src, /pickRetryPages\(status\.pages, autoRetry, retried\)/, 'the bounded picker must gate the pass');
+    assert.match(src, /pickRetryPages\(status\.pages\.filter\(inScope\), autoRetry, retried\)/, 'the bounded picker must stay inside the requested pages');
     assert.match(src, /retried\.add\(p\.id\)/, 're-queueing must spend the retry');
     assert.match(src, /reason: 'auto-timeout'/, 'the retry is named in the saved log');
     assert.match(src, /e instanceof InferenceRpcTimeoutError/, 'only deadline faults earn the retry');

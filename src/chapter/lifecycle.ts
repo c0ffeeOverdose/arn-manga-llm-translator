@@ -8,6 +8,8 @@ export interface AttemptOptions {
     onExpire?: (info: { label: string; elapsedMs: number }) => void;
 }
 export class Attempt {
+    private readonly controller = new AbortController();
+    readonly signal = this.controller.signal;
     private active = true;
     private timer: ReturnType<typeof setTimeout> | undefined;
     private release!: () => void;
@@ -29,6 +31,7 @@ export class Attempt {
     cancel(): void {
         if (!this.active) return;
         this.active = false;
+        this.controller.abort();
         clearTimeout(this.timer);
         this.release();
     }

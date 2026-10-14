@@ -49,7 +49,7 @@ export interface PipelineSettings {
     ocrThinking: string; // thinking level for the separate VLM reader's transcribe call (default 'none' — copying glyphs needs no reasoning)
     parallelLlm: number;        // concurrent LLM calls when context is OFF (1 = serial)
     mergePages: number;         // chapter runner: pages sent in one LLM request (1 = one page per request)
-    prefetchN: number;         // auto pre-translate window: queued pages ahead (1-30)
+    prefetchN: number;         // pages after the visible spread that Auto may translate (1-30)
     // rendering
     renderFont: string;         // 'default' = bundled Sriracha/system per language; else a font-store id
     minFont: number;
@@ -64,7 +64,7 @@ export interface PipelineSettings {
 
 export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
     preset: 'balanced',
-    layoutModel: 'ctd',
+    layoutModel: 'koharu',
     koharuTextConf: 0.25,
     koharuSfxConf: 0.20,
     koharuPanelConf: 0.50,
@@ -183,10 +183,25 @@ export const PRESETS: Record<string, Partial<PipelineSettings>> = {
 // Preset thinking levels (custom text/numbers pass through untouched).
 const KNOWN_THINKING = ['auto', 'none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
-export function applyPreset(name: string, current?: Pick<PipelineSettings, 'layoutModel' | 'inferEngine' | 'detEp'>): PipelineSettings {
-    return { ...DEFAULT_PIPELINE_SETTINGS, ...(PRESETS[name] ?? {}), ...(current ? {
-        layoutModel: current.layoutModel, inferEngine: current.inferEngine, detEp: current.detEp,
-    } : {}), preset: name };
+const PRESET_KEEP_KEYS = [
+    'layoutModel', 'inferEngine', 'detEp', 'inpaint', 'targetLang', 'stylePrompt', 'renderFont',
+    'textSource', 'useOcrModel', 'ocrPerRegion', 'ocrEngine', 'ocrLangs', 'ocrThinking',
+    'readingDir', 'transcribeSrc', 'useContext', 'useCharacters', 'crossChapter',
+    'prefetchN', 'parallelLlm', 'mergePages', 'cacheEnabled', 'cacheMax', 'showToasts',
+] as const satisfies readonly (keyof PipelineSettings)[];
+
+export function defaultLayoutModel(engine: unknown): LayoutModel {
+    return engine === 'cloud' ? 'ctd' : DEFAULT_PIPELINE_SETTINGS.layoutModel;
+}
+
+// Quality presets retain the reader's language, workflow and resource choices.
+export function applyPreset(name: string, current?: Partial<PipelineSettings>): PipelineSettings {
+    const result = { ...DEFAULT_PIPELINE_SETTINGS, ...(PRESETS[name] ?? {}), preset: name };
+    if (current) for (const key of PRESET_KEEP_KEYS) {
+        if (current[key] !== undefined) Object.assign(result, { [key]: current[key] });
+    }
+    result.layoutModel = current?.layoutModel ?? defaultLayoutModel(result.inferEngine);
+    return result;
 }
 
 // Merge stored settings over defaults; old-format keys migrate onto textSource.
@@ -228,7 +243,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         else if (s.visionMode != null || s.useVision != null || s.ocrModel != null) out.textSource = 'page';
     }
     if (out.readingDir !== 'rtl' && out.readingDir !== 'ltr') out.readingDir = 'rtl';
-    if (out.layoutModel !== 'ctd' && out.layoutModel !== 'koharu') out.layoutModel = 'ctd';
+    if (s.layoutModel !== 'ctd' && s.layoutModel !== 'koharu') out.layoutModel = defaultLayoutModel(out.inferEngine);
     for (const k of ['koharuTextConf', 'koharuSfxConf', 'koharuPanelConf'] as const) {
         if (typeof out[k] !== 'number' || !(Number(out[k]) >= 0.05 && Number(out[k]) <= 1)) out[k] = DEFAULT_PIPELINE_SETTINGS[k];
     }
@@ -291,6 +306,7 @@ export function matchingPreset(s: PipelineSettings): string {
         const full = applyPreset(name);
         let same = true;
         for (const k of Object.keys(DEFAULT_PIPELINE_SETTINGS)) {
+            if ((PRESET_KEEP_KEYS as readonly string[]).includes(k)) continue;
             if (k === 'layoutModel' || k.startsWith('koharu')) continue;
             if (k === 'preset' || k === 'prefetchN' || k === 'cacheMax' || k === 'inferEngine' || k === 'detEp' || k === 'showToasts' || k === 'useOcrModel' || k === 'ocrThinking' || k === 'inpaint') continue; // behavior knobs, not quality
             if ((full as any)[k] !== (s as any)[k]) { same = false; break; }

@@ -104,10 +104,10 @@ export async function renderCharsPanel(): Promise<void> {
         await chrome.storage.local.set({ mtCharOverrides: overrides });
     }
     const scopeEl = charsPanel.querySelector('#mt-chars-scope');
-    if (scopeEl) scopeEl.textContent = `Rows are ${bookScopeNote()}`;
+    if (scopeEl) scopeEl.textContent = bookScopeNote().replace(/^./, c => c.toUpperCase());
     const ovOf = (c: CharacterEntry) => findOverride(overrides, scope, c);
     if (!rows.length) {
-        box.innerHTML = '<div style="color:#888;padding:6px">No characters yet — translate some pages first.</div>';
+        box.innerHTML = '<div style="color:#888;padding:6px">Characters appear here after you translate a page.</div>';
     }
     let unnamedHeader = false;
     for (const c of rows) {
@@ -127,18 +127,18 @@ export async function renderCharsPanel(): Promise<void> {
         top.style.cssText = 'display:flex;gap:6px;align-items:center';
         const idTag = document.createElement('span');
         idTag.textContent = c.id ?? '—';
-        idTag.title = 'Roster id — the model answers spk="…" with this id';
+        idTag.title = 'Character ID used by the translation model';
         idTag.style.cssText = `flex:none;min-width:22px;text-align:center;background:${mtPal.accent};color:#fff;border-radius:4px;padding:2px 4px;font-size:11px;font-weight:600`;
-        const name = mkInput(ov?.name ?? c.name ?? '', unnamed ? 'unnamed — who is this?' : 'name?',
+        const name = mkInput(ov?.name ?? c.name ?? '', 'Character name',
             `Name for ${rowLabel(c)}`);
-        name.title = 'Character name — saved as an override, no options page needed';
+        name.title = 'Name to use in future translations. Changes save automatically.';
         name.style.flex = '1';
         name.style.minWidth = '0';
         const sel = document.createElement('select');
-        sel.title = 'Gender (your choice always wins)';
+        sel.title = 'Gender to use in future translations';
         sel.setAttribute('aria-label', `Gender for ${rowLabel(c)}`);
         sel.style.cssText = `flex:none;background:${mtPal.field};color:${mtPal.text};border:1px solid ${mtPal.border};border-radius:4px;padding:3px 2px`;
-        for (const [v, label] of [['?', '?'], ['F', 'F'], ['M', 'M']] as const) {
+        for (const [v, label] of [['?', 'Unknown'], ['F', 'Female'], ['M', 'Male']] as const) {
             const o = document.createElement('option');
             o.value = v; o.textContent = label;
             sel.append(o);
@@ -146,32 +146,32 @@ export async function renderCharsPanel(): Promise<void> {
         sel.value = ov?.gender ?? c.gender;
         const del = document.createElement('button');
         del.textContent = '×';
-        del.title = 'Remove from this book';
+        del.title = 'Remove this character';
         del.setAttribute('aria-label', `Remove ${rowLabel(c)}`);
         del.style.cssText = 'flex:none;background:none;color:#888;border:0;cursor:pointer;font-size:15px;padding:4px 6px';
         top.append(idTag, name, sel, del);
         // line 2/3: the visual anchor and the social facts (both feed the roster)
-        const desc = mkInput(ov?.desc ?? c.desc ?? '', 'description — how to recognize them', `Description for ${rowLabel(c)}`);
-        desc.title = 'Visual anchor sent to the model — say what makes this person recognizable';
+        const desc = mkInput(ov?.desc ?? c.desc ?? '', 'Appearance, e.g. short hair and glasses', `Description for ${rowLabel(c)}`);
+        desc.title = 'Details that help the model recognize this character';
         desc.style.marginTop = '4px';
-        const note = mkInput(ov?.note ?? c.note ?? '', 'note — relation, rank, how they are called', `Note for ${rowLabel(c)}`);
-        note.title = 'Page-stated facts the model accumulates (relations, rank, how others address them)';
+        const note = mkInput(ov?.note ?? c.note ?? '', 'Notes, e.g. relationships or titles', `Note for ${rowLabel(c)}`);
+        note.title = 'Details the model should remember about this character';
         note.style.marginTop = '4px';
         // line 4: provenance + row surgery
         const meta = document.createElement('div');
         meta.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:4px';
         const src = document.createElement('span');
         src.style.cssText = `flex:1;min-width:0;color:${mtPal.muted};font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis`;
-        src.textContent = (ov ? '✓ user' : `learned via ${c.source}`) + (c.absorbed?.length ? ` · ${c.absorbed.length} merged` : '');
+        src.textContent = (ov ? 'Edited by you' : c.source === 'user' ? 'Added by you' : 'Learned from translation') + (c.absorbed?.length ? ` · ${c.absorbed.length} merged` : '');
         meta.append(src);
         const others = rows.filter(r => charKey(r) !== charKey(c));
         if (others.length) {
             const mergeSel = document.createElement('select');
-            mergeSel.title = 'Fold this row into another character';
+            mergeSel.title = 'Combine duplicate entries for the same character';
             mergeSel.setAttribute('aria-label', `Merge ${rowLabel(c)} into`);
             mergeSel.style.cssText = `flex:none;max-width:140px;background:${mtPal.field};color:${mtPal.text};border:1px solid ${mtPal.border};border-radius:4px;padding:3px 2px;font-size:12px`;
             const none = document.createElement('option');
-            none.value = ''; none.textContent = 'merge into…';
+            none.value = ''; none.textContent = 'Merge into…';
             mergeSel.append(none);
             for (const r of others) {
                 const o = document.createElement('option');
@@ -191,7 +191,7 @@ export async function renderCharsPanel(): Promise<void> {
             meta.append(mergeSel);
         }
         if (c.absorbed?.length) {
-            const split = mkButton(`split (${c.absorbed.length})`, 'Restore the rows that were merged into this one');
+            const split = mkButton(`Undo merge (${c.absorbed.length})`, 'Restore the character entries merged here');
             split.onclick = async () => {
                 context.characters = splitBookRow(normalizeBook(context.characters), charKey(c));
                 await saveContext();
@@ -215,7 +215,7 @@ export async function renderCharsPanel(): Promise<void> {
             else all[key] = next;
             await chrome.storage.local.set({ mtCharOverrides: all });
             const st = charsPanel?.querySelector('#mt-char-status');
-            if (st) st.textContent = 'Saved — hit Re-translate to apply.';
+            if (st) st.textContent = 'Saved. Re-translate a page to apply.';
             renderCharsPanel();
         };
         name.onchange = saveRow;
@@ -246,7 +246,7 @@ export async function renderCharsPanel(): Promise<void> {
     gsel.title = 'Gender';
     gsel.setAttribute('aria-label', 'Gender for the new character');
     gsel.style.cssText = `background:${mtPal.field};color:${mtPal.text};border:1px solid ${mtPal.border};border-radius:4px`;
-    for (const [v, label] of [['?', '?'], ['F', 'F'], ['M', 'M']] as const) {
+    for (const [v, label] of [['?', 'Unknown'], ['F', 'Female'], ['M', 'Male']] as const) {
         const o = document.createElement('option');
         o.value = v; o.textContent = label;
         gsel.append(o);
@@ -284,10 +284,10 @@ async function clearAllChars(): Promise<void> {
 
 export function makeCharsPanel(): HTMLDivElement {
     const p = document.createElement('div');
-    p.style.cssText = `position:fixed;bottom:64px;right:16px;z-index:99999;background:${mtPal.bg};color:${mtPal.text};padding:12px;border:1px solid ${mtPal.border};border-radius:12px;font:13px system-ui;box-shadow:0 4px 16px rgba(0,0,0,.4);width:340px;max-height:480px;overflow:auto;display:none`;
+    p.style.cssText = `position:fixed;bottom:64px;right:16px;z-index:99999;background:${mtPal.bg};color:${mtPal.text};padding:12px;border:1px solid ${mtPal.border};border-radius:12px;font:13px system-ui;box-shadow:0 4px 16px rgba(0,0,0,.4);width:340px;max-width:calc(100vw - 32px);max-height:480px;overflow:auto;display:none`;
     p.innerHTML = '<div style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:2px">' +
         '<span style="flex:1">Characters</span>' +
-        '<button id="mt-chars-clear" title="Remove all characters from this book" style="background:none;color:' + mtPal.err + ';border:0;cursor:pointer;font-size:12px;font-weight:400;padding:4px 6px">Clear all</button>' +
+        '<button id="mt-chars-clear" title="Clear characters for this story" style="background:none;color:' + mtPal.err + ';border:0;cursor:pointer;font-size:12px;font-weight:400;padding:4px 6px">Clear all</button>' +
         '<button id="mt-chars-close" title="Close" style="background:none;color:#888;border:0;cursor:pointer;font-size:15px;line-height:1;padding:4px 6px">×</button></div>' +
         '<div id="mt-chars-scope" style="color:#888;font-size:11px;margin-bottom:4px"></div>' +
         '<div id="mt-chars-list"></div>' +

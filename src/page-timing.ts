@@ -1,5 +1,6 @@
-// Small, document-local timing reports contain only durations and whitelisted metadata.
-// They do not depend on visual debug, storage, page URLs, text or image payloads.
+// Timing reports belong to work started in Debug mode. Turning Debug off invalidates
+// that capture; reports contain only durations and whitelisted metadata.
+import { initDebug, isDebug } from './debug';
 declare const __BUILD_ID__: string;
 
 export const TIMING_LABELS = {
@@ -49,9 +50,13 @@ export interface PageTimingReport {
 }
 
 let latest: PageTimer | null = null;
-export function lastPageTiming(): PageTimingReport | null { return latest?.report() ?? null; }
+let debugEpoch = 0;
+void initDebug(on => { if (!on) { latest = null; debugEpoch++; } });
+export function lastPageTiming(): PageTimingReport | null { return isDebug() ? latest?.report() ?? null : null; }
 
 export class PageTimer {
+    private readonly enabled = isDebug();
+    private readonly epoch = debugEpoch;
     readonly startedAt = Date.now();
     readonly meta: PageTimingMeta = {};
     private readonly t0 = performance.now();
@@ -60,20 +65,24 @@ export class PageTimer {
     private stage = 'Reading image';
     private endedAt?: number;
 
-    activate(): void { latest = this; }
-    setStage(stage: string): void { this.stage = stage; }
+    private recording(): boolean { return this.enabled && this.epoch === debugEpoch && isDebug(); }
+    activate(): void { if (this.recording()) latest = this; }
+    setStage(stage: string): void { if (this.recording()) this.stage = stage; }
     add(name: TimingName, ms: number): void {
-        if (Number.isFinite(ms) && ms >= 0) this.ms[name] = (this.ms[name] ?? 0) + ms;
+        if (this.recording() && Number.isFinite(ms) && ms >= 0) this.ms[name] = (this.ms[name] ?? 0) + ms;
     }
     measure<T>(name: TimingName, fn: () => T): T {
+        if (!this.recording()) return fn();
         const t0 = performance.now();
         try { return fn(); } finally { this.add(name, performance.now() - t0); }
     }
     async measureAsync<T>(name: TimingName, fn: () => Promise<T>): Promise<T> {
+        if (!this.recording()) return fn();
         const t0 = performance.now();
         try { return await fn(); } finally { this.add(name, performance.now() - t0); }
     }
     finish(state: 'done' | 'failed'): void {
+        if (!this.recording()) return;
         this.state = state;
         this.endedAt = performance.now();
         if (state === 'done') this.stage = 'Finished';

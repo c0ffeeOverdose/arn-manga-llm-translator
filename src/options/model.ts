@@ -2,40 +2,43 @@
 
 import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type LLMSettings } from '../llm/adapters';
 import { inpaintMode, mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
-import { detModelsInstalled, detDownload, inpaintInstalled, inpaintDownload } from '../llm/ocr-models';
-import { koharuInstalled, importKoharuFile } from '../llm/layout-models';
-import { KOHARU_MODEL } from '../layout-model';
+import { detModelsInstalled, detDownload, detDelete, inpaintInstalled, inpaintDownload, inpaintDelete } from '../llm/ocr-models';
+import { koharuInstalled, koharuDownload, koharuDelete, importKoharuFile } from '../llm/layout-models';
+import { KOHARU_MODEL, type LayoutModel } from '../layout-model';
 import { $, setDirty, setStatus, dlProgress } from './shell';
 import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI, syncDetectionTuning } from './pipeline-section';
 import { hostOriginPatterns, requestHostAccess } from './host-access';
 
 const MODEL_HINTS: Record<string, string> = {
-    openai: 'e.g. gpt-5.4-mini, gpt-5.4-nano — or qwen/qwen3.7-flash, z-ai/glm-5.3-flash via OpenRouter',
-    responses: 'e.g. gpt-5.6-luna, muse-spark-1.3 (cheap + vision)',
-    anthropic: 'e.g. claude-haiku-4-5, claude-sonnet-5',
-    gemini: 'e.g. gemini-3.5-flash-lite, gemini-3.8-flash',
-    cloudflare: 'e.g. @cf/meta/llama-3.2-11b-vision-instruct (pair with OCR text mode; needs a one-time "agree")',
+    openai: 'Use the exact model ID from your provider, including any provider prefix.',
+    responses: 'Use a model ID that your provider supports through the Responses API.',
+    anthropic: 'Use the model ID from your Anthropic account.',
+    gemini: 'Use the model ID from Google AI Studio.',
+    cloudflare: 'Use the full model ID, starting with @cf/.',
 };
 
 // placeholder follows the protocol (static HTML keeps the openai default for first paint)
 const MODEL_PLACEHOLDERS: Record<string, string> = {
-    openai: 'e.g. gpt-5.4-mini',
-    responses: 'e.g. gpt-5.6-luna',
-    anthropic: 'e.g. claude-haiku-4-5',
-    gemini: 'e.g. gemini-3.5-flash-lite',
-    cloudflare: 'e.g. @cf/meta/llama-4-scout-17b-16e-instruct',
+    openai: 'Model ID from your provider',
+    responses: 'Model ID from your provider',
+    anthropic: 'Claude model ID',
+    gemini: 'Gemini model ID',
+    cloudflare: '@cf/provider/model-name',
 };
 
 // per-provider Base URL examples (defaults live in DEFAULT_BASES)
 const BASE_HINTS: Record<string, string> = {
-    openai: ' · OpenRouter: https://openrouter.ai/api/v1 · ollama: http://localhost:11434/v1',
-    responses: ' · OpenCode Go: https://opencode.ai/zen/go/v1 (use a /responses model, e.g. gpt-5.6-luna)',
+    openai: ' For other providers, enter their API URL.',
+    responses: ' For other providers, enter their API URL.',
     anthropic: '',
     gemini: '',
-    cloudflare: ' · replace <ACCOUNT_ID>; token needs Workers AI permission (either /ai or /ai/v1 works)',
+    cloudflare: ' Replace <ACCOUNT_ID> with your account ID. The token needs Workers AI access.',
 };
 
+let localLayoutChoice: LayoutModel | undefined;
+
 export function fillModelFields(s: LLMSettings): void {
+    localLayoutChoice = pipeline.inferEngine === 'local' ? pipeline.layoutModel : undefined;
     ($('provider') as HTMLSelectElement).value = s.provider;
     ($('model') as HTMLInputElement).value = s.model;
     ($('apiKey') as HTMLInputElement).value = s.apiKey;
@@ -85,7 +88,7 @@ export function updateHints() {
     const provider = ($('provider') as HTMLSelectElement).value;
     ($('modelHint') as HTMLDivElement).textContent = MODEL_HINTS[provider] ?? '';
     ($('model') as HTMLInputElement).placeholder = MODEL_PLACEHOLDERS[provider] ?? '';
-    ($('baseHint') as HTMLDivElement).textContent = `Default: ${DEFAULT_BASES[provider as keyof typeof DEFAULT_BASES]}${BASE_HINTS[provider] ?? ''}`;
+    ($('baseHint') as HTMLDivElement).textContent = `Leave blank to use ${DEFAULT_BASES[provider as keyof typeof DEFAULT_BASES]}.${BASE_HINTS[provider] ?? ''}`;
 }
 
 // provider endpoint used for host access; an empty override falls back to the default
@@ -103,12 +106,12 @@ export function markModelDirty(): void {
 export async function saveAll(): Promise<void> {
     const s = currentSettings();
     if (!s.model || !s.apiKey) {
-        setStatus('Enter a model and API key first.', 'err');
+        setStatus('Enter a model ID and API key first.', 'err');
         return;
     }
     const o = currentOcrSettings();
     if (pipeline.useOcrModel && pipeline.textSource !== 'ocr' && (!o.model || !o.apiKey)) {
-        setStatus('Enter the OCR model and API key first (or untick the separate reader).', 'err');
+        setStatus('Enter the reader model ID and API key, or turn off the separate reader.', 'err');
         return;
     }
     // one request covers every origin this save touches: Firefox allows it only in
@@ -126,7 +129,7 @@ export async function saveAll(): Promise<void> {
     Object.assign(pipeline, mergePipeline(stored, pipeline));
     await chrome.storage.local.set({ mtSettings: s, mtOcrSettings: o, mtPipeline: pipeline });
     setDirty(false);
-    setStatus('Saved ✓', 'ok', 2000);
+    setStatus('Changes saved.', 'ok', 2000);
     syncSetupBanner();
 }
 
@@ -146,7 +149,7 @@ export async function testConnection(): Promise<void> {
     const s = currentSettings();
     const el = $('testStatus') as HTMLElement;
     if (!s.model || !s.apiKey) {
-        setStatus('Enter a model and API key first.', 'err', 0, el);
+        setStatus('Enter a model ID and API key first.', 'err', 0, el);
         return;
     }
     setStatus('Testing…', '', 0, el);
@@ -156,7 +159,7 @@ export async function testConnection(): Promise<void> {
         // Thinking rides along for the probe (accepted/rejected).
         const resp = await chrome.runtime.sendMessage({ type: 'mt:test-llm', settings: s, thinking: pipeline.thinkingLevel, temperature: pipeline.temperature });
         if (resp?.ok) {
-            setStatus(`OK — ${resp.reply}${thinkingSuffix(pipeline.thinkingLevel, resp)}`, 'ok', 0, el);
+            setStatus(`Connected.${thinkingSuffix(pipeline.thinkingLevel, resp)}`, 'ok', 0, el);
         } else {
             setStatus(`Failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
         }
@@ -167,9 +170,9 @@ export async function testConnection(): Promise<void> {
 
 // shared Test-status tail for the thinking probe (main + OCR buttons)
 function thinkingSuffix(level: string, resp: { thinking?: string; thinkingError?: string }): string {
-    if (resp.thinking === 'accepted') return ` · thinking ${level}: accepted`;
-    if (resp.thinking === 'rejected') return ` · thinking ${level}: rejected — runs without it`;
-    if (resp.thinking === 'error') return ` · thinking check failed: ${resp.thinkingError ?? 'unknown'}`;
+    if (resp.thinking === 'accepted') return ` Thinking setting "${level}" accepted.`;
+    if (resp.thinking === 'rejected') return ` Thinking setting "${level}" isn't supported. The model default will be used.`;
+    if (resp.thinking === 'error') return ` Couldn't test the thinking setting: ${resp.thinkingError ?? 'unknown error'}`;
     return '';
 }
 
@@ -177,27 +180,27 @@ export async function testOcr(): Promise<void> {
     const s = currentOcrSettings();
     const el = $('ocrTestStatus') as HTMLElement;
     if (!s.model || !s.apiKey) {
-        setStatus('Enter an OCR model and API key first.', 'err', 0, el);
+        setStatus('Enter a reader model ID and API key first.', 'err', 0, el);
         return;
     }
-    setStatus('Testing… (reads the test image)', '', 0, el);
+    setStatus('Reading the test image…', '', 0, el);
     const t0 = Date.now();
     // drifting models take a while — show the clock
-    const tick = setInterval(() => setStatus(`Testing… ${Math.round((Date.now() - t0) / 1000)}s (reads the test image)`, '', 0, el), 1000);
+    const tick = setInterval(() => setStatus(`Reading the test image… ${Math.round((Date.now() - t0) / 1000)}s`, '', 0, el), 1000);
     try {
         await requestHostAccess(hostOriginPatterns([baseUrlOf(s.baseUrl, s.provider)]));
         const imageB64 = await ocrTestImageB64();
         const resp = await chrome.runtime.sendMessage({ type: 'mt:test-ocr', settings: s, thinking: pipeline.ocrThinking, temperature: pipeline.ocrTemperature, imageB64, expect: OCR_TEST_EXPECT });
         const secs = ` · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
         if (resp?.ok && resp.verdict === 'exact') {
-            const cap = resp.multiImage === true ? ' · multi-image OK'
-                : resp.multiImage === false ? ' · single-image only (per-region auto)'
+            const cap = resp.multiImage === true ? ' · accepts multiple images'
+                : resp.multiImage === false ? ' · will read one crop per request'
                 : '';
-            const tempNote = resp.tempDropped ? ' · temperature rejected → provider default' : '';
-            setStatus(`OK — reads correctly ("${resp.got}")${cap}${tempNote}${secs}`, 'ok', 0, el);
+            const tempNote = resp.tempDropped ? ' · using provider default temperature' : '';
+            setStatus(`Test image read correctly${cap}${tempNote}${secs}`, 'ok', 0, el);
         } else if (resp?.ok) {
             setStatus((resp.verdict === 'miss'
-                ? `Saw no text — returned keep on a readable image (expected "${resp.expected}")`
+                ? `No text recognized. Expected "${resp.expected}".`
                 : `Mismatch — returned "${resp.got}" (expected "${resp.expected}")`) + secs, 'err', 0, el);
         } else {
             setStatus(`Failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
@@ -249,9 +252,9 @@ function syncOcrThinkingHint(): void {
     ($('ocrThinkingHint') as HTMLElement).textContent =
         (THINKING_HINTS as Record<string, string>)[v]
         ?? (/^\d+$/.test(v)
-            ? 'Custom token budget — sent as thinkingBudget/budget_tokens where supported.'
+            ? 'Maximum thinking tokens, if your provider supports a token limit.'
             : v
-                ? 'Custom value — sent as-is; rejected values fall back to the model default.'
+                ? 'Uses this value if supported. Otherwise, uses the model default.'
                 : THINKING_HINTS.none);
 }
 ($('ocrThinking') as HTMLInputElement).oninput = () => {
@@ -284,9 +287,9 @@ export function syncInferUI(): void {
     const cloud = pipeline.inferEngine === 'cloud';
     ($('layoutModel') as HTMLSelectElement).value = pipeline.layoutModel;
     $('layoutModelHint').textContent = pipeline.layoutModel === 'koharu'
-        ? cloud ? 'Koharu FP32 runs on-device. Select On-device above to use this model.'
-            : 'One model finds text, sound effects, balloons and panels. OCR and text cleanup use your existing settings.'
-        : 'CTD detects text; a separate model finds panels for reading order.';
+        ? cloud ? 'KoharuLayout runs on-device. Select On-device to use it.'
+            : 'Finds text, sound effects, speech bubbles and panels.'
+        : cloud ? 'Cloud detection uses CTD + Panel.' : 'CTD finds text. The panel model sets the reading order.';
     syncDetectionTuning();
     for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
         const on = (b.dataset.inferVal === 'cloud') === cloud;
@@ -310,13 +313,13 @@ export function syncAiCleanupUI(): void {
     const cloud = pipeline.inferEngine === 'cloud';
     cb.checked = inpaintMode(pipeline) !== 'fill';
     if (pipeline.inpaint === 'off') {
-        hint.textContent = 'Built-in code cleanup — fast and predictable.';
+        hint.textContent = 'Uses basic cleanup to remove the original text.';
     } else if (cloud) {
-        hint.textContent = 'Runs on your cloud GPU — no download. Uses a little more GPU time per page.';
+        hint.textContent = 'Removes text on your detection server. No download needed on this device.';
     } else if (cb.checked) {
-        hint.textContent = 'Runs on this device (needs WebGPU + the model below). Until it is ready, pages keep the built-in cleanup.';
+        hint.textContent = 'Runs on this device. Download the model below to use it.';
     } else {
-        hint.textContent = 'Built-in code cleanup. Tick to run the AI model on this device — one 112MB download.';
+        hint.textContent = 'Uses basic cleanup. Enable AI cleanup to fill in artwork behind the text.';
     }
     const showRow = !cloud && cb.checked;
     $('aiCleanupRow').style.display = showRow ? '' : 'none';
@@ -325,8 +328,9 @@ export function syncAiCleanupUI(): void {
 
 async function renderAiCleanupRow(): Promise<void> {
     const have = await inpaintInstalled().catch(() => false);
+    ($('aiCleanupBtn') as HTMLButtonElement).textContent = have ? 'Delete' : 'Download';
     ($('aiCleanupLabel') as HTMLSpanElement).innerHTML =
-        `Text cleanup model (112MB)${have ? ' <span class="ok-mark">✓</span>' : ''}`;
+        `Text cleanup model (112 MB)${have ? ' <span class="ok-mark">✓</span>' : ''}`;
 }
 
 $('aiCleanupBtn').onclick = async () => {
@@ -336,10 +340,13 @@ $('aiCleanupBtn').onclick = async () => {
     btn.disabled = true;
     row.classList.add('busy');
     try {
-        await inpaintDownload((loaded, total) => {
-            (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = 'text cleanup model';
-            dlProgress(bar, loaded, total);
-        });
+        if (await inpaintInstalled()) await inpaintDelete();
+        else {
+            await inpaintDownload((loaded, total) => {
+                (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = 'text cleanup model';
+                dlProgress(bar, loaded, total);
+            }, true);
+        }
         await renderAiCleanupRow();
         row.classList.remove('busy');
     } catch (e) {
@@ -356,62 +363,78 @@ $('aiCleanupBtn').onclick = async () => {
     setDirty(true);
 };
 
-// pre-download so the first on-device page doesn't pay it mid-chapter. Download-only, no Delete.
+// Installed models use the same Delete → Download flow as OCR models.
 async function renderDetRow(): Promise<void> {
     const selected = pipeline.layoutModel;
-    ($('detBtn') as HTMLButtonElement).textContent = selected === 'koharu' ? 'Import model file' : 'Download';
-    $('detInstallHint').textContent = selected === 'koharu'
-        ? 'Import the supported Koharu FP32 ONNX file once, then use it offline. Development builds can include it automatically.'
-        : 'Downloads once, then works offline. Otherwise fetched automatically on the first on-device page.';
+    $('layoutImportRow').hidden = selected !== 'koharu';
     if (selected === 'koharu') {
         const status = await koharuInstalled().catch(() => 'missing');
         if (pipeline.layoutModel !== selected) return;
-        $('detLabel').textContent = `Koharu FP32 (149.8 MB) · ${status === 'missing' ? 'Not installed' : 'Ready'}`;
+        const installed = status === 'cached';
+        ($('detBtn') as HTMLButtonElement).textContent = installed ? 'Delete' : 'Download';
+        $('detLabel').textContent = `KoharuLayout (149.8 MB) · ${installed ? 'Ready' : 'Not installed'}`;
         return;
     }
     const det = await detModelsInstalled().catch(() => ({ ctd: false, panel: false }));
     if (pipeline.layoutModel !== selected) return;
+    ($('detBtn') as HTMLButtonElement).textContent = det.ctd || det.panel ? 'Delete' : 'Download';
     ($('detLabel') as HTMLSpanElement).innerHTML =
-        `Detection models (CTD 40MB + panel 10MB)${det.ctd && det.panel ? ' <span class="ok-mark">✓</span>' : ''}`;
+        `CTD + Panel models (50 MB)${det.ctd && det.panel ? ' <span class="ok-mark">✓</span>' : ''}`;
 }
 $('detBtn').onclick = async () => {
-    if (pipeline.layoutModel === 'koharu') { ($('layoutFile') as HTMLInputElement).click(); return; }
+    const selected = pipeline.layoutModel;
     const btn = $('detBtn') as HTMLButtonElement;
+    const importBtn = $('layoutImportBtn') as HTMLButtonElement;
     const bar = $('detBar') as HTMLElement;
     const row = bar.parentElement!;
-    btn.disabled = true;
+    btn.disabled = importBtn.disabled = true;
+    $('layoutFileStatus').textContent = '';
     row.classList.add('busy');
     try {
-        await detDownload((file, loaded, total) => {
+        const progress = (file: string, loaded: number, total: number) => {
             (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = file.split('/').pop() ?? '';
             dlProgress(bar, loaded, total);
-        });
+        };
+        if (selected === 'koharu') {
+            if (await koharuInstalled() === 'cached') await koharuDelete();
+            else await koharuDownload((loaded, total) => progress('KoharuLayout', loaded, total), true);
+        } else {
+            const have = await detModelsInstalled();
+            if (have.ctd || have.panel) await detDelete();
+            else await detDownload(progress, true);
+        }
         await renderDetRow();
         row.classList.remove('busy');
     } catch (e) {
-        (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = String((e as Error).message).slice(0, 60);
+        const message = String((e as Error).message);
+        (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = message.slice(0, 60);
+        if (selected === 'koharu' && pipeline.layoutModel === selected) $('layoutFileStatus').textContent = message;
         // keep .busy so the error message stays visible
     } finally {
-        btn.disabled = false;
+        btn.disabled = importBtn.disabled = false;
     }
 };
+
+$('layoutImportBtn').onclick = () => ($('layoutFile') as HTMLInputElement).click();
 
 ($('layoutFile') as HTMLInputElement).onchange = async () => {
     const input = $('layoutFile') as HTMLInputElement, file = input.files?.[0];
     if (!file) return;
     const button = $('detBtn') as HTMLButtonElement, status = $('layoutFileStatus');
-    button.disabled = true; status.textContent = 'Checking model file…';
+    const importButton = $('layoutImportBtn') as HTMLButtonElement;
+    button.disabled = importButton.disabled = true; status.textContent = 'Checking model file…';
     try {
-        if (file.size !== KOHARU_MODEL.bytes) throw new Error('Choose the Koharu FP32 ONNX file (149.8 MB)');
+        if (file.size !== KOHARU_MODEL.bytes) throw new Error('Choose the KoharuLayout ONNX file (149.8 MB)');
         await importKoharuFile(await file.arrayBuffer());
-        status.textContent = 'Koharu FP32 is installed and ready.';
+        status.textContent = 'KoharuLayout is installed and ready.';
         await renderDetRow();
     } catch (e) { status.textContent = (e as Error).message; }
-    finally { button.disabled = false; input.value = ''; }
+    finally { button.disabled = importButton.disabled = false; input.value = ''; }
 };
 
 ($('layoutModel') as HTMLSelectElement).onchange = () => {
     pipeline.layoutModel = ($('layoutModel') as HTMLSelectElement).value === 'koharu' ? 'koharu' : 'ctd';
+    if (pipeline.inferEngine === 'local') localLayoutChoice = pipeline.layoutModel;
     $('layoutFileStatus').textContent = '';
     syncInferUI(); setDirty(true);
 };
@@ -419,7 +442,14 @@ for (const id of ['preset', 'resetAdv']) $(id).addEventListener(id === 'preset' 
 
 for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
     b.onclick = () => {
-        pipeline.inferEngine = (b.dataset.inferVal === 'cloud' ? 'cloud' : 'local') as 'local' | 'cloud';
+        const engine = b.dataset.inferVal === 'cloud' ? 'cloud' : 'local';
+        if (engine !== pipeline.inferEngine) {
+            if (engine === 'cloud') {
+                localLayoutChoice = pipeline.layoutModel;
+                pipeline.layoutModel = 'ctd';
+            } else if (localLayoutChoice) pipeline.layoutModel = localLayoutChoice;
+        }
+        pipeline.inferEngine = engine;
         syncInferUI();
         syncOcrManager();
         setDirty(true);
@@ -443,11 +473,11 @@ export async function testCloud(): Promise<void> {
         setStatus('Enter the endpoint URL and API key first.', 'err', 0, el);
         return;
     }
-    setStatus('Testing cloud… (first call can take a minute to wake it)', '', 0, el);
+    setStatus('Connecting to the detection server… It may need time to wake up.', '', 0, el);
     try {
         const resp = await chrome.runtime.sendMessage({ type: 'mt:test-cloud', endpoint, key });
         if (resp?.ok) {
-            setStatus(`Cloud OK — ${(resp.ms / 1000).toFixed(1)}s (warmed up, ready to read)`, 'ok', 0, el);
+            setStatus(`Detection server ready · ${(resp.ms / 1000).toFixed(1)}s`, 'ok', 0, el);
         } else {
             setStatus(`Cloud failed: ${String(resp?.error ?? 'unknown')}`, 'err', 0, el);
         }
@@ -510,9 +540,9 @@ function syncThinkingHint(): void {
     ($('thinkingHint') as HTMLElement).textContent =
         (THINKING_HINTS as Record<string, string>)[v]
         ?? (/^\d+$/.test(v)
-            ? 'Custom token budget — sent as thinkingBudget/budget_tokens where supported.'
+            ? 'Maximum thinking tokens, if your provider supports a token limit.'
             : v
-                ? 'Custom value — sent as-is; rejected values fall back to the model default.'
+                ? 'Uses this value if supported. Otherwise, uses the model default.'
                 : THINKING_HINTS.auto);
 }
 

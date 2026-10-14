@@ -1,0 +1,47 @@
+{
+    "file": "koharu-fp32-chunked.onnx",
+    "bytes": 149799163,
+    "sha256": "35d89289e92a6dba75b9ccd4ebd447a55aad69c993d0a8e439c57509d598dfd6",
+    "format": "onnx",
+    "precision": "float32",
+    "opset": 17,
+    "ir_version": 8,
+    "attention_query_chunk_size": 256,
+    "source": {
+        "repo": "mayocream/koharu-layout-rfdetr-seg-2xl-1152",
+        "revision": "aed55fdb8ca953c6bec33cf6ed6dd52a9b72bfa2",
+        "file": "model.safetensors",
+        "sha256": "9bf6d2cbd7793c956d8c857bb1672a396eb7f100eb0682f86830d05e31168efb"
+    },
+    "license": "other",
+    "license_url": "https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152/blob/aed55fdb8ca953c6bec33cf6ed6dd52a9b72bfa2/README.md",
+    "export_environment": {
+        "python": "3.12",
+        "rfdetr": "1.7.0",
+        "torch": "2.10.0+cpu",
+        "torchvision": "0.25.0+cpu",
+        "transformers": "5.19.0",
+        "onnx": "1.23.2",
+        "safetensors": "0.8.0"
+    },
+    "input": {
+        "name": "input",
+        "shape": [1, 3, 1152, 1152],
+        "dtype": "float32",
+        "layout": "NCHW",
+        "color": "RGB",
+        "resize": "bilinear, antialiased, float32, stretch to 1152 x 1152",
+        "scale": 0.00392156862745098,
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225]
+    },
+    "outputs": {
+        "dets": { "shape": [1, 300, 4], "dtype": "float32", "description": "Normalized cx, cy, width, height boxes" },
+        "labels": { "shape": [1, 300, 5], "dtype": "float32", "description": "Class logits; sigmoid first four channels, ignore no-object channel" },
+        "masks": { "shape": [1, 300, 288, 288], "dtype": "float32", "description": "Mask logits; bilinearly resize to original image size and threshold at zero" }
+    },
+    "num_select": 160,
+    "selection": "Global top-160 query/class pairs across the first four sigmoid class channels, then per-class thresholds",
+    "classes": { "0": "text", "1": "onomatopoeia", "2": "bubble", "3": "panel" },
+    "recommended_thresholds": { "text": 0.25, "onomatopoeia": 0.20, "bubble": 0.50, "panel": 0.50 }
+}

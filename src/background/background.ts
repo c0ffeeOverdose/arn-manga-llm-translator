@@ -572,7 +572,11 @@ function flightRecentPut(id: string, resp: unknown): void {
     if (flightRecent.size > FLIGHT_RECENT_MAX) flightRecent.delete(flightRecent.keys().next().value!);
 }
 
-function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: (r: unknown) => void, sender?: chrome.runtime.MessageSender) {
+function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: (r: unknown) => void, sender?: chrome.runtime.MessageSender, connected?: () => boolean) {
+    let ownedWaiters: ((resp: unknown) => void)[] | undefined;
+    const ensureConnected = (): void => {
+        if (connected && !connected() && !ownedWaiters?.length) throw new DOMException('Translation stopped', 'AbortError');
+    };
     const trace = sender && isChapterRunnerSender(sender) ? msg.chapterTrace : undefined;
     recordChapterLog(trace, { kind: 'llm-received' });
     const send = (result: unknown): void => {
@@ -635,6 +639,7 @@ function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: 
                 // must not advance the network backoff ladder (1000ms → 4000ms)
                 let errAttempt = 0;
                 for (;;) {
+                    ensureConnected();
                     calls++;
                     const tAttempt = Date.now();
                     recordChapterLog(trace, { kind: 'llm-provider-start', calls });
@@ -715,6 +720,7 @@ function runTranslate(msg: TranslateMsg, reply: (r: unknown) => void, interim?: 
                 return;
             }
             const mine: ((resp: unknown) => void)[] = [];
+            ownedWaiters = mine;
             flightWaiters.set(reqId, mine);
             flightStats.owners++;
             // every exit (ok or error) settles waiters with the same payload.
@@ -911,6 +917,8 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
     }
     if (port.name === 'mt-rpc') {
+        let connected = true;
+        port.onDisconnect.addListener(() => { connected = false; });
         // per-message port-RPC — same runTranslate as the classic path, so
         // behavior is identical on both channels.
         port.onMessage.addListener((msg) => {
@@ -924,7 +932,7 @@ chrome.runtime.onConnect.addListener((port) => {
                 // split-pipeline interim (transcripts) — same channel, filtered
                 // by the content script before it settles its promise
                 try { port.postMessage(r); } catch { /* peer gone */ }
-            }, port.sender);
+            }, port.sender, () => connected);
         });
     }
 });
@@ -943,5 +951,5 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 chrome.contextMenus?.onClicked.addListener((info, tab) => {
     if (info.menuItemId !== 'mt-translate-image' || !tab?.id) return;
-    chrome.tabs.sendMessage(tab.id, { type: 'mt:translate-image', srcUrl: info.srcUrl }).catch(() => {});
+    chrome.tabs.sendMessage(tab.id, { type: 'mt:translate-image', srcUrl: info.srcUrl, fromMenu: true }).catch(() => {});
 });

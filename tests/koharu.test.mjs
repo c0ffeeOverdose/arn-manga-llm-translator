@@ -91,8 +91,8 @@ test('instance logits interpolate before threshold and invalid outputs fail loud
 });
 
 test('model selection migrates defensively and survives quality presets', () => {
-    assert.equal(loadPipelineSettings({}).layoutModel, 'ctd');
-    assert.equal(loadPipelineSettings({ layoutModel: 'unknown' }).layoutModel, 'ctd');
+    assert.equal(loadPipelineSettings({}).layoutModel, 'koharu');
+    assert.equal(loadPipelineSettings({ layoutModel: 'unknown' }).layoutModel, 'koharu');
     const chosen = loadPipelineSettings({ layoutModel: 'koharu', inferEngine: 'local', detEp: 'wasm', koharuTextConf: .4 });
     assert.equal(applyPreset('fast', chosen).layoutModel, 'koharu');
     assert.equal(applyPreset('best', chosen).detEp, 'wasm');
@@ -101,14 +101,22 @@ test('model selection migrates defensively and survives quality presets', () => 
 
 test('CTD cache identity ignores Koharu settings; Koharu model and thresholds separate checkpoints', () => {
     const original = '["Thai","crops","baberu","rtl",0.35,12,0.2,true,false,false,false,null,0,"local",["jpn","eng"],"",false,1280,420,0.85,true,true,true,true,15,10,"auto","none",3,"tile40"]';
-    assert.equal(settingsFingerprint({}), original);
+    assert.equal(settingsFingerprint({ layoutModel: 'ctd' }), original);
     assert.equal(settingsFingerprint({ layoutModel: 'ctd', koharuTextConf: .5 }), original);
     const fp = settingsFingerprint({ layoutModel: 'koharu' });
+    assert.equal(settingsFingerprint({}), fp);
     assert.notEqual(fp, original); assert.notEqual(fp, settingsFingerprint({ layoutModel: 'koharu', koharuTextConf: .5 }));
     const checkpoint = partialEntry('chapter#hash', fp, { boxes: [{x1:0,y1:0,x2:4,y2:4,conf:1}], panels: [],
         ep: 'webgpu', mask: { width:4,height:4,data:new Uint8Array(16).fill(255).buffer } }, 4, 4);
     assert.equal(isResumable(checkpoint, original, 4, 4, false), false);
     assert.equal(isResumable(checkpoint, fp, 4, 4, false), true);
+});
+
+test('cloud cache defaults agree with loaded settings and the existing CTD identity', () => {
+    const legacy = { inferEngine: 'cloud' };
+    assert.equal(settingsFingerprint(legacy), settingsFingerprint({ ...legacy, layoutModel: 'ctd' }));
+    assert.equal(settingsFingerprint(legacy), settingsFingerprint(loadPipelineSettings(legacy)));
+    assert.notEqual(settingsFingerprint(legacy), settingsFingerprint({ ...legacy, layoutModel: 'koharu' }));
 });
 
 const file = ts.createSourceFile('pipeline.ts', readFileSync('src/content/pipeline.ts','utf8'), ts.ScriptTarget.Latest, true);

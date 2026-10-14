@@ -5,13 +5,13 @@ import { overlayOn, setOverlayOn, setOverlayChoice, debugOn, setDebugOn, shareCo
 import { getPages, refKey } from './page-io';
 import { cacheCount, cacheCountChapter } from './page-cache';
 import { isDebug, setDebug } from '../debug';
-import { queue, isBusy, enqueue, dequeue, clearQueue, pageKeyOf, activeKeyGet, paintQueued, resumeAuto, viewportOverlap } from './queue';
+import { queue, isBusy, enqueue, dequeue, pageActive, cancelPage, stopAllJobs, paintBusy, pageKeyOf, activeKeyGet, paintQueued, autoHalted, resumeAuto, viewportOverlap } from './queue';
 import { setStatus, idleStatus, pageCounts, makeToast, logError } from './status-ui';
 import { applyOverlays } from './overlays';
 import { ensureDebugViews } from './ocr';
 import { toggleCharsPanel, charsPanelOpen } from './chars-ui';
-import { setAutoTranslate, lookaheadActive, cancelLookahead } from './auto';
-import { startSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, elementMap, chapterOwnsRequest, resolveChapterRef } from './sweep';
+import { setAutoTranslate, lookaheadActive, cancelLookahead, pauseAuto } from './auto';
+import { startSweep, resumeSweep, cancelSweep, sweepStatus, sweepPages, sweepAttachWhy, elementMap, chapterOwnsRequest, chapterPageStatus, stopChapterPage, updateChapterContext, resolveChapterRef } from './sweep';
 import { initTranslationReset } from './translation-reset';
 import { acceptCacheGeneration } from '../cache-generation';
 import { sendToBackground } from '../bg-rpc';
@@ -24,8 +24,10 @@ export function toggleOverlay(): void {
 }
 
 export async function toggleShareContextToggle(): Promise<void> {
-    setShareContext(!shareContext);
     await loadContext(); // ensure session key exists before saving
+    const next = !shareContext;
+    await updateChapterContext(next);
+    setShareContext(next);
     await saveContext();
 }
 
@@ -89,7 +91,7 @@ async function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => v
     }));
     if (!fresh.length) {
         if (!cands.length) return missPage(sendResponse);
-        setStatus('Already translated — use Retranslate to redo', 'done');
+        setStatus('Already translated. Select Re-translate page to try again.', 'done');
         sendResponse({ ok: true, already: true });
         return;
     }
@@ -104,10 +106,10 @@ async function translateVisible(refs: PageRef[], sendResponse: (r: unknown) => v
         else if (dequeue(c.r)) cancelled++; // second press on a queued spread = cancel it
     }
     if (queued) {
-        setStatus('Translating spread…', 'busy');
+        setStatus('Starting page translation…', 'busy');
         sendResponse({ ok: true, count: queued });
     } else if (cancelled) {
-        setStatus(`Removed from queue — ${idleStatus()}`, 'idle');
+        setStatus('Page removed from the waiting list', 'idle');
         sendResponse({ ok: true, cancelled: true, count: cancelled });
     } else if (active) {
         sendResponse({ ok: true, active: true });
@@ -126,7 +128,7 @@ function missPage(sendResponse: (r: unknown) => void): void {
 
 export function installMessageListener(): void {
     initTranslationReset();
-    chrome.runtime.onMessage.addListener((msg: { type: string; srcUrl?: string }, _sender, sendResponse) => {
+    chrome.runtime.onMessage.addListener((msg: { type: string; srcUrl?: string; fromMenu?: boolean }, _sender, sendResponse) => {
         if (msg?.type === 'mt:reader-identity') {
             sendResponse({ url: location.href, chapter: chapterKey() });
             return;
@@ -135,8 +137,8 @@ export function installMessageListener(): void {
             const refs = getPages();
             // click-directed (menu pick / srcUrl) vs spread (bare popup press means
             // "everything I'm looking at").
-            const clickFresh = !!lastRightClicked && Date.now() - lastRightClickT < 30000;
-            const directed = clickFresh || !!msg.srcUrl;
+            const clickFresh = msg.fromMenu === true && !!lastRightClicked && Date.now() - lastRightClickT < 30000;
+            const directed = msg.fromMenu === true || !!msg.srcUrl;
             // right-clicked element first (precise), browser-attested srcUrl, the img
             // under the click point (overlay-piercing), viewport fallback
             const elHit = clickFresh && refs.find(r => r.el === lastRightClicked);
@@ -158,7 +160,7 @@ export function installMessageListener(): void {
             // already translated → say so instead of queueing a silent no-op job.
             // (Checked before unpinning: a free click must not flip "Show original".)
             if (stateFor(ref)?.det) {
-                setStatus('Already translated — use Retranslate to redo', 'done');
+                setStatus('Already translated. Select Re-translate page to try again.', 'done');
                 sendResponse({ ok: true, already: true });
                 return;
             }
@@ -172,30 +174,45 @@ export function installMessageListener(): void {
                 if (chapterOwnsRequest(ref, false)) { sendResponse({ ok: true, active: true }); return; }
                 const r = enqueue(ref);
                 if (r === 'dup') {
-                    if (dequeue(ref)) { setStatus(`Removed from queue — ${idleStatus()}`, 'idle'); sendResponse({ ok: true, cancelled: true }); }
+                    if (dequeue(ref)) { setStatus('Page removed from the waiting list', 'idle'); sendResponse({ ok: true, cancelled: true }); }
                     else sendResponse({ ok: true, cancelled: false });
                 } else sendResponse(r === 'active' ? { ok: true, active: true } : { ok: true });
             }, e => sendResponse({ ok: false, error: String(e) }));
             return true;
         }
         if (msg?.type === 'mt:cancel-all') {
-            // drop everything queued — the in-flight page runs out (mid-LLM abort
-            // wastes tokens and corrupts the book). Background engines stop too.
+            // Pause Auto and revoke active requests before clearing queued work.
             const n = queue.length + paintQueued();
             const stopping = !!sweepStatus()?.active || cancelLookahead();
-            clearQueue();
+            pauseAuto();
+            stopAllJobs();
             cancelSweep();
-            setStatus(n ? `Cancelled — dropped ${n} queued` : stopping ? 'Stopping background work…' : idleStatus(), 'idle');
+            setStatus(n ? `Stopped. ${n} waiting ${n === 1 ? 'page cancelled' : 'pages cancelled'}.` : stopping ? 'Stopping translations…' : idleStatus(), 'idle');
             sendResponse({ ok: true, dropped: n });
             return;
+        }
+        if (msg?.type === 'mt:stop-page') {
+            pauseAuto();
+            const ref = imgInViewport();
+            if (!ref) { sendResponse({ ok: false, error: 'No manga page in view' }); return; }
+            resolveChapterRef(ref).then(async () => {
+                const stopped = await stopChapterPage(ref) || cancelPage(ref);
+                setStatus(stopped ? 'Page translation stopped' : idleStatus(), 'idle');
+                sendResponse({ ok: true, stopped });
+            }).catch(e => sendResponse({ ok: false, error: String(e) }));
+            return true;
+        }
+        if (msg?.type === 'mt:auto-resume') {
+            setAutoTranslate(true).then(() => sendResponse({ ok: true }));
+            return true;
         }
         if (msg?.type === 'mt:retranslate') {
             // re-translate only the page the reader is on (with context rewind)
             setOverlayChoice('auto'); // explicit translate intent unpins a previous "Show original"
-            resumeAuto(); // user intent — clears a provider halt (rate limit/auth)
+            resumeAuto(true); // retrying one page preserves a user-paused Auto loop
             const ref = imgInViewport();
-            if (!ref) { sendResponse({ ok: false, error: 'no manga image in view' }); return; }
-            if (pageKeyOf(ref) === activeKeyGet()) { sendResponse({ ok: false, error: 'page is rendering right now' }); return; }
+            if (!ref) { sendResponse({ ok: false, error: 'No manga page in view. Scroll to a page and try again.' }); return; }
+            if (pageKeyOf(ref) === activeKeyGet()) { sendResponse({ ok: false, error: 'This page is still being translated. Stop it first to try again.' }); return; }
             // The chapter owner holds this page's pixels and book position: a queue job would
             // duplicate the render and fold the page twice. Let the owner redo it instead.
             resolveChapterRef(ref).then(() => {
@@ -212,7 +229,7 @@ export function installMessageListener(): void {
             return;
         }
         if (msg?.type === 'mt:toggle-context') {
-            toggleShareContextToggle().then(() => sendResponse({ ok: true, shareContext }));
+            toggleShareContextToggle().then(() => sendResponse({ ok: true, shareContext }), e => sendResponse({ ok: false, error: String(e) }));
             return true;
         }
         if (msg?.type === 'mt:toggle-chars') {
@@ -268,7 +285,8 @@ export function installMessageListener(): void {
             sendResponse({
                 ok: true,
                 status: uiText(),
-                busy: isBusy(),
+                busy: isBusy() || paintBusy(),
+                autoPaused: autoHalted()?.kind === 'user',
                 overlayOn,
                 shareContext,
                 debugOn,
@@ -279,12 +297,12 @@ export function installMessageListener(): void {
                 pageTiming: lastPageTiming(),
                 // viewed-page state for the popup's main button (keyed by page —
                 // the reader swaps elements, so element identity lies).
-                viewedTranslated: viewed ? !!stateFor(viewed)?.det : false,
+                viewedTranslated: viewed ? !!stateFor(viewed)?.det || chapterPageStatus(viewed).ready : false,
                 // why the last chapter attach refused — distinguishes "not translated" from
                 // "translated but refused to paint", which looked identical from outside
                 attachWhy: sweepAttachWhy(),
-                viewedQueued: viewed ? queue.some(j => j.key === pageKeyOf(viewed)) : false,
-                viewedActive: viewed ? pageKeyOf(viewed) === activeKeyGet() : false,
+                viewedQueued: viewed ? queue.some(j => j.key === pageKeyOf(viewed)) || chapterPageStatus(viewed).queued : false,
+                viewedActive: viewed ? pageActive(viewed) || chapterPageStatus(viewed).active : false,
                 sweep: sweepStatus(),
                 lookaheadActive: lookaheadActive(),
                 ...pageCounts(),
@@ -305,6 +323,10 @@ export function installMessageListener(): void {
         }
         if (msg?.type === 'mt:sweep-start') {
             startSweep().then(r => sendResponse(r));
+            return true;
+        }
+        if (msg?.type === 'mt:sweep-resume') {
+            resumeSweep().then(sendResponse);
             return true;
         }
         if (msg?.type === 'mt:sweep-cancel') {

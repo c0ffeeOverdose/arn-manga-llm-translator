@@ -61,22 +61,49 @@ export const DET_FILES = [
 
 export const DET_URL = (file: string) => `https://huggingface.co/c0ffeeOverdose/arn-manga-models/resolve/main/${file}?download=true`;
 
-export async function detDownload(onProgress?: (file: string, loaded: number, total: number) => void): Promise<void> {
+export async function detDownload(onProgress?: (file: string, loaded: number, total: number) => void, force = false): Promise<void> {
     for (const f of DET_FILES) {
-        const db = await openDb();
-        const have = await new Promise<boolean>(res => {
-            const q = db.transaction('m', 'readonly').objectStore('m').getKey(f.key);
-            q.onsuccess = () => res(q.result !== undefined);
-            q.onerror = () => res(false);
-        });
-        if (have) continue; // already cached (resume-friendly across files)
-        const buf = await fetchWithProgress(DET_URL(f.file), (loaded, total) => onProgress?.(f.file, loaded, total));
-        await new Promise<void>((res2, rej2) => {
-            const q = db.transaction('m', 'readwrite').objectStore('m').put(buf, f.key);
-            q.onsuccess = () => res2();
-            q.onerror = () => rej2(q.error);
-        });
+        await downloadStoredModel(f.key, DET_URL(f.file), (loaded, total) => onProgress?.(f.file, loaded, total), force);
     }
+}
+
+export async function detDelete(): Promise<void> {
+    await deleteStoredModels(DET_FILES.map(f => f.key));
+}
+
+async function deleteStoredModels(keys: readonly string[]): Promise<void> {
+    const db = await openDb();
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction('m', 'readwrite');
+            const store = tx.objectStore('m');
+            for (const key of keys) store.delete(key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = tx.onabort = () => reject(tx.error);
+        });
+    } finally { db.close(); }
+}
+
+// Replacement downloads preserve the saved file until the new transaction commits.
+async function downloadStoredModel(key: string, url: string, onProgress: ((loaded: number, total: number) => void) | undefined, force: boolean): Promise<void> {
+    const db = await openDb();
+    try {
+        if (!force) {
+            const have = await new Promise<boolean>((resolve, reject) => {
+                const q = db.transaction('m', 'readonly').objectStore('m').getKey(key);
+                q.onsuccess = () => resolve(q.result !== undefined);
+                q.onerror = () => reject(q.error);
+            });
+            if (have) return;
+        }
+        const buf = await fetchWithProgress(url, onProgress, { cache: force ? 'reload' : 'default' });
+        await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction('m', 'readwrite');
+            tx.objectStore('m').put(buf, key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = tx.onabort = () => reject(tx.error);
+        });
+    } finally { db.close(); }
 }
 
 // Streamed download with progress. Short reads throw (never cache corrupt buffers);
@@ -84,28 +111,32 @@ export async function detDownload(onProgress?: (file: string, loaded: number, to
 const STALL_MS = 30000;
 // Transient failures must not kill a multi-file batch — retry each fetch. Files are immutable, so GET retries are safe.
 const FETCH_RETRIES = 3;
-export async function fetchWithProgress(url: string, onProgress?: (loaded: number, total: number) => void): Promise<ArrayBuffer> {
+class DownloadHttpError extends Error {
+    constructor(readonly status: number) { super(`HTTP ${status}`); }
+}
+export async function fetchWithProgress(url: string, onProgress?: (loaded: number, total: number) => void, options: { cache?: RequestCache } = {}): Promise<ArrayBuffer> {
     let lastErr: unknown = null;
     for (let attempt = 0; ; attempt++) {
         try {
-            return await fetchOnce(url, onProgress);
+            return await fetchOnce(url, onProgress, options);
         } catch (e) {
             lastErr = e;
+            if (e instanceof DownloadHttpError && [401, 403, 429].includes(e.status)) throw e;
             if (attempt + 1 >= FETCH_RETRIES) throw lastErr;
             await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
         }
     }
 }
 
-async function fetchOnce(url: string, onProgress?: (loaded: number, total: number) => void): Promise<ArrayBuffer> {
+async function fetchOnce(url: string, onProgress: ((loaded: number, total: number) => void) | undefined, options: { cache?: RequestCache }): Promise<ArrayBuffer> {
     const ctrl = new AbortController();
     let to: ReturnType<typeof setTimeout> | undefined;
     const clear = () => { if (to !== undefined) { clearTimeout(to); to = undefined; } };
     const bump = () => { clear(); to = setTimeout(() => ctrl.abort(new Error('stalled')), STALL_MS); };
     try {
         bump();
-        const resp = await fetch(url, { signal: ctrl.signal });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const resp = await fetch(url, { ...options, signal: ctrl.signal });
+        if (!resp.ok) throw new DownloadHttpError(resp.status);
         const total = +(resp.headers.get('content-length') ?? 0);
         const reader = resp.body?.getReader();
         if (!reader) {
@@ -255,27 +286,10 @@ export async function inpaintInstalled(): Promise<boolean> {
     });
 }
 
-export async function inpaintDownload(onProgress?: (loaded: number, total: number) => void): Promise<void> {
-    const db = await openDb();
-    const have = await new Promise<boolean>(res => {
-        const q = db.transaction('m', 'readonly').objectStore('m').getKey(INPAINT_KEY);
-        q.onsuccess = () => res(q.result !== undefined);
-        q.onerror = () => res(false);
-    });
-    if (have) return;
-    const buf = await fetchWithProgress(DET_URL(INPAINT_FILE), onProgress);
-    await new Promise<void>((res, rej) => {
-        const q = db.transaction('m', 'readwrite').objectStore('m').put(buf, INPAINT_KEY);
-        q.onsuccess = () => res();
-        q.onerror = () => rej(q.error);
-    });
+export async function inpaintDownload(onProgress?: (loaded: number, total: number) => void, force = false): Promise<void> {
+    await downloadStoredModel(INPAINT_KEY, DET_URL(INPAINT_FILE), onProgress, force);
 }
 
 export async function inpaintDelete(): Promise<void> {
-    const db = await openDb();
-    await new Promise<void>(res => {
-        const q = db.transaction('m', 'readwrite').objectStore('m').delete(INPAINT_KEY);
-        q.onsuccess = () => res();
-        q.onerror = () => res();
-    });
+    await deleteStoredModels([INPAINT_KEY]);
 }

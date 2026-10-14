@@ -9,6 +9,7 @@ import { readerStartAllowed } from '../chapter/reader';
 import { cacheClear } from '../content/page-cache';
 import { CACHE_GENERATION_KEY, cacheReady, cacheGeneration, acceptCacheGeneration, assertCacheCurrent } from '../cache-generation';
 import { createChapterLog, appendChapterLog, recordChapterLog, latestChapterLogHead, chapterLogOwned } from '../chapter/log-store';
+import { chapterSettingsChanged } from '../chapter/settings';
 
 declare const __BUILD_ID__: string;
 
@@ -22,6 +23,15 @@ let runner: ChapterRunner = createRunner();
 let liveId = '';
 let liveLogId = '';
 let clearing: Promise<unknown> | undefined;
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !chapterSettingsChanged(changes)) return;
+    void (async () => {
+        const id = liveId || (await sessGet('mtChapterActive')).mtChapterActive;
+        if (typeof id !== 'string' || !id || !await runner.live(id)) return;
+        await writeRecord(`settings-stale:${id}`, true);
+        await chrome.runtime.sendMessage({ type: 'mt:chapter-command', id, command: 'settings-changed' });
+    })().catch(() => {});
+});
 async function binding(tab: number): Promise<Binding | undefined> {
     return (await sessGet(bindingKey(tab)))[bindingKey(tab)] as Binding | undefined;
 }
@@ -88,7 +98,7 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
     await writeRecord(`host:${id}`, config);
     liveId = id;
     liveLogId = logId;
-    await sessSet({ [bindingKey(tab)]: { id, kind: config.kind, chapter: data.chapter } });
+    await sessSet({ mtChapterActive: id, [bindingKey(tab)]: { id, kind: config.kind, chapter: data.chapter } });
     await runner.ensure(id);
     // A created runner context can still fail to attach (a stale document no-ops, or its module
     // dies before the handshake). Without this the start reports a session that nothing will
@@ -114,6 +124,7 @@ async function clearTranslations(): Promise<unknown> {
     liveId = '';
     const keys = Object.keys(await sessGet(null)).filter(key => key.startsWith('mtChapterTab:'));
     await sessRemove(keys);
+    await sessRemove('mtChapterActive');
     await clearRecords();
     await cacheClear();
     const tabs = await chrome.tabs.query({});
@@ -167,10 +178,20 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (msg.type === 'mt:chapter-command') return;
     const work = async () => {
         if (msg.type === 'mt:chapter-host-init' || msg.type === 'mt:chapter-runner-ready'
-            || msg.type === 'mt:chapter-publish' || msg.type === 'mt:chapter-context') {
+            || msg.type === 'mt:chapter-publish' || msg.type === 'mt:chapter-context' || msg.type === 'mt:chapter-log-enable') {
             const config = await authenticatedRunner(sender, msg);
             if (!config) return { ok: false, error: 'Unknown chapter session' };
             if (msg.type === 'mt:chapter-host-init') return { ok: true, config };
+            if (msg.type === 'mt:chapter-log-enable') {
+                const logId = config.logId && await chapterLogOwned(config.logId, config.readerTab, config.chapter) ? config.logId
+                    : await createChapterLog(config.readerTab, config.chapter, typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'development', navigator.userAgent);
+                if (logId) {
+                    config.logId = logId;
+                    await writeRecord(`host:${config.id}`, config);
+                    if (liveId === config.id) liveLogId = logId;
+                }
+                return { ok: true, logId };
+            }
             if (msg.type === 'mt:chapter-runner-ready') { attachWatch.hit(config.id); return { ok: true }; }
             if (msg.type === 'mt:chapter-context') {
                 recordChapterLog(config.logId ? { logId: config.logId } : undefined, { kind: 'context-received' });
@@ -228,10 +249,11 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                     } satisfies ChapterProgress };
                 }
             }
-            if (status && ['running', 'waiting', 'stopping'].includes(status.phase) && !(await runner.live(b.id))) {
+            if (status && (['running', 'waiting', 'stopping'].includes(status.phase) || status.pages.some(p => p.phase !== 'ready')) && !(await runner.live(b.id))) {
                 const cfg = await readRecord<HostConfig>(`host:${b.id}`);
                 recordChapterLog(cfg?.logId ? { logId: cfg.logId } : undefined, { kind: 'runner-lost', reason: 'disconnected' });
                 status.phase = 'error';
+                status.runnerLost = true;
                 status.message = 'Translation paused — the background task stopped; start again to continue';
                 status.inflight = 0;
                 await writeRecord(`status:${b.id}`, status);
@@ -254,7 +276,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                 return { ok: true };
             }
             return await chrome.runtime.sendMessage({ type: 'mt:chapter-command', id: b.id,
-                command: msg.command, page: msg.page, pages: msg.pages, completeManifest: msg.completeManifest });
+                command: msg.command, page: msg.page, pages: msg.pages, completeManifest: msg.completeManifest, shareContext: msg.shareContext });
         }
         return { ok: false };
     };

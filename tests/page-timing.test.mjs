@@ -2,14 +2,16 @@ import { build } from 'esbuild';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const bundle = await build({ entryPoints: ['src/page-timing.ts'], bundle: true, format: 'esm', write: false });
-const { PageTimer, lastPageTiming, formatPageTiming, timingSeconds } = await import(
+const bundle = await build({ stdin: { contents: `export * from './src/page-timing'; export { setDebug } from './src/debug';`,
+    resolveDir: process.cwd(), loader: 'ts' }, bundle: true, format: 'esm', write: false });
+const { PageTimer, lastPageTiming, formatPageTiming, timingSeconds, setDebug } = await import(
     'data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64')
 );
 
-test('timings accumulate with visual debug off and preserve asynchronous failures', async () => {
+test('timings accumulate in Debug mode and preserve asynchronous failures', async () => {
+    setDebug(true);
     const timer = new PageTimer();
-    timer.meta.debug = false;
+    timer.meta.debug = true;
     timer.activate();
     timer.add('cropExpand', 3);
     timer.add('cropExpand', 4);
@@ -20,7 +22,7 @@ test('timings accumulate with visual debug off and preserve asynchronous failure
     const report = lastPageTiming();
     assert.equal(report.state, 'failed');
     assert.equal(report.stage, 'Translation requests');
-    assert.equal(report.meta.debug, false);
+    assert.equal(report.meta.debug, true);
     assert.equal(report.ms.cropExpand, 7);
     assert.ok(report.ms.llm >= 0);
     assert.ok(report.ms.paint >= 0);
@@ -28,6 +30,7 @@ test('timings accumulate with visual debug off and preserve asynchronous failure
 });
 
 test('reports are snapshots and export only safe metadata, never full settings or responses', () => {
+    setDebug(true);
     const timer = new PageTimer();
     Object.assign(timer.meta, {
         page: '2000x3000', model: 'test-model', provider: 'openai', calls: 1,
@@ -47,6 +50,7 @@ test('reports are snapshots and export only safe metadata, never full settings o
 });
 
 test('copy formatting rejects unexpected durations and bounds text fields', () => {
+    setDebug(true);
     const timer = new PageTimer();
     timer.add('paint', Infinity);
     timer.add('png', -5);
@@ -58,4 +62,31 @@ test('copy formatting rejects unexpected durations and bounds text fields', () =
     assert.doesNotMatch(text, /PRIVATE_DURATION|NaN|Infinity/);
     assert.doesNotMatch(text, /m{129}/);
     assert.equal(timingSeconds(1234), '1.23s');
+});
+
+test('Debug off runs the work without recording timings or publishing a report', async () => {
+    setDebug(false);
+    const timer = new PageTimer();
+    timer.activate(); timer.add('paint', 12);
+    assert.equal(timer.measure('paint', () => 42), 42);
+    await assert.rejects(timer.measureAsync('llm', async () => { throw Error('fixture'); }), /fixture/);
+    timer.finish('failed');
+    assert.equal(lastPageTiming(), null);
+    assert.deepEqual(timer.report().ms, {});
+    setDebug(true); timer.finish('done');
+    assert.equal(lastPageTiming(), null, 'enabling Debug does not adopt work started without it');
+});
+
+test('turning Debug off invalidates an in-flight timing capture across a later re-enable', async () => {
+    setDebug(true);
+    const timer = new PageTimer(); timer.activate();
+    let release;
+    const pending = timer.measureAsync('llm', () => new Promise(resolve => { release = resolve; }));
+    setDebug(false); setDebug(true); release('ok');
+    assert.equal(await pending, 'ok');
+    timer.finish('done');
+    assert.equal(lastPageTiming(), null);
+    assert.equal(timer.report().ms.llm, undefined);
+    const fresh = new PageTimer(); fresh.add('paint', 3); fresh.finish('done');
+    assert.equal(lastPageTiming().ms.paint, 3);
 });

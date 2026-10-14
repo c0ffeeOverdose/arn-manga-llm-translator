@@ -20,7 +20,7 @@ import { attachModelBalloons } from './model-balloon';
 import { recordChapterLog } from '../chapter/log-store';
 import type { ChapterTrace } from '../chapter/log';
 
-export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; fp?: string; cacheEpoch?: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer; timing?: PageTimer }
+export interface Prep { srcUrl: string; bitmap: ImageBitmap; det: DetectResult; hash: string; fp?: string; cacheEpoch?: string; cached?: Pick<CachedPage, 'outputs' | 'extras' | 'mentions' | 'patches' | 'patchesGen'>; resumed?: true; ocrResumed?: true; cacheMiss?: string; prepMs?: number; origBytes?: ArrayBuffer; timing?: PageTimer; signal?: AbortSignal }
 
 // Headless detect resolve — shared by lookahead prefetch and chapter sweep (DOM jobs use
 // preparePage instead). Full hit → {det:null}; resumable partial → rebuilt det; else fresh
@@ -42,7 +42,7 @@ export async function resolveHeadlessDet(
             return { det: null, resumed: false, cached: hit };
         }
         if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
-            onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
+            onStatus(hit.texts?.length ? 'Reusing saved text…' : 'Reusing text detection…', 'llm');
             return { det: detFromPartial(hit, bitmap.width, bitmap.height)!, resumed: true };
         }
     }
@@ -65,15 +65,15 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
     const endpoint = String((mtSettings as LLMSettings | undefined)?.cloudEndpoint ?? '').trim();
     const key = String((mtSettings as LLMSettings | undefined)?.cloudKey ?? '').trim();
     if (pipeline.inferEngine === 'cloud') {
-        if (pipeline.layoutModel === 'koharu') throw Object.assign(new Error('Koharu FP32 currently runs on-device. Select On-device in Options → Model.'), { kind: 'cloud' });
+        if (pipeline.layoutModel === 'koharu') throw Object.assign(new Error('KoharuLayout runs on-device. Select On-device in Settings → Model.'), { kind: 'cloud' });
         recordChapterLog(opts?.chapterTrace, { kind: 'stage', stage: 'detect', execution: 'cloud' });
         if (!endpoint || !key) {
             throw Object.assign(
-                new Error('Cloud engine selected but endpoint/key missing'),
-                { kind: 'cloud', hint: 'Options → Model → Cloud: paste the endpoint URL + API key, then Test cloud & prewarm' },
+                new Error('Cloud detection needs an endpoint URL and API key.'),
+                { kind: 'cloud', hint: 'Settings → Model → Cloud: add the endpoint URL and API key, then select Test cloud connection.' },
             );
         }
-        onStatus('Cloud detecting…', 'detect');
+        onStatus('Finding text on the server…', 'detect');
         // page/crops modes feed the image to the LLM, so the server OCR pass would be paid
         // for and discarded; only OCR-text mode (or the split reader) needs those texts
         const needsTexts = pipeline.textSource === 'ocr' || pipeline.useOcrModel;
@@ -90,8 +90,8 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
             });
         } catch (e) {
             throw Object.assign(
-                new Error(`Cloud detect failed: ${(e as Error)?.message ?? e}`),
-                { kind: 'cloud', hint: 'Options → Model → Cloud → Test cloud & prewarm (also wakes a sleeping endpoint)' },
+                new Error(`Cloud detection failed: ${(e as Error)?.message ?? e}`),
+                { kind: 'cloud', hint: 'In Settings → Model → Cloud, select Test cloud connection to check or wake the server.' },
             );
         }
     }
@@ -171,28 +171,28 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
 // fromSweep: the caller IS the sweep (already claimed) — skip the sweep-wait.
 // waitSweep=false for user-driven jobs: an explicit Translate press must not sit behind a
 // slow sweep's claim (auto prefetch still waits — it would duplicate the sweep).
-export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false, waitSweep = true): Promise<Prep | null> {
+export async function preparePage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep = false, waitSweep = true, signal?: AbortSignal): Promise<Prep | null> {
     const timing = new PageTimer();
     timing.activate();
     try {
         const prep = await prepareMeasuredPage(ref, force, (s, stage) => {
             timing.setStage(s);
             onStatus(s, stage);
-        }, fromSweep, waitSweep, timing);
+        }, fromSweep, waitSweep, timing, signal);
         if (!prep) { timing.finish('done'); return null; }
         Object.assign(timing.meta, {
             page: `${prep.bitmap.width}x${prep.bitmap.height}`, boxes: prep.det.boxes.length,
             engine: pipeline.inferEngine, textSource: pipeline.textSource,
             thinking: pipeline.thinkingLevel, debug: isDebug(), cached: !!prep.cached,
         });
-        return { ...prep, timing };
+        return { ...prep, timing, signal };
     } catch (e) {
         timing.finish('failed');
         throw e;
     }
 }
 
-async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep: boolean, waitSweep: boolean, timing: PageTimer): Promise<Prep | null> {
+async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnStatus, fromSweep: boolean, waitSweep: boolean, timing: PageTimer, signal?: AbortSignal): Promise<Prep | null> {
     const cacheEpoch = await cacheReady();
     const existing = stateFor(ref);
     if (existing?.det && !force) return null;
@@ -205,6 +205,7 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
     const srcUrl = existing ? existing.orig : refKey(ref);
     resetContextIfNewChapter();
     await loadPipeline();
+    signal?.throwIfAborted();
     const fp = settingsFingerprint(pipeline);
     Object.assign(timing.meta, { engine: pipeline.inferEngine, textSource: pipeline.textSource,
         thinking: pipeline.thinkingLevel, debug: isDebug() });
@@ -237,6 +238,7 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
             ({ bitmap, bytes } = await readSource(existing?.origBytes));
         }
         timing.meta.page = `${bitmap.width}x${bitmap.height}`;
+        signal?.throwIfAborted();
         const tCache = performance.now();
         const cacheDone = () => timing.add('cache', performance.now() - tCache);
         // persistent cache: same image bytes + same settings → skip detect + LLM.
@@ -252,6 +254,7 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
             await Promise.race([sweepWait(refKey(ref), onStatus), new Promise(r => setTimeout(r, 150000))]);
         }
         const hash = timing.measure('cacheHash', () => pageHashFromBitmap(bitmap));
+        signal?.throwIfAborted();
         assertCacheCurrent(cacheEpoch);
         // miss-reason instrument: a revisit that SHOULD hit but misses needs a verdict in one
         // dump (absent | fp | dims | splitgen | mask | identity | disabled)
@@ -268,7 +271,7 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
             if (hitDet) {
                 cacheDone();
                 cacheMiss = undefined;
-                onStatus('Cache hit…');
+                onStatus('Loading saved translation…');
                 return { srcUrl, bitmap, fp, det: hitDet, hash, cacheEpoch, cached: hit, prepMs: prepMs(),
                     // canvas cache hit still needs the original bytes (re-translate reads the stash)
                     origBytes: ref.kind === 'canvas' ? bytes : undefined };
@@ -281,7 +284,7 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
                     isCloud: pipeline.inferEngine === 'cloud',
                     verifyIdentity: row => verifyCachedIdentity(bitmap!, row) });
                 if (selected) {
-                    onStatus('Cache hit…');
+                    onStatus('Loading saved translation…');
                     cacheDone();
                     return { srcUrl, bitmap, fp, det: selected.det, hash, cacheEpoch, cached: selected.entry, prepMs: prepMs(),
                         origBytes: ref.kind === 'canvas' ? bytes : undefined };
@@ -293,7 +296,7 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
             if (isResumable(hit, fp, bitmap.width, bitmap.height, pipeline.inferEngine === 'cloud')) {
                 cacheDone();
                 cacheMiss = undefined;
-                onStatus(hit.texts?.length ? 'Resuming saved OCR…' : 'Resuming saved detection…', 'llm');
+                onStatus(hit.texts?.length ? 'Reusing saved text…' : 'Reusing text detection…', 'llm');
                 return { srcUrl, bitmap, fp, det: detFromPartial(hit, bitmap.width, bitmap.height)!, hash, cacheEpoch, resumed: true as const,
                     ...(hit.texts?.length ? { ocrResumed: true as const } : null), prepMs: prepMs(),
                     origBytes: ref.kind === 'canvas' ? bytes : undefined };
@@ -302,13 +305,16 @@ async function prepareMeasuredPage(ref: PageRef, force: boolean, onStatus: MtOnS
                 // total miss with a fresh warming trace for this page = the previous document died
                 // before its detect checkpoint landed (prevWarming never self-matches)
                 const w = prevWarming;
-                if (w && samePagePath(w.key, refKey(ref)) && warmingFresh(w.ts)) onStatus('Warming was interrupted — restarting…', 'read');
+                if (w && samePagePath(w.key, refKey(ref)) && warmingFresh(w.ts)) onStatus('Page preparation was interrupted. Starting again…', 'read');
             }
         }
         cacheDone();
+        signal?.throwIfAborted();
         const det = await timing.measureAsync('detect', () => detectPage(bitmap, onStatus, { lo: fromSweep, timing }));
+        signal?.throwIfAborted();
         await timing.measureAsync('order', () => orderDetection(det, bitmap));
         assertCacheCurrent(cacheEpoch);
+        signal?.throwIfAborted();
         // detect checkpoint: a page-turn kills this document mid-job — the next load resumes
         // from this entry (same key the full entry overwrites). Zero-box pages skip it.
         // Written even with the cache off (in-flight work, not a cached translation).

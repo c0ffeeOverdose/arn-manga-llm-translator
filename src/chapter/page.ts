@@ -30,6 +30,19 @@ import { chapterLogError, type ChapterLogStage, type ChapterTrace } from './log'
 
 let id = '';
 let logId = '';
+let enablingLog: Promise<void> | undefined;
+function enableChapterLog(): Promise<void> {
+    if (!isDebug() || logId || !config || !status) return Promise.resolve();
+    return enablingLog ??= (async () => {
+        try {
+            const r = await sendToBackground<{ ok?: boolean; logId?: string }>({ type: 'mt:chapter-log-enable', id },
+                { timeoutMs: 10_000, label: 'enable chapter log' });
+            if (!isDebug() || !r?.ok || !r.logId) return;
+            logId = config.logId = status.logId = r.logId;
+            await publish();
+        } finally { enablingLog = undefined; }
+    })();
+}
 function trace(pages?: number[]): ChapterTrace | undefined { return logId ? { logId, pages } : undefined; }
 function step(stage: ChapterLogStage, pages?: number[]): void { recordChapterLog(trace(pages), { kind: 'stage', stage }); }
 function pageStatus(pages: number[], valid: () => boolean = () => true): (text: string, stage?: string) => void {
@@ -48,6 +61,7 @@ const PAGE_LEASE_MS = 300_000;
 const diagnostics: string[] = [];
 (globalThis as unknown as { __mtLog: string[] }).__mtLog = diagnostics;
 const note = (m: string): void => {
+    if (!isDebug()) return;
     diagnostics.push(m);
     if (diagnostics.length > 200) diagnostics.shift();
 };
@@ -66,9 +80,15 @@ let priority = '';
 let publishChain: Promise<unknown> = Promise.resolve();
 const pendingForce = new Set<string>();
 const attempts = new Set<Attempt>();
+const attemptPages = new WeakMap<Attempt, string[]>();
+const leaseSignals = new WeakMap<() => boolean, AbortSignal>();
+const contextSharing = new WeakMap<ContextState, boolean>();
+let settingsStale = false;
+const pageEpochs = new Map<string, number>();
 const visitedDocuments = new Set<string>();
 
 async function discover(generation: number): Promise<boolean> {
+    if (config.requestedPages) return false;
     const url = config.nextDocument;
     if (!url) return false;
     if (visitedDocuments.has(url)) throw new Error('Reader pagination repeats a page');
@@ -124,7 +144,7 @@ function publish(): Promise<void> {
     status.inflight = status.pages.filter(p => ['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)).length;
     // The runner has no console a user (or a harness) can open — the last few breadcrumbs
     // ride along for diagnosis. Never the user-facing `message`: the pill reads that.
-    status.diagnostics = diagnostics.length ? diagnostics.slice(-6).join(' | ').slice(0, 900) : undefined;
+    status.diagnostics = isDebug() && diagnostics.length ? diagnostics.slice(-6).join(' | ').slice(0, 900) : undefined;
     recordChapterLog(trace(), { kind: 'progress', phase: status.phase, done: status.done, total: status.total,
         errors: status.errors, inflight: status.inflight });
     const statusEl = statusElement();
@@ -179,10 +199,11 @@ function showFatal(e: unknown): void {
     }
     // Persist the reason: an offscreen document has no console a user can open, so a crash
     // would otherwise be invisible and the reader would only see "no chapter session".
-    if (id) void writeRecord(`error:${id}`, { message: msg, stack: (e as Error)?.stack ?? '' }).catch(() => {});
+    if (id) void writeRecord(`error:${id}`, { message: msg,
+        ...(isDebug() ? { stack: (e as Error)?.stack ?? '' } : {}) }).catch(() => {});
 }
-async function contextFor(entries?: Contribution[], beforeOrder?: number): Promise<ContextState> {
-    if (!config.shareContext) return { pairs: [], characters: [] };
+async function contextFor(entries?: Contribution[], beforeOrder?: number, sharing = config.shareContext): Promise<ContextState> {
+    if (!sharing) return { pairs: [], characters: [] };
     step(entries ? 'contextWrite' : 'context', entries?.map(e => e.order + 1));
     const r = await sendToBackground<{ ok?: boolean; error?: string; context?: ContextState }>(
         { type: 'mt:chapter-context', id, entries, beforeOrder }, { timeoutMs: 15_000, label: 'chapter context' });
@@ -219,8 +240,8 @@ function stage(item: ProgressItem, valid: () => boolean, phase: ProgressItem['ph
 // Page-local failures do not end the run. Provider refusals and confirmed browser-wide
 // graphics stalls pause it: another page cannot repair a shared unavailable resource.
 async function markFailed(page: ChapterPage, item: ProgressItem, e: unknown, valid: () => boolean): Promise<void> {
-    note(`work p${page.order} FAIL ${(e as Error).name}: ${(e as Error).message}`.slice(0, 200));
     if (!valid()) return;
+    note(`work p${page.order} FAIL ${(e as Error).name}: ${(e as Error).message}`.slice(0, 200));
     const err = e as Error & { kind?: string };
     recordChapterLog(trace([page.order + 1]), { kind: err.kind === 'source' ? 'page-waiting' : 'page-failed', ...chapterLogError(e) });
     // A page that already reached 'ready' in this run is done; a late publish failure must
@@ -252,6 +273,7 @@ interface Prepared {
     bytesKey: string;
     identityKey: string;
     force: boolean;
+    shareContext?: boolean;
     out?: TranslationResult;         // cached translation: commit without an LLM call
     patches?: CachedPage['patches']; // reusable AI-cleanup patches (cached path only)
     patchesGen?: number;
@@ -367,12 +389,17 @@ async function preparePage(page: ChapterPage, generation: number, cacheEpoch: st
 function warmPrepared(p: Prepared, valid: () => boolean): void {
     if (valid() && status.phase === 'running' && !p.warm) p.warm = computeAiPatches(p.bitmap, p.det, p.det.boxes, []).catch(() => null);
 }
+function releasePrepared(p: Prepared): void {
+    if (p.warm) void p.warm.finally(() => p.bitmap.close()).catch(() => {});
+    else p.bitmap.close();
+}
 
 async function translateOrThrow(p: Prepared, snapshot: ContextState, cacheEpoch: string, live: () => boolean): Promise<TranslateOutcome> {
     try {
         step('translationPrep', [p.page.order + 1]);
         const out = await translateRegions(p.bitmap, p.det, pageStatus([p.page.order + 1], live), {
             fold: false, lo: true, context: snapshot, fresh: p.force, cacheEpoch, onStarve: starveNotice,
+            shareContext: contextSharing.get(snapshot) ?? config.shareContext, signal: leaseSignals.get(live),
             chapterTrace: trace([p.page.order + 1]),
             valid: () => live() && status.phase === 'running',
             afterOcr: inpaintMode(config.pipeline) === 'local' ? () => warmPrepared(p, live) : undefined,
@@ -380,7 +407,7 @@ async function translateOrThrow(p: Prepared, snapshot: ContextState, cacheEpoch:
         if ('error' in out && out.error) throw Object.assign(new Error(out.error), { kind: out.errorKind });
         return out;
     } catch (e) {
-        note(`llm p${p.page.order} ${(e as Error).message}`.slice(0, 200));
+        if (live()) note(`llm p${p.page.order} ${(e as Error).message}`.slice(0, 200));
         throw e;
     }
 }
@@ -396,7 +423,7 @@ async function commitPage(p: Prepared, out: TranslationResult, valid: () => bool
     const rendered = await renderPage({ kind: 'img', el: document.createElement('img') },
         { srcUrl: page.url, bitmap, det, hash, cacheEpoch,
             cached: { ...out, patches: p.patches, ...(p.patches?.length ? { patchesGen: p.patchesGen } : null) } },
-        pageStatus([page.order + 1], valid), false, { paintOnly: true, detached: true, warm: p.warm, onPatches: value => { patches = value; } });
+        pageStatus([page.order + 1], valid), false, { paintOnly: true, detached: true, valid, warm: p.warm, onPatches: value => { patches = value; } });
     let blob: Blob;
     try { blob = await (await fetch(rendered.translated)).blob(); }
     finally { URL.revokeObjectURL(rendered.translated); }
@@ -422,7 +449,7 @@ async function commitPage(p: Prepared, out: TranslationResult, valid: () => bool
     } else await cacheDelete(bytesKey, cacheEpoch);
     const contribution = { id: page.id, order: page.order, hash, outputs: out.outputs, mentions: out.mentions ?? [] };
     if (!valid()) return;
-    await contextFor([contribution]);
+    await contextFor([contribution], undefined, p.shareContext ?? config.shareContext);
     if (!valid()) return;
     config.force?.delete(page.id);
     item.revision = (item.revision ?? 0) + 1;
@@ -453,7 +480,9 @@ async function withPageLease<T>(page: ChapterPage, item: ProgressItem, valid: ()
         },
     });
     attempts.add(attempt);
+    attemptPages.set(attempt, [page.id]);
     const live = () => valid() && attempt.valid();
+    leaseSignals.set(live, attempt.signal);
     const task = run(live);
     task.catch(() => {}); // a lease that expired abandons its task; late rejections are noise
     const result = await Promise.race([task, attempt.cancelled.then(() => undefined)]);
@@ -466,6 +495,7 @@ async function withPageLease<T>(page: ChapterPage, item: ProgressItem, valid: ()
 // the per-page fallback of a failed group.
 async function settlePrepared(p: Prepared, snapshot: ContextState, cacheEpoch: string, live: () => boolean): Promise<void> {
     try {
+        p.shareContext = contextSharing.get(snapshot) ?? config.shareContext;
         // A revoked attempt (Stop, retry, cache reset) must not start new provider work.
         if (!live()) return;
         if (status.phase !== 'running') { p.item.phase = 'queued'; return; }
@@ -475,13 +505,14 @@ async function settlePrepared(p: Prepared, snapshot: ContextState, cacheEpoch: s
     } catch (e) {
         await markFailed(p.page, p.item, e, live);
     } finally {
-        p.bitmap.close();
+        releasePrepared(p);
     }
 }
 
 async function workSingle(page: ChapterPage, snapshot: ContextState, generation: number, cacheEpoch: string): Promise<void> {
     const item = status.pages.find(p => p.id === page.id)!;
-    const valid = () => generation === epoch && cacheCurrent(cacheEpoch);
+    const revision = pageEpochs.get(page.id);
+    const valid = () => generation === epoch && revision === pageEpochs.get(page.id) && cacheCurrent(cacheEpoch);
     await withPageLease(page, item, valid, async (live) => {
         const prepared = await preparePage(page, generation, cacheEpoch, live);
         if (prepared === 'done' || prepared === 'skip') return;
@@ -520,7 +551,8 @@ async function combinePages(pages: Prepared[]): Promise<{ bitmap: ImageBitmap; d
 // they are ready. Page-local group failure or lease expiry falls back to per-page calls, so one stuck
 // page still costs one page.
 async function runGroup(group: ChapterPage[], snapshot: ContextState, generation: number, cacheEpoch: string): Promise<void> {
-    const valid = () => generation === epoch && cacheCurrent(cacheEpoch);
+    const revisions = new Map(group.map(p => [p.id, pageEpochs.get(p.id)]));
+    const valid = () => generation === epoch && group.every(p => revisions.get(p.id) === pageEpochs.get(p.id)) && cacheCurrent(cacheEpoch);
     const prepared: Prepared[] = [];
     await Promise.all(group.map(async (page) => {
         const item = status.pages.find(p => p.id === page.id)!;
@@ -531,6 +563,7 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
             await withPageLease(p.page, p.item, valid, live => settlePrepared(p, snapshot, cacheEpoch, live));
             return;
         }
+        p.shareContext = contextSharing.get(snapshot) ?? config.shareContext;
         prepared.push(p);
     }));
     // Parallel preparation must not reorder the story seen by the merged request.
@@ -539,7 +572,7 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
     if (!valid() || status.phase !== 'running') {
         for (const p of prepared) {
             if (valid()) p.item.phase = 'queued';
-            p.bitmap.close();
+            releasePrepared(p);
         }
         if (valid()) await publish();
         return;
@@ -574,14 +607,17 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         },
     });
     attempts.add(attempt);
+    attemptPages.set(attempt, prepared.map(p => p.page.id));
+    let call: Promise<TranslateOutcome> | undefined;
     try {
         const groupPages = prepared.map(p => p.page.order + 1);
         step('translationPrep', groupPages);
-        const call = translateRegions(combined.bitmap, combined.det, pageStatus(groupPages, valid), {
+        call = translateRegions(combined.bitmap, combined.det, pageStatus(groupPages, valid), {
             fold: false, lo: true, context: snapshot, fresh: prepared.some(p => p.force),
+            shareContext: contextSharing.get(snapshot) ?? config.shareContext, signal: attempt.signal,
             cacheEpoch, onStarve: starveNotice, regionCap: combined.total, checkpoint: false,
             chapterTrace: trace(groupPages),
-            valid: () => valid() && status.phase === 'running',
+            valid: () => valid() && attempt.valid() && status.phase === 'running',
             // page mode: one annotated image per page, badges numbered globally across the group
             pageSegments: config.pipeline.textSource === 'page' ? combined.segments : undefined,
             // OCR is done and the LLM request is about to leave: the GPU is idle for the whole
@@ -592,7 +628,7 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         }).then(r => {
             if ('error' in r && r.error) throw Object.assign(new Error(r.error), { kind: r.errorKind });
             return r;
-        });
+        }).finally(() => combined.bitmap.close());
         call.catch(() => {});
         out = await Promise.race([call, attempt.cancelled.then(() => null)]);
     } catch (e) {
@@ -602,13 +638,13 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
     } finally {
         attempt.finish();
         attempts.delete(attempt);
-        combined.bitmap.close();
+        if (!call) combined.bitmap.close();
     }
-    if (!valid()) { for (const p of prepared) p.bitmap.close(); return; }
+    if (!valid()) { for (const p of prepared) releasePrepared(p); return; }
     if (sharedFailure) {
         for (const p of prepared) {
             try { await markFailed(p.page, p.item, sharedFailure, valid); }
-            finally { p.bitmap.close(); }
+            finally { releasePrepared(p); }
         }
         return;
     }
@@ -632,7 +668,7 @@ async function runGroup(group: ChapterPage[], snapshot: ContextState, generation
         base += count;
         try { await commitPage(p, slice, valid); }
         catch (e) { await markFailed(p.page, p.item, e, valid); }
-        finally { p.bitmap.close(); }
+        finally { releasePrepared(p); }
     }
 }
 
@@ -643,7 +679,9 @@ async function runSlot(group: ChapterPage[], generation: number): Promise<void> 
     step('context', group.map(p => p.order + 1));
     const cacheEpoch = config.cacheEpoch ?? await cacheReady();
     const order = Math.min(...group.map(p => p.order));
+    const sharing = config.shareContext;
     const snapshot = await contextFor(undefined, order);
+    contextSharing.set(snapshot, sharing);
     if (generation !== epoch) return;
     if (group.length === 1) { await workSingle(group[0], snapshot, generation, cacheEpoch); return; }
     await runGroup(group, snapshot, generation, cacheEpoch);
@@ -679,7 +717,8 @@ async function pump(): Promise<void> {
     let seq = 0;
     let discovery: Promise<boolean> | null = null;
     let discoveryStopped = false;
-    const phases = (): PagePhase[] => status.pages.map(p => pagePhase(p.phase));
+    const inScope = (p: { id: string }): boolean => !config.requestedPages || config.requestedPages.includes(p.id);
+    const phases = (): PagePhase[] => status.pages.map(p => inScope(p) ? pagePhase(p.phase) : 'paused');
     const hasQueued = (): boolean => phases().some(ph => ph === 'queued');
     const fill = (): void => {
         while (slots.size < slotCount()) {
@@ -713,7 +752,7 @@ async function pump(): Promise<void> {
                 // manual retry does. A paused run (shared fault) or a page that already spent
                 // its retry never re-enters, so this cannot loop.
                 if (generation === epoch && status.phase === 'running') {
-                    const retry = pickRetryPages(status.pages, autoRetry, retried);
+                    const retry = pickRetryPages(status.pages.filter(inScope), autoRetry, retried);
                     if (retry.length) {
                         for (const p of retry) { retried.add(p.id); p.phase = 'queued'; }
                         note(`auto-retry ${retry.length} timed-out ${retry.length === 1 ? 'page' : 'pages'}`);
@@ -731,7 +770,7 @@ async function pump(): Promise<void> {
             }
             // Walk the reader ahead while pages translate, so a freed slot never waits on
             // discovery. Only when nothing is queued — the walk is a serial reader cursor.
-            if (!hasQueued() && !discovery && !discoveryStopped && config.nextDocument) {
+            if (!config.requestedPages && !hasQueued() && !discovery && !discoveryStopped && config.nextDocument) {
                 discovery = discover(generation).then(ok => {
                     if (!ok) discoveryStopped = true;
                     return ok;
@@ -748,7 +787,10 @@ async function pump(): Promise<void> {
         } else if (status.phase === 'running') {
             // Pixel-waiting pages are the reader's problem, not a failure of the run: the
             // chapter is complete when the manifest is complete and nothing is left to do.
-            status.phase = config.completeManifest ? 'complete' : 'waiting';
+            status.phase = config.requestedPages || status.pages.some(p => p.phase === 'paused')
+                ? 'stopped' : config.completeManifest ? 'complete' : 'waiting';
+            if (config.requestedPages) status.message = status.pages.filter(inScope).every(p => p.phase === 'ready')
+                ? 'Page translation complete' : 'Page translation paused';
         }
         await publish();
     } catch (e) { stop('Translation paused — could not save chapter progress'); showFatal(e); }
@@ -762,7 +804,15 @@ async function pump(): Promise<void> {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-    if (sender.id !== chrome.runtime.id || msg?.type !== 'mt:chapter-command' || msg.id !== id || !status) return;
+    if (sender.id !== chrome.runtime.id || msg?.type !== 'mt:chapter-command' || msg.id !== id) return;
+    if (msg.command === 'settings-changed') {
+        settingsStale = true;
+        if (config) config.settingsStale = true;
+        if (status) { status.settingsStale = true; stop('Translation paused — settings changed; start again to use them'); }
+        respond({ ok: true });
+        return;
+    }
+    if (!status) return;
     // Priority is a scheduling hint, not a progress update. It may arrive during setup,
     // but must neither start unconfigured work nor echo a status back to the reader.
     if (msg.command === 'prioritize') {
@@ -772,12 +822,44 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         return;
     }
     if (msg.command === 'stop') stop();
-    if (msg.command === 'retry') {
+    if (msg.command === 'context') {
+        config.shareContext = msg.shareContext === true;
+        setShareContext(config.shareContext);
+    }
+    if (msg.command === 'stop-page') {
+        const page = status.pages.find(p => p.id === String(msg.page));
+        if (page && page.phase !== 'ready') {
+            for (const attempt of attempts) {
+                const members = attemptPages.get(attempt) ?? [];
+                if (!members.includes(page.id)) continue;
+                attempt.cancel();
+                for (const p of status.pages) if (members.includes(p.id) && p.phase !== 'ready') {
+                    pageEpochs.set(p.id, (pageEpochs.get(p.id) ?? 0) + 1);
+                    p.phase = 'queued';
+                }
+            }
+            pageEpochs.set(page.id, (pageEpochs.get(page.id) ?? 0) + 1);
+            page.phase = 'paused';
+        }
+    }
+    if (['retry', 'request', 'resume'].includes(msg.command) && (settingsStale || config.settingsStale)) {
+        respond({ ok: false, error: 'Settings changed — start chapter translation again to use them' });
+        return;
+    }
+    if (msg.command === 'resume') {
+        if (typeof msg.shareContext === 'boolean') { config.shareContext = msg.shareContext; setShareContext(config.shareContext); }
+        config.requestedPages = undefined;
+        for (const p of status.pages) if (p.phase === 'failed' || p.phase === 'paused') p.phase = 'queued';
+        status.phase = 'running'; status.message = undefined;
+    }
+    if (msg.command === 'retry' || msg.command === 'request') {
+        if (typeof msg.shareContext === 'boolean') { config.shareContext = msg.shareContext; setShareContext(config.shareContext); }
         priority = String(msg.page);
         const page = status.pages.find(p => p.id === priority);
         if (page) {
-            config.force ??= new Set();
-            config.force.add(page.id);
+            if (!['running', 'waiting'].includes(status.phase)) config.requestedPages = [page.id];
+            else if (config.requestedPages && !config.requestedPages.includes(page.id)) config.requestedPages.push(page.id);
+            if (msg.command === 'retry') { config.force ??= new Set(); config.force.add(page.id); }
             // Revoke the active generation before resetting its phases, so a late
             // answer cannot replace the user's newer retranslation intent.
             if (['reading', 'detecting', 'translating', 'rendering'].includes(page.phase)) {
@@ -818,7 +900,10 @@ async function attach(runnerId: string): Promise<void> {
     step('generation');
     await cacheReady();
     step('debug');
-    await initDebug();
+    await initDebug(on => {
+        if (!on) diagnostics.length = 0;
+        else void enableChapterLog().catch(() => {});
+    });
     step('config');
     const response = await sendToBackground<{ ok?: boolean; error?: string; config?: HostConfig }>(
         { type: 'mt:chapter-host-init', id }, { timeoutMs: 12_000, label: 'host init' });
@@ -840,6 +925,7 @@ async function attach(runnerId: string): Promise<void> {
         inflight: 0, errors: 0, completeManifest: config.completeManifest,
         pages: config.pages.map(p => ({ id: p.id, url: p.url, order: p.order, phase: 'queued' })) };
     status.notice = undefined;
+    await enableChapterLog().catch(() => {});
     // Fresh run: retry bookkeeping must not inherit a previous run's pages or spends.
     autoRetry.clear();
     retried.clear();
@@ -853,9 +939,8 @@ async function attach(runnerId: string): Promise<void> {
     // Storage-change events are optional: an offscreen document is given only the runtime
     // API, and the shim may not cover every area this build talks to. A missing event must
     // not take the whole run down.
-    chrome.storage?.onChanged?.addListener((changes, area) => {
-        if (area === 'local' && (changes.mtPipeline || changes.mtSettings || changes.mtOcrSettings)) stop('Translation paused — settings changed; start again to use them');
-    });
+    settingsStale ||= config.settingsStale === true || await readRecord<boolean>(`settings-stale:${id}`) === true;
+    if (settingsStale) { config.settingsStale = true; status.settingsStale = true; stop('Translation paused — settings changed; start again to use them'); }
     await publish();
     initialized = true;
     recordChapterLog(trace(), { kind: 'setup-ready' });

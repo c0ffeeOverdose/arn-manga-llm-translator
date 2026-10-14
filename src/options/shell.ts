@@ -9,7 +9,7 @@ let dirty = false;
 // shared download-progress renderer (bars in OCR / model / font sections)
 export function dlProgress(bar: HTMLElement, loaded: number, total: number): void {
     const fill = bar.querySelector('.fill') as HTMLElement ?? bar;
-    const txt = total ? `${(loaded / 1e6).toFixed(1)}/${(total / 1e6).toFixed(1)}MB` : `${(loaded / 1e6).toFixed(1)}MB`;
+    const txt = total ? `${(loaded / 1e6).toFixed(1)}/${(total / 1e6).toFixed(1)} MB` : `${(loaded / 1e6).toFixed(1)} MB`;
     (bar.parentElement!.querySelector('.dl-text') as HTMLElement).textContent = txt;
     if (total) fill.style.width = `${Math.min(100, loaded / total * 100)}%`;
     else fill.classList.add('indet');
@@ -17,7 +17,7 @@ export function dlProgress(bar: HTMLElement, loaded: number, total: number): voi
 
 export function renderBar(): void {
     const el = $('status') as HTMLSpanElement;
-    if (dirty && !el.textContent) el.textContent = 'You have unsaved changes';
+    if (dirty && !el.textContent) el.textContent = 'Unsaved changes';
     const visible = dirty || !!el.textContent;
     $('dirtyBar').style.display = visible ? 'flex' : 'none';
     ($('barBtns') as HTMLElement).style.display = dirty ? 'flex' : 'none';

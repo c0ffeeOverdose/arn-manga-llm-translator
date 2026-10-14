@@ -65,6 +65,8 @@ Then load it as an unpacked extension:
 - **Firefox:** `about:debugging#/runtime/this-firefox` → *Load Temporary
   Add-on* → select any file inside `dist-firefox/`
 
+KoharuLayout is the default on-device layout model. Saved model choices are kept.
+
 Models (~150 MB) download automatically on first use and are cached in
 IndexedDB — no bundling, nothing shipped in the repo.
 
@@ -77,6 +79,14 @@ IndexedDB — no bundling, nothing shipped in the repo.
 3. Open any manga chapter, right-click the page → **Translate this page**.
    Use the popup to enable auto-translate, pre-translation ahead of your
    reading position, memory depth, and fonts.
+
+The popup has **Stop this page**, **Stop all translations**, **Resume auto** and
+**Resume chapter translation** controls. Translate to chapter end starts from the page you are
+viewing; Re-translate affects the current page. See
+[translation controls](docs/translation-controls.md) for scope and settings behavior.
+
+Progress and errors appear in the reader's pill. Enable **Options → Advanced → Debug mode**
+to record and view chapter logs, error history, timing reports and model diagnostics.
 
 ## Optional: cloud inference
 
@@ -129,19 +139,24 @@ Security policy: [SECURITY.md](SECURITY.md).
 
 ## License
 
-GPL-3.0-only — see [LICENSE](LICENSE). This project bundles a derivative of
-[comic-text-detector](https://github.com/dmMaze/comic-text-detector) (GPL-3.0),
-which sets the license for the whole extension. Model attributions are in
-[NOTICE](NOTICE).
+The extension is licensed under GPL-3.0-only — see [LICENSE](LICENSE). Models,
+libraries and fonts keep their own licenses. Attribution and model terms are in
+[NOTICE](NOTICE); bundled license texts are in [licenses](licenses/README.md).
 
 ## Acknowledgements
 
 - [comic-text-detector](https://github.com/dmMaze/comic-text-detector) — text
   detection (ONNX export via
   [lemon-manga-translator](https://github.com/lemondouble/lemon-manga-translator))
+- [KoharuLayout](https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152) —
+  layout detection by mayocream (custom model and Manga109 terms)
 - [Baberu OCR](https://huggingface.co/genshiai-daichi/baberu-ocr) —
   Japanese/English/Chinese OCR
 - [manga-panel-detector-yolo26n](https://huggingface.co/leoxs22/manga-panel-detector-yolo26n) —
-  panel ordering
-- [onnxruntime-web](https://github.com/microsoft/onnxruntime-web),
+  panel detection by Leandro Narosky, trained on Manga109-s (AGPL-3.0)
+- [AnimeMangaInpainting](https://huggingface.co/dreMaz/AnimeMangaInpainting) —
+  text cleanup by dreMaz, based on [LaMa](https://github.com/advimman/lama)
+- [Sriracha](https://fonts.google.com/specimen/Sriracha) —
+  default Thai font by Suppakit Chalermlarp; Cadson Demak and Pablo Impallari
+- [onnxruntime-web](https://github.com/microsoft/onnxruntime),
   [Tesseract.js](https://github.com/naptha/tesseract.js)

@@ -1,5 +1,5 @@
 #!/bin/sh
-# One-time: export leoxs22/manga-panel-detector-yolo26n (.pt, Apache-2.0) to ONNX for ORT-Web.
+# One-time: export leoxs22/manga-panel-detector-yolo26n (.pt, AGPL-3.0) to ONNX for ORT-Web.
 # Output: models/panel-yolo26n.onnx (gitignored). Model by Leandro Narosky, Manga109-s.
 set -e
 cd "$(dirname "$0")/.."

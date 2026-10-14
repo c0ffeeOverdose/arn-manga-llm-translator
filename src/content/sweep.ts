@@ -7,7 +7,7 @@ import { galleryAllUrls, matchAnchor, pageHashFromBitmap, samePagePath, unpackMa
     registerSweepWaiter, abortLookahead, settingsFingerprint, packMask, cachePut, cachePutMany, cacheKey,
     pageKey, PAGE_KEY_GEN, readerPageNumber, resizeCachedPage } from './page-cache';
 import { viewportOverlap, dropAutoQueued, resumeAuto, isBusy, paintBusy, haltAuto } from './queue';
-import { lookaheadActive } from './auto';
+import { lookaheadActive, pauseAuto } from './auto';
 import { setActivity, removeActivity, lastMsgSet, renderStatus, pillUnDismiss, logError } from './status-ui';
 import { remainingPages, sweepCount, type SweepCountReason, chapterMessage, type ChapterPage, type ChapterProgress, type ChapterStart } from '../chapter/model';
 import { blobDataUrl } from '../chapter/store';
@@ -101,6 +101,7 @@ export function sweepActive(): boolean {
 export interface SweepStatus {
     active: boolean; phase: 'starting' | 'running' | 'stopping' | 'dead'; stopping: boolean;
     done: number; total: number; errors: number; skipped: number; inflight: number;
+    canResume?: boolean;
     // Why the run stopped (runner message) — the halt line is a CTA, not a diagnosis.
     message?: string;
     diagnostics?: string; // runner breadcrumbs (stuck labels etc.) — shown in the popup for support
@@ -111,8 +112,9 @@ export function sweepStatus(): SweepStatus | null {
     return { active: sweepActive(), phase: progress.phase === 'stopping' ? 'stopping' : 'running',
         stopping: progress.phase === 'stopping', done: progress.done, total: progress.total,
         errors: progress.errors, skipped: 0, inflight: progress.inflight,
+        canResume: !sweepActive() && !progress.settingsStale && !progress.runnerLost && progress.pages.some(p => p.phase !== 'ready'),
         ...(progress.message ? { message: progress.message } : null),
-        ...(progress.diagnostics ? { diagnostics: progress.diagnostics } : null) };
+        ...(isDebug() && progress.diagnostics ? { diagnostics: progress.diagnostics } : null) };
 }
 function original(ref: PageRef): string {
     return viewSource(ref);
@@ -252,8 +254,35 @@ export function sweepHas(url: string): boolean {
     return !!owned(url) && sweepActive();
 }
 async function control(command: string, extra: Record<string, unknown> = {}): Promise<any> {
-    return sendToBackground({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra },
+    const response = await sendToBackground<{ ok?: boolean; error?: string }>({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra },
         { timeoutMs: 15_000, label: 'chapter control' });
+    if (!response?.ok) throw new Error(response?.error || 'The chapter task is unavailable — start chapter translation again');
+    return response;
+}
+export function chapterPageStatus(ref: PageRef): { active: boolean; queued: boolean; ready: boolean } {
+    const page = ownedRef(ref);
+    return { active: !!page && sweepActive() && ['reading', 'detecting', 'translating', 'rendering'].includes(page.phase),
+        queued: !!page && sweepActive() && page.phase === 'queued', ready: page?.phase === 'ready' };
+}
+export async function stopChapterPage(ref: PageRef): Promise<boolean> {
+    const page = ownedRef(ref);
+    if (!page || !sweepActive() || page.phase === 'ready') return false;
+    await control('stop-page', { page: page.id });
+    return true;
+}
+export async function updateChapterContext(sharing: boolean): Promise<void> {
+    if (progress?.chapter === chapterKey() && sweepActive()) await control('context', { shareContext: sharing });
+}
+export async function resumeSweep(): Promise<{ ok: boolean; error?: string }> {
+    if (!sweepStatus()?.canResume) return { ok: false, error: 'Start chapter translation again to continue' };
+    if (isBusy() || paintBusy() || lookaheadActive()) return { ok: false, error: 'Finish or stop the current page before resuming the chapter' };
+    try {
+        await control('resume', { shareContext });
+        if (progress) { progress.phase = 'running'; progress.message = undefined; showProgress(); }
+        resumeAuto();
+        return { ok: true };
+    }
+    catch (e) { reportError(e); return { ok: false, error: (e as Error).message }; }
 }
 
 function prioritize(page: ProgressPage): void {
@@ -271,14 +300,17 @@ function prioritize(page: ProgressPage): void {
 export function chapterOwnsRequest(ref: PageRef, force: boolean): boolean {
     const page = ownedRef(ref);
     if (!page) return false;
-    if (!sweepActive() && !force && page.phase !== 'ready') return false;
+    if (progress?.settingsStale || progress?.runnerLost) return false;
     refs.set(page.id, ref);
     if (force) {
+        if (!sweepActive()) pauseAuto();
         // Keep the old state until replacement: it owns the original pixels behind a
         // revoked reader blob. The new revision replaces its paint and context together.
         applied.delete(ref.el);
         prioritized = '';
-        void control('retry', { page: page.id }).catch(reportError);
+        void control('retry', { page: page.id, shareContext }).catch(reportError);
+    } else if (page.phase === 'paused' || page.phase === 'failed' || (!sweepActive() && page.phase !== 'ready')) {
+        void control('request', { page: page.id, shareContext }).catch(reportError);
     } else {
         prioritize(page);
         if (page.phase === 'ready') void attach(ref, page);
@@ -465,7 +497,7 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         log({ kind: 'stage', stage: 'settings' });
         await loadPipeline();
         if (pipeline.inferEngine === 'cloud' && pipeline.layoutModel === 'koharu') {
-            throw Object.assign(new Error('Koharu FP32 currently runs on-device. Select On-device in Options → Model.'), { kind: 'cloud' });
+            throw Object.assign(new Error('KoharuLayout runs on-device. Select On-device in Settings → Model.'), { kind: 'cloud' });
         }
         await loadContext();
         // Cloud engine: pay the container wake ONCE here — otherwise the first pages race a
@@ -562,6 +594,7 @@ function readerImageFilter(): { minW?: number; minH?: number } | undefined {
     return { minW: Math.round(minW * 0.5), minH: Math.round(minH * 0.5) };
 }
 export function cancelSweep(): { ok: boolean } {
+    pauseAuto();
     startCancelled = true;
     if (progress && sweepActive()) {
         progress.phase = 'stopping';

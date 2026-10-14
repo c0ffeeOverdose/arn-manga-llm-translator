@@ -1,7 +1,8 @@
-# KoharuLayout FP32
+# KoharuLayout
 
-Choose **Options → Model → Layout model → KoharuLayout FP32**, select **On-device**,
-then save changes. CTD + Panel remains the default and can be selected again.
+KoharuLayout is the default model for on-device detection. To change it, open
+**Settings → Model → Layout model** and save your choice. Saved model choices are
+retained. Cloud detection uses CTD + Panel.
 Koharu finds text, sound effects, balloons and panels together. OCR, translation,
 reading direction and text cleanup continue to use your existing settings.
 
@@ -12,21 +13,48 @@ quality varies with the page; this is an alternative to CTD, not an accuracy gua
 ## Install once
 
 Development builds include `models/koharu-fp32-chunked.onnx` when present. Store
-builds contain no weights. Use **Import model file** to install that ONNX file into
-the extension's local model store. The extension checks the exact size and SHA-256
-before accepting it. SafeTensors, FP16, INT8 and unbounded-attention ONNX exports
-are different files and will be refused. Imported models work offline.
+builds contain no weights. Use **Download** to install the model from
+[arn-manga-models](https://huggingface.co/c0ffeeOverdose/arn-manga-models), or let the
+first on-device translation download it automatically. A progress bar tracks the
+download. The extension checks the exact size and SHA-256 before saving the model
+locally; subsequent translations work offline without downloading it again.
+
+Once installed, the button becomes **Delete**, matching the OCR model manager.
+Delete removes the downloaded file from the local model store and returns the button
+to **Download**. To reinstall, delete it and then download a fresh copy from the mirror;
+the download bypasses the browser's HTTP cache. CTD/Panel are managed together, and
+the text cleanup model uses the same Delete/Download flow. Other models, OCR files
+and saved translations are preserved. Development-bundled files remain part of the
+extension package; Delete removes only the downloaded/imported copy.
+
+Koharu checks saved bytes before loading. A wrong size or SHA-256 triggers one
+replacement attempt from the development bundle or mirror. An invalid replacement
+fails without looping and leaves the previous bytes untouched. Cryptography/runtime
+errors do not trigger a replacement, and `noDownload: true` never repairs through
+the network.
+
+**Import model file** remains available for installing a local copy of the same
+ONNX file. SafeTensors, FP16, INT8 and unbounded-attention ONNX exports are different
+files and will be refused. Availability checks never download a model, and callers
+using `noDownload: true` can only load cached or development-bundled files.
 
 - File: `koharu-fp32-chunked.onnx`
 - Size: 149,799,163 bytes (149.8 MB)
 - SHA-256: `35d89289e92a6dba75b9ccd4ebd447a55aad69c993d0a8e439c57509d598dfd6`
 
-No public converted-weight mirror is configured. The original weights and model
-card are at [mayocream/KoharuLayout](https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152),
+The original weights and model card are at
+[mayocream/KoharuLayout](https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152),
 revision `aed55fdb8ca953c6bec33cf6ed6dd52a9b72bfa2`. The model has custom/other
 licensing and separate training-data terms; see that model card. The extension's
-GPL license does not replace those terms. Converted weights are not published by
-this implementation.
+GPL license does not replace those terms. The mirror retains the upstream credits
+and per-file license in its model card and `koharu-fp32-chunked.json`.
+
+The [existing ShiniShiho ONNX export](https://huggingface.co/ShiniShiho/koharu-layout-rfdetr-seg-2xl-1152-onnx)
+retains the original 1152px segmentation heads, but has a different graph and checksum.
+It is not the extension's supported artifact. The browser-specific export preserves
+FP32 weights and 1152px resolution while bounding attention allocations with 256-query
+chunks. It avoids the repeated-inference GPU memory failures observed with straight
+exports on the tested 6 GiB device. This result is scoped to the tested runtime and hardware.
 
 ## Reproduce the supported export
 
@@ -44,6 +72,24 @@ node build.mjs --firefox
 The exporter verifies both the input and output checksums. A different output
 checksum requires investigating the export environment before using the artifact;
 do not bypass the extension's file check.
+
+## Publish the runtime mirror
+
+The model card and artifact manifest are maintained in `docs/model-mirror/`.
+With `huggingface_hub` installed in a separate Python environment, verify the payload
+before publishing the model, manifest, card and licensed exporter together:
+
+```sh
+python scripts/publish-koharu-model.py --dry-run
+hf auth login
+python scripts/publish-koharu-model.py
+```
+
+Publishing requires write access to `c0ffeeOverdose/arn-manga-models`. The script
+verifies the model size and checksum, and uses the reviewed mirror revision as a
+parent commit so newer model-card edits cannot be overwritten accidentally.
+If the remote repository has changed, review the current card and update the payload
+and `MIRROR_BASE_REVISION` before publishing.
 
 ## Settings and existing translations
 

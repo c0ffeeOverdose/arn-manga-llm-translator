@@ -69,7 +69,7 @@
       color-scheme: light;
     }
     * { box-sizing: border-box; }
-    body { width: 280px; margin: 0; background: var(--bg); color: var(--text); font: 13px/1.5 system-ui, sans-serif; }
+    body { width: 320px; margin: 0; background: var(--bg); color: var(--text); font: 13px/1.5 system-ui, sans-serif; }
     .wrap { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
     h1 { font-size: 15px; margin: 0 0 2px; font-weight: 700; letter-spacing: -0.01em; }
     header.top { display: flex; align-items: flex-start; gap: 8px; }
@@ -101,6 +101,8 @@
     .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     .row { display: flex; align-items: center; justify-content: space-between; }
+    .row > label { flex: 1; min-width: 0; cursor: pointer; }
+    #autoSite { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .divider { height: 1px; background: var(--border); margin: 4px 0; }
     .group-label { font-size: 10.5px; font-weight: 600; color: var(--muted);
                    text-transform: uppercase; letter-spacing: .07em; margin: 4px 0 0; }
@@ -165,47 +167,41 @@
     <header class="top">
       <div class="titles">
         <h1>Arn Manga LLM Translator</h1>
-        <div class="sub">Translate manga, manhwa &amp; webtoons on the page</div>
       </div>
       <button id="settings" aria-label="Settings" title="Settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
     </header>
-    <div id="privacyNote">Translating sends page images + text to the AI provider <b>you</b> chose in Settings (your key, your bill). Detection &amp; drawing stay on your device.<br><button id="privacyAck">Got it — don't show again</button></div>
+    <div id="privacyNote">Translation sends images or text to the provider in Settings. Provider fees may apply. Detection runs on your device unless you select Cloud.<br><button id="privacyAck">Got it</button></div>
     <button id="translate" class="btn">Translate this page</button>
-    <button id="sweep" class="btn ghost slim" style="width:100%">Translate to end of chapter</button>
+    <button id="sweep" class="btn ghost slim" style="width:100%" title="Translate from this page to the last page of the chapter">Translate to chapter end</button>
+    <button id="sweepResume" class="btn ghost slim" style="width:100%" title="Continue the previous chapter translation from where you stopped" hidden>Resume chapter translation</button>
     <div id="sweepWhy" class="hint" hidden></div>
-    <details class="usage-wrap" id="chapterLogWrap" hidden>
-      <summary>Latest chapter translation log</summary>
-      <div id="chapterLogBody"></div>
-      <button id="chapterLogCopy" class="btn ghost">Copy chapter log</button>
-      <div id="chapterLogNote" role="status">Saved across reader reloads. No keys, URLs, page text or images.</div>
-      <textarea id="chapterLogText" rows="8" readonly hidden aria-label="Chapter translation log for manual copying"></textarea>
-    </details>
     <div class="grid">
       <button id="showOriginal" class="btn ghost">Show original</button>
-      <button id="retranslate" class="btn ghost">Re-translate</button>
+      <button id="retranslate" class="btn ghost" title="Translate this page again with your current settings">Re-translate page</button>
     </div>
     <div class="divider"></div>
     <div class="row">
-      <span>Auto-translate <span id="autoSite" class="sub"></span></span>
-      <label class="switch"><input type="checkbox" id="auto"><span class="slider"></span></label>
+      <label for="auto">Auto-translate <span id="autoSite" class="sub"></span></label>
+      <span class="switch"><input type="checkbox" id="auto"><span class="slider"></span></span>
     </div>
+    <div id="autoPaused" hidden><span class="hint">Auto-translate paused</span> <button id="resumeAuto" class="btn ghost slim">Resume auto</button></div>
     <div class="row">
-      <span>Pages ahead</span>
+      <label for="ahead">Pages ahead</label>
       <span id="aheadVal" class="sub">3</span>
     </div>
-    <input type="range" id="ahead" min="1" max="30" step="1" style="width:100%;accent-color:var(--accent)" title="Auto pre-translate window — queued pages ahead (costs tokens per page)">
+    <input type="range" id="ahead" min="1" max="30" step="1" style="width:100%;accent-color:var(--accent)" title="Translate this many extra pages as you read. More pages use more tokens.">
     <div class="row">
-      <span>Show token usage</span>
-      <label class="switch"><input type="checkbox" id="showUsage" checked><span class="slider"></span></label>
+      <label for="showUsage">Show token usage</label>
+      <span class="switch"><input type="checkbox" id="showUsage" checked><span class="slider"></span></span>
     </div>
     <div class="linkrow">
       <button id="chars">Characters</button>
-      <button id="context">Context: on</button>
-      <button id="readingDir" title="Region numbering order — retranslate the page to apply">RTL</button>
+      <button id="context" aria-pressed="true" title="Include recent dialogue in future translations to keep names and wording consistent">Context: on</button>
+      <button id="readingDir" title="Reading order. Click to switch, then re-translate the page to apply.">Right to left</button>
     </div>
     <div class="row">
-      <span id="cacheLabel">Cached pages</span>
-      <button id="cacheClear" class="btn ghost slim" title="Forget all cached translations">Clear</button>
+      <div>Saved translations<div id="cacheLabel" class="sub"></div></div>
+      <button id="cacheClear" class="btn ghost slim" title="Clear saved translations on all sites">Clear</button>
     </div>
     <div class="divider"></div>
     <!-- hidden until refreshStatus has something to show: the popup window
@@ -214,15 +210,22 @@
     <summary class="group-label"><span id="stateDot"></span>Status</summary>
     <div class="status" id="status"></div>
     <div class="status" id="sweepDetails" style="display:none;margin-top:4px"></div>
-    <button id="cancelAll" class="btn ghost slim" style="display:none;width:100%;margin-top:6px">Cancel all</button>
     </details>
+    <button id="cancelAll" class="btn ghost slim" style="display:none;width:100%">Stop all translations</button>
     <div id="errBanner"></div>
     <details class="usage-wrap" id="usageWrap" style="display:none"><summary>Token usage</summary><div id="usageBox" class="usage" style="border:0;padding:4px 0 0"></div></details>
+    <details class="usage-wrap" id="chapterLogWrap" hidden>
+      <summary>Chapter log</summary>
+      <div id="chapterLogBody"></div>
+      <button id="chapterLogCopy" class="btn ghost">Copy chapter log</button>
+      <div id="chapterLogNote" role="status">Only recorded with Debug on. Excludes keys, URLs, dialogue and images.</div>
+      <textarea id="chapterLogText" rows="8" readonly hidden aria-label="Chapter translation log for manual copying"></textarea>
+    </details>
     <details class="usage-wrap" id="timingWrap" style="display:none">
-      <summary>Last page timing</summary>
+      <summary>Page timing</summary>
       <div id="timingBody"></div>
       <button id="timingCopy" class="btn ghost">Copy timing report</button>
-      <div id="timingNote" role="status">Includes device/browser and model name, but no keys, page text or images. Copy before reloading the reader.</div>
+      <div id="timingNote" role="status">Includes browser, device and model details. Excludes keys, dialogue and images. Reloading clears this report.</div>
       <textarea id="timingText" rows="8" readonly hidden aria-label="Timing report for manual copying"></textarea>
     </details>
     <div id="errlog" class="errlog"></div>

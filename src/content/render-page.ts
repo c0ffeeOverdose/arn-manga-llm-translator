@@ -2,7 +2,7 @@
 // cache, fold into the book.
 
 import { chosenOrientation, ensureFont, renderTuning, RENDER_GEN, layoutArea, effBoxesForAreas, growDarkArea } from './render';
-import { updateContext, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
+import { updateContext, type ContextState, type RegionOutput, type ExtraRegion, type Mention, type BookOp } from '../llm/core';
 import { isDebug } from '../debug';
 import { cacheKey, pageKey, PAGE_KEY_GEN, settingsFingerprint, cachePutMany, cacheDelete, packMask, dropProgressT0, INPAINT_PATCH_GEN, type CachedPage } from './page-cache';
 import { withEncodeLock, inpaintPage, cloudInpaint, cloudConfig, type MtOnStatus, type DetectResult } from './detection';
@@ -17,13 +17,14 @@ import { sweepPageOrder, idlePageOrder } from './sweep';
 import { inpaintMode } from '../llm/pipeline-settings';
 import { ownCopyNeeded, ownOriginalUrl, getPages } from './page-io';
 import { translateRegions, ensurePageDebugViews } from './ocr';
-import { rewindContextBefore, replayPagesAfter, viewportOverlap } from './queue';
+import { contextBefore, replayPagesAfter, viewportOverlap } from './queue';
 import { bookHas, bookAdd, bookDrop } from './sweep';
 import { starveNotice } from './status-ui';
 import { saveContext } from './state';
 import { identifyBitmap, signatureOf } from '../image-identity';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { PageTimer } from '../page-timing';
+import { checkCancelled } from './cancellation';
 
 // Dump-only twin of the paint's area resolution (see the `areas` entry below).
 function dumpAreas(
@@ -64,30 +65,34 @@ function dumpAreas(
 // ordered commit still folds later (its !bookHas guard makes the double-visit
 // harmless). The book snapshot is skipped too (context is mid-chapter at paint time).
 export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus, force: boolean,
-    opts: { paintOnly?: boolean; detached?: boolean; warm?: Promise<AiPatches | null>; onPatches?: (patches: CachedPage['patches']) => void } = {}): Promise<PageState> {
+    opts: { paintOnly?: boolean; detached?: boolean; valid?: () => boolean; warm?: Promise<AiPatches | null>; onPatches?: (patches: CachedPage['patches']) => void } = {}): Promise<PageState> {
     const timing = prep.timing ?? new PageTimer();
     const notify = onStatus;
     onStatus = (s, stage) => { timing.setStage(s); notify(s, stage); };
     const cacheEpoch = prep.cacheEpoch ?? await cacheReady();
-    assertCacheCurrent(cacheEpoch);
+    const ensureCurrent = (): void => {
+        assertCacheCurrent(cacheEpoch);
+        checkCancelled(prep.signal);
+        if (opts.valid && !opts.valid()) throw new DOMException('Translation stopped', 'AbortError');
+    };
+    ensureCurrent();
     const paintOnly = opts.paintOnly === true;
 
     const { srcUrl, bitmap, det } = prep;
     const existing = stateFor(ref) ?? pages.get(srcUrl);
     // twin prep made before the first job finished — reuse it, don't pay twice.
     if (existing?.det && !force) return existing;
-    if (existing?.det && shareContext && !paintOnly) await rewindContextBefore(existing);
-    // the rebuilt book excludes this page — its hash must refold (fresh fold
-    // below re-registers; an error leaves it dropped so arrival refolds).
-    // Same for the progress stamp: a force retranslate counts fresh.
-    if (existing?.hash) bookDrop(existing.hash);
+    await loadContext();
+    const snapshot = existing?.det && shareContext && !paintOnly ? await contextBefore(existing) : context;
+    ensureCurrent();
+    // The request sees pre-page context; the live book changes with the committed render.
     if (existing) dropProgressT0(srcUrl);
     // the book as it was just before THIS page folds (after any rewind above):
     // a later re-translate restores it. MUST load first: translateRegions loads
     // lazily, and a snapshot taken before that captures the empty default.
-    await loadContext();
-    const bookBefore = paintOnly ? undefined : context.characters;
-    const pairsBefore = paintOnly ? undefined : context.pairs;
+    const bookBefore = paintOnly ? undefined : snapshot.characters;
+    const pairsBefore = paintOnly ? undefined : snapshot.pairs;
+    let nextContext: ContextState | undefined;
     let outputs: RegionOutput[], extras: ExtraRegion[], usedLLM: boolean;
     let mentions: Mention[] = [];
     let bookOps: BookOp[] | undefined;
@@ -98,296 +103,313 @@ export async function renderPage(ref: PageRef, prep: Prep, onStatus: MtOnStatus,
     // AI cleanup rides the LLM wait: mask + model windows depend only on
     // detection, so compute patches for every box while the LLM is in flight.
     let aiWarm: Promise<AiPatches | null> | null = null;
-    if (prep.cached) {
-        // persistent cache hit: identical image bytes + identical settings — the
-        // LLM is not called. Outputs still fold into the book (fresh session).
-        onStatus('Cache hit…');
-        ({ outputs, extras, mentions = [] } = prep.cached);
-        usedLLM = false;
-        annWCache = bitmap.width; annHCache = bitmap.height;
-        rawLLM = '(cached — no LLM call)';
-        // already folded by whoever produced this entry — refolding would duplicate
-        // its pairs. Otherwise fold + register.
-        if (shareContext && !paintOnly && !bookHas(prep.hash)) { const u = updateContext(context, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs, pipeline.charLimit); setContext(u.ctx); bookOps = u.bookOps.length ? u.bookOps : undefined; await saveContext(); bookAdd(prep.hash); }
-    } else {
-        onStatus('Translating…');
-        ({ outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, errorRetryAfterMs, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
-            {
-                progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled,
-                fresh: force,
-                cacheEpoch, cacheFingerprint: prep.fp,
-                timing,
-                onStarve: starveNotice,
-                // AI cleanup warm: starts the moment OCR ends (the infer lock
-                // is about to go idle) and runs through the LLM's network
-                // wait — a cold inpaint session uploads 112MB here too
-                afterOcr: inpaintMode(pipeline) === 'local'
-                    ? () => { aiWarm = computeAiPatches(bitmap, det, det.boxes, []).catch(() => null); }
-                    : undefined,
-            }));
+    try {
+        if (prep.cached) {
+            // persistent cache hit: identical image bytes + identical settings — the
+            // LLM is not called. Outputs still fold into the book (fresh session).
+            onStatus('Loading saved translation…');
+            ({ outputs, extras, mentions = [] } = prep.cached);
+            usedLLM = false;
+            annWCache = bitmap.width; annHCache = bitmap.height;
+            rawLLM = '(cached — no LLM call)';
+            // already folded by whoever produced this entry — refolding would duplicate
+            // its pairs. Otherwise fold + register.
+            if (shareContext && !paintOnly && !bookHas(prep.hash)) { const u = updateContext(snapshot, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs, pipeline.charLimit); nextContext = u.ctx; bookOps = u.bookOps.length ? u.bookOps : undefined; }
+        } else {
+            onStatus('Translating…');
+            ({ context: nextContext, outputs, extras, mentions, bookOps, usedLLM, error, errorKind, errorHint, errorRetryAfterMs, annW: annWCache, annH: annHCache, badgeR, raw: rawLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = await translateRegions(bitmap, det, onStatus,
+                {
+                    progressKey: srcUrl, continued: !!prep.resumed || !pipeline.cacheEnabled,
+                    fresh: force,
+                    fold: false, context: snapshot, signal: prep.signal, valid: opts.valid,
+                    cacheEpoch, cacheFingerprint: prep.fp,
+                    timing,
+                    onStarve: starveNotice,
+                    // AI cleanup warm: starts the moment OCR ends (the infer lock
+                    // is about to go idle) and runs through the LLM's network
+                    // wait — a cold inpaint session uploads 112MB here too
+                    afterOcr: inpaintMode(pipeline) === 'local'
+                        ? () => { aiWarm = computeAiPatches(bitmap, det, det.boxes, []).catch(() => null); }
+                        : undefined,
+                }));
 
-        if (error) {
-            const e = new Error(`LLM failed: ${error}`) as Error & { kind?: string; hint?: string; retryAfterMs?: number };
-            e.kind = errorKind; e.hint = errorHint; e.retryAfterMs = errorRetryAfterMs;
-            throw e;
+            ensureCurrent();
+            if (error) {
+                const e = new Error(`Translation failed: ${error}`) as Error & { kind?: string; hint?: string; retryAfterMs?: number };
+                e.kind = errorKind; e.hint = errorHint; e.retryAfterMs = errorRetryAfterMs;
+                throw e;
+            }
         }
-        bookAdd(prep.hash); // folded above (translateRegions) — arrivals skip refold
-    }
 
-    const tBase = performance.now();
-    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-    ctx.drawImage(bitmap, 0, 0);
-    timing.add('renderBase', performance.now() - tBase);
+        const tBase = performance.now();
+        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+        ctx.drawImage(bitmap, 0, 0);
+        timing.add('renderBase', performance.now() - tBase);
 
-    // AI text cleanup: patches from the cache when valid, otherwise generated
-    // once from the original bitmap. Any failure falls back to the built-in
-    // fill — a page must never fail here.
-    const aiMode = inpaintMode(pipeline);
-    const tCleanup = performance.now();
-    timing.meta.cleanupSource = 'fill';
-    let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
-    let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiPre = false, aiError: string | undefined;
-    let aiMaskMs = 0, aiLockWaitMs = 0, aiEncodeMs = 0;
-    let savedPatches = false; // crops written to the cache this visit (diagnostic)
-    if (aiMode !== 'fill') {
-        const cached = prep.cached?.patches?.length && prep.cached.patchesGen === INPAINT_PATCH_GEN
-            ? prep.cached.patches : null;
-        if (cached) { aiPatches = cached; timing.meta.cleanupSource = 'cache'; }
-        else {
-            const plan = erasePlan(det, outputs);
-            if (plan.boxesToErase.length) {
-                onStatus('Cleaning text…', 'render');
-                if (aiMode === 'local') {
-                    // Warm patches cover every box with no keep clearing — usable only
-                    // when no keep box sits inside an erase window. Patch `i` indexes det.boxes.
-                    // The chapter runner hands its pre-LLM warm through opts.warm.
-                    const warm: AiPatches | null = aiWarm ? await (aiWarm as Promise<AiPatches | null>)
-                        : opts.warm ? await opts.warm : null;
-                    let r: AiPatches | null = null;
-                    if (warm) {
+        // AI text cleanup: patches from the cache when valid, otherwise generated
+        // once from the original bitmap. Any failure falls back to the built-in
+        // fill — a page must never fail here.
+        const aiMode = inpaintMode(pipeline);
+        const tCleanup = performance.now();
+        timing.meta.cleanupSource = 'fill';
+        let aiPatches: { x1: number; y1: number; x2: number; y2: number; png: ArrayBuffer }[] | null = null;
+        let aiGenerated = false, aiMs = 0, aiWindows = 0, aiWarmUsed = false, aiPre = false, aiError: string | undefined;
+        let aiMaskMs = 0, aiLockWaitMs = 0, aiEncodeMs = 0;
+        let savedPatches = false; // crops written to the cache this visit (diagnostic)
+        if (aiMode !== 'fill') {
+            const cached = prep.cached?.patches?.length && prep.cached.patchesGen === INPAINT_PATCH_GEN
+                ? prep.cached.patches : null;
+            if (cached) { aiPatches = cached; timing.meta.cleanupSource = 'cache'; }
+            else {
+                const plan = erasePlan(det, outputs);
+                if (plan.boxesToErase.length) {
+                    onStatus('Removing original text…', 'render');
+                    if (aiMode === 'local') {
+                        // Warm patches cover every box with no keep clearing — usable only
+                        // when no keep box sits inside an erase window. Patch `i` indexes det.boxes.
+                        // The chapter runner hands its pre-LLM warm through opts.warm.
+                        const warm: AiPatches | null = aiWarm ? await (aiWarm as Promise<AiPatches | null>)
+                            : opts.warm ? await opts.warm : null;
+                        let r: AiPatches | null = null;
+                        if (warm) {
+                            const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
+                                a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+                            if (!plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
+                                const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
+                                const patches = warm.patches.filter(p => idx.has(p.i ?? -1));
+                                if (patches.length) { r = { ...warm, patches }; aiWarmUsed = true; }
+                            }
+                        }
+                        try {
+                            if (!r) r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes);
+                            if (r) {
+                                timing.meta.cleanupSource = aiWarmUsed ? 'local-warm' : 'local';
+                                aiPatches = r.patches; aiGenerated = true;
+                                aiMs = r.ms; aiWindows = r.windows; aiMaskMs = r.maskMs;
+                                aiLockWaitMs = r.lockWaitMs; aiEncodeMs = r.encodeMs;
+                            }
+                        } catch (e) {
+                            aiError = String((e as Error)?.message ?? e).slice(0, 120);
+                            if (isDebug()) console.log('[mt] AI cleanup unavailable — using built-in fill:', aiError);
+                        }
+                    } else {
+                        // cloud engine: prefer the patches merged into the detect
+                        // roundtrip; fall through to /v1/inpaint when a keep box
+                        // sits inside an erase window.
                         const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
                             a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
-                        if (!plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
+                        if (det.cloudPatches?.length && !plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
                             const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
-                            const patches = warm.patches.filter(p => idx.has(p.i ?? -1));
-                            if (patches.length) { r = { ...warm, patches }; aiWarmUsed = true; }
-                        }
-                    }
-                    try {
-                        if (!r) r = await computeAiPatches(bitmap, det, plan.boxesToErase, plan.keepBoxes);
-                        if (r) {
-                            timing.meta.cleanupSource = aiWarmUsed ? 'local-warm' : 'local';
-                            aiPatches = r.patches; aiGenerated = true;
-                            aiMs = r.ms; aiWindows = r.windows; aiMaskMs = r.maskMs;
-                            aiLockWaitMs = r.lockWaitMs; aiEncodeMs = r.encodeMs;
-                        }
-                    } catch (e) {
-                        aiError = String((e as Error)?.message ?? e).slice(0, 120);
-                        if (isDebug()) console.log('[mt] AI cleanup unavailable — using built-in fill:', aiError);
-                    }
-                } else {
-                    // cloud engine: prefer the patches merged into the detect
-                    // roundtrip; fall through to /v1/inpaint when a keep box
-                    // sits inside an erase window.
-                    const overlaps = (a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }) =>
-                        a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
-                    if (det.cloudPatches?.length && !plan.keepBoxes.some(k => plan.boxesToErase.some(b => overlaps(k, b)))) {
-                        const idx = new Set(plan.boxesToErase.map(b => det.boxes.indexOf(b)));
-                        const pre = det.cloudPatches.filter(p => idx.has(p.i ?? -1));
-                        // full coverage only — paintRegions skips the fill when ANY
-                        // patches exist, so a partial set would strand boxes.
-                        if (pre.length && pre.length === plan.boxesToErase.length) {
-                            aiPatches = pre; aiWindows = pre.length; aiPre = true;
-                            timing.meta.cleanupSource = 'cloud-detect';
-                        }
-                    }
-                    if (!aiPatches) {
-                        // the same client-side mask rides along, so local and cloud
-                        // erase the same pixels.
-                        const { boxes, mask, maskMs } = timing.measure('cleanupMask', () => eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes));
-                        aiMaskMs = maskMs;
-                        const cfg = await cloudConfig();
-                        if (cfg.endpoint && cfg.key) {
-                            try {
-                                const r = await cloudInpaint(
-                                    bitmap, boxes,
-                                    { quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw, endpoint: cfg.endpoint, key: cfg.key, mask, timing },
-                                );
-                                if (r.patches.length) {
-                                    aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows;
-                                    timing.meta.cleanupSource = 'cloud-request';
-                                }
-                            } catch (e) {
-                                aiError = String((e as Error)?.message ?? e).slice(0, 120);
-                                if (isDebug()) console.log('[mt] cloud AI cleanup unavailable — using built-in fill:', aiError);
+                            const pre = det.cloudPatches.filter(p => idx.has(p.i ?? -1));
+                            // full coverage only — paintRegions skips the fill when ANY
+                            // patches exist, so a partial set would strand boxes.
+                            if (pre.length && pre.length === plan.boxesToErase.length) {
+                                aiPatches = pre; aiWindows = pre.length; aiPre = true;
+                                timing.meta.cleanupSource = 'cloud-detect';
                             }
-                        } else {
-                            aiError = 'cloud endpoint not configured';
+                        }
+                        if (!aiPatches) {
+                            // the same client-side mask rides along, so local and cloud
+                            // erase the same pixels.
+                            const { boxes, mask, maskMs } = timing.measure('cleanupMask', () => eraseBoxesAndMask(bitmap, det, plan.boxesToErase, plan.keepBoxes));
+                            aiMaskMs = maskMs;
+                            const cfg = await cloudConfig();
+                            if (cfg.endpoint && cfg.key) {
+                                try {
+                                    const r = await cloudInpaint(
+                                        bitmap, boxes,
+                                        { quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw, endpoint: cfg.endpoint, key: cfg.key, mask, timing },
+                                    );
+                                    if (r.patches.length) {
+                                        aiPatches = r.patches; aiGenerated = true; aiMs = r.ms; aiWindows = r.windows;
+                                        timing.meta.cleanupSource = 'cloud-request';
+                                    }
+                                } catch (e) {
+                                    aiError = String((e as Error)?.message ?? e).slice(0, 120);
+                                    if (isDebug()) console.log('[mt] cloud AI cleanup unavailable — using built-in fill:', aiError);
+                                }
+                            } else {
+                                aiError = 'cloud endpoint not configured';
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    timing.add('cleanup', performance.now() - tCleanup);
-    await timing.measureAsync('font', () => ensureFont());
-    const paintPatches = aiPatches?.length
-        ? await timing.measureAsync('patchDecode', () => decodePaintPatches(aiPatches!)) : null;
+        timing.add('cleanup', performance.now() - tCleanup);
+        await timing.measureAsync('font', () => ensureFont());
+        ensureCurrent();
+        const paintPatches = aiPatches?.length
+            ? await timing.measureAsync('patchDecode', () => decodePaintPatches(aiPatches!)) : null;
 
-    let layouts: ReturnType<typeof paintRegions>;
-    let frame: ImageData;
-    const tRender0 = performance.now();
-    try {
-        frame = timing.measure('renderRead', () => ctx.getImageData(0, 0, canvas.width, canvas.height));
-        onStatus('Rendering…', 'render');
-        layouts = timing.measure('paint', () => paintRegions(canvas, frame, det, outputs, paintPatches));
-    } finally { for (const patch of paintPatches ?? []) patch.dispose(); }
+        let layouts: ReturnType<typeof paintRegions>;
+        let frame: ImageData;
+        const tRender0 = performance.now();
+        try {
+            frame = timing.measure('renderRead', () => ctx.getImageData(0, 0, canvas.width, canvas.height));
+            onStatus('Adding translated text…', 'render');
+            layouts = timing.measure('paint', () => paintRegions(canvas, frame, det, outputs, paintPatches));
+        } finally { for (const patch of paintPatches ?? []) patch.dispose(); }
 
-    timing.measure('paint', () => paintExtras(canvas, frame, det, extras));
-    const renderMs = Math.round(performance.now() - tRender0); // paint only (excludes PNG encode + overlays)
+        timing.measure('paint', () => paintExtras(canvas, frame, det, extras));
+        const renderMs = Math.round(performance.now() - tRender0); // paint only (excludes PNG encode + overlays)
 
-    // single debug dump: everything needed to diagnose a bad page render
-    if (isDebug()) timing.measure('debug', () => console.log('[mt] page result', JSON.stringify({
-        page: `${bitmap.width}x${bitmap.height}`,
-        ann: `${annWCache}x${annHCache}`,
-        ...(badgeR != null ? { badgeR } : null), // drawn region-badge radius (ann px): a mis-mapping report shows the mark size without decoding the JPEG
-        hash: prep.hash, // content hash — same visual page, different hash = read-path pixels differ
-        ...(prep.cacheMiss ? { cacheMiss: prep.cacheMiss } : null), // why a revisit re-translated: absent|fp|dims|mask|disabled
-        ...(prep.resumed ? { resumed: true } : null), // continued from a detect checkpoint, not from zero
-        ...(prep.ocrResumed ? { ocrResumed: true } : null), // …and the OCR text came back too (OCR did not run)
-        ...(prep.prepMs != null ? { prepMs: prep.prepMs } : null), // read + hash + cache-gate ms (excludes queue wait)
-        renderMs, // paint ms (excludes PNG encode + overlays)
-        ...(aiMode !== 'fill' ? {
-            inpaint: {
-                mode: aiMode, ms: aiMs, windows: aiWindows, patches: aiPatches?.length ?? 0,
-                cached: !!aiPatches && !aiGenerated && !aiWarmUsed,
-                // breakdown: mask build (main thread) / PNG encode + transfer /
-                // worker ORT queue wait; warm = patches rode the LLM wait
-                ...((aiGenerated || aiWarmUsed) ? { maskMs: aiMaskMs, encodeMs: aiEncodeMs, lockWaitMs: aiLockWaitMs } : null),
-                ...(aiWarmUsed ? { warm: true } : null),
-                ...(savedPatches ? { saved: true } : null), // crops persisted for the next visit
-                ...(aiPre ? { pre: true } : null), // patches rode the cloud detect call, not a second roundtrip
-                ...(aiError ? { error: aiError } : null),
-            },
-        } : null),
-        minFont: renderTuning.minFont, // effective floor — stale options look identical to a render bug
-        gen: RENDER_GEN, // render-logic generation — stale extension shows an older number
-        detConf: pipeline.detConf, // threshold that let these boxes through — low values explain junk regions
-        usedLLM,
-        det: { model: pipeline.layoutModel, ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null, splitGen: det.splitGen ?? null, ...(det.cloudMs ? { cloud: det.cloudMs } : null) },
-        llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
-        ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
-        boxes: det.boxes.map(b => ({
-            x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2),
-            // split children carry their side of the cut — the tell for
-            // "two frames shifted next to each other" reports
-            ...(b.clip ? { clip: [Math.round(b.clip.x1), Math.round(b.clip.y1), Math.round(b.clip.x2), Math.round(b.clip.y2)] } : null),
-        })),
-        panels: (det.panels ?? []).map(p => ({ x1: Math.round(p.x1), y1: Math.round(p.y1), x2: Math.round(p.x2), y2: Math.round(p.y2), conf: +p.conf.toFixed(2) })),
-        ...(det.panelSkipped ? { panelSkipped: det.panelSkipped } : null),
-        // placement areas the renderer actually used (same effective boxes the
-        // paint used — what you see is what painted).
-        areas: dumpAreas(ctx, frame, det, outputs, layouts),
-        // chosen layout per region: {i, fontSize, line count} — null layout
-        // (skipped/degenerate) is simply absent
-        layout: layouts,
-        outputs: outputs.map(o => ({ i: o.index, t: o.translation, s: o.source || null, spk: o.spk ? { d: o.spk.desc || o.spk.id || '', g: o.spk.gender, n: o.spk.name ?? null } : null })),
-        extras,
-        ...(bookOps?.length ? { bookOps } : null),
-    })));
-    if (rawLLM == null) console.warn('[mt] llm raw unavailable — stale service worker? reload the extension');
-    assertCacheCurrent(cacheEpoch);
-    const tPngQueue = performance.now();
-    const blob = await withEncodeLock(() => {
-        timing.add('pngWait', performance.now() - tPngQueue);
-        return timing.measureAsync('png', () => canvasPngBlob(canvas));
-    });
-    assertCacheCurrent(cacheEpoch);
-    const state: PageState = {
-        cacheEpoch,
-        orig: srcUrl,
-        translated: URL.createObjectURL(blob),
-        det: retainDetection(det),
-        outputs,
-        mentions,
-        bookBefore,
-        pairsBefore,
-        hash: prep.hash,
-        image: timing.measure('identity', () => identifyBitmap(bitmap, det.boxes)),
-        // canvas pages have no URL to re-read — carry the original bytes forward
-        // (and a decoded translated bitmap for write-back) with the state
-        origBytes: prep.origBytes ?? existing?.origBytes,
-        translatedBmp: ref.kind === 'canvas' ? canvas.transferToImageBitmap() : undefined,
-    };
-    // Execution hosts return a rendered artifact without touching reader/book state.
-    if (opts.detached) { opts.onPatches?.(aiPatches ?? undefined); return state; }
-    // blob-origin readers: keep an extension-owned copy now — once we swap in
-    // the translated blob the reader's URL may be dead (see ownOriginalUrl).
-    if (ownCopyNeeded(srcUrl, bitmap.width, bitmap.height)) {
-        state.origOwn = await timing.measureAsync('originalCopy', () => ownOriginalUrl(bitmap));
-        if (isDebug() && state.origOwn) console.log('[mt] orig copy', JSON.stringify({ src: srcUrl.slice(-14), px: bitmap.width * bitmap.height }));
+        // single debug dump: everything needed to diagnose a bad page render
+        if (isDebug()) timing.measure('debug', () => console.log('[mt] page result', JSON.stringify({
+            page: `${bitmap.width}x${bitmap.height}`,
+            ann: `${annWCache}x${annHCache}`,
+            ...(badgeR != null ? { badgeR } : null), // drawn region-badge radius (ann px): a mis-mapping report shows the mark size without decoding the JPEG
+            hash: prep.hash, // content hash — same visual page, different hash = read-path pixels differ
+            ...(prep.cacheMiss ? { cacheMiss: prep.cacheMiss } : null), // why a revisit re-translated: absent|fp|dims|mask|disabled
+            ...(prep.resumed ? { resumed: true } : null), // continued from a detect checkpoint, not from zero
+            ...(prep.ocrResumed ? { ocrResumed: true } : null), // …and the OCR text came back too (OCR did not run)
+            ...(prep.prepMs != null ? { prepMs: prep.prepMs } : null), // read + hash + cache-gate ms (excludes queue wait)
+            renderMs, // paint ms (excludes PNG encode + overlays)
+            ...(aiMode !== 'fill' ? {
+                inpaint: {
+                    mode: aiMode, ms: aiMs, windows: aiWindows, patches: aiPatches?.length ?? 0,
+                    cached: !!aiPatches && !aiGenerated && !aiWarmUsed,
+                    // breakdown: mask build (main thread) / PNG encode + transfer /
+                    // worker ORT queue wait; warm = patches rode the LLM wait
+                    ...((aiGenerated || aiWarmUsed) ? { maskMs: aiMaskMs, encodeMs: aiEncodeMs, lockWaitMs: aiLockWaitMs } : null),
+                    ...(aiWarmUsed ? { warm: true } : null),
+                    ...(savedPatches ? { saved: true } : null), // crops persisted for the next visit
+                    ...(aiPre ? { pre: true } : null), // patches rode the cloud detect call, not a second roundtrip
+                    ...(aiError ? { error: aiError } : null),
+                },
+            } : null),
+            minFont: renderTuning.minFont, // effective floor — stale options look identical to a render bug
+            gen: RENDER_GEN, // render-logic generation — stale extension shows an older number
+            detConf: pipeline.detConf, // threshold that let these boxes through — low values explain junk regions
+            usedLLM,
+            det: { model: pipeline.layoutModel, ep: det.ep, ms: Math.round(det.inferMs), initMs: det.initMs ?? null, panelMs: det.panelMs ?? null, lockWaitMs: det.lockWaitMs ?? null, splitGen: det.splitGen ?? null, ...(det.cloudMs ? { cloud: det.cloudMs } : null) },
+            llm: usage || llmCalls ? { calls: llmCalls ?? 1, ms: llmMs, inTok: usage?.inTok ?? null, outTok: usage?.outTok ?? null, cachedInTok: usage?.cachedInTok ?? null } : null,
+            ocr: ocrStatus ? { ok: ocrStatus.filter(s => s === 'ok').length, empty: ocrStatus.filter(s => s === 'empty').length, ms: ocrMs ?? null, lockWaitMs: ocrLockWaitMs ?? null } : null,
+            boxes: det.boxes.map(b => ({
+                x1: Math.round(b.x1), y1: Math.round(b.y1), x2: Math.round(b.x2), y2: Math.round(b.y2), conf: +b.conf.toFixed(2),
+                // split children carry their side of the cut — the tell for
+                // "two frames shifted next to each other" reports
+                ...(b.clip ? { clip: [Math.round(b.clip.x1), Math.round(b.clip.y1), Math.round(b.clip.x2), Math.round(b.clip.y2)] } : null),
+            })),
+            panels: (det.panels ?? []).map(p => ({ x1: Math.round(p.x1), y1: Math.round(p.y1), x2: Math.round(p.x2), y2: Math.round(p.y2), conf: +p.conf.toFixed(2) })),
+            ...(det.panelSkipped ? { panelSkipped: det.panelSkipped } : null),
+            // placement areas the renderer actually used (same effective boxes the
+            // paint used — what you see is what painted).
+            areas: dumpAreas(ctx, frame, det, outputs, layouts),
+            // chosen layout per region: {i, fontSize, line count} — null layout
+            // (skipped/degenerate) is simply absent
+            layout: layouts,
+            outputs: outputs.map(o => ({ i: o.index, t: o.translation, s: o.source || null, spk: o.spk ? { d: o.spk.desc || o.spk.id || '', g: o.spk.gender, n: o.spk.name ?? null } : null })),
+            extras,
+            ...(bookOps?.length ? { bookOps } : null),
+        })));
+        if (rawLLM == null) console.warn('[mt] llm raw unavailable — stale service worker? reload the extension');
+        ensureCurrent();
+        const tPngQueue = performance.now();
+        const blob = await withEncodeLock(() => {
+            ensureCurrent();
+            timing.add('pngWait', performance.now() - tPngQueue);
+            return timing.measureAsync('png', () => canvasPngBlob(canvas));
+        });
+        ensureCurrent();
+        const state: PageState = {
+            cacheEpoch,
+            orig: srcUrl,
+            translated: URL.createObjectURL(blob),
+            det: retainDetection(det),
+            outputs,
+            mentions,
+            bookBefore,
+            pairsBefore,
+            hash: prep.hash,
+            image: timing.measure('identity', () => identifyBitmap(bitmap, det.boxes)),
+            // canvas pages have no URL to re-read — carry the original bytes forward
+            // (and a decoded translated bitmap for write-back) with the state
+            origBytes: prep.origBytes ?? existing?.origBytes,
+            translatedBmp: ref.kind === 'canvas' ? canvas.transferToImageBitmap() : undefined,
+        };
+        // Execution hosts return a rendered artifact without touching reader/book state.
+        if (opts.detached) { opts.onPatches?.(aiPatches ?? undefined); return state; }
+        // blob-origin readers: keep an extension-owned copy now — once we swap in
+        // the translated blob the reader's URL may be dead (see ownOriginalUrl).
+        if (ownCopyNeeded(srcUrl, bitmap.width, bitmap.height)) {
+            state.origOwn = await timing.measureAsync('originalCopy', () => ownOriginalUrl(bitmap));
+            if (isDebug() && state.origOwn) console.log('[mt] orig copy', JSON.stringify({ src: srcUrl.slice(-14), px: bitmap.width * bitmap.height }));
+        }
+        // debug views ride along only when debug is on — zero cost otherwise.
+        // one on each frame so Original/Translate toggle keeps its debug boxes.
+        if (debugOn && det.boxes.length) {
+            // canvas pages reuse the kept translated bitmap (transfer is one-shot);
+            // img pages transfer here as before — the canvas is dead after this
+            const bmp = state.translatedBmp ?? canvas.transferToImageBitmap();
+            await timing.measureAsync('debug', () => ensurePageDebugViews(state, bitmap, bmp));
+            if (!state.translatedBmp) bmp.close();
+        }
+        try { ensureCurrent(); }
+        catch (e) {
+            for (const url of [state.translated, state.origOwn, state.debug, state.debugOrig]) if (url) URL.revokeObjectURL(url);
+            state.translatedBmp?.close(); state.debugBmp?.close(); state.debugOrigBmp?.close();
+            throw e;
+        }
+        if (existing) {
+            unregPage(existing);
+            URL.revokeObjectURL(existing.translated);
+            if (existing.debug) URL.revokeObjectURL(existing.debug);
+            if (existing.debugOrig) URL.revokeObjectURL(existing.debugOrig);
+        }
+        regPage(state);
+        if (existing?.hash) bookDrop(existing.hash);
+        if (!paintOnly) {
+            if (shareContext && nextContext) {
+                setContext(nextContext);
+                if (force) replayPagesAfter(state);
+                await saveContext();
+            }
+            bookAdd(prep.hash);
+        }
+        // Only a sole visible page may inherit the URL's slot; spreads need manifest or byte identity.
+        const soleVisible = viewportOverlap(ref) > 0 && getPages().filter(page => viewportOverlap(page) > 0).length === 1;
+        const order = sweepPageOrder(prep.srcUrl) ?? (soleVisible ? idlePageOrder() : null);
+        const slotKey = order != null ? pageKey(chapterKey(), order) : undefined;
+        const cacheKeys = (): string[] => [cacheKey(chapterKey(), prep.hash), ...(slotKey ? [slotKey] : [])];
+        const entryBase = {
+            fp: prep.fp ?? settingsFingerprint(pipeline),
+            w: bitmap.width, h: bitmap.height,
+            boxes: det.boxes, panels: det.panels ?? [], outputs, extras, mentions,
+            mask: packMask(det.mask), splitGen: det.splitGen ?? 0, ep: det.ep, sourceHash: prep.hash,
+            ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
+        };
+        const writeCache = (extra: Partial<CachedPage>): void => {
+            if (prep.fp && prep.fp !== settingsFingerprint(pipeline)) return;
+            const rows = cacheKeys().map(key => ({ ...entryBase, ...extra, key,
+                ...(key === slotKey ? { patches: undefined, patchesGen: undefined,
+                    idSig: state.image && signatureOf(state.image), idGray: state.image?.gray, idRegions: state.image?.regions } : null) }));
+            void cachePutMany(rows, pipeline.cacheMax, cacheEpoch);
+        };
+        if (!prep.cached && pipeline.cacheEnabled && (det.boxes.length === 0 || outputs.length > 0)) {
+            if (aiPatches?.length) savedPatches = true;
+            writeCache(aiPatches?.length ? { patches: aiPatches, patchesGen: INPAINT_PATCH_GEN } : {});
+        } else if (!prep.cached) {
+            // cache off: drop the resume checkpoint this finished job may have used.
+            for (const key of cacheKeys()) void cacheDelete(key, cacheEpoch);
+        } else if ((aiGenerated || aiWarmUsed) && aiPatches?.length && pipeline.cacheEnabled) {
+            // cache hit that produced crops this visit — persist so the next visit skips the
+            // model. Both sources must persist: a fresh compute (aiGenerated) and the warm
+            // run that rode the LLM wait (aiWarmUsed). Saving only the former meant every
+            // later visit re-ran the model for the same page.
+            savedPatches = true;
+            writeCache({ patches: aiPatches, patchesGen: INPAINT_PATCH_GEN });
+        }
+        if (usage) {
+            sessionUsage.pages++;
+            sessionUsage.inTok += usage.inTok ?? 0;
+            sessionUsage.outTok += usage.outTok ?? 0;
+            sessionUsage.cachedInTok += usage.cachedInTok ?? 0;
+        }
+        setLastPageUsage({ inTok: usage?.inTok, outTok: usage?.outTok, cachedInTok: usage?.cachedInTok, ms: llmMs, calls: llmCalls });
+        return state;
+    } finally {
+        await (aiWarm ?? opts.warm)?.catch(() => {});
     }
-    // debug views ride along only when debug is on — zero cost otherwise.
-    // one on each frame so Original/Translate toggle keeps its debug boxes.
-    if (debugOn && det.boxes.length) {
-        // canvas pages reuse the kept translated bitmap (transfer is one-shot);
-        // img pages transfer here as before — the canvas is dead after this
-        const bmp = state.translatedBmp ?? canvas.transferToImageBitmap();
-        await timing.measureAsync('debug', () => ensurePageDebugViews(state, bitmap, bmp));
-        if (!state.translatedBmp) bmp.close();
-    }
-    assertCacheCurrent(cacheEpoch);
-    if (existing) {
-        unregPage(existing);
-        URL.revokeObjectURL(existing.translated);
-        if (existing.debug) URL.revokeObjectURL(existing.debug);
-        if (existing.debugOrig) URL.revokeObjectURL(existing.debugOrig);
-    }
-    regPage(state);
-    // Only a sole visible page may inherit the URL's slot; spreads need manifest or byte identity.
-    const soleVisible = viewportOverlap(ref) > 0 && getPages().filter(page => viewportOverlap(page) > 0).length === 1;
-    const order = sweepPageOrder(prep.srcUrl) ?? (soleVisible ? idlePageOrder() : null);
-    const slotKey = order != null ? pageKey(chapterKey(), order) : undefined;
-    const cacheKeys = (): string[] => [cacheKey(chapterKey(), prep.hash), ...(slotKey ? [slotKey] : [])];
-    const entryBase = {
-        fp: prep.fp ?? settingsFingerprint(pipeline),
-        w: bitmap.width, h: bitmap.height,
-        boxes: det.boxes, panels: det.panels ?? [], outputs, extras, mentions,
-        mask: packMask(det.mask), splitGen: det.splitGen ?? 0, ep: det.ep, sourceHash: prep.hash,
-        ...(order != null ? { order, keyGen: PAGE_KEY_GEN } : null),
-    };
-    const writeCache = (extra: Partial<CachedPage>): void => {
-        if (prep.fp && prep.fp !== settingsFingerprint(pipeline)) return;
-        const rows = cacheKeys().map(key => ({ ...entryBase, ...extra, key,
-            ...(key === slotKey ? { patches: undefined, patchesGen: undefined,
-                idSig: state.image && signatureOf(state.image), idGray: state.image?.gray, idRegions: state.image?.regions } : null) }));
-        void cachePutMany(rows, pipeline.cacheMax, cacheEpoch);
-    };
-    if (!prep.cached && pipeline.cacheEnabled && (det.boxes.length === 0 || outputs.length > 0)) {
-        if (aiPatches?.length) savedPatches = true;
-        writeCache(aiPatches?.length ? { patches: aiPatches, patchesGen: INPAINT_PATCH_GEN } : {});
-    } else if (!prep.cached) {
-        // cache off: drop the resume checkpoint this finished job may have used.
-        for (const key of cacheKeys()) void cacheDelete(key, cacheEpoch);
-    } else if ((aiGenerated || aiWarmUsed) && aiPatches?.length && pipeline.cacheEnabled) {
-        // cache hit that produced crops this visit — persist so the next visit skips the
-        // model. Both sources must persist: a fresh compute (aiGenerated) and the warm
-        // run that rode the LLM wait (aiWarmUsed). Saving only the former meant every
-        // later visit re-ran the model for the same page.
-        savedPatches = true;
-        writeCache({ patches: aiPatches, patchesGen: INPAINT_PATCH_GEN });
-    }
-    if (force && shareContext) {
-        replayPagesAfter(state);
-        await saveContext();
-    }
-    if (usage) {
-        sessionUsage.pages++;
-        sessionUsage.inTok += usage.inTok ?? 0;
-        sessionUsage.outTok += usage.outTok ?? 0;
-        sessionUsage.cachedInTok += usage.cachedInTok ?? 0;
-    }
-    setLastPageUsage({ inTok: usage?.inTok, outTok: usage?.outTok, cachedInTok: usage?.cachedInTok, ms: llmMs, calls: llmCalls });
-    return state;
 }

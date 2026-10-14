@@ -17,6 +17,28 @@ test('defaults are balanced preset', () => {
   assert.equal(matchingPreset(DEFAULT_PIPELINE_SETTINGS), 'balanced');
 });
 
+test('on-device model defaults to Koharu without replacing saved model choices', () => {
+  for (const stored of [null, {}, { targetLang: 'English' }, { layoutModel: 'unknown' }]) {
+    assert.equal(loadPipelineSettings(stored).layoutModel, 'koharu');
+  }
+  for (const layoutModel of ['ctd', 'koharu']) {
+    const saved = loadPipelineSettings({ layoutModel });
+    assert.equal(saved.layoutModel, layoutModel);
+    for (const preset of ['balanced', 'fast', 'best']) assert.equal(applyPreset(preset, saved).layoutModel, layoutModel);
+  }
+});
+
+test('cloud settings without a saved model keep the supported CTD model', () => {
+  for (const stored of [{ inferEngine: 'cloud' }, { inferEngine: 'cloud', layoutModel: 'unknown' }]) {
+    assert.equal(loadPipelineSettings(stored).layoutModel, 'ctd');
+  }
+  for (const preset of ['balanced', 'fast', 'best']) {
+    assert.equal(applyPreset(preset).layoutModel, 'koharu');
+    assert.equal(applyPreset(preset, { inferEngine: 'cloud' }).layoutModel, 'ctd');
+  }
+  assert.equal(loadPipelineSettings({ inferEngine: 'cloud', layoutModel: 'koharu' }).layoutModel, 'koharu');
+});
+
 test('batching defaults to one call with three pages for fresh and partial settings', () => {
   for (const settings of [DEFAULT_PIPELINE_SETTINGS, loadPipelineSettings(null),
     loadPipelineSettings({}), loadPipelineSettings({ targetLang: 'English' }),
@@ -317,6 +339,20 @@ test('loadPipelineSettings validates inpaint', () => {
 test('presets never touch the AI cleanup choice', () => {
   assert.equal(applyPreset('fast').inpaint, DEFAULT_PIPELINE_SETTINGS.inpaint);
   assert.equal(applyPreset('best').inpaint, DEFAULT_PIPELINE_SETTINGS.inpaint);
+});
+
+test('quality preset changes retain language, tone, fonts, OCR and reading preferences', () => {
+    const chosen = loadPipelineSettings({ targetLang: 'English', stylePrompt: 'Formal', renderFont: 'sarabun',
+        textSource: 'ocr', ocrEngine: 'tesseract', ocrLangs: ['eng'], useOcrModel: true,
+        readingDir: 'ltr', inpaint: 'off', layoutModel: 'koharu', inferEngine: 'cloud', parallelLlm: 2, mergePages: 5 });
+    for (const preset of ['fast', 'best', 'balanced']) {
+        const changed = applyPreset(preset, chosen);
+        for (const key of ['targetLang', 'stylePrompt', 'renderFont', 'textSource', 'ocrEngine', 'ocrLangs',
+            'useOcrModel', 'readingDir', 'inpaint', 'layoutModel', 'inferEngine', 'parallelLlm', 'mergePages']) {
+            assert.deepEqual(changed[key], chosen[key], `${preset}: ${key}`);
+        }
+        assert.equal(matchingPreset(changed), preset);
+    }
 });
 
 test('mergePages is a batching knob with defensive bounds', () => {

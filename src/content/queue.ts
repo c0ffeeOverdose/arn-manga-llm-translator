@@ -4,7 +4,7 @@
 // NOTE: mutual imports with status-ui/overlays are fine — every cross-module
 // use happens inside function bodies, never at module top level.
 
-import { updateContext, type CharacterEntry, type PairLine } from '../llm/core';
+import { updateContext, type CharacterEntry, type PairLine, type ContextState } from '../llm/core';
 import { cooldownMark, cooldownClear, paintLaneSize, ownedByPath, type FailMark, pageHashFromBitmap } from './page-cache';
 import { isDebug } from '../debug';
 import type { MtStage } from './detection';
@@ -17,10 +17,12 @@ import { setActivity, removeActivity, lastMsgSet, renderStatus, makeToast, logEr
 import { applyOverlays } from './overlays';
 import { bookHas, chapterOwnsRequest } from './sweep';
 import type { PageTimer } from '../page-timing';
-import { disposePreparedJob } from './prepared-job';
+import { disposePreparedJob, retainPreparedJob } from './prepared-job';
+import { cancellable, checkCancelled } from './cancellation';
 
 export const queue: Job[] = [];
 let running = false;
+const activeJobs = new Map<string, Job>();
 // paint lane: cache-hit jobs with folded outputs need no LLM and no book mutation,
 // so they must not hold the serial pump — up to paintLaneSize at once.
 const paintQueue: Job[] = [];
@@ -55,7 +57,9 @@ export function haltAuto(kind: string, retryAfterMs = 0): void {
     autoHalt = { kind, until: retryAfterMs > 0 ? Date.now() + retryAfterMs : 0 };
 }
 export function autoHalted(): { kind: string; until: number } | null { return autoHalt; }
-export function resumeAuto(): void { autoHalt = null; }
+export function resumeAuto(preserveUserPause = false): void {
+    if (!preserveUserPause || autoHalt?.kind !== 'user') autoHalt = null;
+}
 let activeRef: PageRef | null = null; // job currently rendering
 let activeKey: string | null = null; // its page key — twins on swapped elements map here
 let activePrep: Promise<Prep | null> | null = null; // its prep — seam owners await members' preps, active included
@@ -74,6 +78,26 @@ export function activeKeyGet(): string | null { return activeKey; }
 export function activePrepGet(): Promise<Prep | null> | null { return activePrep; }
 export function activeRefGet(): PageRef | null { return activeRef; }
 export function queueFind(key: string): Job | undefined { return queue.find(j => j.key === key); }
+export function activeJobExists(key: string): boolean { return activeJobs.has(key); }
+export function pageActive(ref: PageRef): boolean {
+    const key = pageKeyOf(ref);
+    return activeJobs.has(key) || paintActive.has(key);
+}
+export function cancelPage(ref: PageRef): boolean {
+    const key = pageKeyOf(ref);
+    const job = activeJobs.get(key) ?? paintActive.get(key);
+    if (job) { job.controller?.abort(); removeActivity(key); return true; }
+    if (dequeue(ref)) return true;
+    const at = paintQueue.findIndex(j => j.key === key);
+    if (at < 0) return false;
+    const queued = paintQueue.splice(at, 1)[0];
+    queued.controller?.abort(); disposePreparedJob(queued); removeActivity(key);
+    return true;
+}
+export function stopAllJobs(): void {
+    for (const job of [...activeJobs.values(), ...paintActive.values()]) job.controller?.abort();
+    clearQueue();
+}
 
 // Ownership by page PATH, for callers holding a URL but no element (sweep items from
 // manifest/paged/gallery lists): the same page may already be queued/rendering/painting
@@ -81,7 +105,7 @@ export function queueFind(key: string): Job | undefined { return queue.find(j =>
 // flavors above stay exact-key; this one is the volatile twin.
 export function queueOwnsPath(path: string): boolean {
     const painting = [...paintQueue.map(j => j.key), ...paintActive.keys()];
-    return ownedByPath(path, activeKey, queue.map(j => j.key), painting);
+    return ownedByPath(path, activeKey, [...queue.map(j => j.key), ...activeJobs.keys()], painting);
 }
 
 export function isBusy(): boolean {
@@ -96,13 +120,15 @@ export function pageKeyOf(ref: PageRef): string {
 // it as it was BEFORE that page — replay every other page's outputs in reading order, keep
 // user-added entries. Without this, a wrong first guess (first-wins) survives every re-translate.
 export async function rewindContextBefore(...targets: (PageState | undefined)[]): Promise<void> {
+    setContext(await contextBefore(...targets));
+}
+export async function contextBefore(...targets: (PageState | undefined)[]): Promise<ContextState> {
     await loadContext();
     // Snapshot first: the target's bookBefore/pairsBefore is the exact pre-fold state, and
     // unlike a replay it works in a fresh session (no page states to rebuild from).
     const snapped = targets.find((t): t is PageState => !!t?.bookBefore);
     if (snapped) {
-        setContext({ pairs: [...(snapped.pairsBefore ?? [])], characters: [...snapped.bookBefore!] });
-        return;
+        return { pairs: [...(snapped.pairsBefore ?? [])], characters: [...snapped.bookBefore!] };
     }
     // No snapshot (state created before this field existed): rebuild PAIRS only from the
     // accumulated page states and keep characters untouched — a wiped book is unrecoverable.
@@ -111,7 +137,7 @@ export async function rewindContextBefore(...targets: (PageState | undefined)[])
         if (targets.includes(st) || !st.outputs?.length) continue;
         rebuilt = updateContext(rebuilt, st.outputs, [], false, pipeline.contextPairs, pipeline.charLimit).ctx;
     }
-    setContext({ pairs: rebuilt.pairs, characters: context.characters });
+    return { pairs: rebuilt.pairs, characters: context.characters };
 }
 
 // …and after the fresh translation, fold the FOLLOWING pages back in (stored outputs, no
@@ -144,12 +170,15 @@ export function enqueue(ref: PageRef, force = false, auto = false): 'queued' | '
     }
     // detection kicks off NOW — it overlaps whatever LLM call is in flight. Status goes to
     // the activity registry (priority picks the winner), never straight to the pill.
-    const prep = preparePage(ref, force, (s, stage) => setActivity(key, s, force ? 'force' : 'view', stage), false, auto)
+    const controller = new AbortController();
+    const prep = preparePage(ref, force, (s, stage) => {
+        if (!controller.signal.aborted) setActivity(key, s, force ? 'force' : 'view', stage);
+    }, false, auto, controller.signal)
         .catch(e => { throw e; }); // surface prepare errors in runJob
     // orphan suppressor: dropped twins never get awaited — without this their late rejections
     // surface as pageerror noise. runJob still sees every rejection via job.prep.
     prep.catch(() => {});
-    const job = { ref, force, prep, key, auto };
+    const job = { ref, force, prep, key, auto, controller };
     // explicit intent (manual / re-translate) jumps a prefetch backlog
     if (force) queue.unshift(job);
     else queue.push(job);
@@ -164,7 +193,9 @@ export function dequeue(ref: PageRef): boolean {
     const key = pageKeyOf(ref);
     const i = queue.findIndex(j => j.key === key);
     if (i === -1) return false;
-    disposePreparedJob(queue.splice(i, 1)[0]);
+    const job = queue.splice(i, 1)[0];
+    job.controller?.abort();
+    disposePreparedJob(job);
     removeActivity(key); // its in-flight prep must not resurrect as a ghost
     return true;
 }
@@ -202,16 +233,20 @@ function pumpPaint(): void {
         paintRunning++;
         paintActive.set(job.key, job);
         claimPaint(job.key); // shared with out-of-band painters (the arrival sweep)
-        const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
+        const st = (s: string, stage?: MtStage) => {
+            if (!job.controller?.signal.aborted) setActivity(job.key, s, job.force ? 'force' : 'view', stage);
+        };
         void (async () => {
             let timing: PageTimer | undefined;
             let painted = false;
             try {
-                const prep = await job.prep;
+                const prep = await cancellable(job.prep, job.controller?.signal);
                 if (!prep) { removeActivity(job.key); renderStatus(); return; } // painted while queued
                 timing = prep.timing;
                 timing?.activate();
-                await renderPage(job.ref, prep, st, job.force);
+                const releasePrepared = retainPreparedJob(job);
+                await cancellable(renderPage(job.ref, prep, st, job.force).finally(releasePrepared), job.controller?.signal);
+                checkCancelled(job.controller?.signal);
                 painted = true;
                 cooldownClear(failMarks, job.key);
                 removeActivity(job.key);
@@ -287,20 +322,26 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     activeRef = job.ref;
     activeKey = job.key;
     activePrep = job.prep;
+    activeJobs.set(job.key, job);
     const endKeepalive = keepaliveOpen();
-    const st = (s: string, stage?: MtStage) => setActivity(job.key, s, job.force ? 'force' : 'view', stage);
+    const st = (s: string, stage?: MtStage) => {
+        if (!job.controller?.signal.aborted) setActivity(job.key, s, job.force ? 'force' : 'view', stage);
+    };
     let timing: PageTimer | undefined;
     let handedToPaint = false;
-    try {
+    const releasePrepared = retainPreparedJob(job);
+    const task = (async () => {
         let prep;
         try {
             prep = await job.prep;
         } catch (e) {
+            checkCancelled(job.controller?.signal);
             const pe = e as Error & { kind?: string; hint?: string };
             const wrapped = new Error('Detection failed: ' + (pe.message ?? e)) as Error & { kind?: string; hint?: string };
             wrapped.kind = pe.kind; wrapped.hint = pe.hint;
             throw wrapped;
         }
+        checkCancelled(job.controller?.signal);
         if (!prep) {
             // translated while queued — stay silent (debug still logs)
             if (isDebug()) console.log('[mt] job dropped (already translated):', job.key.slice(-14));
@@ -310,7 +351,9 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         timing?.activate();
         // ghost-drop BEFORE any LLM call (auto only — manual intent always wins). A 2.5s pill
         // flash (not silence): the only trace that a page-turn orphaned the job.
-        if (job.auto && (await ghostDropped(job, prep))) {
+        const dropped = job.auto && await ghostDropped(job, prep);
+        checkCancelled(job.controller?.signal);
+        if (dropped) {
             timing?.finish('done');
             if (isDebug()) console.log('[mt] job dropped (ghost):', job.key.slice(-14));
             removeActivity(job.key); lastMsgSet(null); setStatus('Skipped (page changed)', 'idle'); renderStatus(); return;
@@ -325,7 +368,7 @@ export async function runJob(allowSeam: boolean): Promise<void> {
             return;
         }
         let joined: PageState | null = null;
-        if (allowSeam && job.ref.kind === 'img' && !prep.cached) {
+        if (allowSeam && !job.force && job.ref.kind === 'img' && !prep.cached) {
             const join = () => trySeam(job, prep, st).catch(e => {
                 console.warn('[mt] seam failed, solo fallback:', (e as Error)?.message ?? e);
                 return null;
@@ -334,19 +377,21 @@ export async function runJob(allowSeam: boolean): Promise<void> {
             if (joined && timing) timing.meta.joined = true;
         }
         const state = joined ?? await renderPage(job.ref, prep, st, job.force);
+        checkCancelled(job.controller?.signal);
         if (state.det && state.det.boxes.length) {
             // auto-show only when the user hasn't pinned "Show original" mid-run
             if (overlayChoice === 'auto') setOverlayOn(true);
             const mode = state.outputs?.length ? `LLM ${state.outputs.length}/${state.det.boxes.length} regions` : 'no usable text';
+            const message = state.outputs?.length ? 'Page translation complete' : 'No translated text found on this page';
             removeActivity(job.key);
-            lastMsgSet({ text: `Done (${state.det.ep}, ${Math.round(state.det.inferMs)}ms, ${mode}, ${context.characters.length} characters)`, phase: 'done' });
+            lastMsgSet({ text: isDebug() ? `Done (${state.det.ep}, ${Math.round(state.det.inferMs)}ms, ${mode}, ${context.characters.length} characters)` : message, phase: 'done' });
             renderStatus();
             // single-page work toasts per page; auto pre-translate stays quiet and
             // reports through the pill counts + paused hint instead of a toast storm
-            if (!job.auto) makeToast('Page done — ' + mode, 'ok');
+            if (!job.auto) makeToast(isDebug() ? 'Page done — ' + mode : message, 'ok');
         } else {
             removeActivity(job.key);
-            lastMsgSet({ text: 'Done (no text found)', phase: 'done' });
+            lastMsgSet({ text: isDebug() ? 'Done (no text found)' : 'No text found on this page', phase: 'done' });
             renderStatus();
         }
         // sweep instead of pointing at the (possibly replaced) element —
@@ -355,9 +400,12 @@ export async function runJob(allowSeam: boolean): Promise<void> {
         else applyOverlays();
         cooldownClear(failMarks, job.key);
         timing?.finish('done');
+    })().finally(releasePrepared);
+    try {
+        await cancellable(task, job.controller?.signal);
     } catch (e) {
         timing?.finish('failed');
-        if ((e as Error)?.name === 'AbortError') return;
+        if (job.controller?.signal.aborted || (e as Error)?.name === 'AbortError') { removeActivity(job.key); renderStatus(); return; }
         const err = e as Error & { kind?: string; hint?: string; retryAfterMs?: number };
         cooldownMark(failMarks, job.key, Date.now());
         // Shared failures pause background work: another page cannot repair a provider
@@ -375,31 +423,33 @@ export async function runJob(allowSeam: boolean): Promise<void> {
     } finally {
         if (!handedToPaint) disposePreparedJob(job);
         endKeepalive();
-        activeRef = null;
-        activeKey = null;
-        activePrep = null;
+        if (activeJobs.get(job.key) === job) activeJobs.delete(job.key);
+        if (activeRef === job.ref) {
+            const other = [...activeJobs.values()].at(-1);
+            activeRef = other?.ref ?? null;
+            activeKey = other?.key ?? null;
+            activePrep = other?.prep ?? null;
+        }
     }
 }
 
-// Drop everything still queued (story change / manual cancel). The page currently rendering
-// runs to completion — aborting mid-LLM would corrupt the book (and the tokens are spent
-// already). Paint-lane backlog drops too (in-flight paints run out on their own).
+// Drop queued work; callers that also stop active jobs use stopAllJobs.
 export function clearQueue(): void {
-    for (const j of queue) { disposePreparedJob(j); removeActivity(j.key); }
+    for (const j of queue) { j.controller?.abort(); disposePreparedJob(j); removeActivity(j.key); }
     queue.length = 0;
-    for (const j of paintQueue) { disposePreparedJob(j); removeActivity(j.key); }
+    for (const j of paintQueue) { j.controller?.abort(); disposePreparedJob(j); removeActivity(j.key); }
     paintQueue.length = 0;
 }
 
 // Toggle-off: drop queued AUTO work (manual/force intent + the in-flight page survive).
 // Completed pages are cached — the unstarted backlog simply never runs.
-export function dropAutoQueued(): number {
+export function dropAutoQueued(allowed?: ReadonlySet<string>): number {
     let n = 0;
     for (let i = queue.length - 1; i >= 0; i--) {
-        if (queue[i].auto && !queue[i].force) { disposePreparedJob(queue[i]); removeActivity(queue[i].key); queue.splice(i, 1); n++; }
+        if (queue[i].auto && !queue[i].force && !allowed?.has(queue[i].key)) { queue[i].controller?.abort(); disposePreparedJob(queue[i]); removeActivity(queue[i].key); queue.splice(i, 1); n++; }
     }
     for (let i = paintQueue.length - 1; i >= 0; i--) {
-        if (paintQueue[i].auto && !paintQueue[i].force) { disposePreparedJob(paintQueue[i]); removeActivity(paintQueue[i].key); paintQueue.splice(i, 1); n++; }
+        if (paintQueue[i].auto && !paintQueue[i].force && !allowed?.has(paintQueue[i].key)) { paintQueue[i].controller?.abort(); disposePreparedJob(paintQueue[i]); removeActivity(paintQueue[i].key); paintQueue.splice(i, 1); n++; }
     }
     return n;
 }

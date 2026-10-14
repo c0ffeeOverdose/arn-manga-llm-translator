@@ -7,7 +7,8 @@ import { koharuInstalled } from '../llm/layout-models';
 import { FONT_PRESETS, fontList, fontDownload, fontDelete, fontAddCustom, fontName, fontIdFromUrl, fontRead } from '../llm/font-store';
 import { charKey, overrideKey, claimLegacyOverrides, type CharOverride } from '../llm/core';
 import { $ } from './shell';
-import { pipeline, markCustom, savePipeline } from './pipeline-section';
+import { pipeline, markCustom, forgetSelectedFont } from './pipeline-section';
+import { initDebug, isDebug } from '../debug';
 
 const mtCharOverridesKey = 'mtCharOverrides';
 const mtCharTitlesKey = 'mtCharTitles';
@@ -155,12 +156,12 @@ function charRow(section: BookSection, c: BookRow, overrides: Record<string, Cha
     const idTag = document.createElement('span');
     idTag.className = 'char-id';
     idTag.textContent = c.id ?? '—';
-    idTag.title = 'Roster id — the model answers spk="…" with this id';
+    idTag.title = 'Character ID used by the translation model';
     const label = c.fullName && c.fullName !== c.name ? (c.name ? `${c.name} (${c.fullName})` : c.fullName) : c.name;
-    const name = textInput(ov?.name ?? label ?? '', 'name', `Name for ${rowLabel(c)}`);
+    const name = textInput(ov?.name ?? label ?? '', 'Character name', `Name for ${rowLabel(c)}`);
     const sel = document.createElement('select');
     sel.setAttribute('aria-label', `Gender for ${rowLabel(c)}`);
-    for (const [v, text] of [['?', 'unknown'], ['F', 'female'], ['M', 'male']] as const) {
+    for (const [v, text] of [['?', 'Unknown'], ['F', 'Female'], ['M', 'Male']] as const) {
         const o = document.createElement('option');
         o.value = v; o.textContent = text;
         sel.append(o);
@@ -171,23 +172,23 @@ function charRow(section: BookSection, c: BookRow, overrides: Record<string, Cha
     const descLine = document.createElement('div');
     descLine.className = 'line';
     const descLabel = document.createElement('label');
-    descLabel.textContent = 'desc';
-    const desc = textInput(ov?.desc ?? c.desc ?? '', 'how to recognize them', `Description for ${rowLabel(c)}`);
-    desc.title = 'Visual anchor sent to the model — what makes this person recognizable';
+    descLabel.textContent = 'Appearance';
+    const desc = textInput(ov?.desc ?? c.desc ?? '', 'e.g. Short hair and glasses', `Description for ${rowLabel(c)}`);
+    desc.title = 'Details that help the model recognize this character';
     descLine.append(descLabel, desc);
     const noteLine = document.createElement('div');
     noteLine.className = 'line';
     const noteLabel = document.createElement('label');
-    noteLabel.textContent = 'note';
-    const note = textInput(ov?.note ?? c.note ?? '', 'relation, rank, how they are called', `Note for ${rowLabel(c)}`);
-    note.title = 'Page-stated facts (relations, rank, how others address them)';
+    noteLabel.textContent = 'Notes';
+    const note = textInput(ov?.note ?? c.note ?? '', 'Relationships, titles or other details', `Note for ${rowLabel(c)}`);
+    note.title = 'Details the model should remember about this character';
     noteLine.append(noteLabel, note);
 
     const meta = document.createElement('div');
     meta.className = 'meta';
     const src = document.createElement('span');
     src.className = 'src';
-    src.textContent = `learned via ${c.source}`;
+    src.textContent = c.source === 'user' ? 'Added by you' : 'Learned from translation';
     meta.append(src);
 
     const saveRow = async () => {
@@ -206,7 +207,7 @@ function charRow(section: BookSection, c: BookRow, overrides: Record<string, Cha
         // inline feedback on the row itself — the footer status belongs to save/test
         const saved = document.createElement('span');
         saved.className = 'char-saved';
-        saved.textContent = 'saved — retranslate the page to apply';
+        saved.textContent = 'Saved. Re-translate a page to apply.';
         item.append(saved);
         setTimeout(() => saved.remove(), 2500);
         renderCharacters(all); // rows may have merged under a shared name
@@ -218,7 +219,7 @@ function charRow(section: BookSection, c: BookRow, overrides: Record<string, Cha
     if (ov) {
         const tag = document.createElement('span');
         tag.className = 'src';
-        tag.textContent = '✓ user';
+        tag.textContent = 'Edited by you';
         meta.append(tag);
     }
     item.append(head, descLine, noteLine, meta);
@@ -230,7 +231,7 @@ export async function renderCharacters(overrides: Record<string, CharOverride>):
     const box = $('characters');
     box.innerHTML = '';
     if (!sections.length) {
-        box.innerHTML = '<div class="empty">No characters yet — translate some pages first.</div>';
+        box.innerHTML = '<div class="empty">Characters appear here after you translate a page.</div>';
         return;
     }
     // legacy bare edits get pinned to the book that shows the row (once), so a c1 from one
@@ -251,12 +252,12 @@ export async function renderCharacters(overrides: Record<string, CharOverride>):
         nameEl.textContent = section.label;
         const count = document.createElement('span');
         count.className = 'src';
-        count.textContent = `${section.rows.length} row${section.rows.length === 1 ? '' : 's'}`;
+        count.textContent = `${section.rows.length} character${section.rows.length === 1 ? '' : 's'}`;
         const clear = document.createElement('button');
         clear.type = 'button';
         clear.className = 'btn ghost sm';
         clear.textContent = 'Clear';
-        clear.title = 'Remove this book and its edits';
+        clear.title = 'Clear characters and edits for this story';
         clear.onclick = () => { void clearBook(section); };
         head.append(nameEl, count, clear);
         box.append(head);
@@ -285,8 +286,9 @@ export async function renderAutoSites(): Promise<void> {
     const list = autoSiteList(mtAutoSites);
     // legacy global flag with no list yet = enabled everywhere until first toggle
     const rows = list.length ? list : (mtAutoTranslate === true ? ['*'] : []);
+    ($('autoSitesClear') as HTMLButtonElement).disabled = rows.length === 0;
     if (!rows.length) {
-        box.innerHTML = '<div class="empty">Auto-translate is off everywhere — enable it from the popup on a manga site.</div>';
+        box.innerHTML = '<div class="empty">No sites enabled.</div>';
         return;
     }
     for (const origin of rows) {
@@ -294,11 +296,11 @@ export async function renderAutoSites(): Promise<void> {
         row.className = 'char-row';
         const desc = document.createElement('div');
         desc.className = 'desc';
-        desc.textContent = origin === '*' ? 'All sites (old global setting)' : origin;
+        desc.textContent = origin === '*' ? 'All sites' : origin;
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'btn ghost sm';
-        btn.textContent = 'Remove';
+        btn.textContent = 'Turn off';
         btn.onclick = async () => {
             const v = await chrome.storage.local.get('mtAutoSites') as { mtAutoSites?: unknown };
             const next = origin === '*' ? [] : autoSiteRemove(autoSiteList(v.mtAutoSites), origin);
@@ -320,7 +322,7 @@ export async function renderFontManager(): Promise<void> {
     sel.innerHTML = '';
     const def = document.createElement('option');
     def.value = 'default';
-    def.textContent = 'Default (per language)';
+    def.textContent = 'Language default';
     sel.append(def);
     for (const id of installed) {
         const o = document.createElement('option');
@@ -329,7 +331,7 @@ export async function renderFontManager(): Promise<void> {
         sel.append(o);
     }
     sel.value = installed.has(cur) || cur === 'default' ? cur : 'default';
-    if (sel.value !== cur) { pipeline.renderFont = sel.value as string; savePipeline(); }
+    if (sel.value !== cur) { pipeline.renderFont = sel.value as string; markCustom(); }
 
     // preset rows
     const list = $('fontPresetList');
@@ -357,6 +359,7 @@ export async function renderFontManager(): Promise<void> {
             try {
                 if (installed.has(preset.id)) {
                     await fontDelete(preset.id);
+                    await forgetSelectedFont(preset.id);
                 } else {
                     btn.textContent = '…';
                     await fontDownload(preset, (loaded, total) => {
@@ -432,6 +435,7 @@ $('fontAdd').onclick = async () => {
             } else throw e;
         }
         pipeline.renderFont = id;
+        markCustom();
         ($('fontUrl') as HTMLInputElement).value = '';
         ($('fontNameInput') as HTMLInputElement).value = '';
         status.textContent = `Added: ${name}`;
@@ -447,18 +451,25 @@ $('fontAdd').onclick = async () => {
     drawFontPreview();
 };
 ($('fontPreviewText') as HTMLInputElement).oninput = drawFontPreview;
-renderFontManager();
 
 // ---- diagnostics (About tab): installed-file integrity + runtime models ----
+function showDiagnostics(): void {
+    $('diagnosticsCard').hidden = !isDebug();
+    if (!isDebug()) $('diagOut').textContent = 'Not run yet.';
+}
+const diagnosticsReady = (async () => { await initDebug(showDiagnostics); showDiagnostics(); })();
 const DIAG_FILES: [string, string][] = [
     ['ORT webgpu bundle', 'ort/ort.webgpu.bundle.min.mjs'],
     ['ORT wasm runtime', 'ort/ort-wasm-simd-threaded.wasm'],
 ];
 ($('diagRun') as HTMLButtonElement).onclick = async () => {
+    await diagnosticsReady;
+    if (!isDebug()) return;
     const out = $('diagOut') as HTMLElement;
     out.textContent = 'Checking…';
     const lines: string[] = [`Extension v${chrome.runtime.getManifest().version}`];
     for (const [label, path] of DIAG_FILES) {
+        if (!isDebug()) return;
         try {
             const r = await fetch(chrome.runtime.getURL(path), { method: 'HEAD' });
             const len = +(r.headers.get('content-length') ?? 0);
@@ -471,7 +482,7 @@ const DIAG_FILES: [string, string][] = [
         const [baberu, langs, fonts, det] = await Promise.all([baberuInstalled(), ocrInstalled(), fontList(), detModelsInstalled()]);
         // detection weights live in IDB (downloaded on first on-device use), not the bundle
         lines.push(`CTD model: ${det.ctd ? 'cached' : 'not downloaded (fetches on first on-device page)'}`);
-        lines.push(`Koharu FP32: ${await koharuInstalled()}`);
+        lines.push(`KoharuLayout: ${await koharuInstalled()}`);
         lines.push(`Panel model: ${det.panel ? 'cached' : 'not downloaded (fetches on first page)'}`);
         lines.push(`Baberu OCR: ${baberu ? 'downloaded' : 'not downloaded'}`);
         lines.push(`Tesseract langs: ${langs.length ? langs.join(', ') : 'none'}`);
@@ -479,5 +490,5 @@ const DIAG_FILES: [string, string][] = [
     } catch (e) {
         lines.push(`Model store: FAILED — ${String((e as Error)?.message ?? e).slice(0, 100)}`);
     }
-    out.textContent = lines.join('\n');
+    if (isDebug()) out.textContent = lines.join('\n');
 };

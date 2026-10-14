@@ -32,6 +32,7 @@ async function fixture({ chunkSize = null, disconnect = false, cloud = true, sta
         : { ok: true, outputs: payload.regions.map(region => ({ index: region.index, translation: region.source })), extras: [], mentions: [] };
     const scope = {
         ...helpers, performance, Date, crypto,
+        checkCancelled: signal => signal?.throwIfAborted(), cancellable: task => task, DOMException,
         PageTimer: class { meta = {}; setStage() {} add() {} measureAsync(_key, run) { return run(); } },
         pipeline: { textSource: split ? 'crops' : 'ocr', ocrEngine: 'baberu', useOcrModel: split },
         context: {}, shareContext: false, EMPTY_CONTEXT: {}, llmChunkSize: chunkSize,

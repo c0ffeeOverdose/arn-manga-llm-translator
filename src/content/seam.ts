@@ -9,20 +9,21 @@ import { updateContext, type Mention, type RegionOutput } from '../llm/core';
 import { isDebug } from '../debug';
 import { cacheReady, assertCacheCurrent } from '../cache-generation';
 import { type DetectResult, type DetBox, type MtOnStatus } from './detection';
-import { pipeline, context, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, loadContext, type PageRef, type PageState } from './state';
+import { pipeline, context, setContext, shareContext, chapterKey, pages, regPage, unregPage, debugOn, sessionUsage, setLastPageUsage, saveContext, loadContext, type PageRef, type PageState } from './state';
 import { getPages, fetchBitmap, writePage, ownCopyNeeded, ownOriginalUrl } from './page-io';
 import { detectPage, orderDetection, paintRegions, paintExtras, type Prep } from './pipeline';
 import { translateRegions, renderDebugView, panelRanks } from './ocr';
-import { rewindContextBefore, replayPagesAfter, pageKeyOf, enqueue, dequeue, queueFind, activeKeyGet, activePrepGet, paintFind } from './queue';
+import { contextBefore, replayPagesAfter, pageKeyOf, queueFind, activeKeyGet, activePrepGet, paintFind } from './queue';
 import { bookAdd, bookDrop } from './sweep';
 import { starveNotice } from './status-ui';
 import { retainPreparedJob } from './prepared-job';
 import { retainDetection, restoreDetection } from './retained-detection';
+import { checkCancelled } from './cancellation';
 
 interface SeamMember { ref: PageRef; key: string; srcUrl: string; bitmap: ImageBitmap; hash: string; det: DetectResult }
-export const SEAM_MAX = 4; // owner + 3 — bounds the stitch canvas + pulled jobs
+export const SEAM_MAX = 4; // bounds the stitch canvas and borrowed inputs
 
-export interface Job { ref: PageRef; force: boolean; prep: Promise<Prep | null>; key: string; auto: boolean }
+export interface Job { ref: PageRef; force: boolean; prep: Promise<Prep | null>; key: string; auto: boolean; controller?: AbortController }
 
 // edge-row pixels for the continuity guard. Null on any failure (caller treats
 // null as reject — fail closed).
@@ -61,23 +62,21 @@ async function bandConfirms(u: SeamMember, l: SeamMember): Promise<boolean> {
 
 export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promise<PageState | null> {
     const cacheEpoch = prep.cacheEpoch ?? await cacheReady();
-    assertCacheCurrent(cacheEpoch);
+    const inputs: Job[] = [];
+    const provisional: PageState[] = [];
+    const committed = new Set<PageState>();
+    const ensureCurrent = (): void => {
+        assertCacheCurrent(cacheEpoch);
+        checkCancelled(prep.signal);
+        for (const input of inputs) checkCancelled(input.controller?.signal);
+    };
+    ensureCurrent();
     // trace helper: every bailout logs its reason (debug-gated).
     const trace = (why: string, extra?: object) => {
         if (isDebug()) console.log('[mt] seam?', JSON.stringify({ page: prep.bitmap.width + 'x' + prep.bitmap.height, why, ...(extra ?? {}) }));
     };
-    // prune helper (declared here so the catch below can also reach it):
-    // pulled members outside the final chain return to the pool.
-    const pulled: PageRef[] = [];
     const owned = new Set<ImageBitmap>();
     const borrowed: (() => void)[] = [];
-    const chainKeys = new Set<string>();
-    const prune = () => {
-        for (const ref of pulled) {
-            if (!chainKeys.has(pageKeyOf(ref))) dequeue(ref);
-        }
-        pulled.length = 0;
-    };
     try {
         // contiguous img run around the job with matching width (±2px); canvases
         // and undecodable imgs break the run. Key match, not element: the reader
@@ -104,10 +103,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         // No pull until THIS page shows real cut ink at an edge: a pulled neighbor costs a
         // full read + detect (cloud bills it), and the fail-safe direction is the split.
         if (!seamEdgeSuspect(prep.det.mask, prep.bitmap.height)) { trace('no-edge-ink'); return null; }
-        // resolve pixels + solo boxes per member: queued/active preps first (no
-        // re-detect), rendered states next, auto-pulled enqueue last (manual never
-        // expands scope — no surprise LLM spend). Unresolvable members become
-        // HOLES that split the run; a block of <2 means solo.
+        // Borrow only requested or already translated neighbours; stitching cannot expand intent.
         const members: (SeamMember | null)[] = [];
         // concurrent resolution: pulls enqueue upfront so all member preps overlap,
         // then one join. Order kept via placeholders.
@@ -124,15 +120,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 const q = queueFind(key) ?? paintFind(key);
                 let mp: Prep | null = null;
                 try {
-                    if (q) { borrowed.push(retainPreparedJob(q)); mp = await q.prep; }
+                    if (q) { inputs.push(q); borrowed.push(retainPreparedJob(q)); mp = await q.prep; }
                     else if (key === activeKeyGet() && activePrepGet()) mp = await activePrepGet();
-                    else if (job.auto || job.force) {
-                        const r = enqueue(ref, false, true);
-                        const jq = (r === 'queued' || r === 'dup') ? queueFind(key) : undefined;
-                        if (jq) pulled.push(ref);
-                        if (jq) { borrowed.push(retainPreparedJob(jq)); mp = await jq.prep; }
-                        else mp = key === activeKeyGet() && activePrepGet() ? await activePrepGet() : null;
-                    }
                 } catch (e) { trace('member-prep-fail', { member: key.slice(-16), err: String((e as Error)?.message ?? e).slice(0, 80) }); mp = null; }
                 const st = pages.get(key);
                 // NOTE: cached member preps are FIRST-class stitch inputs — excluding
@@ -152,13 +141,14 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             })());
         }
         for (const { idx, m } of await Promise.all(pend)) members[idx] = m;
+        ensureCurrent();
         // owner's contiguous block only
         const me = members.findIndex(m => m?.key === job.key);
         let blo = me, bhi = me;
         while (blo > 0 && members[blo - 1]) blo--;
         while (bhi + 1 < members.length && members[bhi + 1]) bhi++;
         const block = members.slice(blo, bhi + 1) as SeamMember[];
-        if (block.length < 2) { trace('lone-block'); prune(); return null; }
+        if (block.length < 2) { trace('lone-block'); return null; }
         // gate every adjacent pair on solo boxes; shrink to the maximal linked
         // sub-run containing the job.
         const linked = [true];
@@ -215,7 +205,6 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     block[i + 1].det.boxes.map(b => [Math.round(b.x1), Math.round(b.y1), Math.round(b.x2), Math.round(b.y2)]),
                 ]).filter(Boolean),
             });
-            prune();
             return null;
         }
         // pixel-continuity: every remaining pair must continue row-exact (kills
@@ -236,16 +225,8 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                     block[i + 1].det.boxes.map(b => [Math.round(b.x1), Math.round(b.y1), Math.round(b.x2), Math.round(b.y2)]),
                 ]).filter(Boolean),
             });
-            prune();
             return null;
         }
-        for (const m of chain) chainKeys.add(m.key);
-        prune();
-        // rebuild the keep-set from the FINAL chain (pixel-rejected members
-        // return to the pool with everything else unlinked).
-        chainKeys.clear();
-        for (const m of chain) chainKeys.add(m.key);
-        prune();
         trace('linked', { n: chain.length, members: chain.map(m => m.srcUrl.slice(-16)) });
         // stitch: exact concatenation (slices are cut, not overlapped).
         onStatus(`Stitching ${chain.length} pages…`);
@@ -259,6 +240,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
         const stitchBmp = await createImageBitmap(stitch);
         owned.add(stitchBmp);
         const det = await detectPage(stitchBmp, onStatus);
+        ensureCurrent();
         // safety net: stitch context can drop a marginal edge line the solo pass
         // caught. Re-add solo boxes the stitch missed — EXCEPT fragments of a
         // bubble the stitch already found whole (IoU≥0.3, or >50% inside a
@@ -279,28 +261,29 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 }
             }
         });
-        if (!det.boxes.length) { prune(); return null; }
+        if (!det.boxes.length) return null;
         await orderDetection(det, stitchBmp);
-        if (det.mask.data.byteLength !== W * H) { prune(); return null; } // slice math needs row-major W×H
+        if (det.mask.data.byteLength !== W * H) return null; // slice math needs row-major W×H
         // rewind one book for the whole chain (members rendered solo before get
         // their fragment contribution rewound).
-        if (shareContext) {
-            const olds = chain.map(m => pages.get(m.key)).filter((s): s is PageState => !!s);
-            if (olds.length) await rewindContextBefore(...olds);
-            for (const o of olds) if (o.hash) bookDrop(o.hash); // rebuilt book excludes them — refold below re-registers
-        }
+        const olds = chain.map(m => pages.get(m.key)).filter((s): s is PageState => !!s);
         // pre-chain snapshot for every member state — a later re-translate of
         // any slice restores this instead of replaying states it may not have.
         await loadContext();
-        const bookBefore = context.characters;
-        const pairsBefore = context.pairs;
-        const outcome = await translateRegions(stitchBmp, det, onStatus, { cacheEpoch, onStarve: starveNotice });
-        if (outcome.error) { prune(); return null; } // members fall back to solo (parked normally)
-        for (const m of chain) bookAdd(m.hash); // folded above (whole-stitch context) — arrivals skip refold
+        const snapshot = shareContext && olds.length ? await contextBefore(...olds) : context;
+        ensureCurrent();
+        const bookBefore = snapshot.characters;
+        const pairsBefore = snapshot.pairs;
+        const signals = [prep.signal, ...inputs.map(input => input.controller?.signal)].filter((signal): signal is AbortSignal => !!signal);
+        const outcome = await translateRegions(stitchBmp, det, onStatus, { cacheEpoch, onStarve: starveNotice,
+            fold: false, context: snapshot, signal: AbortSignal.any(signals), valid: () => { ensureCurrent(); return true; } });
+        ensureCurrent();
+        if (outcome.error) return null;
         const { outputs, extras, mentions, bookOps, usedLLM, usage, llmCalls, llmMs, ocrStatus, ocrMs, ocrLockWaitMs } = outcome;
         const annWCache = outcome.annW, annHCache = outcome.annH;
         const rawLLM = outcome.raw;
         await ensureFont();
+        ensureCurrent();
         const frame = sctx.getImageData(0, 0, W, H);
         const layouts = paintRegions(stitch, frame, det, outputs);
         paintExtras(stitch, frame, det, extras);
@@ -329,6 +312,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             try { sc.getContext('2d')!.drawImage(slice, 0, 0); }
             finally { slice.close(); }
             const blob = await sc.convertToBlob({ type: 'image/png' });
+            ensureCurrent();
             const spans = (b: DetBox) => b.y1 < my0 || b.y2 > my0 + mh;
             const inRange = (b: DetBox) => b.y2 > my0 && b.y1 < my0 + mh;
             const remap = new Map<number, number>();
@@ -365,6 +349,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 pairsBefore,
                 hash: m.hash,
             };
+            provisional.push(state);
             // blob-origin reader: extension-owned original copy per member (see ownOriginalUrl).
             if (ownCopyNeeded(m.srcUrl, m.bitmap.width, m.bitmap.height)) {
                 state.origOwn = await ownOriginalUrl(m.bitmap);
@@ -377,7 +362,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 finally { debugBitmap.close(); }
             }
             const existing = pages.get(m.key);
-            assertCacheCurrent(cacheEpoch);
+            ensureCurrent();
             if (existing) {
                 unregPage(existing);
                 URL.revokeObjectURL(existing.translated);
@@ -385,6 +370,7 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
                 if (existing.debugOrig) URL.revokeObjectURL(existing.debugOrig);
             }
             regPage(state);
+            committed.add(state);
             if (pipeline.cacheEnabled) {
                 void cachePut({
                     key: cacheKey(chapterKey(), m.hash),
@@ -402,6 +388,14 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             writePage(m.ref, state);
             if (!top) top = state;
         }
+        ensureCurrent();
+        if (shareContext) {
+            setContext(outcome.context ?? updateContext(snapshot, outputs, mentions, pipeline.useCharacters, pipeline.contextPairs, pipeline.charLimit).ctx);
+            if (job.force && top) replayPagesAfter(top);
+            await saveContext();
+        }
+        for (const old of olds) if (old.hash) bookDrop(old.hash);
+        for (const member of chain) bookAdd(member.hash);
         if (usage) {
             sessionUsage.pages++;
             sessionUsage.inTok += usage.inTok ?? 0;
@@ -409,19 +403,16 @@ export async function trySeam(job: Job, prep: Prep, onStatus: MtOnStatus): Promi
             sessionUsage.cachedInTok += usage.cachedInTok ?? 0;
         }
         setLastPageUsage({ inTok: usage?.inTok, outTok: usage?.outTok, cachedInTok: usage?.cachedInTok, ms: llmMs, calls: llmCalls });
-        if (job.force && shareContext && top) {
-            replayPagesAfter(top);
-            await saveContext();
-        }
         return top;
     } catch (e) {
         assertCacheCurrent(cacheEpoch);
         // no chain was committed (or it was partial — members re-queue cleanly).
-        chainKeys.clear();
-        try { prune(); } catch { /* prune is best-effort */ }
         console.warn('[mt] seam failed, solo fallback:', (e as Error)?.message ?? e);
         return null;
     } finally {
+        for (const state of provisional) if (!committed.has(state)) {
+            for (const url of [state.translated, state.origOwn, state.debug, state.debugOrig]) if (url) URL.revokeObjectURL(url);
+        }
         for (const bitmap of owned) bitmap.close();
         for (const release of borrowed) release();
     }

@@ -14,6 +14,7 @@ const stubs = {
         export const mtState = null;`,
     'page-io': `export const getPages = () => globalThis.fixture.pages;`,
     queue: `export const queue = []; export const failMarks = new Map(); export const activeKeyGet = () => null;
+        export const activeJobExists = () => false;
         export const activeRefGet = () => null; export const pageKeyOf = r => r.key; export const viewportOverlap = () => 0;
         export const paintFind = () => undefined; export const paintHas = () => false; export const paintQueued = () => 0;
         export const autoHalted = () => null;`,

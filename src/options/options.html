@@ -122,8 +122,7 @@
     border-radius: 16px; padding: 22px 24px; margin-bottom: 16px;
     box-shadow: var(--shadow-card);
   }
-  h2 { font-size: 11.5px; margin: 0 0 16px; color: var(--muted);
-       font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+  h2 { font-size: 16px; margin: 0 0 16px; color: var(--text); font-weight: 600; }
   .card + .card { margin-top: 16px; }
 
   label { display: block; margin: 0 0 6px; font-weight: 550; font-size: 13px; }
@@ -218,6 +217,8 @@
   .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   a.btn { display: inline-block; text-decoration: none; text-align: center; }
   .hint a { color: var(--accent); }
+  .help-list { margin: 8px 0; padding-left: 18px; }
+  .help-list li + li { margin-top: 6px; }
   .btn:disabled { opacity: .5; cursor: default; }
 
   /* ---- dirty bar: fixed bottom on every tab, only while unsaved changes (or a message) exist ---- */
@@ -287,21 +288,33 @@
                  text-transform: uppercase; letter-spacing: .06em; }
   .adv-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 32px; }
   @media (max-width: 640px) { .adv-cols { grid-template-columns: 1fr; } }
+  @media (max-width: 480px) {
+    .page { padding: 20px 12px; }
+    .card { padding: 18px 16px; }
+    #setupBanner { align-items: flex-start; }
+    #setupBanner .btn { flex: none; }
+    #dirtyBar { flex-wrap: wrap; }
+    #dirtyBar #status { flex-basis: 100%; }
+    #barBtns { width: 100%; justify-content: flex-end; }
+    .font-add { flex-wrap: wrap; }
+    .font-add #fontUrl { flex-basis: 100% !important; }
+  }
 
   /* ---- model manager rows (OCR langs / baberu / fonts) ---- */
   .dl-list { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
-  .dl-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .dl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
   .dl-row:last-child { border-bottom: 0; }
-  .dl-row .name { flex: 1; }
-  #detRow .dl-row { flex-wrap: wrap; }
-  #detRow .name { min-width: 150px; }
-  #detRow .btn { white-space: nowrap; }
-  #detRow .dl-row:not(.busy) .dl-bar, #detRow .dl-row:not(.busy) .dl-text { display: none; }
+  .dl-row .name { flex: 1; min-width: 120px; }
+  #detRow .dl-row, #aiCleanupRow .dl-row { flex-wrap: wrap; }
+  #detRow .name, #aiCleanupRow .name { min-width: 150px; }
+  #detRow .btn, #aiCleanupRow .btn { white-space: nowrap; }
+  #detRow .dl-row:not(.busy) .dl-bar, #detRow .dl-row:not(.busy) .dl-text,
+  #aiCleanupRow .dl-row:not(.busy) .dl-bar, #aiCleanupRow .dl-row:not(.busy) .dl-text { display: none; }
   .dl-row .name .ok-mark { color: var(--ok); font-weight: 600; }
   .dl-bar { width: 90px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; flex: none; }
   /* empty bars/text stay hidden until a download actually runs — otherwise
      every row shows a fake "progress track" */
-  .dl-row:not(.busy) .dl-bar, .dl-row:not(.busy) .dl-text { visibility: hidden; }
+  .dl-row:not(.busy) .dl-bar, .dl-row:not(.busy) .dl-text { display: none; }
   .dl-bar .fill { height: 100%; width: 0; background: var(--accent); transition: width .2s; display: block; }
   .dl-bar .fill.indet { width: 40%; animation: dl-slide 1s infinite alternate; }
   @keyframes dl-slide { from { transform: translateX(-60%); } to { transform: translateX(160%); } }
@@ -322,7 +335,7 @@
   .char-item .head input[type=text] { flex: 1; width: auto; min-width: 0; }
   .char-item .head select { width: 96px; flex: none; }
   .char-item .line { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
-  .char-item .line label { flex: none; width: 46px; text-align: right; font-size: 11px; color: var(--muted); }
+  .char-item .line label { flex: none; width: 70px; font-size: 12px; color: var(--muted); }
   .char-item .line input[type=text] { flex: 1; width: auto; min-width: 0; }
   .char-item .meta { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
   .char-item .meta .src { font-size: 11px; color: var(--muted); }
@@ -330,6 +343,23 @@
   .char-book:first-child { margin-top: 0; }
   .char-book .char-book-name { flex: 1; font-weight: 600; }
   .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+  .about-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .about-notices { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 12px; font-size: 12px; }
+  .about-notices a, .credit-list a { color: var(--accent); text-decoration: none; }
+  .about-notices a:hover, .credit-list a:hover { text-decoration: underline; }
+  .about-notices a:focus-visible, .credit-list a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .credit-list { list-style: none; padding: 0; margin: 0; }
+  .credit-list li { padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .credit-list li:first-child { padding-top: 0; }
+  .credit-list li:last-child { border-bottom: 0; padding-bottom: 0; }
+  .credit-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; font-size: 13px; }
+  .credit-title a { font-weight: 550; }
+  .credit-title span, .credit-meta { color: var(--muted); font-size: 12px; }
+  .credit-meta { margin-top: 2px; }
+  .credits-extra { margin-top: 16px; }
+  .credits-extra summary { cursor: pointer; padding: 6px 0; font-size: 13px; }
+  .credits-extra summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .credits-extra[open] .credit-list { margin-top: 10px; }
 
   /* font preview: previews render on white manga paper — stays white in both themes */
   #fontPreview { background: #fff; border: 1px solid var(--border); border-radius: 10px; width: 100%; height: 64px; margin-top: 10px; }
@@ -339,12 +369,11 @@
 <div class="page">
   <header>
     <h1>Arn Manga LLM Translator</h1>
-    <p>Everything runs on your device. Bring your own API key — it's sent only to the provider you choose.</p>
   </header>
 
   <div id="setupBanner">
-    <span>No API key yet — 1) pick a provider &amp; model, 2) paste key, 3) Save Changes &amp; Test.</span>
-    <button id="setupGo" type="button" class="btn sm">Set up your model</button>
+    <span>Choose a translation model and add your API key to get started.</span>
+    <button id="setupGo" type="button" class="btn sm">Set up</button>
   </div>
 
   <div class="tabs" role="tablist">
@@ -364,11 +393,11 @@
         <label for="preset">Quality preset</label>
         <select id="preset">
           <option value="balanced">Balanced (recommended)</option>
-          <option value="fast">Fast — fewer tokens</option>
-          <option value="best">Best quality</option>
+          <option value="fast">Fast (smaller images)</option>
+          <option value="best">Detailed (larger images)</option>
           <option value="custom">Custom</option>
         </select>
-        <div class="hint">Sets detection, image sizes and memory in one go. Manual changes under Advanced make this Custom.</div>
+        <div class="hint">Adjusts detection, image size and dialogue history.</div>
       </div>
 
       <div class="field">
@@ -378,30 +407,29 @@
           <button type="button" id="targetLangToggle" class="combo-toggle" aria-label="Show all languages" tabindex="-1">▾</button>
           <ul id="targetLangList" class="combo-list" role="listbox" hidden></ul>
         </div>
-        <div class="hint">Type to search, or pick from the list — any other language works too. Thai ships with a handwriting font.</div>
       </div>
 
       <div class="field">
         <label for="stylePreset">Tone</label>
         <select id="stylePreset">
           <option value="">Follow the original tone</option>
-          <option value="Polite and formal register — courteous diction, honorifics where the target language has them">Polite / formal</option>
-          <option value="Casual register, like close friends talking — relaxed diction, no formality markers">Casual / friends</option>
-          <option value="Teen street slang — blunt, slangy diction with interjections">Street / teen</option>
-          <option value="Elevated literary register — formal vocabulary suited to period pieces">Literary / period</option>
+          <option value="Polite and formal register — courteous diction, honorifics where the target language has them">Formal</option>
+          <option value="Casual register, like close friends talking — relaxed diction, no formality markers">Casual</option>
+          <option value="Teen street slang — blunt, slangy diction with interjections">Slang</option>
+          <option value="Elevated literary register — formal vocabulary suited to period pieces">Literary</option>
           <option value="__custom">Custom…</option>
         </select>
-        <textarea id="stylePrompt" rows="2" placeholder="Custom tone rule — e.g. casual youthful speech" style="display:none"></textarea>
+        <textarea id="stylePrompt" rows="2" placeholder="e.g. Use casual speech between friends" aria-label="Custom tone instructions" style="display:none"></textarea>
       </div>
 
       <div class="field">
-        <label>Appearance</label>
+        <label>Theme</label>
         <div class="seg" id="themeSeg" role="radiogroup" aria-label="Theme">
           <button type="button" data-theme-val="system" role="radio">System</button>
           <button type="button" data-theme-val="dark" role="radio">Dark</button>
           <button type="button" data-theme-val="light" role="radio">Light</button>
         </div>
-        <label class="check"><input type="checkbox" id="showToasts" checked> Page notifications (done/error popups)</label>
+        <label class="check"><input type="checkbox" id="showToasts" checked> Notify when a page finishes or fails</label>
       </div>
     </div>
 
@@ -409,30 +437,31 @@
       <h2>Auto-translate sites</h2>
       <div id="autoSites"></div>
       <div class="field">
-        <button type="button" id="autoSitesClear" class="btn ghost sm">Clear all</button>
+        <button type="button" id="autoSitesClear" class="btn ghost sm">Turn off on all sites</button>
       </div>
-      <div class="hint">Auto-translate is per-site (toggled from the popup on each site). Removing a site stops auto there; manual translate still works everywhere.</div>
+      <div class="hint">Enable auto-translate from the popup on a manga site.</div>
     </div>
   </div>
 
   <!-- ============ Model ============ -->
   <div class="tab" id="tab-model">
     <div class="card">
-      <h2>Connect your model</h2>
+      <h2>Translation model</h2>
+      <p class="hint" style="margin:-8px 0 18px">Sends images or text to your provider. Provider fees may apply.</p>
       <div class="field">
-        <label for="provider">Protocol</label>
+        <label for="provider">API type</label>
         <select id="provider">
-          <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, ollama…)</option>
-          <option value="responses">Responses API (OpenAI responses)</option>
+          <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, Ollama)</option>
+          <option value="responses">OpenAI Responses API</option>
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="gemini">Google Gemini</option>
-          <option value="cloudflare">Cloudflare Workers AI (Meta / Qwen / Gemma)</option>
+          <option value="cloudflare">Cloudflare Workers AI</option>
         </select>
       </div>
 
       <div class="field">
-        <label for="model">Model</label>
-        <input type="text" id="model" placeholder="e.g. gpt-5.4-mini">
+        <label for="model">Model ID</label>
+        <input type="text" id="model" placeholder="Model ID from your provider">
         <div class="hint" id="modelHint"></div>
       </div>
 
@@ -442,7 +471,7 @@
       </div>
 
       <div class="field">
-        <label for="baseUrl">Base URL <span class="hint">(optional — custom endpoints)</span></label>
+        <label for="baseUrl">API URL <span class="hint">(optional)</span></label>
         <input type="text" id="baseUrl" placeholder="https://api.openai.com/v1">
         <div class="hint" id="baseHint"></div>
       </div>
@@ -463,7 +492,7 @@
         <div class="range-head"><label for="temperature">Temperature</label><span class="unit-wrap"><input type="number" id="temperatureNum" class="val-input" min="0" max="1" step="0.05" aria-label="Temperature value"></span></div>
         <input type="range" id="temperature" min="0" max="1" step="0.05">
         <label class="check"><input type="checkbox" id="temperatureAuto" checked> Provider default</label>
-        <div class="hint">Checked = the provider's own default (usually 1.0). Untick to pin a value — lower is more literal and deterministic, better for translation.</div>
+        <div class="hint">Use the provider's default, or set a value. Lower values reduce variation between replies.</div>
       </div>
 
       <button id="test" type="button" class="btn ghost" style="width:100%">Test connection</button>
@@ -477,32 +506,35 @@
           <button type="button" data-infer-val="local" role="radio">On-device</button>
           <button type="button" data-infer-val="cloud" role="radio">Cloud</button>
         </div>
-        <div class="hint">On-device is private and works offline. Cloud runs detection + OCR on your own endpoint — faster on slow phones, needs internet.</div>
+        <div class="hint">On-device finds text locally. Cloud sends pages to your detection server. Translation still uses the provider above.</div>
       </div>
 
       <div class="field">
         <label for="layoutModel">Layout model</label>
         <select id="layoutModel" aria-describedby="layoutModelHint">
+          <option value="koharu" selected>KoharuLayout</option>
           <option value="ctd">CTD + Panel</option>
-          <option value="koharu">KoharuLayout FP32</option>
         </select>
         <div class="hint" id="layoutModelHint"></div>
       </div>
 
       <div class="field" id="detEpField" style="display:none">
-        <label class="check"><input type="checkbox" id="forceWasm"> Force CPU (wasm)</label>
-        <div class="hint">Auto uses the GPU. Tick this if Auto gives detection errors or blank results — CPU can be much slower.</div>
+        <label class="check"><input type="checkbox" id="forceWasm"> Use CPU instead of GPU</label>
+        <div class="hint">Try this if detection fails or returns blank results. CPU processing can be slower.</div>
       </div>
 
       <div id="detRow" style="display:none">
         <input type="file" id="layoutFile" accept=".onnx" hidden>
         <div class="dl-row">
-          <span class="name" id="detLabel">Detection models (CTD 40MB + panel 10MB)</span>
+          <span class="name" id="detLabel">KoharuLayout (149.8 MB)</span>
           <span class="dl-text"></span>
           <span class="dl-bar" id="detBar"><span class="fill"></span></span>
           <button id="detBtn" type="button" class="btn ghost sm">Download</button>
         </div>
-        <div class="hint" id="detInstallHint" style="margin-top:8px">Downloads once, then works offline. Otherwise fetched automatically on the first on-device page.</div>
+        <div class="hint" id="detInstallHint" style="margin-top:8px">Saved on this device after download. Missing models download when needed. To reinstall, select Delete, then Download.</div>
+        <div id="layoutImportRow" hidden style="margin-top:8px">
+          <button id="layoutImportBtn" type="button" class="btn ghost sm">Import model file</button>
+        </div>
         <div class="hint" id="layoutFileStatus" role="status" aria-live="polite" style="margin-top:8px;overflow-wrap:anywhere"></div>
       </div>
 
@@ -517,12 +549,14 @@
           <input type="password" id="cloudKey" placeholder="paste from the setup notebook">
         </div>
 
-        <button id="testCloud" type="button" class="btn ghost" style="width:100%">Test cloud &amp; prewarm</button>
+        <button id="testCloud" type="button" class="btn ghost" style="width:100%">Test cloud connection</button>
         <div class="hint" id="cloudTestStatus" style="min-height:18px;margin-top:6px"></div>
-        <div class="hint">No endpoint yet? Run the server yourself:
-          <br>• <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/colab-server.ipynb" target="_blank" rel="noopener">Run it on Colab</a> — free GPU; needs only a Google sign-in (no card, no other account). URL changes each session; VM ends after ~90 min idle (12 h max).
-          <br>• <a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Deploy it to Modal</a> — stable URL; Starter is free ($30/mo credit, no card to start). Sleeps when idle — first page may wait ~1–2 min.
-          <br>Both print the endpoint + key to paste above; press <b>Test</b> before reading. Pages go to YOUR endpoint only.</div>
+        <div class="hint">Need a detection server?
+          <ul class="help-list">
+            <li><a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/colab-server.ipynb" target="_blank" rel="noopener">Run on Colab</a>. Start a session to get an endpoint URL and key.</li>
+            <li><a href="https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb" target="_blank" rel="noopener">Deploy to Modal</a> for an endpoint you can reuse.</li>
+          </ul>
+          Paste the URL and key above, then test the connection. The test also wakes the server.</div>
       </fieldset>
 
       <div class="field">
@@ -532,106 +566,107 @@
 
       <div id="aiCleanupRow" style="display:none">
         <div class="dl-row">
-          <span class="name" id="aiCleanupLabel">Text cleanup model (112MB)</span>
+          <span class="name" id="aiCleanupLabel">Text cleanup model (112 MB)</span>
           <span class="dl-text"></span>
           <span class="dl-bar" id="aiCleanupBar"><span class="fill"></span></span>
           <button id="aiCleanupBtn" type="button" class="btn ghost sm">Download</button>
         </div>
-        <div class="hint" style="margin-top:8px">Erases the original text with a manga-trained model instead of a flat fill — noticeably cleaner over artwork and screentones. Runs on the GPU (WebGPU); without one, pages keep the built-in cleanup.</div>
+        <div class="hint" style="margin-top:8px">Removes original text and fills in the artwork behind it. Requires WebGPU. Basic cleanup is used when the model can't run.</div>
       </div>
     </div>
 
     <div class="card">
-      <h2>How the model reads text</h2>
+      <h2>Text sent for translation</h2>
       <div class="field">
+        <label for="textSource">Input</label>
         <select id="textSource">
-          <option value="page">Full page + crops — best quality (needs image support)</option>
-          <option value="crops">Crops only — safer for strict models (needs image support)</option>
-          <option value="ocr">OCR text — for text-only models</option>
+          <option value="page">Page image and text crops</option>
+          <option value="crops">Text crops only</option>
+          <option value="ocr">Recognized text (OCR)</option>
         </select>
-        <div class="hint">OCR runs wherever detection runs (see above) — on-device needs the models below, cloud needs none.</div>
+        <div class="hint">Image modes need a model that accepts images. OCR extracts the text first, so the translation model only receives text.</div>
       </div>
 
       <div class="field">
         <label for="readingDir">Reading direction</label>
         <select id="readingDir">
-          <option value="rtl">Right-to-left — manga (top to bottom in each column)</option>
-          <option value="ltr">Left-to-right — manhwa / western comics</option>
+          <option value="rtl">Right to left (manga)</option>
+          <option value="ltr">Left to right (manhwa, western comics)</option>
         </select>
-        <div class="hint">Sets the region numbering order for every mode above.</div>
+        <div class="hint">Sets the order in which dialogue is read and translated.</div>
       </div>
 
       <div class="field">
-        <label class="check"><input type="checkbox" id="transcribeSrc"> Also transcribe source text (vision only)</label>
-        <div class="hint">The model copies each box's original text alongside the translation — richer cross-page context at roughly 2× output tokens. No effect in OCR mode.</div>
+        <label class="check"><input type="checkbox" id="transcribeSrc"> Keep original dialogue in context</label>
+        <div class="hint">With image input, also asks the model to return the original text. Uses more output tokens. OCR already includes it.</div>
       </div>
 
       <div class="field">
-        <label class="check"><input type="checkbox" id="ocrSeparate"> Use a separate model just for reading text</label>
-        <div class="hint">A cheap/fast vision model transcribes each box, then your main model translates text-only — 2 LLM calls per page, using the same images as above. No effect in OCR mode.</div>
+        <label class="check"><input type="checkbox" id="ocrSeparate"> Use a separate model to read images</label>
+        <div class="hint">One model reads the text; your translation model translates it. Adds a reading request. Only used with image input.</div>
       </div>
 
       <fieldset id="ocrSeparateFields" style="display:none">
         <div class="field">
-          <label for="ocrProvider">OCR protocol</label>
+          <label for="ocrProvider">Reader API type</label>
           <select id="ocrProvider">
-            <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, ollama…)</option>
-            <option value="responses">Responses API (OpenAI responses)</option>
+            <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, Ollama)</option>
+            <option value="responses">OpenAI Responses API</option>
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="gemini">Google Gemini</option>
-            <option value="cloudflare">Cloudflare Workers AI (Meta / Qwen / Gemma)</option>
+            <option value="cloudflare">Cloudflare Workers AI</option>
           </select>
         </div>
 
         <div class="field">
-          <label for="ocrModel">OCR model</label>
-          <input type="text" id="ocrModel" placeholder="e.g. gpt-5.4-nano">
+          <label for="ocrModel">Reader model ID</label>
+          <input type="text" id="ocrModel" placeholder="Model ID with image support">
         </div>
 
         <div class="field">
-          <label for="ocrApiKey">OCR API key</label>
+          <label for="ocrApiKey">Reader API key</label>
           <input type="password" id="ocrApiKey" placeholder="sk-…">
         </div>
 
         <div class="field">
-          <label for="ocrBaseUrl">OCR Base URL <span class="hint">(optional — custom endpoints)</span></label>
+          <label for="ocrBaseUrl">Reader API URL <span class="hint">(optional)</span></label>
           <input type="text" id="ocrBaseUrl" placeholder="https://api.openai.com/v1">
         </div>
 
         <div class="field">
-          <label for="ocrThinking">OCR thinking level</label>
+          <label for="ocrThinking">Reader thinking level</label>
           <input type="text" id="ocrThinking" list="ocrThinkingList" placeholder="none" autocomplete="off">
           <datalist id="ocrThinkingList"></datalist>
           <div class="hint" id="ocrThinkingHint"></div>
         </div>
 
         <div class="field">
-          <div class="range-head"><label for="ocrTemperature">OCR temperature</label><span class="unit-wrap"><input type="number" id="ocrTemperatureNum" class="val-input" min="0" max="1" step="0.05" aria-label="OCR temperature value"></span></div>
+          <div class="range-head"><label for="ocrTemperature">Reader temperature</label><span class="unit-wrap"><input type="number" id="ocrTemperatureNum" class="val-input" min="0" max="1" step="0.05" aria-label="Reader temperature value"></span></div>
           <input type="range" id="ocrTemperature" min="0" max="1" step="0.05">
           <label class="check"><input type="checkbox" id="ocrTemperatureAuto"> Provider default</label>
-          <div class="hint">Transcribe calls only — 0 keeps the reading literal and its output format stable. Unticked by default (0 is sent).</div>
+          <div class="hint">Only affects image reading. The default is 0 to reduce variation in the recognized text.</div>
         </div>
 
         <div class="field">
-          <label class="check"><input type="checkbox" id="ocrPerRegion"> Always read one region at a time</label>
-          <div class="hint">One crop per call — for models that accept a single image (e.g. Cloudflare llama-3.2-11b-vision). Leave off for auto-detect: a rejected batch falls back to per-region on its own and remembers the model.</div>
+          <label class="check"><input type="checkbox" id="ocrPerRegion"> Read one text crop per request</label>
+          <div class="hint">For models that accept one image at a time. Leave off to try multiple crops first and switch automatically if needed.</div>
         </div>
 
         <div class="field" style="display:flex;gap:8px">
-          <button id="ocrCopy" type="button" class="btn ghost sm">Copy from main</button>
-          <button id="ocrTest" type="button" class="btn ghost sm">Test OCR model</button>
+          <button id="ocrCopy" type="button" class="btn ghost sm">Use translation API settings</button>
+          <button id="ocrTest" type="button" class="btn ghost sm">Test image reading</button>
         </div>
         <div class="hint" id="ocrTestStatus" style="min-height:18px;margin-top:6px"></div>
       </fieldset>
 
       <div id="ocrManager" style="display:none">
-        <div class="hint" id="ocrCloudNote" style="display:none">Cloud inference reads the text on the server — nothing to download or select here.</div>
+        <div class="hint" id="ocrCloudNote" style="display:none">Your detection server handles OCR. No OCR download is needed on this device.</div>
         <div id="ocrLocalRows">
         <div class="field">
-          <label for="ocrEngine">OCR engine</label>
+          <label for="ocrEngine">On-device OCR</label>
           <select id="ocrEngine">
-            <option value="baberu">Baberu — best for Japanese, vertical text and sound effects (122 MB)</option>
-            <option value="tesseract">Tesseract — many languages, small download</option>
+            <option value="baberu">Baberu (Japanese, 122 MB)</option>
+            <option value="tesseract">Tesseract (multiple languages)</option>
           </select>
         </div>
 
@@ -644,7 +679,7 @@
             <button id="baberuBtn" type="button" class="btn ghost sm">Download</button>
           </div>
         </div>
-        <div class="hint" style="margin-top:8px">Downloads once, then works offline. Delete anytime.</div>
+        <div class="hint" style="margin-top:8px">OCR runs locally after download. To reinstall a model, select Delete, then Download.</div>
         </div>
       </div>
     </div>
@@ -653,25 +688,25 @@
   <!-- ============ Appearance ============ -->
   <div class="tab" id="tab-appearance">
     <div class="card">
-      <h2>Render font</h2>
+      <h2>Translation text</h2>
       <div class="field">
         <label for="renderFont">Font</label>
-        <select id="renderFont"><option value="default">Default (per language)</option></select>
+        <select id="renderFont"><option value="default">Language default</option></select>
       </div>
       <div class="field">
-        <div class="range-head"><label for="minFont">Smallest font</label><span class="unit-wrap"><input type="number" id="minFontNum" class="val-input" min="1" max="72" step="1"><span class="unit">px</span></span></div>
+        <div class="range-head"><label for="minFont">Minimum font size</label><span class="unit-wrap"><input type="number" id="minFontNum" class="val-input" min="1" max="72" step="1"><span class="unit">px</span></span></div>
         <input type="range" id="minFont" min="8" max="24" step="1">
-        <div class="hint">Floor for shrink-to-fit: smaller fits long text without clipping, but gets hard to read.</div>
+        <div class="hint">Text can shrink to this size to fit a bubble. Lower values fit more text but can be harder to read.</div>
       </div>
       <div class="field">
-        <div class="range-head"><label for="textScale">Text size vs original</label><span class="unit-wrap"><input type="number" id="textScaleNum" class="val-input" min="0.6" max="1.6" step="0.05"><span class="unit">×</span></span></div>
+        <div class="range-head"><label for="textScale">Text size</label><span class="unit-wrap"><input type="number" id="textScaleNum" class="val-input" min="0.6" max="1.6" step="0.05"><span class="unit">×</span></span></div>
         <input type="range" id="textScale" min="0.6" max="1.6" step="0.05">
-        <div class="hint">Ceiling for the font, measured from the original text's line pitch: 1 = same size as the source, higher reads easier, lower leaves more air. Long text still shrinks to fit.</div>
+        <div class="hint">1× matches the original text size. Increase for larger text. Long translations still shrink to fit.</div>
       </div>
       <div class="field">
         <div class="range-head"><label for="textStroke">Text outline</label><span class="unit-wrap"><input type="number" id="textStrokeNum" class="val-input" min="0" max="0.5" step="0.01"><span class="unit">×font</span></span></div>
         <input type="range" id="textStroke" min="0" max="0.3" step="0.01">
-        <div class="hint">Edge around the text (0 = off). Helps on busy art; invisible on matching bubbles. Color follows Auto unless overridden below.</div>
+        <div class="hint">Adds an edge around letters so they stand out over artwork. Set to 0 to turn it off.</div>
       </div>
       <div class="field adv-cols">
         <div>
@@ -683,19 +718,18 @@
           <div class="color-row"><input type="color" class="swatch" id="strokeColorPick" value="#ffffff"><label class="check"><input type="checkbox" id="strokeColorAuto" checked> Auto</label></div>
         </div>
       </div>
-      <div class="hint">Auto follows the text: dark edge on light text, white edge on dark text.</div>
+      <div class="hint">Auto chooses text and outline colors for contrast with the background.</div>
       <div class="field">
         <label>Downloadable fonts</label>
-        <div class="hint">Presets download once and work offline.</div>
       </div>
       <div id="fontPresetList" class="dl-list"></div>
-      <div class="field" style="display:flex;gap:8px;margin-top:12px">
-        <input type="text" id="fontUrl" placeholder="https://…/MyFont.ttf" style="flex:1">
-        <input type="text" id="fontNameInput" placeholder="Name" style="width:100px;flex:none">
-        <button id="fontAdd" type="button" class="btn ghost sm">Add</button>
+      <div class="field font-add" style="display:flex;gap:8px;margin-top:12px">
+        <input type="text" id="fontUrl" placeholder="https://…/MyFont.ttf" aria-label="Font file URL" style="flex:1;min-width:0">
+        <input type="text" id="fontNameInput" placeholder="Font name" aria-label="Font name" style="width:100px;flex:none">
+        <button id="fontAdd" type="button" class="btn ghost sm">Add font</button>
       </div>
       <div class="hint" id="fontAddStatus"></div>
-      <label>Preview on manga paper</label>
+      <label for="fontPreviewText">Preview</label>
       <canvas id="fontPreview" height="64"></canvas>
       <input type="text" id="fontPreviewText" value="สวัสดีครับ Hello 123" style="margin-top:8px">
     </div>
@@ -705,10 +739,10 @@
   <div class="tab" id="tab-characters">
     <div class="card">
       <h2>Characters</h2>
-      <div class="hint" style="margin:-8px 0 12px">Names, descriptions, and notes are yours to edit and always win — saved per story, so one manga's edits never touch another. The id (c1, c2, …) is how the model references each row.</div>
-      <div id="characters"><div class="empty">No characters yet — translate some pages first.</div></div>
+      <div class="hint" style="margin:-8px 0 12px">Edit names, appearance and notes to guide future translations. Changes save automatically for each story. Re-translate a page to apply them there.</div>
+      <div id="characters"><div class="empty">Characters appear here after you translate a page.</div></div>
       <div style="margin-top:16px">
-        <button id="clearChars" class="btn danger">Clear character memory</button>
+        <button id="clearChars" class="btn danger">Clear characters from all stories</button>
       </div>
     </div>
   </div>
@@ -716,20 +750,20 @@
   <!-- ============ Advanced ============ -->
   <div class="tab" id="tab-advanced">
     <div class="card">
-      <h2>Advanced tuning</h2>
+      <h2>Translation settings</h2>
       <div class="adv-cols">
         <div>
           <div class="group-label">Detection</div>
           <div id="legacyDetectionTuning">
           <div class="field">
-            <div class="range-head"><label for="detConf">Confidence</label><input type="number" id="detConfNum" class="val-input" min="0" max="1" step="0.05"></div>
+            <div class="range-head"><label for="detConf">Text confidence</label><input type="number" id="detConfNum" class="val-input" min="0" max="1" step="0.05"></div>
             <input type="range" id="detConf" min="0.10" max="0.60" step="0.05">
-            <div class="hint">Lower catches more small text, with more false positives.</div>
+            <div class="hint">Lower values detect more text, but may also select artwork.</div>
           </div>
           <div class="field">
             <div class="range-head"><label for="panelConf">Panel confidence</label><input type="number" id="panelConfNum" class="val-input" min="0.05" max="1" step="0.01"></div>
             <input type="range" id="panelConf" min="0.05" max="0.50" step="0.05">
-            <div class="hint">Lower catches faint panels (bleed), with more false boxes.</div>
+            <div class="hint">Lower values detect more panels, but may mistake other shapes for panels.</div>
           </div>
           </div>
           <div id="koharuDetectionTuning" hidden>
@@ -748,29 +782,28 @@
             <div class="hint">Defaults: text 0.25, sound effects 0.20, panels 0.50. Lower values may include artwork.</div>
           </div>
           <div class="field">
-            <div class="range-head"><label for="detMinSize">Min region size</label><span class="unit-wrap"><input type="number" id="detMinSizeNum" class="val-input" min="1" max="200" step="1"><span class="unit">px</span></span></div>
+            <div class="range-head"><label for="detMinSize">Minimum text area</label><span class="unit-wrap"><input type="number" id="detMinSizeNum" class="val-input" min="1" max="200" step="1"><span class="unit">px</span></span></div>
             <input type="range" id="detMinSize" min="6" max="30" step="1">
           </div>
-          <label class="check"><input type="checkbox" id="deferLabels"> Small labels read after balloon dialogue</label>
-          <label class="check"><input type="checkbox" id="vlmAssisted"> Model reports missed text (hand-written signs, SFX)</label>
-          <label class="check"><input type="checkbox" id="debugBoxes"> Debug mode: boxes on page + console logs</label>
+          <label class="check"><input type="checkbox" id="deferLabels"> Read small labels after dialogue</label>
+          <label class="check"><input type="checkbox" id="vlmAssisted"> Ask the model to find missed text</label>
 
-          <div class="group-label">Memory</div>
-          <label class="check"><input type="checkbox" id="useContext"> Send recent dialogue for consistency</label>
-          <label class="check"><input type="checkbox" id="useCharacters"> Send &amp; learn character genders</label>
+          <div class="group-label">Context</div>
+          <label class="check"><input type="checkbox" id="useContext"> Include recent dialogue</label>
+          <label class="check"><input type="checkbox" id="useCharacters"> Remember characters for translation</label>
           <label class="check"><input type="checkbox" id="crossChapter"> Keep characters across chapters</label>
           <div class="field" style="margin-top:12px">
-            <div class="range-head"><label for="contextPairs">Memory depth</label><input type="number" id="contextPairsNum" class="val-input" min="0" max="200" step="5"></div>
+            <div class="range-head"><label for="contextPairs">Dialogue history</label><input type="number" id="contextPairsNum" class="val-input" min="0" max="200" step="5"></div>
             <input type="range" id="contextPairs" min="0" max="120" step="5">
-            <div class="hint">Typing above 120 works (slider stays pinned) but each page sends more history.</div>
+            <div class="hint">Number of recent dialogue entries sent with each request. More history uses more tokens.</div>
           </div>
         </div>
         <div>
           <div class="group-label">Images</div>
           <div class="field">
-            <div class="range-head"><label for="cropSize">Region crop size</label><span class="unit-wrap"><input type="number" id="cropSizeNum" class="val-input" min="100" max="1200" step="20"><span class="unit">px</span></span></div>
+            <div class="range-head"><label for="cropSize">Text crop size</label><span class="unit-wrap"><input type="number" id="cropSizeNum" class="val-input" min="100" max="1200" step="20"><span class="unit">px</span></span></div>
             <input type="range" id="cropSize" min="280" max="720" step="20">
-            <div class="hint">Bigger crops read small text better but cost more tokens.</div>
+            <div class="hint">Larger crops can make small text easier to read and may use more tokens.</div>
           </div>
           <div class="field">
             <div class="range-head"><label for="fullPageSize">Full page size</label><span class="unit-wrap"><input type="number" id="fullPageSizeNum" class="val-input" min="400" max="2560" step="80"><span class="unit">px</span></span></div>
@@ -780,50 +813,100 @@
 
           <div class="group-label">Performance</div>
           <div class="field">
-            <div class="range-head"><label for="parallelLlm">Parallel LLM calls</label><input type="number" id="parallelLlmNum" class="val-input" min="1" max="10" step="1"></div>
+            <div class="range-head"><label for="parallelLlm">Requests at a time</label><input type="number" id="parallelLlmNum" class="val-input" min="1" max="10" step="1"></div>
             <input type="range" id="parallelLlm" min="1" max="6" step="1">
-            <div class="hint">Lower it if you hit rate limits. While reading, queued pages also translate in parallel when memory is off.</div>
+            <div class="hint">Lower this if your provider limits requests. Auto-translate uses parallel requests when dialogue context is off.</div>
           </div>
           <div class="field">
-            <div class="range-head"><label for="mergePages">Pages per LLM request</label><input type="number" id="mergePagesNum" class="val-input" min="1" max="10" step="1"></div>
+            <div class="range-head"><label for="mergePages">Chapter pages per request</label><input type="number" id="mergePagesNum" class="val-input" min="1" max="10" step="1"></div>
             <input type="range" id="mergePages" min="1" max="10" step="1">
             <div class="hint chapter-batch" id="chapterBatch" style="margin-top:6px"></div>
             <div class="hint">Other translations always send one page per request.</div>
           </div>
-          <div class="group-label">Translation cache</div>
+          <div class="group-label">Saved translations</div>
           <div class="field">
-            <label class="check"><input type="checkbox" id="cacheEnabled"> Reuse translations when reopening pages</label>
-            <div class="hint">Skips detect + LLM on pages you've already translated.</div>
+            <label class="check"><input type="checkbox" id="cacheEnabled"> Save translations for reuse</label>
+            <div class="hint">Uses a saved result when you translate a page again with the same settings.</div>
             <div class="range-head" style="margin-top:10px"><label for="cacheMax">Stored pages</label><input type="number" id="cacheMaxNum" class="val-input" min="10" max="2000" step="10"></div>
             <input type="range" id="cacheMax" min="10" max="1000" step="10">
-            <div class="hint">Oldest entries auto-clear past this.</div>
+            <div class="hint">Older saved pages are removed when this limit is reached.</div>
             <div class="range-head" id="cacheCountRow" style="margin-top:10px"><label>Cached pages</label><span class="hint" id="cacheCount">…</span></div>
-            <button id="cacheClear" type="button" class="btn ghost" style="width:100%;margin-top:10px">Clear translation cache</button>
+            <button id="cacheClear" type="button" class="btn ghost" style="width:100%;margin-top:10px">Clear saved translations on all sites</button>
           </div>
         </div>
       </div>
-      <button id="resetAdv" class="btn quiet">Restore defaults</button>
+      <button id="resetAdv" class="btn quiet">Restore Balanced settings</button>
+    </div>
+    <div class="card">
+      <h2>Troubleshooting</h2>
+      <label class="check"><input type="checkbox" id="debugBoxes"> Debug mode</label>
+      <div class="hint">Show detection boxes and record logs and timings. Applies immediately.</div>
     </div>
   </div>
 
   <div class="tab" id="tab-about">
     <div class="card">
-      <h2>Support the project</h2>
-      <p class="hint" style="margin:0 0 12px">Arn Manga LLM Translator is free. No account, no server — translation runs on your machine; donations keep it that way.</p>
-      <a class="btn" href="https://ko-fi.com/c0ffeeoverdose" target="_blank" rel="noopener">Support on Ko-fi</a>
-    </div>
-    <div class="card">
-      <h2>Credits</h2>
-      <p class="hint" style="margin:0 0 8px">Made by c0ffeeOverdose · © 2026<br>Free software under the GNU GPL v3.0 (GPL-3.0-only) — share and modify freely, <a href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/blob/main/LICENSE" target="_blank" rel="noopener">full text</a>.<br>Models keep their own licenses (see <a href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/blob/main/NOTICE" target="_blank" rel="noopener">NOTICE</a>):</p>
-      <p class="hint" style="margin:0 0 12px">Comic Text Detector — dmMaze, ONNX export by lemondouble (GPL-3.0)<br>Manga panel detector — Leandro Narosky, trained on Manga109-s (Apache-2.0)<br>Baberu OCR — genshiai-daichi (Apache-2.0)<br>Tesseract language data — tesseract-ocr (Apache-2.0)</p>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator" target="_blank" rel="noopener">Source on GitHub</a>
-        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/issues/new" target="_blank" rel="noopener">Report an issue</a>
+      <h2>Project</h2>
+      <p id="aboutVersion" class="hint" style="margin:0 0 4px"></p>
+      <p class="hint" style="margin:0">Made by c0ffeeOverdose · © 2026</p>
+      <div class="about-links">
+        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator" target="_blank" rel="noopener">GitHub</a>
+        <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/issues/new" target="_blank" rel="noopener">Report a bug</a>
         <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/releases" target="_blank" rel="noopener">Releases</a>
         <a class="btn ghost sm" href="https://github.com/c0ffeeOverdose/arn-manga-llm-translator/blob/main/PRIVACY.md" target="_blank" rel="noopener">Privacy</a>
       </div>
+      <div class="about-notices">
+        <a href="../licenses/LICENSE.txt" target="_blank" rel="noopener">GPL-3.0-only</a>
+        <a href="../licenses/NOTICE.txt" target="_blank" rel="noopener">Third-party notices</a>
+      </div>
     </div>
     <div class="card">
+      <h2>Credits</h2>
+      <ul class="credit-list">
+        <li>
+          <div class="credit-title"><a href="https://github.com/dmMaze/comic-text-detector" target="_blank" rel="noopener">Comic Text Detector</a><span>Text detection</span></div>
+          <div class="credit-meta">dmMaze · ONNX export by <a href="https://github.com/lemondouble/lemon-manga-translator" target="_blank" rel="noopener">lemondouble</a> · GPL-3.0</div>
+        </li>
+        <li>
+          <div class="credit-title"><a href="https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152" target="_blank" rel="noopener">KoharuLayout</a><span>Layout detection</span></div>
+          <div class="credit-meta">mayocream · <a href="https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152#license-and-training-data-terms" target="_blank" rel="noopener">Custom model terms</a> · Trained on Manga109</div>
+        </li>
+        <li>
+          <div class="credit-title"><a href="https://huggingface.co/leoxs22/manga-panel-detector-yolo26n" target="_blank" rel="noopener">Manga panel detector</a><span>Panel detection</span></div>
+          <div class="credit-meta">Leandro Narosky · AGPL-3.0 · Trained on Manga109-s</div>
+        </li>
+        <li>
+          <div class="credit-title"><a href="https://huggingface.co/genshiai-daichi/baberu-ocr" target="_blank" rel="noopener">Baberu OCR</a><span>Text recognition</span></div>
+          <div class="credit-meta">genshiai-daichi · Apache-2.0</div>
+        </li>
+        <li>
+          <div class="credit-title"><a href="https://huggingface.co/dreMaz/AnimeMangaInpainting" target="_blank" rel="noopener">AnimeMangaInpainting</a><span>Text removal</span></div>
+          <div class="credit-meta">dreMaz · MIT · Based on <a href="https://github.com/advimman/lama" target="_blank" rel="noopener">LaMa</a> (Apache-2.0)</div>
+        </li>
+      </ul>
+      <details class="credits-extra">
+        <summary>Libraries and fonts</summary>
+        <ul class="credit-list">
+          <li>
+            <div class="credit-title"><a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">ONNX Runtime Web</a><span>On-device models</span></div>
+            <div class="credit-meta">Microsoft · <a href="../licenses/ONNXRuntime-MIT.txt" target="_blank" rel="noopener">MIT</a></div>
+          </li>
+          <li>
+            <div class="credit-title"><a href="https://github.com/naptha/tesseract.js" target="_blank" rel="noopener">Tesseract.js</a><span>Text recognition</span></div>
+            <div class="credit-meta">Tesseract.js, <a href="https://github.com/naptha/tesseract.js-core" target="_blank" rel="noopener">Tesseract.js-core</a> and <a href="https://github.com/tesseract-ocr/tessdata_fast" target="_blank" rel="noopener">language data</a> · Apache-2.0</div>
+          </li>
+          <li>
+            <div class="credit-title"><a href="https://fonts.google.com/specimen/Sriracha" target="_blank" rel="noopener">Sriracha</a><span>Default Thai font</span></div>
+            <div class="credit-meta">Suppakit Chalermlarp · Cadson Demak, Pablo Impallari · <a href="../licenses/Sriracha-OFL.txt" target="_blank" rel="noopener">SIL OFL 1.1</a></div>
+          </li>
+          <li>
+            <div class="credit-title"><a href="https://github.com/google/fonts" target="_blank" rel="noopener">Downloadable fonts</a></div>
+            <div class="credit-meta">Google Fonts · Each font keeps its own license.</div>
+          </li>
+        </ul>
+      </details>
+    </div>
+    <div class="card" id="diagnosticsCard" hidden>
       <h2>Diagnostics</h2>
       <p class="hint" style="margin:0 0 12px">Checks the installed files and downloaded models. Copy the results when reporting a bug.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
@@ -831,14 +914,18 @@
       </div>
       <div class="hint" id="diagOut" style="margin:0;white-space:pre-line">Not run yet.</div>
     </div>
+    <div class="card">
+      <h2>Support</h2>
+      <a class="btn ghost sm" href="https://ko-fi.com/c0ffeeoverdose" target="_blank" rel="noopener">Donate on Ko-fi</a>
+    </div>
   </div>
 </div>
 
 <div id="dirtyBar" style="display:none">
   <span id="status"></span>
   <span id="barBtns" style="display:none">
-    <button id="discard" type="button" class="btn quiet">Reset</button>
-    <button id="saveAll" type="button" class="btn">Save Changes</button>
+    <button id="discard" type="button" class="btn quiet">Discard changes</button>
+    <button id="saveAll" type="button" class="btn">Save changes</button>
   </span>
 </div>
 

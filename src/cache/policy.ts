@@ -1,7 +1,7 @@
 import type { DetBox, DetectResult, InpaintPatch } from '../content/detection';
 import type { RegionOutput, ExtraRegion, Mention } from '../llm/core';
 import type { ImageSignature, ImageRegion } from '../image-identity';
-import { DEFAULT_PIPELINE_SETTINGS, type PipelineSettings } from '../llm/pipeline-settings';
+import { DEFAULT_PIPELINE_SETTINGS, defaultLayoutModel, type PipelineSettings } from '../llm/pipeline-settings';
 import { KOHARU_MODEL } from '../layout-model';
 
 export const CACHE_MAX = 200;
@@ -229,6 +229,7 @@ export type FingerprintOpts = Partial<PipelineSettings>;
 // Paid results follow input and prompt settings; presentation and pool sizing reuse them.
 export function settingsFingerprint(o: FingerprintOpts): string {
     const s = { ...DEFAULT_PIPELINE_SETTINGS, ...o };
+    s.layoutModel = o.layoutModel ?? defaultLayoutModel(s.inferEngine);
     return JSON.stringify([s.targetLang, s.textSource, s.ocrEngine, s.readingDir,
         s.detConf, s.detMinSize, s.panelConf, s.deferLabels, s.transcribeSrc, s.useOcrModel,
         s.ocrPerRegion, s.temperature, s.ocrTemperature, s.inferEngine, s.ocrLangs,

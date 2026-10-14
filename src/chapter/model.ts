@@ -15,7 +15,7 @@ export interface ChapterPage {
     // page ordinal, never a different page.
     alt?: string;
 }
-export type PagePhase = 'queued' | 'reading' | 'detecting' | 'translating' | 'rendering' | 'ready' | 'failed' | 'waiting';
+export type PagePhase = 'queued' | 'reading' | 'detecting' | 'translating' | 'rendering' | 'ready' | 'failed' | 'waiting' | 'paused';
 export interface ChapterProgress {
     id: string;
     logId?: string;
@@ -29,6 +29,8 @@ export interface ChapterProgress {
     pages: { id: string; url: string; phase: PagePhase; hash?: string; revision?: number; order?: number;
         image?: ImageSignature; matchedBy?: 'url' | 'image' }[];
     message?: string;
+    settingsStale?: boolean;
+    runnerLost?: boolean;
     // Transient, user-facing line shown with the running progress (e.g. "retrying with smaller
     // batches" after an empty reply was split). Set and cleared by the runner.
     notice?: string;
@@ -96,8 +98,8 @@ export function sweepCount(total: number, anchor: number): { count: number; reas
 
 export function sweepCountMessage(reason: SweepCountReason): string {
     switch (reason) {
-        case 'no-pages': return 'No pages found on this reader — open a page image and try again';
-        case 'no-anchor': return 'Could not match the page you are on — scroll to a page image and try again';
+        case 'no-pages': return 'No chapter pages found. Open a page image and try again.';
+        case 'no-anchor': return 'Could not find your current page. Scroll to a page image and try again.';
         case 'last-page': return 'You are on the last page of this chapter';
         default: return '';
     }
@@ -115,7 +117,7 @@ export function pickRetryPages<T extends { id: string; phase: string }>(
 export function chapterMessage(s: ChapterProgress): string {
     const ready = `${s.done} of ${s.total} ${s.total === 1 ? 'page' : 'pages'} ready to read`;
     if (s.phase === 'stopping') return `Stopping chapter translation… · ${ready}`;
-    if (s.phase === 'stopped') return `Translation stopped · ${ready}`;
+    if (s.phase === 'stopped') return `${s.message || 'Translation stopped'} · ${ready}`;
     if (s.phase === 'error') return `${s.message || 'Chapter translation paused'} · ${ready}`;
     if (s.phase === 'waiting') return `${ready} · Waiting for more page images`;
     if (s.phase === 'complete') return s.errors
@@ -128,5 +130,5 @@ export function chapterMessage(s: ChapterProgress): string {
 export function providerMessage(kind?: string): string {
     if (kind === 'ratelimit') return 'Translation paused — provider request limit reached';
     if (kind === 'auth') return 'Translation paused — check your API key and provider balance';
-    return 'Chapter translation paused — open the error details to continue';
+    return 'Chapter translation paused. Try translating from this page again.';
 }

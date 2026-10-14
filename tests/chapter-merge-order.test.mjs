@@ -1,5 +1,5 @@
 import ts from 'typescript';
-import { transform } from 'esbuild';
+import { build, transform } from 'esbuild';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
@@ -11,6 +11,8 @@ const functions = source.statements.filter(node => ts.isFunctionDeclaration(node
 assert.equal(functions.length, 4);
 const compiled = await transform(functions.map(node => node.getText(source)).join('\n'), { loader: 'ts' });
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+const attemptBuild = await build({ entryPoints: ['src/chapter/lifecycle.ts'], bundle: true, format: 'esm', write: false });
+const { Attempt } = await import('data:text/javascript;base64,' + Buffer.from(attemptBuild.outputFiles[0].text).toString('base64'));
 
 function deferred() {
     let resolve;
@@ -21,6 +23,7 @@ function deferred() {
 function fixture(cached = [], opts = {}) {
     const pages = Array.from({ length: 4 }, (_, order) => ({ id: `p${order}`, order }));
     const pending = pages.map(() => deferred());
+    const reply = deferred(), closed = [];
     const requests = [], warms = [], renders = [], cachedCommits = [], failures = [];
     const prepared = pages.map(page => ({ page, item: { id: page.id }, force: false,
         bitmap: { width: 600, height: 800, order: page.order, close() {} },
@@ -32,7 +35,9 @@ function fixture(cached = [], opts = {}) {
         config: { pipeline: { textSource: 'ocr', cacheEnabled: false }, cacheEpoch: '', force: undefined },
         cacheCurrent: () => true, cacheReady: async () => '',
         PAGE_LEASE_MS: 300_000, attempts: new Set(),
-        Attempt: class { cancelled = new Promise(() => {}); finish() {} },
+        pageEpochs: new Map(), contextSharing: new WeakMap(), attemptPages: new WeakMap(),
+        releasePrepared: p => p.bitmap.close(),
+        Attempt,
         preparePage: page => pending[page.order].promise,
         withPageLease: (_page, _item, valid, run) => run(valid),
         settlePrepared: async (p) => { assert.ok(p.out, 'this fixture must not enter a per-page fallback'); cachedCommits.push({ order: p.page.order, cached: true }); },
@@ -41,12 +46,13 @@ function fixture(cached = [], opts = {}) {
         recordChapterLog() {}, shiftDetectionBoxY: (box, y) => ({ ...box, y1: box.y1 + y, y2: box.y2 + y }),
         stage: () => {}, publish: async () => {}, contextFor: async () => ({}),
         OffscreenCanvas: class { pages = []; getContext() { return { drawImage: bitmap => this.pages.push(bitmap.order) }; } },
-        createImageBitmap: async canvas => ({ pages: canvas.pages, close() {} }),
+        createImageBitmap: async canvas => ({ pages: canvas.pages, close() { closed.push('combined'); } }),
         translateRegions: async (bitmap, det, _onStatus, translateOpts) => {
             requests.push({ pages: bitmap.pages, sources: det.boxes.map(box => box.source) });
             if (opts.failure) return { error: 'Graphics processing stopped responding', errorKind: 'inference' };
             // The real call fires afterOcr exactly here: OCR done, LLM request about to start.
             translateOpts?.afterOcr?.();
+            if (opts.holdReply) await reply.promise;
             return { outputs: det.boxes.map((box, i) => ({ index: i + 1, source: box.source, translation: box.source })),
                 extras: [], mentions: [] };
         },
@@ -71,7 +77,13 @@ function fixture(cached = [], opts = {}) {
     };
     runInNewContext(compiled.code, scope);
     const done = scope.runGroup(pages, { pairs: [], characters: [] }, 1, 'epoch');
-    return { requests, warms, renders, cachedCommits, failures, done,
+    return { requests, warms, renders, cachedCommits, failures, done, closed,
+        releaseReply: () => reply.resolve(),
+        cancelPage(order) {
+            scope.pageEpochs.set(pages[order].id, 1);
+            prepared[order].item.phase = 'paused';
+            for (const attempt of scope.attempts) attempt.cancel();
+        },
         pause() { scope.status.phase = 'error'; },
         async finish(order) { pending[order].resolve(prepared[order]); await tick(); } };
 }
@@ -136,4 +148,16 @@ test('a slot finishing preparation after another slot paused the run cannot star
     for (const order of [3, 2, 1, 0]) await f.finish(order);
     await f.done;
     assert.deepEqual(f.requests, []); assert.deepEqual(f.renders, []); assert.deepEqual(f.warms, []);
+});
+
+test('cancelling a merged page does not retry it and retains combined pixels until the late call settles', async () => {
+    const f = fixture([], { holdReply: true });
+    try {
+        for (const order of [3, 2, 1, 0]) await f.finish(order);
+        assert.equal(f.requests.length, 1);
+        f.cancelPage(1); await f.done;
+        assert.deepEqual(f.renders, []); assert.deepEqual(f.closed, []);
+        f.releaseReply(); await tick();
+        assert.deepEqual(f.closed, ['combined']); assert.equal(f.requests.length, 1);
+    } finally { f.releaseReply(); }
 });

@@ -25,14 +25,14 @@ const stubs = {
     queue: `export const viewportOverlap = ref => fixture.hidden.has(ref.el) ? 0 : 1; export const dropAutoQueued = () => {};
         export const resumeAuto = () => {}; export const isBusy = () => false; export const paintBusy = () => false;
         export const haltAuto = () => {};`,
-    auto: `export const lookaheadActive = () => false;`,
+    auto: `export const lookaheadActive = () => false; export const pauseAuto = () => {};`,
     'status-ui': `export const setActivity = () => {}; export const removeActivity = () => {};
         export const lastMsgSet = () => {}; export const renderStatus = () => {}; export const pillUnDismiss = () => {};
         export const logError = async () => {};`,
     protocol: `export const chapterSignature = () => 'test:signature';`,
     store: `export const blobDataUrl = async () => '';`,
     discovery: `export const nextDocument = () => undefined; export const guessNextDocument = () => undefined; export const hasNextPage = () => false;`,
-    debug: `export const isDebug = () => false;`,
+    debug: `export const isDebug = () => false; export const initDebug = async () => {};`,
     ocr: `export const ensurePageDebugViews = async () => {};`,
 };
 await build({ entryPoints: ['src/content/sweep.ts'], bundle: true, format: 'esm', outfile: '.test-build/chapter-order.mjs',

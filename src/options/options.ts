@@ -5,11 +5,12 @@ import type { PipelineSettings } from '../llm/pipeline-settings';
 import { $, setDirty, wireTabs, loadThemeChoice } from './shell';
 import { fillModelFields, fillOcrFields, updateHints, markModelDirty, saveAll, discardAll, testConnection, testOcr, syncSetupBanner, syncInferUI, syncThinkingUI, testCloud } from './model';
 import { pipeline, loadStoredPipeline, syncAdvancedUI } from './pipeline-section';
-import { renderCharacters, clearCharacters, renderAutoSites, drawFontPreview } from './panels';
+import { renderCharacters, clearCharacters, renderAutoSites, drawFontPreview, renderFontManager } from './panels';
 
 interface CharOverride { gender: 'M' | 'F' | '?'; name?: string }
 
 async function load(): Promise<void> {
+    $('aboutVersion').textContent = `Version ${chrome.runtime.getManifest().version}`;
     const { mtSettings, mtOcrSettings, mtPipeline, mtCharOverrides, mtDebug } = await chrome.storage.local.get(['mtSettings', 'mtOcrSettings', 'mtPipeline', 'mtCharOverrides', 'mtDebug']);
     // pipeline first — fillModelFields reads pipeline.thinkingLevel
     loadStoredPipeline(mtPipeline as PipelineSettings | undefined);
@@ -17,6 +18,7 @@ async function load(): Promise<void> {
     fillModelFields({ ...DEFAULT_SETTINGS, ...(mtSettings ?? {}) } as LLMSettings);
     fillOcrFields({ ...DEFAULT_SETTINGS, ...(mtOcrSettings ?? {}) } as LLMSettings);
     syncAdvancedUI();
+    await renderFontManager();
     // debug overlay is its own key (not pipeline): applies instantly, no save needed
     ($('debugBoxes') as HTMLInputElement).checked = mtDebug === true;
     updateHints();
@@ -44,7 +46,10 @@ $('test').onclick = testConnection;
 $('ocrTest').onclick = testOcr;
 $('testCloud').onclick = testCloud;
 ($('saveAll') as HTMLButtonElement).onclick = saveAll;
-($('discard') as HTMLButtonElement).onclick = () => discardAll(fillModelFields, syncAdvancedUI);
+($('discard') as HTMLButtonElement).onclick = async () => {
+    await discardAll(fillModelFields, syncAdvancedUI);
+    await renderFontManager();
+};
 $('clearChars').onclick = clearCharacters;
 wireTabs((tab) => {
     // the preview paints blank while its tab is hidden — repaint on open

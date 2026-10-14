@@ -27,11 +27,11 @@ export async function storedContext(chapter: string, bookKey: string): Promise<C
     }
     return ctx;
 }
-async function persist(chapter: string, bookKey: string, ctx: ContextState, ledger?: Ledger, share = true): Promise<void> {
+async function persist(chapter: string, bookKey: string, ctx: ContextState, ledger?: Ledger, share?: boolean): Promise<void> {
     if (ledger) ledger.last = structuredClone(ctx);
     await sessSet({
         [`mtCtx:${chapter}`]: JSON.stringify({ chapter, context: ctx }),
-        [`mtShare:${chapter}`]: share,
+        [`mtShare:${chapter}`]: share ?? (await sessGet(`mtShare:${chapter}`))[`mtShare:${chapter}`] !== false,
         ...(ledger ? { [`mtChapterLedger:${chapter}`]: ledger } : {}),
     });
     if (bookKey.startsWith('mtBook:')) await chrome.storage.local.set({ [bookKey]: JSON.stringify(ctx.characters) });

@@ -1,5 +1,6 @@
 import { sanitizeChapterEvent, updateChapterLogPage, type ChapterLogHead, type ChapterLogInput, type ChapterLogEvent,
     type ChapterLogPage, type ChapterLogReport, type ChapterTrace } from './log';
+import { initDebug, isDebug } from '../debug';
 
 // Separate event/page rows keep each write small. All writers share one atomic IDB
 // transaction; the popup reads this extension-origin database without a worker RPC.
@@ -43,7 +44,10 @@ function publicHead(head: StoredHead): ChapterLogHead {
     return safe;
 }
 export async function createChapterLog(readerTab: number, chapter: string, build: string, userAgent: string): Promise<string> {
+    await initDebug();
+    if (!isDebug()) return '';
     const d = await db();
+    if (!isDebug()) return '';
     const id = crypto.randomUUID(), now = Date.now();
     const scope = await scopeOf(chapter);
     await new Promise<void>((resolve, reject) => {
@@ -51,6 +55,7 @@ export async function createChapterLog(readerTab: number, chapter: string, build
         const heads = tx.objectStore('heads');
         const all = heads.getAll();
         all.onsuccess = () => {
+            if (!isDebug()) return;
             const old = (all.result as StoredHead[]).sort((a, b) => b.startedAt - a.startedAt).slice(KEEP_RUNS - 1);
             for (const head of old) {
                 heads.delete(head.id);
@@ -70,14 +75,18 @@ export async function createChapterLog(readerTab: number, chapter: string, build
     return id;
 }
 export async function appendChapterLog(logId: string, input: ChapterLogInput): Promise<void> {
+    await initDebug();
+    if (!isDebug()) return;
     const event = sanitizeChapterEvent(input);
     if (!event || !logId) return;
     const d = await db();
+    if (!isDebug()) return;
     await new Promise<void>((resolve, reject) => {
         const tx = d.transaction(['heads', 'events', 'pages'], 'readwrite');
         const heads = tx.objectStore('heads');
         const headRequest = heads.get(logId);
         headRequest.onsuccess = () => {
+            if (!isDebug()) return;
             const head = headRequest.result as StoredHead | undefined;
             if (!head) return;
             const seq = ++head.sequence;
@@ -106,23 +115,29 @@ export async function appendChapterLog(logId: string, input: ChapterLogInput): P
     });
 }
 export function recordChapterLog(trace: ChapterTrace | undefined, event: ChapterLogInput): void {
-    if (!trace?.logId) return;
+    if (!isDebug() || !trace?.logId) return;
     void appendChapterLog(trace.logId, { ...event, at: Date.now(), pages: event.pages ?? trace.pages,
         request: event.request ?? trace.request }).catch(() => {});
 }
 export async function chapterLogOwned(logId: string, readerTab: number, chapter: string): Promise<boolean> {
+    await initDebug();
+    if (!isDebug()) return false;
     const d = await db();
     const head = await request(d.transaction('heads').objectStore('heads').get(logId)) as StoredHead | undefined;
-    return head?.readerTab === readerTab && head?.scope === await scopeOf(chapter);
+    return isDebug() && head?.readerTab === readerTab && head?.scope === await scopeOf(chapter);
 }
 export async function latestChapterLogHead(readerTab?: number): Promise<ChapterLogHead | undefined> {
+    await initDebug();
+    if (!isDebug()) return;
     const d = await db();
     const all = await request(d.transaction('heads').objectStore('heads').getAll()) as StoredHead[];
     all.sort((a, b) => b.startedAt - a.startedAt);
     const head = all.find(h => h.readerTab === readerTab) ?? all[0];
-    return head ? publicHead(head) : undefined;
+    return isDebug() && head ? publicHead(head) : undefined;
 }
 export async function readChapterLog(logId: string): Promise<ChapterLogReport | undefined> {
+    await initDebug();
+    if (!isDebug()) return;
     const d = await db();
     const tx = d.transaction(['heads', 'events', 'pages']);
     const [head, rows, pages] = await Promise.all([
@@ -130,10 +145,12 @@ export async function readChapterLog(logId: string): Promise<ChapterLogReport | 
         request(tx.objectStore('events').index('byRun').getAll(logId)) as Promise<{ event: ChapterLogEvent }[]>,
         request(tx.objectStore('pages').index('byRun').getAll(logId)) as Promise<{ page: ChapterLogPage }[]>,
     ]);
-    return head ? { schema: 1, capturedAt: Date.now(), head: publicHead(head),
+    return isDebug() && head ? { schema: 1, capturedAt: Date.now(), head: publicHead(head),
         pages: pages.map(row => row.page).sort((a, b) => a.page - b.page), events: rows.map(row => row.event) } : undefined;
 }
 export async function recordChapterWorkerWake(): Promise<void> {
+    await initDebug();
+    if (!isDebug()) return;
     const d = await db();
     const heads = await request(d.transaction('heads').objectStore('heads').getAll()) as StoredHead[];
     await Promise.all(heads.filter(h => ['preparing', 'running', 'waiting', 'stopping'].includes(h.phase))
