@@ -5,7 +5,7 @@ export const KOHARU_MODEL = {
     file: 'koharu-fp32-chunked.onnx',
     bytes: 149799163,
     sha256: '35d89289e92a6dba75b9ccd4ebd447a55aad69c993d0a8e439c57509d598dfd6',
-    recipe: 'koharu-fp32-q256-v2',
+    recipe: 'koharu-fp32-q256-v3',
 } as const;
 
 export interface KoharuThresholds {

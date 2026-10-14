@@ -20,7 +20,7 @@ export const renderTuning = { minFont: MIN_FONT, letterSpacing: TRACKING, vertic
 
 // Render-logic generation, stamped into the [mt] page result dump.
 // Bump on ANY render.ts layout change.
-export const RENDER_GEN = 43;
+export const RENDER_GEN = 44;
 
 // Absolute floor for last-resort shrink below minFont before the overflow path clips.
 // Primary loop still honors minFont; only overflowing text goes below it.
@@ -192,6 +192,7 @@ function wrapUnitsIntoLines(
     ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
     segments: string[],
     widthFor: (lineIdx: number) => number,
+    measure: (text: string) => number = text => ctx.measureText(text).width,
 ): { lines: string[]; failed: boolean } {
     const lines: string[] = [];
     for (const seg of segments) {
@@ -199,13 +200,13 @@ function wrapUnitsIntoLines(
         let cur: Unit[] = [];
         for (const u of units) {
             const cand = joinUnits([...cur, u]);
-            if (ctx.measureText(cand).width <= widthFor(lines.length)) {
+            if (measure(cand) <= widthFor(lines.length)) {
                 cur.push(u);
             } else {
                 if (!cur.length) return { lines: [], failed: true }; // single unit wider than the area
                 lines.push(joinUnits(cur));
                 cur = [u];
-                if (ctx.measureText(u.t).width > widthFor(lines.length)) return { lines: [], failed: true };
+                if (measure(u.t) > widthFor(lines.length)) return { lines: [], failed: true };
             }
         }
         if (cur.length) lines.push(joinUnits(cur));
@@ -1504,6 +1505,50 @@ export function layoutTextFit(
     for (let size = cap; size >= HARD_MIN_FONT; size = size > HARD_MIN_FONT ? Math.max(HARD_MIN_FONT, size - 2) : 0) {
         setFont(ctx, size);
         const lh = size * (1 + HEADROOM + LINE_SPACING);
+        const paintWidth = (text: string): number => {
+            const metric = ctx.measureText(text), actual = metric.actualBoundingBoxLeft + metric.actualBoundingBoxRight;
+            return Number.isFinite(actual) ? actual + (renderTuning.textStroke > 0 ? Math.max(1, size * renderTuning.textStroke) : 0) + 1 : metric.width;
+        };
+        const centerAt = (lines: string[], top: number): number | null => {
+            let lo = -Infinity, hi = Infinity;
+            for (let j = 0; j < lines.length; j++) {
+                const b0 = prof.vertical ? top - (j + 1) * lh : top + j * lh;
+                const iv = midIv(b0, b0 + lh);
+                if (!iv) return null;
+                const width = paintWidth(lines[j]);
+                lo = Math.max(lo, iv[0] + width / 2 - 0.5);
+                hi = Math.min(hi, iv[1] - width / 2 + 0.5);
+            }
+            return lo <= hi ? Math.max(lo, Math.min(hi, midCross)) : null;
+        };
+        // Wrap at each proposed anchor around one shared center. Independently
+        // filling each row can produce lines that cannot share a paragraph center.
+        if (boxC != null) {
+            const maxLines = Math.max(1, Math.floor((stackFit + 0.5) / lh));
+            for (let n = 1; n <= maxLines; n++) {
+                const span = n * lh;
+                if (span > stackFit + 0.5) continue;
+                for (const anchor of [boxC, stack0 + stackLen / 2]) {
+                    const start = Math.max(stack0, Math.min(anchor - span / 2, stack0 + stackLen - span));
+                    const top = prof.vertical ? start + span : start;
+                    const bands = Array.from({ length: n }, (_, j) => {
+                        const p = prof.vertical ? top - (j + 1) * lh : top + j * lh;
+                        return midIv(p, p + lh);
+                    });
+                    if (bands.some(iv => !iv)) continue;
+                    const lo = Math.max(...bands.map(iv => iv![0])), hi = Math.min(...bands.map(iv => iv![1]));
+                    if (lo >= hi) continue;
+                    const center = (lo + hi) / 2;
+                    const wrapped = wrapUnitsIntoLines(ctx, segments, j => {
+                        const iv = bands[j];
+                        return iv ? 2 * Math.min(center - iv[0], iv[1] - center) : 0;
+                    }, paintWidth);
+                    if (wrapped.failed || wrapped.lines.length !== n) continue;
+                    if (centerAt(wrapped.lines, top) != null) return { lines: wrapped.lines, fontSize: size, lineHeight: lh, top,
+                        centers: wrapped.lines.map(() => center) };
+                }
+            }
+        }
         const anchorA = prof.vertical ? stack0 + stackLen : stack0;
         const edge = wrapUnitsIntoLines(ctx, segments, widthFor(anchorA, lh));
         // Centered block by free-boundary search: walk candidate spans ascending; first self-consistent wrap wins.
@@ -1540,24 +1585,10 @@ export function layoutTextFit(
             const boxTop = Math.min(Math.max(boxC - span / 2, stack0), Math.max(stack0, stack0 + stackLen - span));
             if (Math.abs(boxTop - areaTop) > 0.5) tops.unshift(boxTop);
         }
-        const centerAt = (top: number): number | null => {
-            let lo = -Infinity, hi = Infinity;
-            for (let j = 0; j < lines.length; j++) {
-                const b0 = prof.vertical ? top - (j + 1) * lh : top + j * lh;
-                const iv = midIv(b0, b0 + lh);
-                if (!iv) return null;
-                const metric = ctx.measureText(lines[j]);
-                const actual = metric.actualBoundingBoxLeft + metric.actualBoundingBoxRight;
-                const width = Number.isFinite(actual) ? actual + (renderTuning.textStroke > 0 ? Math.max(1, size * renderTuning.textStroke) : 0) + 1 : metric.width;
-                lo = Math.max(lo, iv[0] + width / 2 - 0.5);
-                hi = Math.min(hi, iv[1] - width / 2 + 0.5);
-            }
-            return lo <= hi ? Math.max(lo, Math.min(hi, midCross)) : null;
-        };
         let out: LaidOutFit | null = null;
         let wonBoxC = false;
         for (const top of tops) {
-            const center = centerAt(top);
+            const center = centerAt(lines, top);
             if (center == null) continue;
             const centers = lines.map(() => center);
             out = { lines, fontSize: size, lineHeight: lh, top, centers };

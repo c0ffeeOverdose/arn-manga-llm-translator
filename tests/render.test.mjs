@@ -738,6 +738,35 @@ test('a paragraph keeps a common center in a sideways-drifting profile', () => {
     });
 });
 
+test('shared-center wrapping uses the available height before shrinking a shifted paragraph', () => {
+    const rows = 180, i1 = Int32Array.from({ length: rows }, (_, y) => y < 90 ? 0 : 30);
+    const i2 = Int32Array.from(i1, x => x + 200);
+    const runs = { vertical: false, p0: 0, p1: rows - 1, i1, i2, enclosed: 1 };
+    const ctx = fakeCtx();
+    const advance = ctx.measureText;
+    ctx.measureText = text => {
+        const metric = advance(text);
+        return { ...metric, actualBoundingBoxLeft: 0, actualBoundingBoxRight: metric.width };
+    };
+    const prior = { ...renderTuning };
+    setRenderTuning({ minFont: 12, textStroke: 0.1 });
+    try {
+        const fit = layoutTextFit(ctx, 'alpha beta gamma delta '.repeat(5),
+            { x: 0, y: 0, w: 230, h: rows, runs }, 20, undefined, 90);
+        assert.ok(fit && fit.fontSize >= 14, 'rewrapping uses the shared horizontal room');
+        assert.ok(fit.lines.length * fit.lineHeight > 150, 'the paragraph uses the available height');
+        assert.ok(fit.top >= 0 && fit.top + fit.lines.length * fit.lineHeight <= rows + 0.5);
+        assert.equal(new Set(fit.centers).size, 1);
+        ctx.font = `${fit.fontSize}px fake`;
+        fit.lines.forEach((line, j) => {
+            const band = runInterval(runs, fit.top + j * fit.lineHeight, fit.top + (j + 1) * fit.lineHeight);
+            const half = (ctx.measureText(line).width + fit.fontSize * 0.1 + 1) / 2;
+            assert.ok(fit.centers[j] - half >= band[0] - 0.5);
+            assert.ok(fit.centers[j] + half <= band[1] + 0.5);
+        });
+    } finally { setRenderTuning(prior); }
+});
+
 test('runInterval: edge sliver/hole rows are trimmed, an interior hole still nulls', () => {
   const rows = 20;
   const prof = bandProfile(rows, () => 100, 10);

@@ -67,6 +67,10 @@ placement area; the orange dashed contour follows the per-row shape used for wra
 and clipping. These areas are measured from the original page in both views. Text can
 extend beyond red while staying inside the usable balloon shape.
 
+Paragraph wrapping uses one shared center and includes glyph outlines and strokes in
+its width measurement. It tries placement around the source text and the balloon's
+center before reducing the font, so a changing contour can use the available height.
+
 Changing quality presets preserves the selected model. New translation requests
 and chapter runs use that choice. Active chapter runs retain their captured settings.
 Saved results are matched to the selected model and its thresholds; existing legacy
