@@ -10,7 +10,7 @@ export let presetsPristine = true; // false once user edits advanced fields → 
 
 export function loadStoredPipeline(stored: PipelineSettings | undefined): void {
     pipeline = loadPipelineSettings(stored);
-    presetsPristine = stored == null;
+    presetsPristine = matchingPreset(pipeline) !== 'custom';
 }
 
 export async function forgetSelectedFont(id: string): Promise<void> {

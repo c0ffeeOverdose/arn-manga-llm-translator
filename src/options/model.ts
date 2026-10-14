@@ -438,7 +438,12 @@ $('layoutImportBtn').onclick = () => ($('layoutFile') as HTMLInputElement).click
     $('layoutFileStatus').textContent = '';
     syncInferUI(); setDirty(true);
 };
-for (const id of ['preset', 'resetAdv']) $(id).addEventListener(id === 'preset' ? 'change' : 'click', syncInferUI);
+for (const id of ['preset', 'resetAdv']) $(id).addEventListener(id === 'preset' ? 'change' : 'click', () => {
+    syncInferUI();
+    syncThinkingUI();
+    syncTemperatureUI();
+    syncOcrTemperatureUI();
+});
 
 for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
     b.onclick = () => {
