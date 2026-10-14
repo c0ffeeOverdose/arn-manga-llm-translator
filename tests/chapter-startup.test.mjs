@@ -120,6 +120,20 @@ test('priority during slow setup cannot start inference or echo unchanged progre
     } finally { f.command('stop'); f.load.resolve(); f.det.resolve(); }
 });
 
+test('progress publication order continues after restoring a checkpoint', async () => {
+    const pages = [{ id: 'p0', order: 0, url: 'https://reader.test/page.png', descramble: false }];
+    const progress = { id: 'run', chapter: 'https://reader.test/chapter/123456', sequence: 50, phase: 'stopped',
+        done: 0, total: 1, errors: 0, inflight: 0, completeManifest: true, pages: pages.map(p => ({ ...p, phase: 'queued' })) };
+    const f = runnerFixture({ config: { pages }, progress });
+    try {
+        f.load.resolve(); await until(() => f.ready === 1);
+        f.command('resume'); f.det.resolve();
+        await until(() => f.publishes.at(-1)?.phase === 'complete');
+        assert.ok(f.publishes[0].sequence > 50);
+        assert.ok(f.publishes.every((p, i) => i === 0 || p.sequence > f.publishes[i - 1].sequence));
+    } finally { f.command('stop'); f.det.resolve(); }
+});
+
 test('retranslate after Stop processes only the requested page; Resume continues the remaining chapter', async () => {
     const pages = Array.from({ length: 3 }, (_, order) => ({ id: `p${order}`, order, url: `https://reader.test/page-${order}.png`, descramble: false }));
     const progress = { id: 'run', chapter: 'https://reader.test/chapter/123456', phase: 'stopped', done: 1, total: 3,

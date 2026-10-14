@@ -18,6 +18,7 @@ export interface ChapterPage {
 export type PagePhase = 'queued' | 'reading' | 'detecting' | 'translating' | 'rendering' | 'ready' | 'failed' | 'waiting' | 'paused';
 export interface ChapterProgress {
     id: string;
+    sequence?: number; // monotonic within a run, including after checkpoint restore
     logId?: string;
     chapter: string;
     phase: 'running' | 'stopping' | 'stopped' | 'complete' | 'waiting' | 'error';

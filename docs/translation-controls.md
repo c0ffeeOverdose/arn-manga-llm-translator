@@ -18,6 +18,9 @@ For example, after starting at page 10 and stopping, go to page 3 and press **Tr
 chapter end** to translate page 3 onward. **Resume chapter translation** instead continues the
 unfinished part of the run that began at page 10.
 
+One chapter translation can run at a time. Starting one in another tab pauses the
+previous chapter. Return to that tab and select **Translate to chapter end** to continue.
+
 **Re-translate page** replaces the current page's translation. After a stopped chapter run it
 processes just that page and leaves the remaining chapter paused. Re-translate during an
 active chapter does not cancel the other pages you already requested.

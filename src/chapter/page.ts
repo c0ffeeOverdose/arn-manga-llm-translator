@@ -139,6 +139,7 @@ function statusElement(): HTMLElement | null {
     return typeof document === 'undefined' ? null : document.querySelector('#status');
 }
 function publish(): Promise<void> {
+    status.sequence = (status.sequence ?? 0) + 1;
     status.done = status.pages.filter(p => p.phase === 'ready').length;
     status.errors = status.pages.filter(p => p.phase === 'failed').length;
     status.inflight = status.pages.filter(p => ['reading', 'detecting', 'translating', 'rendering'].includes(p.phase)).length;

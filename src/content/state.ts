@@ -144,30 +144,30 @@ export let ui: HTMLDivElement | null = null;
 export function setUi(v: HTMLDivElement | null): void { ui = v; }
 
 export let pipeline: PipelineSettings = { ...DEFAULT_PIPELINE_SETTINGS };
-let customFontLoaded = ''; // font-store id whose FontFace is already on document.fonts
+let pipelineRevision = 0;
+const loadedFonts = new Map<string, string>();
+const loadingFonts = new Map<string, Promise<void>>();
 
-export async function loadPipeline(settings?: PipelineSettings): Promise<PipelineSettings> {
-    if (hostIdentity) return pipeline;
-    if (settings) pipeline = settings;
-    else {
-        const { mtPipeline } = await chrome.storage.local.get('mtPipeline');
-        pipeline = loadPipelineSettings(mtPipeline);
-    }
+function applyRenderSettings(): void {
+    const font = loadedFonts.get(pipeline.renderFont);
     setRenderTuning({
         minFont: pipeline.minFont,
         letterSpacing: pipeline.letterSpacing,
         verticalThreshold: pipeline.verticalThreshold,
-        font: fontStackFor(pipeline.targetLang),
+        font: font ? `"${font}", ${fontStackFor(pipeline.targetLang)}` : fontStackFor(pipeline.targetLang),
         textColor: pipeline.textColor,
         strokeColor: pipeline.strokeColor,
         textStroke: pipeline.textStroke,
         textScale: pipeline.textScale,
     });
-    // user-selected render font: fetch bytes from the background, register a FontFace FIRST
-    // in the stack — missing glyphs fall through to the per-language default
-    if (pipeline.renderFont !== 'default' && pipeline.renderFont !== customFontLoaded) {
+}
+function loadRenderFont(id: string): Promise<void> {
+    if (loadedFonts.has(id)) return Promise.resolve();
+    const pending = loadingFonts.get(id);
+    if (pending) return pending;
+    const task = (async () => {
         const resp = await sendToBackground<{ ok: boolean; name?: string; b64?: string; error?: string } | null>(
-            { type: 'mt:font-get', id: pipeline.renderFont }, { timeoutMs: 10_000, retries: 1, label: 'font load' },
+            { type: 'mt:font-get', id }, { timeoutMs: 10_000, retries: 1, label: 'font load' },
         ).catch(e => { console.warn('[mt] custom font unavailable:', (e as Error).message); return null; });
         if (resp?.ok && resp.b64 && resp.name) {
             try {
@@ -177,14 +177,27 @@ export async function loadPipeline(settings?: PipelineSettings): Promise<Pipelin
                 const face = new FontFace(resp.name, bytes.buffer);
                 await face.load();
                 document.fonts.add(face);
-                customFontLoaded = pipeline.renderFont;
-                setRenderTuning({ font: `"${resp.name}", ${fontStackFor(pipeline.targetLang)}` });
+                loadedFonts.set(id, resp.name);
             } catch (e) {
                 console.warn('[mt] custom font failed, using default:', e);
             }
         } else if (resp && !resp.ok) {
             console.warn('[mt] custom font unavailable:', resp.error);
         }
+    })().finally(() => loadingFonts.delete(id));
+    loadingFonts.set(id, task);
+    return task;
+}
+export async function loadPipeline(settings?: PipelineSettings): Promise<PipelineSettings> {
+    if (hostIdentity) return pipeline;
+    const revision = ++pipelineRevision;
+    const next = settings ?? loadPipelineSettings((await chrome.storage.local.get('mtPipeline')).mtPipeline);
+    if (revision !== pipelineRevision || hostIdentity) return pipeline;
+    pipeline = next;
+    applyRenderSettings();
+    if (next.renderFont !== 'default') {
+        await loadRenderFont(next.renderFont);
+        if (revision === pipelineRevision && !hostIdentity) applyRenderSettings();
     }
     return pipeline;
 }
@@ -203,16 +216,14 @@ export let context: ContextState = EMPTY_CONTEXT;
 let savedContext: ContextState = structuredClone(EMPTY_CONTEXT);
 let hostIdentity: { chapter: string; bookKey: string } | null = null;
 export function configureChapterHost(chapter: string, book: string, settings: PipelineSettings, ctx: ContextState): void {
+    pipelineRevision++;
     hostIdentity = { chapter, bookKey: book };
     pipeline = settings;
     context = structuredClone(ctx);
     savedContext = structuredClone(ctx);
     contextChapter = chapter;
     contextLoaded = true;
-    setRenderTuning({ minFont: pipeline.minFont, letterSpacing: pipeline.letterSpacing,
-        verticalThreshold: pipeline.verticalThreshold, font: fontStackFor(pipeline.targetLang),
-        textColor: pipeline.textColor, strokeColor: pipeline.strokeColor,
-        textStroke: pipeline.textStroke, textScale: pipeline.textScale });
+    applyRenderSettings();
 }
 export function setContext(c: ContextState): void { context = c; }
 export let contextChapter = chapterKey();
@@ -225,22 +236,32 @@ export function setShareContext(v: boolean): void { shareContext = v; }
 // chapter id → manga id (for the cross-chapter book). Resolved once per
 // chapter change; a failure falls back to the old chapter-scoped behavior.
 let mangaId: string | null = null;
-let mangaIdTried = false;
+let mangaRevision = 0;
+let mangaResolution: { chapter: string; promise: Promise<string | null> } | null = null;
 
 export async function resolveMangaId(): Promise<string | null> {
-    if (mangaIdTried) return mangaId;
-    mangaIdTried = true;
+    const chapter = chapterKey();
+    if (mangaResolution?.chapter === chapter) return mangaResolution.promise;
+    const revision = ++mangaRevision;
+    mangaId = null;
     // MangaDex-only: anywhere else the regex misses and the book stays chapter-scoped
     if (!/(^|\.)mangadex\./.test(location.hostname)) return null;
     const m = location.pathname.match(/^\/chapter\/([^/]+)/);
     if (!m) return null;
-    try {
-        const resp = await fetch(`https://api.mangadex.org/chapter/${m[1]}?includes%5B%5D=manga`);
-        const data = await resp.json();
-        const rel = (data?.data?.relationships ?? []).find((r: { type: string }) => r.type === 'manga');
-        if (rel?.id) mangaId = rel.id as string;
-    } catch { /* offline/API fail → book stays chapter-scoped */ }
-    return mangaId;
+    const promise = (async () => {
+        let resolved: string | null = null;
+        try {
+            const resp = await fetch(`https://api.mangadex.org/chapter/${m[1]}?includes%5B%5D=manga`);
+            const data = await resp.json();
+            const rel = (data?.data?.relationships ?? []).find((r: { type: string }) => r.type === 'manga');
+            if (typeof rel?.id === 'string') resolved = rel.id;
+        } catch { /* offline/API fail → book stays chapter-scoped */ }
+        if (revision !== mangaRevision || chapterKey() !== chapter) return null;
+        mangaId = resolved;
+        return mangaId;
+    })();
+    mangaResolution = { chapter, promise };
+    return promise;
 }
 
 // The book is manga-scoped (storage.local, survives restarts) when cross-chapter is on and
@@ -391,7 +412,8 @@ export function resetContextIfNewChapter() {
         contextSaveRevision++;
         shareContext = true;
         mangaId = null;
-        mangaIdTried = false;
+        mangaRevision++;
+        mangaResolution = null;
         storyScope = null; // re-derive for the new chapter (URL/DOM may have changed)
         resolveMangaId(); // resolve for the new chapter (async, non-blocking)
     }

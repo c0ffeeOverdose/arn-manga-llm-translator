@@ -23,11 +23,42 @@ let runner: ChapterRunner = createRunner();
 let liveId = '';
 let liveLogId = '';
 let clearing: Promise<unknown> | undefined;
+let runnerChanges: Promise<unknown> = Promise.resolve();
+function changeRunner<T>(work: () => Promise<T>): Promise<T> {
+    const next = runnerChanges.then(work, work);
+    runnerChanges = next.catch(() => {});
+    return next;
+}
+async function activeSession(): Promise<string> {
+    const id = liveId || (await sessGet('mtChapterActive')).mtChapterActive;
+    return typeof id === 'string' ? id : '';
+}
+async function retireRunner(id: string, message = 'Translation paused — another chapter was started. Start again to continue.'): Promise<void> {
+    await runner.stop(id);
+    liveId = liveLogId = '';
+    await sessRemove('mtChapterActive');
+    const config = await readRecord<HostConfig>(`host:${id}`);
+    if (!config) return;
+    const status: ChapterProgress = await readRecord<ChapterProgress>(`status:${id}`) ?? {
+        id, chapter: config.chapter, phase: 'running', done: 0, total: config.pages.length, errors: 0, inflight: 0,
+        completeManifest: config.completeManifest,
+        pages: config.pages.map(page => ({ id: page.id, url: page.url, order: page.order, phase: 'queued' as const })),
+    } satisfies ChapterProgress;
+    if (!['running', 'waiting', 'stopping'].includes(status.phase) && status.pages.every(page => page.phase === 'ready')) return;
+    status.phase = 'stopped';
+    status.runnerLost = true;
+    status.sequence = (status.sequence ?? 0) + 1;
+    status.inflight = 0;
+    status.message = message;
+    for (const page of status.pages) if (['reading', 'detecting', 'translating', 'rendering'].includes(page.phase)) page.phase = 'queued';
+    await writeRecord(`status:${id}`, status);
+    void chrome.tabs.sendMessage(config.readerTab, { type: 'mt:chapter-update', status }).catch(() => {});
+}
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !chapterSettingsChanged(changes)) return;
     void (async () => {
-        const id = liveId || (await sessGet('mtChapterActive')).mtChapterActive;
-        if (typeof id !== 'string' || !id || !await runner.live(id)) return;
+        const id = await activeSession();
+        if (!id || !await runner.live(id) || id !== await activeSession()) return;
         await writeRecord(`settings-stale:${id}`, true);
         await chrome.runtime.sendMessage({ type: 'mt:chapter-command', id, command: 'settings-changed' });
     })().catch(() => {});
@@ -44,7 +75,7 @@ async function authenticatedRunner(sender: chrome.runtime.MessageSender, msg: { 
     if (!id) return;
     if (!isRunnerSender(sender)) return;
     const config = await readRecord<HostConfig>(`host:${id}`);
-    return config && config.id === id ? config : undefined;
+    return config && config.id === id && id === await activeSession() ? config : undefined;
 }
 export function isChapterRunnerSender(sender: chrome.runtime.MessageSender): boolean {
     return isRunnerSender(sender);
@@ -61,22 +92,28 @@ export async function chapterReaderUrl(sender: chrome.runtime.MessageSender): Pr
     // A fetch proxied on behalf of the runner has no tab: it must inherit the reader's
     // origin so the private-network policy compares against the page the user is reading.
     if (isRunnerSender(sender)) {
-        const id = liveId;
+        const id = await activeSession();
         return id ? (await readRecord<HostConfig>(`host:${id}`))?.readerUrl ?? '' : '';
     }
     return sender.url ?? '';
 }
 async function start(tab: number, data: ChapterStart): Promise<unknown> {
+    const current = await chrome.tabs.get(tab);
+    if (!readerStartAllowed(data.readerUrl, data.chapter, current.url ?? '', new URL(data.readerUrl).origin)) {
+        return { ok: false, error: 'Reader changed; try again' };
+    }
     const token = await cacheReady();
     if (data.cacheEpoch !== undefined) assertCacheCurrent(data.cacheEpoch);
     const old = await binding(tab);
+    const active = await activeSession();
     if (old) {
         const status = await readRecord<ChapterProgress>(`status:${old.id}`);
-        if (old.chapter === data.chapter && status && ['running', 'waiting'].includes(status.phase) && await runner.live(old.id)) {
+        if (active === old.id && old.chapter === data.chapter && status && ['running', 'waiting'].includes(status.phase) && await runner.live(old.id)) {
             return { ok: true, id: old.id, status };
         }
-        await runner.stop(old.id);
     }
+    if (active) await retireRunner(active);
+    else if (await runner.live('')) await runner.stop('');
     assertCacheCurrent(token);
     const id = crypto.randomUUID();
     const logId = data.logId && await chapterLogOwned(data.logId, tab, data.chapter).catch(() => false) ? data.logId
@@ -108,6 +145,7 @@ async function start(tab: number, data: ChapterStart): Promise<unknown> {
         await runner.ensure(id);
         if (!await attachWatch.wait(id, ATTACH_TIMEOUT_MS)) {
             recordChapterLog({ logId }, { kind: 'failure', reason: 'timeout' });
+            await retireRunner(id, 'Translation paused — the background task did not start. Start again to retry.');
             return { ok: false, error: 'The translator background task did not start — reload the extension and try again' };
         }
     }
@@ -120,13 +158,15 @@ async function clearTranslations(): Promise<unknown> {
     await chrome.storage.local.set({ [CACHE_GENERATION_KEY]: generation });
     await acceptCacheGeneration(generation);
     await Promise.allSettled([...starts.values()]);
-    await runner.stop(liveId);
-    liveId = '';
-    const keys = Object.keys(await sessGet(null)).filter(key => key.startsWith('mtChapterTab:'));
-    await sessRemove(keys);
-    await sessRemove('mtChapterActive');
-    await clearRecords();
-    await cacheClear();
+    await changeRunner(async () => {
+        await runner.stop(await activeSession());
+        liveId = liveLogId = '';
+        const keys = Object.keys(await sessGet(null)).filter(key => key.startsWith('mtChapterTab:'));
+        await sessRemove(keys);
+        await sessRemove('mtChapterActive');
+        await clearRecords();
+        await cacheClear();
+    });
     const tabs = await chrome.tabs.query({});
     const readers = await Promise.all(tabs.filter(t => t.id !== undefined).map(t =>
         chrome.tabs.sendMessage(t.id!, { type: 'mt:cache-reset', generation }, { frameId: 0 }).catch(() => null)));
@@ -172,7 +212,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     // The runner asks which session it owns; the answer is also what starts it pumping.
     if (msg.type === 'mt:chapter-runner-boot') {
         if (!isRunnerSender(sender)) return;
-        respond({ ok: true, id: liveId || undefined, logId: liveLogId || undefined });
+        activeSession().then(id => respond({ ok: true, id: id || undefined, logId: liveLogId || undefined }), () => respond({ ok: false }));
         return true;
     }
     if (msg.type === 'mt:chapter-command') return;
@@ -203,6 +243,9 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             }
             const status = msg.status as ChapterProgress;
             if (status.id !== config.id || status.chapter !== config.chapter) return { ok: false };
+            const saved = await readRecord<ChapterProgress>(`status:${config.id}`);
+            if (config.id !== await activeSession()) return { ok: false };
+            if (saved && (status.sequence ?? 0) < (saved.sequence ?? 0)) return { ok: true };
             await writeRecord(`status:${config.id}`, status);
             void chrome.tabs.sendMessage(config.readerTab, { type: 'mt:chapter-update', status }).catch(() => {});
             return { ok: true };
@@ -228,7 +271,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             if (!identity || !readerStartAllowed(data.readerUrl, data.chapter, identity.url, origin)) return { ok: false, error: 'Reader changed; try again' };
             const pending = starts.get(tab);
             if (pending) return pending;
-            const p = start(tab, data).finally(() => starts.delete(tab));
+            const p = changeRunner(() => start(tab, data)).finally(() => starts.delete(tab));
             starts.set(tab, p);
             return p;
         }
@@ -249,13 +292,15 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                     } satisfies ChapterProgress };
                 }
             }
-            if (status && (['running', 'waiting', 'stopping'].includes(status.phase) || status.pages.some(p => p.phase !== 'ready')) && !(await runner.live(b.id))) {
+            if (status && !status.runnerLost && (['running', 'waiting', 'stopping'].includes(status.phase) || status.pages.some(p => p.phase !== 'ready'))
+                && (b.id !== await activeSession() || !(await runner.live(b.id)))) {
                 const cfg = await readRecord<HostConfig>(`host:${b.id}`);
                 recordChapterLog(cfg?.logId ? { logId: cfg.logId } : undefined, { kind: 'runner-lost', reason: 'disconnected' });
                 status.phase = 'error';
                 status.runnerLost = true;
                 status.message = 'Translation paused — the background task stopped; start again to continue';
                 status.inflight = 0;
+                status.sequence = (status.sequence ?? 0) + 1;
                 await writeRecord(`status:${b.id}`, status);
             }
             return { ok: true, status, id: b.id };
@@ -270,6 +315,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                 mask: mask ? { w: mask.w, h: mask.h, data: await blobDataUrl(new Blob([mask.data])) } : undefined } };
         }
         if (msg.type === 'mt:chapter-control') {
+            if (b.id !== await activeSession()) return { ok: false, error: 'Start chapter translation again to continue' };
             if (msg.command === 'stop') {
                 // The runner owns the cancel; closing it early would strand the drain.
                 await chrome.runtime.sendMessage({ type: 'mt:chapter-command', id: b.id, command: msg.command }).catch(() => {});
@@ -285,15 +331,19 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 });
 
 chrome.tabs.onRemoved.addListener(tab => {
-    void (async () => {
+    void changeRunner(async () => {
         const b = await binding(tab);
         if (b) {
             const cfg = await readRecord<HostConfig>(`host:${b.id}`);
             recordChapterLog(cfg?.logId ? { logId: cfg.logId } : undefined, { kind: 'reader-closed' });
-            await runner.stop(b.id);
+            if (b.id === await activeSession()) {
+                await runner.stop(b.id);
+                liveId = liveLogId = '';
+                await sessRemove('mtChapterActive');
+            }
             await sessRemove(bindingKey(tab));
         }
-    })();
+    }).catch(() => {});
 });
 
 // A runner URL change on hot reload must not leave two live runners.

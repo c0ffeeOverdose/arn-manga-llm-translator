@@ -211,10 +211,15 @@ statusSection.ontoggle = () => { if (!statusSection.open) statusPinned = true; }
 let lastCtx = true, lastChars = false, lastOverlay = true, lastDir: 'rtl' | 'ltr' = 'rtl';
 let sweepRunning = false; // mirrored from mt:status each poll — the button toggles start/cancel
 let viewedAction: 'translate' | 'stop' = 'translate';
+let statusRevision = 0;
+let renderedStatusRevision = 0;
 
 async function refreshStatus(): Promise<void> {
     await debugReady;
+    const revision = ++statusRevision;
     const resp = await send({ type: 'mt:status' });
+    if (revision < renderedStatusRevision) return;
+    renderedStatusRevision = revision;
     if (resp?.ok) {
         renderTiming(resp.pageTiming ?? null);
         const counts = resp.translated && resp.loaded ? ` · ${resp.translated}/${resp.loaded} pages` : '';
@@ -304,6 +309,7 @@ async function refreshStatus(): Promise<void> {
             sweepBtn.disabled = false;
         } else {
             const sc = await send({ type: 'mt:sweep-count' }) as { ok?: boolean; count?: number; reason?: string } | null;
+            if (revision !== renderedStatusRevision) return;
             const n = sc?.count ?? 0;
             const why = sc?.ok ? sweepCountMessage(sc.reason as SweepCountReason) : '';
             if (n > 0) {
@@ -325,6 +331,7 @@ async function refreshStatus(): Promise<void> {
         }
         // translation cache size (separate message — IDB read, not part of mt:status)
         const cc = await send({ type: 'mt:cache-count' });
+        if (revision !== renderedStatusRevision) return;
         cacheLabel.textContent = cc?.ok ? `${cc.mine ?? cc.count} on this site · ${cc.count} total` : '';
     } else {
         renderTiming(null);

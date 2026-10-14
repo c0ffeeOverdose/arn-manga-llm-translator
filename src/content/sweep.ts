@@ -32,6 +32,9 @@ let startCancelled = false;
 let observedChapter = '';
 let refreshBusy = false;
 let refreshPending = false;
+let progressRevision = 0;
+let intentRevision = 0;
+let stoppingRun = '';
 let preloadBusy = false;
 let discoverAt = 0;
 let notified = '';
@@ -52,6 +55,19 @@ const evidence = new Map<string, Promise<ImageIdentity | undefined>>();
 const sourceImages = new Map<string, Promise<ImageIdentity>>();
 const preloadViews = new WeakMap<Element, string>();
 
+// Publications are ordered within a run; polling cannot replace a newer push or intent.
+function acceptProgress(next: ChapterProgress): boolean {
+    if (next.chapter !== chapterKey()) return false;
+    if (progress?.id === next.id && (next.sequence ?? 0) < (progress.sequence ?? 0)) return false;
+    if (progress?.id !== next.id) { imageAliases.clear(); evidence.clear(); stoppingRun = ''; }
+    progress = stoppingRun === next.id && ['running', 'waiting'].includes(next.phase) ? { ...next, phase: 'stopping' } : next;
+    if (stoppingRun === next.id && !runPhaseActive(next.phase)) stoppingRun = '';
+    observedChapter = next.chapter;
+    progressRevision++;
+    showProgress();
+    return true;
+}
+
 function syncBook(): void {
     if (foldedChapter !== chapterKey()) { foldedChapter = chapterKey(); folded.clear(); }
 }
@@ -59,6 +75,9 @@ export function bookHas(hash: string): boolean { syncBook(); return folded.has(h
 export function bookAdd(hash: string): void { syncBook(); folded.add(hash); }
 export function bookDrop(hash: string): void { syncBook(); folded.delete(hash); }
 export function forgetSweep(): void {
+    progressRevision++;
+    intentRevision++;
+    stoppingRun = '';
     startCancelled = true;
     progress = null; refs.clear(); evidence.clear(); imageAliases.clear(); sourceImages.clear(); sourceRequests.clear();
     folded.clear(); notified = ''; attachWhy = ''; prioritized = '';
@@ -254,10 +273,27 @@ export function sweepHas(url: string): boolean {
     return !!owned(url) && sweepActive();
 }
 async function control(command: string, extra: Record<string, unknown> = {}): Promise<any> {
-    const response = await sendToBackground<{ ok?: boolean; error?: string }>({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra },
-        { timeoutMs: 15_000, label: 'chapter control' });
-    if (!response?.ok) throw new Error(response?.error || 'The chapter task is unavailable — start chapter translation again');
-    return response;
+    const previous = progress;
+    let optimistic: ChapterProgress | undefined;
+    if (['resume', 'retry', 'request'].includes(command)) {
+        intentRevision++;
+        progressRevision++;
+        stoppingRun = '';
+        if (progress) {
+            progress = optimistic = { ...progress, phase: 'running', message: undefined };
+            showProgress();
+        }
+    }
+    const revision = intentRevision;
+    try {
+        const response = await sendToBackground<{ ok?: boolean; error?: string }>({ type: 'mt:chapter-control', chapter: chapterKey(), command, ...extra },
+            { timeoutMs: 15_000, label: 'chapter control' });
+        if (!response?.ok) throw new Error(response?.error || 'The chapter task is unavailable — start chapter translation again');
+        return response;
+    } catch (e) {
+        if (optimistic && progress === optimistic && previous && revision === intentRevision) acceptProgress(previous);
+        throw e;
+    }
 }
 export function chapterPageStatus(ref: PageRef): { active: boolean; queued: boolean; ready: boolean } {
     const page = ownedRef(ref);
@@ -276,10 +312,12 @@ export async function updateChapterContext(sharing: boolean): Promise<void> {
 export async function resumeSweep(): Promise<{ ok: boolean; error?: string }> {
     if (!sweepStatus()?.canResume) return { ok: false, error: 'Start chapter translation again to continue' };
     if (isBusy() || paintBusy() || lookaheadActive()) return { ok: false, error: 'Finish or stop the current page before resuming the chapter' };
+    const revision = intentRevision + 1;
+    const run = progress?.id, chapter = chapterKey();
     try {
         await control('resume', { shareContext });
-        if (progress) { progress.phase = 'running'; progress.message = undefined; showProgress(); }
-        resumeAuto();
+        if (revision !== intentRevision || chapterKey() !== chapter || progress?.id !== run) return { ok: true };
+        if (progress && ['running', 'waiting', 'complete'].includes(progress.phase)) resumeAuto();
         return { ok: true };
     }
     catch (e) { reportError(e); return { ok: false, error: (e as Error).message }; }
@@ -468,6 +506,9 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
     if (starting) return { ok: true, starting: true };
     if (sweepActive()) return { ok: true, total: progress?.total };
     starting = true;
+    intentRevision++;
+    progressRevision++;
+    stoppingRun = '';
     startCancelled = false;
     const chapter = chapterKey();
     let logId = '';
@@ -566,11 +607,11 @@ export async function startSweep(): Promise<{ ok: boolean; total?: number; error
         } }, { timeoutMs: 90_000, label: 'chapter start' });
         assertCacheCurrent(cacheEpoch);
         if (!response?.ok) throw new Error(response?.error || 'Could not start chapter translation');
-        if (startCancelled) { await control('stop'); return { ok: true, cancelled: true }; }
-        progress = response.status ?? { id: response.id, chapter, phase: 'running', done: 0, total: pages.length,
+        if (startCancelled || chapter !== chapterKey()) { await control('stop', { chapter }); return { ok: true, cancelled: true }; }
+        if (response.status) acceptProgress(response.status);
+        else if (progress?.id !== response.id) acceptProgress({ id: response.id, chapter, phase: 'running', done: 0, total: pages.length,
             errors: 0, inflight: 0, completeManifest: found.complete,
-            pages: pages.map(p => ({ id: p.id, url: p.url, phase: 'queued' })) };
-        showProgress();
+            pages: pages.map(p => ({ id: p.id, url: p.url, phase: 'queued' })) });
         return { ok: true, total: pages.length };
     } catch (e) {
         log({ kind: 'failure', ...chapterLogError(e) });
@@ -594,12 +635,24 @@ function readerImageFilter(): { minW?: number; minH?: number } | undefined {
     return { minW: Math.round(minW * 0.5), minH: Math.round(minH * 0.5) };
 }
 export function cancelSweep(): { ok: boolean } {
+    intentRevision++;
+    progressRevision++;
     pauseAuto();
     startCancelled = true;
     if (progress && sweepActive()) {
+        const run = progress.id, previousPhase = progress.phase, revision = intentRevision;
+        stoppingRun = progress.id;
         progress.phase = 'stopping';
         showProgress();
-        void control('stop').catch(reportError);
+        void control('stop').catch(e => {
+            if (progress?.id === run && stoppingRun === run && revision === intentRevision) {
+                stoppingRun = '';
+                progress.phase = previousPhase;
+                progressRevision++;
+                showProgress();
+            }
+            reportError(e);
+        });
     }
     return { ok: true };
 }
@@ -904,15 +957,23 @@ async function refresh(): Promise<void> {
     try {
         const token = await cacheReady();
         if (observedChapter !== chapter) {
+            progressRevision++;
+            stoppingRun = '';
             observedChapter = chapter; progress = null; refs.clear(); imageAliases.clear(); evidence.clear(); sourceImages.clear();
             removeActivity('sweep');
         }
-        const response = await sendToBackground<{ status?: ChapterProgress }>(
+        const revision = progressRevision;
+        const response = await sendToBackground<{ ok?: boolean; status?: ChapterProgress | null }>(
             { type: 'mt:chapter-status', chapter }, { timeoutMs: 10_000, retries: 1, label: 'chapter status' });
         if (!cacheCurrent(token) || chapterKey() !== chapter) return;
-        if (response?.status) {
-            if (progress?.id !== response.status.id) { imageAliases.clear(); evidence.clear(); }
-            progress = response.status; showProgress();
+        if (response?.status && revision === progressRevision) acceptProgress(response.status);
+        else if (response?.ok && response.status === null && revision === progressRevision && !starting) {
+            progressRevision++;
+            progress = null;
+            stoppingRun = '';
+            refs.clear(); imageAliases.clear(); evidence.clear();
+            attachWhy = ''; prioritized = '';
+            removeActivity('sweep');
         }
         if (!progress) return;
         const visibleRefs = getPages().filter(ref => viewportOverlap(ref) > 0)
@@ -956,10 +1017,7 @@ export function initSweep(): void {
     chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         if (sender.id !== chrome.runtime.id) return;
         if (msg?.type === 'mt:chapter-update' && msg.status.chapter === chapterKey()) {
-            if (progress?.id !== msg.status.id) { imageAliases.clear(); evidence.clear(); }
-            progress = msg.status;
-            showProgress();
-            requestRefresh();
+            if (acceptProgress(msg.status)) requestRefresh();
         }
         if (msg?.type === 'mt:chapter-context-updated' && msg.chapter === chapterKey()) acceptChapterContext(msg.context);
         if (msg?.type === 'mt:chapter-source' && msg.chapter === chapterKey()) {
