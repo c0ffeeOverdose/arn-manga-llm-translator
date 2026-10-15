@@ -26,12 +26,46 @@ Open `cloud-setup.ipynb` in Google Colab → Runtime → Run all → paste the t
 values it prints. Or from a terminal:
 
 ```sh
-modal secret create arn-manga-key ARN_API_KEY=<random>
+python -m pip install modal==1.5.5
 modal deploy modal_app.py
+modal workspace proxy-tokens create
 ```
 
-The endpoint scales to zero when idle; the first request after a break includes
-model startup time. Check your account's current compute quota and pricing.
+Run these commands from `server/`. Paste the combined `wk-….ws-…` value from the
+printed Authorization header into the extension's existing API key field, without
+the `Bearer ` prefix. Do not use the `ak-`/`as-` deployment login credentials.
+On workspaces with RBAC, allow the token in the deployment environment:
+`modal workspace proxy-tokens allow wk-<token-id> <environment>`.
+Without RBAC tokens are workspace-wide and `allow` reports `Token is not
+environment-scoped` — nothing else is needed. The notebook handles both cases
+automatically. Modal shows a token secret only once; if it is lost, delete that
+token and create another.
+
+Every path, including `/` and `/health`, requires [Modal proxy authentication](https://modal.com/docs/guide/webhook-proxy-auth)
+before reaching the GPU function. There is no separate `ARN_API_KEY` secret on
+Modal. The extension uses the same single Bearer key for Test, warm, detection
+and cleanup; standalone/Colab keys still work with those deployments.
+
+The endpoint scales to zero when idle; the first authorized request after a break
+includes model startup time. **Test/prewarm and the notebook's authenticated test
+wake the GPU and consume compute even without translating a page.** Reserved
+resources during the warm idle window are also billed. At most one GPU container
+runs; this limits concurrent allocations, not total spending. Check your account's
+current compute quota and pricing. Do not attach an unauthenticated uptime monitor
+to the GPU endpoint.
+
+### Updating an existing Modal deployment
+
+Redeploy the updated server and replace the old random `ARN_API_KEY` in the
+extension with a Proxy Token. Updating only the extension does not protect an
+already-deployed endpoint. The old `arn-manga-key` secret is no longer used.
+
+Notebook reruns create new Proxy Tokens; previously created Proxy Tokens remain
+valid until deleted in Modal Settings → Proxy Auth Tokens, or with
+`modal workspace proxy-tokens delete wk-<token-id>`. Stop an exposed deployment
+while migrating. Stopping/redeploying the app does not revoke Proxy Tokens.
+Tokens can access other protected apps in their workspace (or allowed environments
+with RBAC), so keep them private and remove unused tokens.
 
 ## Local run
 
@@ -43,7 +77,7 @@ MODEL_DIR=/path/to/models ARN_API_KEY=<random> python serve.py # Bearer auth
 
 `serve.py` is the platform-neutral launcher: `ARN_API_KEY` set = auth on
 (`/` and `/health` stay open for the extension's Test/warm probe), `PORT`
-selects the port. Modal keeps its own wrapper for the same rule.
+selects the port. Modal instead protects every path at its proxy.
 Running `uvicorn app:app` directly does not enable that middleware, even with
 `ARN_API_KEY` set. The Dockerfile also starts the bare app: add authentication/TLS
 at the deployment boundary before exposing it publicly.
@@ -57,8 +91,9 @@ an older or mismatched server reports an error rather than silently returning CT
 
 ## API
 
-- `GET /health` → `{ok, device, layoutModel, layoutModels, layoutRecipe, modelSha256, panels, ep, splitGen}` (no auth — Koharu/OCR readiness,
-  not proof that the key is accepted or the optional cleanup model is loaded)
+- `GET /health` → `{ok, device, layoutModel, layoutModels, layoutRecipe, modelSha256, panels, ep, splitGen}` (Koharu/OCR readiness,
+  not proof that the optional cleanup model is loaded). Modal requires proxy auth;
+  standalone/Colab health is public and does not validate the key.
 - `POST /v1/page?layout_model=koharu&min_size=12` — raw PNG/JPEG bytes in the body →
   `{ok, layoutModel, layoutRecipe, modelSha256, w, h, boxes:[{x1,y1,x2,y2,conf}], panels, balloons, panelSkipped?, splitGen, mask:{w,h,b64}, texts[],
   ms:{body,detect,ocr,total}}`. `texts[i]` belongs to `boxes[i]`; text is raw

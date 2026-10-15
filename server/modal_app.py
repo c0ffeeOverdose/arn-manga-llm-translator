@@ -1,4 +1,4 @@
-# Modal deployment of server/app.py: T4 GPU, scale-to-zero, Bearer auth. Deploy from inside server/.
+# Modal deployment of server/app.py: T4/L4 GPU, scale-to-zero, proxy auth. Deploy from inside server/.
 # app.py bakes into the image — each deploy is immutable, no runtime mounts.
 import os
 import sys
@@ -43,23 +43,7 @@ app = modal.App("arn-manga")
 
 # scaledown_window=90: reading bursts run nonstop; 90s covers page-to-page pauses without a long idle tail.
 @app.function(image=image, gpu=["T4", "L4"], timeout=600, scaledown_window=90,
-              secrets=[modal.Secret.from_name("arn-manga-key")])
-@modal.asgi_app()
+              min_containers=0, max_containers=1)
+@modal.asgi_app(requires_proxy_auth=True)
 def api():
-    import os
-
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse
-
-    key = os.environ["ARN_API_KEY"]
-
-    class Auth(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            if request.url.path in ("/", "/health"):
-                return await call_next(request)
-            if request.headers.get("authorization") != f"Bearer {key}":
-                return JSONResponse({"ok": False, "error": "unauthorized"}, 401)
-            return await call_next(request)
-
-    fastapi_app.add_middleware(Auth)
     return fastapi_app

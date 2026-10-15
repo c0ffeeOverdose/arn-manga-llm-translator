@@ -1531,9 +1531,8 @@ export async function cloudConfig(): Promise<{ endpoint: string; key: string }> 
     };
 }
 
-// Modal scales to zero: the first request after idle pays the container boot + model load.
-// A sweep pays that ONCE up front instead of letting the first page calls race the boot.
-// /health is auth-exempt and returns only after the models are up.
+// Authenticate health before chapter requests so a cold server finishes model
+// startup under the longer warm deadline, not the per-page request cap.
 export async function cloudWarm(endpoint: string, key: string, chapterTrace?: ChapterTrace): Promise<number> {
     const trace = chapterTrace ? { ...chapterTrace, request: crypto.randomUUID() } : undefined;
     recordChapterLog(trace, { kind: 'cloud-sent', stage: 'warm', deadlineMs: 190_000 });

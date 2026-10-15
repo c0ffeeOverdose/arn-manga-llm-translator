@@ -301,8 +301,8 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
         return true;
     }
     if (msg?.type === 'mt:test-cloud') {
-        // cloud inference check: reachability + auth + model readiness. Doubles
-        // as a prewarm — run this from options before reading, not mid-chapter.
+        // Health wakes the server and checks model readiness; only deployments
+        // protecting health also validate this credential here.
         (async () => {
             try {
                 const base = String(msg.endpoint ?? '').replace(/\/$/, '');
@@ -342,7 +342,10 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 const base = String(msg.endpoint ?? '').replace(/\/$/, '');
                 if (!/^https?:\/\//.test(base)) { sendResponse({ ok: false, error: 'Endpoint URL must start with http(s)://' }); return; }
                 recordChapterLog(trace, { kind: 'cloud-http-start', deadlineMs: 180_000 });
-                const r = await fetch(`${base}/health`, { signal: ctrl.signal });
+                const r = await fetch(`${base}/health`, {
+                    headers: msg.key ? { Authorization: `Bearer ${msg.key}` } : {},
+                    signal: ctrl.signal,
+                });
                 recordChapterLog(trace, { kind: 'cloud-http-reply', status: r.status });
                 if (!r.ok) { recordChapterLog(trace, { kind: 'cloud-response', status: r.status, reason: 'http' }); sendResponse({ ok: false, error: `cloud warm HTTP ${r.status}` }); return; }
                 recordChapterLog(trace, { kind: 'cloud-response', status: r.status });

@@ -1,7 +1,7 @@
 # Standalone launcher for platforms with no wrapper of their own (Colab's own
 # GPU — server/colab-server.ipynb — or any VPS). Modal keeps modal_app.py.
-# Same Bearer rule either way: ARN_API_KEY set = auth on, / and /health stay
-# open (the extension reads /health for Test/warm), everything else 401s.
+# ARN_API_KEY enables standalone Bearer auth except on / and /health.
+# Modal instead authenticates every path at its proxy, before GPU allocation.
 import os
 
 from app import app

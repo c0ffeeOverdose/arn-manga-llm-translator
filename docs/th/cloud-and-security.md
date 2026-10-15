@@ -46,7 +46,7 @@ Cloud-only/cache-only startup ไม่สร้าง local ORT iframe
 | [balloon_surface.py](../../server/balloon_surface.py) | physical text-surface refinement ก่อน OCR |
 | [models_manifest.py](../../server/models_manifest.py) | model source metadata ที่ setup scripts ใช้ |
 | [serve.py](../../server/serve.py) | standalone launcher และ optional Bearer middleware |
-| [modal_app.py](../../server/modal_app.py) | deployment image/providers/secrets และ auth wrapper ของ Modal |
+| [modal_app.py](../../server/modal_app.py) | deployment image/providers, proxy auth และเพดาน GPU containers ของ Modal |
 | [Dockerfile](../../server/Dockerfile) | CPU image; bake weights เข้า image |
 
 `MODEL_DIR` default `/models`; standalone ใช้ `ORT_PROVIDERS=CPUExecutionProvider` ถ้าไม่ override
@@ -62,9 +62,10 @@ generated notebooks มาจาก [make-colab.py](../../scripts/make-colab.py)
 ### `GET /health`
 
 ตอบ `ok`, `device`, `layoutModel`, `layoutModels`, `layoutRecipe`, `modelSha256`, `panels`, `ep`, `splitGen`
-`ok` สะท้อน Koharu/Baberu loaded ไม่ใช่ authentication test และไม่ได้รับประกันว่า optional cleanup model พร้อม
+`ok` สะท้อน Koharu/Baberu loaded และไม่ได้รับประกันว่า optional cleanup model พร้อม
 `panels` ระบุ panel inference ของ Koharu
-root และ health ตั้งใจยกเว้น Bearer auth ใน wrappers เพื่อ Test/warm
+Modal ตรวจ auth ที่ proxy ทุก path รวม root/health ก่อนถึง GPU ส่วน standalone/Colab
+ยังเปิด health เป็น public จึงไม่พิสูจน์ว่า key ถูกต้อง ส่วนขยายส่ง Bearer key ทั้ง Test และ chapter warm
 
 ### `POST /v1/page`
 
@@ -121,9 +122,26 @@ Cloud detection ล้มเหลวเป็น `kind:'cloud'` ไม่ fallb
 
 - `serve.py` เปิด Bearer middleware เมื่อ `ARN_API_KEY` มีค่า ถ้าไม่ตั้งจะเตือนและไม่มี auth
 - `uvicorn app:app` โดยตรงไม่ได้เปิด middleware ของ `serve.py` แม้ export env key ไว้
-- Modal wrapper อ่าน secret `ARN_API_KEY` และตรวจทุก path ยกเว้น root/health
+- Modal ใช้ `asgi_app(requires_proxy_auth=True)` ปฏิเสธ Proxy Token ที่หายไปหรือไม่ถูกต้องก่อนถึง GPU รวม root/health โดยไม่ใช้ `ARN_API_KEY` ภายใน container
+- ใส่ Proxy Token แบบรวม `wk-….ws-…` ในช่อง API key เดิม ไม่ต้องใส่คำว่า `Bearer ` และไม่ใช่ credentials `ak-`/`as-` สำหรับ deploy ทุก Cloud operation ส่ง key นี้ผ่าน Authorization Bearer เหมือนกัน
+- notebook สร้าง token และถ้าเปิด RBAC จะอนุญาต deployment environment ให้อัตโนมัติ ส่วน workspace ที่ไม่มี RBAC token เป็นแบบ workspace-wide และ `allow` จะตอบ `Token is not environment-scoped` จึงไม่ต้องทำอะไรเพิ่ม token ไม่ได้จำกัดเฉพาะ app นี้: ใช้กับ protected apps อื่นใน workspace ได้ หรือเฉพาะ allowed environments เมื่อเปิด RBAC modal แสดง secret ของ token เพียงครั้งเดียว ต้องเก็บเป็นความลับและลบ token ที่ไม่ใช้
 - Dockerfile ปัจจุบันเริ่ม `uvicorn app:app` โดยตรง ต้องมี auth/reverse-proxy layer ก่อนเปิดให้เข้าถึงสาธารณะ
-- health สำเร็จจึงไม่พิสูจน์ว่า API key ถูกต้อง ต้องมี authenticated request path ที่เกี่ยวข้องด้วย
+- public health ของ standalone สำเร็จไม่ได้พิสูจน์ว่า API key ถูกต้อง ต้องมี authenticated request path ที่เกี่ยวข้องด้วย
+
+deployment Modal เดิมต้อง redeploy server และเปลี่ยน random key เดิมในส่วนขยายเป็น Proxy Token
+อัปเดตส่วนขยายอย่างเดียวไม่ป้องกัน URL ที่ deploy ไว้แล้ว ส่วน secret `arn-manga-key` เดิมไม่ใช้งานหลังย้าย
+รัน notebook ใหม่จะสร้าง Proxy Token ใหม่ แต่ Proxy Tokens ก่อนหน้ายังใช้ได้จนกว่าจะลบใน
+Modal Settings → Proxy Auth Tokens หรือ `modal workspace proxy-tokens delete`
+การ Stop/redeploy app ไม่ได้เพิกถอน credentials ระดับ workspace เหล่านี้
+
+**health บน GPU endpoint ไม่ใช่ liveness probe ฟรี** การ Test/prewarm ด้วย key ที่ถูกต้อง
+รวม authenticated checks ใน notebook สามารถปลุก GPU และโหลดโมเดลแม้ไม่ได้แปลหน้าใด
+ทรัพยากรที่จองไว้ระหว่าง warm idle ก็คิดค่าใช้จ่าย deployment ตั้ง `min_containers=0`,
+`max_containers=1`, `scaledown_window=90` ซึ่งจำกัดจำนวน containers พร้อมกัน ไม่ใช่ยอดเงินสะสม
+ถ้า valid token หลุดก็ยังเผา compute ได้ ต้องตรวจ quota/pricing ของบัญชีและไม่เพิ่ม public monitor ที่เรียก GPU app
+
+อ้างอิง [Modal proxy authentication](https://modal.com/docs/guide/webhook-proxy-auth)
+และ [idle/cold-start billing](https://modal.com/docs/guide/cold-start)
 
 ใช้ HTTPS เมื่อผ่าน network ที่ไม่เชื่อถือ เพราะ HTTP ไม่เข้ารหัสข้อมูลระหว่างทาง
 อย่าใส่คีย์จริงใน URL ตัวอย่าง shell history หรือ configuration ที่ commit

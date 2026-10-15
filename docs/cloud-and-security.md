@@ -44,7 +44,7 @@ crops/encoding and rendering still run in the browser.
 | [balloon_surface.py](../server/balloon_surface.py) | Physical text-surface refinement before OCR |
 | [models_manifest.py](../server/models_manifest.py) | Model-source metadata for setup scripts |
 | [serve.py](../server/serve.py) | Standalone launcher and optional Bearer middleware |
-| [modal_app.py](../server/modal_app.py) | Modal deployment image/providers/secrets and auth wrapper |
+| [modal_app.py](../server/modal_app.py) | Modal deployment image/providers, proxy auth and GPU scaling limit |
 | [Dockerfile](../server/Dockerfile) | CPU image with baked-in weights |
 
 `MODEL_DIR` defaults to `/models`; standalone provider default is
@@ -62,9 +62,10 @@ quota/pricing before deploying.
 ### `GET /health`
 
 Returns `ok`, `device`, `layoutModel`, `layoutModels`, `layoutRecipe`, `modelSha256`,
-`panels`, `ep`, `splitGen`. `ok` reflects loaded Koharu/Baberu, not key acceptance or
-optional cleanup readiness. `panels` identifies Koharu panel inference. Wrappers intentionally exempt root/health from Bearer
-checks for Test/warm.
+`panels`, `ep`, `splitGen`. `ok` reflects loaded Koharu/Baberu, not optional cleanup
+readiness. `panels` identifies Koharu panel inference. Modal authenticates every path
+at its proxy, including root/health; standalone/Colab health remains public and does
+not validate the key. The extension sends its Bearer key for Test and chapter warm.
 
 ### `POST /v1/page`
 
@@ -123,9 +124,29 @@ failures can use built-in fill so rendering can continue.
 
 - `serve.py` installs Bearer middleware when `ARN_API_KEY` is set; otherwise it warns and runs unauthenticated.
 - Bare `uvicorn app:app` does not install that middleware, even with the key exported.
-- Modal's wrapper reads secret `ARN_API_KEY`, checking every path except root/health.
+- Modal uses `asgi_app(requires_proxy_auth=True)` to reject missing/invalid Proxy Tokens before reaching the GPU function, including root/health. No in-container `ARN_API_KEY` is needed.
+- A Proxy Token is entered in the existing API key field as `wk-….ws-…` (without `Bearer `), not the `ak-`/`as-` credentials used to deploy. Every Cloud operation sends it through the same Authorization Bearer header.
+- The setup notebook creates a token and, on workspaces with RBAC, allows it in the deployment environment; without RBAC tokens are workspace-wide and `allow` reports `Token is not environment-scoped`, so nothing else is needed. Proxy Tokens can reach other protected apps in the workspace, or allowed environments with RBAC; they are not app-specific. Modal shows a new secret only once — keep it private and delete unused tokens.
 - The current Dockerfile launches bare `uvicorn app:app`; add authentication/reverse-proxy protection before public exposure.
-- Health success does not validate a key. Verify an authenticated operation too.
+- Public standalone health success does not validate a key. Verify an authenticated operation too.
+
+Existing Modal deployments must be redeployed and the extension's old random key
+replaced with a Proxy Token. An extension update alone does not secure the old URL.
+The old `arn-manga-key` secret is unused after migration. Notebook reruns create
+new Proxy Tokens; previous Proxy Tokens remain valid until deleted in Modal
+Settings → Proxy Auth Tokens or with `modal workspace proxy-tokens delete`.
+Stopping/redeploying an app does not revoke these workspace credentials.
+
+**Health is not a free external liveness probe on the GPU endpoint.** Authorized
+Test/prewarm requests, including the notebook's authenticated checks, can start the
+GPU and load models even without translating. Warm idle resources are also billed.
+The deployment sets `min_containers=0`, `max_containers=1`, `scaledown_window=90`;
+the single-container limit caps concurrency, not accumulated spending. An exposed
+valid token can still consume compute. Check account quotas/pricing; do not add an
+unauthenticated monitor that calls the GPU app.
+
+See Modal's [proxy authentication](https://modal.com/docs/guide/webhook-proxy-auth)
+and [idle/cold-start billing](https://modal.com/docs/guide/cold-start) guides.
 
 Use HTTPS across untrusted networks; HTTP endpoints are unencrypted. Keep real keys
 out of example URLs, shell history and committed configuration.
