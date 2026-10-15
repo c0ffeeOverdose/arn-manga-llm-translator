@@ -1,8 +1,9 @@
 # KoharuLayout
 
-KoharuLayout is the default model for on-device detection. To change it, open
+KoharuLayout is the default model for on-device and Cloud detection. To change it, open
 **Settings → Model → Layout model** and save your choice. Saved model choices are
-retained. Cloud detection uses CTD + Panel.
+retained. Cloud uses the same pinned Koharu export on your server; it does not run
+local layout inference. CTD remains selectable with text-position ordering on Cloud.
 Koharu finds text, sound effects, balloons and panels together. OCR, translation,
 reading direction and text cleanup continue to use your existing settings.
 
@@ -123,6 +124,7 @@ Saved results are matched to the selected model and its thresholds; existing leg
 CTD cache fingerprints are preserved. Use Re-translate to replace an already visible
 translation with fresh detection from the newly selected model.
 
-Koharu currently runs on-device. Selecting it with Cloud produces a clear settings
-error before uploading a page. Cloud continues to support the existing CTD path.
+Koharu runs on-device or on your Cloud server. Update/redeploy the server to use
+the same model recipe as the extension; mismatched servers report an error instead
+of silently returning CTD results. Cloud needs no local model download. On-device
 Auto tries WebGPU and can use CPU when WebGPU is unavailable; Force CPU uses WASM.

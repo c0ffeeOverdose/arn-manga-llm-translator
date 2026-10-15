@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODAL_VERSION = "1.5.5"  # pinned: this is the client the deploy was proven with
 
 sys.path.insert(0, os.path.join(ROOT, "server"))
-from models_manifest import CTD_URL, BABERU, BABERU_FILES, INPAINT_URL  # noqa: E402
+from models_manifest import CTD_URL, KOHARU_FILE, KOHARU_URL, BABERU, BABERU_FILES, INPAINT_URL  # noqa: E402
 
 
 def read(name):
@@ -125,6 +125,7 @@ modal_nb = {"nbformat": 4, "nbformat_minor": 5,
     writefile_cell("app.py", read("app.py")),
     writefile_cell("split.py", read("split.py")),
     writefile_cell("balloon_surface.py", read("balloon_surface.py")),
+    writefile_cell("koharu.py", read("koharu.py")),
     writefile_cell("models_manifest.py", read("models_manifest.py")),
     md([
         "## 4. Deploy\n",
@@ -219,7 +220,7 @@ def code_text(text):
 
 # ---- colab-server.ipynb: run the server on Colab's own GPU ----------------
 # cloudflared quick tunnel = public https URL, no account; new every session (the notebook says so).
-_models = [("ctd.onnx", CTD_URL), ("lama-manga-512-fp16w.onnx", INPAINT_URL)] + [(dst, f"{BABERU}/{src}?download=true")
+_models = [(KOHARU_FILE, KOHARU_URL), ("ctd.onnx", CTD_URL), ("lama-manga-512-fp16w.onnx", INPAINT_URL)] + [(dst, f"{BABERU}/{src}?download=true")
                                     for src, dst in BABERU_FILES]
 _FILES = textwrap.indent("FILES = [\n" + "".join(
     f"    ({json.dumps(n)}, {json.dumps(u)}),\n" for n, u in _models) + "]", " " * 8)
@@ -285,25 +286,36 @@ colab_nb = {"nbformat": 4, "nbformat_minor": 5,
     writefile_cell("app.py", read("app.py")),
     writefile_cell("split.py", read("split.py")),
     writefile_cell("balloon_surface.py", read("balloon_surface.py")),
+    writefile_cell("koharu.py", read("koharu.py")),
+    writefile_cell("models_manifest.py", read("models_manifest.py")),
     writefile_cell("serve.py", read("serve.py")),
     md_text("""
-        ## 3. Download the models (~230MB)
+        ## 3. Download the models
 
         Fetched fresh every session (the VM is wiped between sessions) and
         skipped when the files are already here.
     """),
     code_text(_FILES + """
         import os, subprocess
+        from models_manifest import KOHARU_FILE
+        from koharu import validate_model
         MODEL_DIR = "/content/models"
         os.makedirs(MODEL_DIR, exist_ok=True)
         for name, url in FILES:
             dest = os.path.join(MODEL_DIR, name)
             if os.path.isfile(dest) and os.path.getsize(dest) > 0:
-                print("have", name)
-                continue
+                try:
+                    if name == KOHARU_FILE:
+                        validate_model(dest)
+                    print("have", name)
+                    continue
+                except RuntimeError:
+                    print("replacing unsupported model", name)
             part = dest + ".part"
             r = subprocess.run(["curl", "-fL", "--retry", "3", "--retry-all-errors", "-o", part, url])
             assert r.returncode == 0, f"download failed: {name}"
+            if name == KOHARU_FILE:
+                validate_model(part)
             os.replace(part, dest)
             print("got", name, str(os.path.getsize(dest) // 1048576) + "MB")
         print("models ready in", MODEL_DIR)

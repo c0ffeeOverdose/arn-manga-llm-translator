@@ -11,7 +11,7 @@ import { recordChapterLog } from '../chapter/log-store';
 import { chapterLogError, type ChapterTrace } from '../chapter/log';
 import { IdleResource } from './idle-resource';
 import { InferenceRpcTimeoutError, diagnoseInferenceError } from './inference-health';
-import type { LayoutModel, KoharuThresholds } from '../layout-model';
+import { KOHARU_MODEL, type LayoutModel, type KoharuThresholds } from '../layout-model';
 import type { ModelBalloon } from './model-balloon';
 
 export interface DetBox {
@@ -53,7 +53,7 @@ export interface DetectResult {
     // below CLOUD_SPLIT_GEN re-detect instead of rendering fused boxes from cache
     splitGen?: number;
     panelMs?: number;   // YOLO panel infer ms (0/absent when skipped) — timing breakdown only
-    panels?: DetBox[];      // YOLO panel boxes (empty when the model is missing)
+    panels?: DetBox[];      // layout-model panel boxes (empty when unavailable)
     panelSkipped?: string;  // why panel ordering was skipped (strip aspect / gate) — page-result log only
     dropped?: DetBox[];     // CTD near-misses below threshold — debug overlay only
     panelDropped?: DetBox[]; // YOLO panels below threshold — debug overlay only
@@ -1546,12 +1546,13 @@ export async function cloudWarm(endpoint: string, key: string, chapterTrace?: Ch
 export async function cloudDetect(
     bitmap: ImageBitmap,
     endpoint: string, key: string,
-    opts: { confThr: number; minSize: number; quality: number; gray: boolean; inpaint?: boolean; texts?: boolean; timing?: PageTimer; chapterTrace?: ChapterTrace },
+    opts: { confThr: number; minSize: number; quality: number; gray: boolean; layoutModel?: LayoutModel; koharu?: KoharuThresholds; inpaint?: boolean; texts?: boolean; timing?: PageTimer; chapterTrace?: ChapterTrace },
 ): Promise<DetectResult> {
     // capped upload (mobile uplink): CTD/Baberu inputs are resize-invariant, so anything above
     // CLOUD_MAX_SIDE is pure wire cost — response coords come back in sent space and are mapped
     // back with `scale` below
     const tEnc = performance.now();
+    const layoutModel = opts.layoutModel ?? 'koharu';
     const trace = opts.chapterTrace ? { ...opts.chapterTrace, request: crypto.randomUUID() } : undefined;
     recordChapterLog(trace, { kind: 'stage', stage: 'cloudEncode' });
     const { b64: jpegB64, scale } = await bitmapToJpegB64Capped(bitmap, opts.quality, opts.gray, CLOUD_MAX_SIDE);
@@ -1566,6 +1567,7 @@ export async function cloudDetect(
         resp = await sendToBackground({
             type: 'mt:cloud-page', endpoint, key,
             confThr: opts.confThr, minSize: opts.minSize, jpegB64,
+            layoutModel, koharu: opts.koharu,
             inpaint: opts.inpaint === true,
             // page/crops modes read the image at the LLM — tell the server to skip its OCR pass
             texts: opts.texts !== false,
@@ -1582,6 +1584,10 @@ export async function cloudDetect(
         const tDecode = performance.now();
         const j = resp.page;
         if (!j?.ok) throw new Error(String(j?.error ?? 'cloud failed'));
+        if ((j.layoutModel ?? 'ctd') !== layoutModel || (layoutModel === 'koharu'
+            && (j.layoutRecipe !== KOHARU_MODEL.recipe || j.modelSha256 !== KOHARU_MODEL.sha256))) {
+            throw new Error('The detection server does not support the selected model version. Update your server and try again.');
+        }
         // response coords are in SENT-image space (capped upload) — scale everything back to
         // full-page space here; every consumer downstream works in full-page coords
         const boxes: DetBox[] = (j.boxes ?? []).map((b: any) => ({
@@ -1629,7 +1635,9 @@ export async function cloudDetect(
             detect: j.ms?.detect, ocr: j.ms?.ocr, inpaint: j.ms?.inpaint, total: j.ms?.total, body: j.ms?.body,
         };
         return {
+            layoutModel,
             boxes,
+            balloons: layoutModel === 'koharu' && Array.isArray(j.balloons) ? j.balloons : undefined,
             mask: { width: w, height: h, data: maskData },
             inferMs: Math.round(j.ms?.detect ?? 0),
             ep: 'cloud',
@@ -1641,8 +1649,10 @@ export async function cloudDetect(
                 enc: encMs, net: Math.max(0, upMs - serverTotal), total: serverTotal,
             },
             cloudPatches: cloudPatches.length ? cloudPatches : undefined,
-            panels: [],
-            panelSkipped: String(j.panelSkipped ?? 'cloud: banding fallback'),
+            panels: (j.panels ?? []).map((b: any) => ({
+                x1: +b.x1 * scale, y1: +b.y1 * scale, x2: +b.x2 * scale, y2: +b.y2 * scale, conf: +b.conf,
+            })),
+            panelSkipped: j.panelSkipped ? String(j.panelSkipped) : undefined,
         };
     }
 }

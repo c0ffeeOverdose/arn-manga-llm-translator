@@ -12,6 +12,7 @@ const bundle = async entry => {
 const { koharuInput, decodeKoharu } = await bundle('src/iframe/koharu.ts');
 const { applyPreset, loadPipelineSettings } = await bundle('src/llm/pipeline-settings.ts');
 const { settingsFingerprint, isResumable, partialEntry } = await bundle('src/cache/policy.ts');
+const { attachModelBalloons } = await bundle('src/content/model-balloon.ts');
 
 test('native antialiased RGB resize and normalization matches a non-square reference', () => {
     const pixels = Uint8ClampedArray.from({ length: 5 * 7 * 4 }, (_, i) => i);
@@ -112,21 +113,24 @@ test('CTD cache identity ignores Koharu settings; Koharu model and thresholds se
     assert.equal(isResumable(checkpoint, fp, 4, 4, false), true);
 });
 
-test('cloud cache defaults agree with loaded settings and the existing CTD identity', () => {
-    const legacy = { inferEngine: 'cloud' };
-    assert.equal(settingsFingerprint(legacy), settingsFingerprint({ ...legacy, layoutModel: 'ctd' }));
-    assert.equal(settingsFingerprint(legacy), settingsFingerprint(loadPipelineSettings(legacy)));
-    assert.notEqual(settingsFingerprint(legacy), settingsFingerprint({ ...legacy, layoutModel: 'koharu' }));
+test('cloud cache defaults agree with Koharu settings and separate the legacy CTD identity', () => {
+    const settings = { inferEngine: 'cloud' };
+    assert.equal(settingsFingerprint(settings), settingsFingerprint({ ...settings, layoutModel: 'koharu' }));
+    assert.equal(settingsFingerprint(settings), settingsFingerprint(loadPipelineSettings(settings)));
+    assert.notEqual(settingsFingerprint(settings), settingsFingerprint({ ...settings, layoutModel: 'ctd' }));
+    assert.equal(settingsFingerprint({ ...settings, layoutModel: 'ctd', koharuTextConf: .7 }),
+        settingsFingerprint({ ...settings, layoutModel: 'ctd' }));
 });
 
 const file = ts.createSourceFile('pipeline.ts', readFileSync('src/content/pipeline.ts','utf8'), ts.ScriptTarget.Latest, true);
 const fns = file.statements.filter(n => ts.isFunctionDeclaration(n) && ['orderDetection','detectPage'].includes(n.name?.text));
 const compiled = await transform(fns.map(n => n.getText(file)).join('\n').replaceAll('export ',''), { loader:'ts' });
 function pipelineFixture(settings) {
-    const scope = { pipeline: loadPipelineSettings(settings), chrome: { storage:{ local:{ get:async()=>({}) } } },
+    const scope = { pipeline: loadPipelineSettings(settings), chrome: { storage:{ local:{ get:async()=>({ mtSettings: { cloudEndpoint: 'https://cloud.example.test', cloudKey: 'mock' } }) } } },
         recordChapterLog(){}, mergeParagraphLines: boxes=>boxes, panelsUsable:()=>true,
         sortReadingOrder: boxes=>boxes, orderByPanels: boxes=>boxes, dropContainedBoxes: boxes=>boxes,
         panelsDetect:()=>{ throw new Error('Legacy panel model must not run'); },
+        attachModelBalloons, inpaintMode: ()=>'fill', pageIsGrayscale:()=>true,
         cloudDetect:()=>{ throw new Error('Page must not upload'); }, detect:()=>{ throw new Error('Local must not run'); } };
     runInNewContext(compiled.code, scope); return scope;
 }
@@ -136,7 +140,28 @@ test('Koharu ordering consumes its own panels, including an empty panel result',
         await f.orderDetection({ layoutModel:'koharu',ep:'webgpu',boxes:[],mask:{},panels }, {width:20,height:20});
     }
 });
-test('unsupported Cloud selection fails before local inference or page upload', async () => {
+test('Cloud Koharu dispatches its selected model and thresholds without local inference', async () => {
     const f = pipelineFixture({ layoutModel:'koharu', inferEngine:'cloud' });
-    await assert.rejects(f.detectPage({},()=>{}), e => e.kind === 'cloud' && /On-device/.test(e.message));
+    let options;
+    f.cloudDetect = async (_bitmap, _endpoint, _key, opts)=>{ options=opts; return {ep:'cloud'}; };
+    assert.equal((await f.detectPage({},()=>{})).ep,'cloud');
+    assert.equal(options.layoutModel,'koharu');
+    assert.equal(options.koharu.text,.25);
+    assert.equal(options.koharu.panel,.5);
+});
+test('Cloud Koharu uses its panels and retains texts and patch indices after balloon association', async () => {
+    const f = pipelineFixture({ layoutModel:'koharu', inferEngine:'cloud' });
+    const boxes=[{x1:1,y1:1,x2:4,y2:4,conf:1},{x1:6,y1:1,x2:9,y2:4,conf:1}];
+    const mask={width:10,height:6,data:new Uint8Array(60).fill(255).buffer};
+    const balloons=boxes.map(b=>({...b,width:10,height:6,rows:Array.from({length:3},()=>[b.x1,b.x2])}));
+    const panels=[{x1:0,y1:0,x2:10,y2:6,conf:1}];
+    let ordered=false;
+    f.orderByPanels=(bs,ps)=>{assert.equal(ps,panels);ordered=true;return [...bs].reverse();};
+    f.sortReadingOrder=()=>{throw Error('Koharu panels must not be discarded');};
+    const det={layoutModel:'koharu',ep:'cloud',boxes,panels,balloons,mask,cloudTexts:['left','right'],
+        cloudPatches:[{i:0,png:'left'},{i:1,png:'right'}]};
+    await f.orderDetection(det,{width:10,height:6});
+    assert.ok(ordered); assert.ok(det.boxes.every(b=>b.balloon));
+    assert.deepEqual(Array.from(det.cloudTexts),['right','left']);
+    assert.deepEqual(Array.from(det.cloudPatches,p=>[p.i,p.png]),[[0,'right'],[1,'left']]);
 });

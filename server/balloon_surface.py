@@ -210,7 +210,7 @@ def split_connected_clusters(comps, parent, w, h, accept=None):
             rest.remove(c)
         split.append(big)
         split.append(rest)
-    if len(split) < 2 or len(split) > 8:
+    if len(split) < 2 or len(split) > 8 or any(not cs for cs in split):
         return None
     if accept is not None and not accept(split):
         return None

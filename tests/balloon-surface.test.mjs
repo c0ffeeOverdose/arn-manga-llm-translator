@@ -9,6 +9,14 @@ const { splitMergedBoxes } = await import('data:text/javascript;base64,' + Buffe
 const client = await build({ entryPoints: ['src/content/render.ts'], bundle: true, format: 'esm', write: false });
 const { mergeParagraphLines } = await import('data:text/javascript;base64,' + Buffer.from(client.outputFiles[0].contents).toString('base64'));
 
+test('lettering absorbing all nearby fragments keeps the original region instead of an empty split', () => {
+    const comps = [{ x1: 40, y1: 40, x2: 120, y2: 150, conf: .9 },
+        { x1: 20, y1: 146, x2: 45, y2: 168, conf: .9 },
+        { x1: 115, y1: 146, x2: 140, y2: 168, conf: .9 }];
+    const parent = { x1: 10, y1: 30, x2: 150, y2: 180, conf: .9 };
+    assert.equal(splitConnectedClusters(comps, parent, 200, 200, 0), null);
+});
+
 function fixture({ together = false, open = false, tone = 255, scale = 1, outside = tone, close = false } = {}) {
     const W = 200 * scale, H = 120 * scale;
     const data = new Uint8ClampedArray(W * H * 4).fill(outside), ink = new Uint8Array(W * H);

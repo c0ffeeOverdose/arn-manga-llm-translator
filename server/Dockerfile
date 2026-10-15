@@ -7,10 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
   && rm -rf /var/lib/apt/lists/* \
   && pip install --no-cache-dir fastapi "uvicorn[standard]" onnxruntime numpy pillow opencv-python-headless
 WORKDIR /app
-COPY app.py split.py balloon_surface.py ./
+COPY app.py split.py balloon_surface.py koharu.py models_manifest.py ./
 RUN mkdir -p /models \
   && curl -fL -o /models/ctd.onnx \
     "https://huggingface.co/lemondouble/lemon-manga-translator/resolve/main/onnx/comic-text-detector/ctd.onnx?download=true" \
+  && curl -fL -o /models/koharu-fp32-chunked.onnx \
+    "https://huggingface.co/c0ffeeOverdose/arn-manga-models/resolve/main/koharu-fp32-chunked.onnx?download=true" \
+  && echo "35d89289e92a6dba75b9ccd4ebd447a55aad69c993d0a8e439c57509d598dfd6  /models/koharu-fp32-chunked.onnx" | sha256sum -c - \
   && for f in "onnx/vision_int4.onnx vision-int4.onnx" "onnx/decoder_prefill_int8.onnx baberu-prefill.onnx" "onnx/decoder_step_int8.onnx baberu-step.onnx"; do \
     set -- $f; curl -fL -o /models/$2 "https://huggingface.co/genshiai-daichi/baberu-ocr/resolve/main/$1?download=true"; \
   done \

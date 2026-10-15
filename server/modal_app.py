@@ -8,10 +8,12 @@ import modal
 sys.path.insert(0, os.environ.get("PKG_DIR", os.path.dirname(os.path.abspath(__file__))))
 # NOTE: sibling import resolved locally at deploy parse time; baked copy used remotely.
 from app import app as fastapi_app
-from models_manifest import CTD_URL, BABERU, BABERU_FILES, INPAINT_URL
+from models_manifest import CTD_URL, KOHARU_FILE, KOHARU_URL, KOHARU_SHA256, BABERU, BABERU_FILES, INPAINT_URL
 
 dl = [f"mkdir -p /models",
-      f'curl -fL -o /models/ctd.onnx "{CTD_URL}"']
+      f'curl -fL -o /models/ctd.onnx "{CTD_URL}"',
+      f'curl -fL -o /models/{KOHARU_FILE} "{KOHARU_URL}"',
+      f'echo "{KOHARU_SHA256}  /models/{KOHARU_FILE}" | sha256sum -c -']
 dl += [f'curl -fL -o /models/{dst} "{BABERU}/{src}?download=true"'
        for src, dst in BABERU_FILES]
 dl.append(f'curl -fL -o /models/lama-manga-512-fp16w.onnx "{INPAINT_URL}"')
@@ -31,6 +33,7 @@ image = (
     .add_local_file("app.py", remote_path="/pkg/app.py")
     .add_local_file("split.py", remote_path="/pkg/split.py")
     .add_local_file("balloon_surface.py", remote_path="/pkg/balloon_surface.py")
+    .add_local_file("koharu.py", remote_path="/pkg/koharu.py")
     # the container re-imports modal_app.py, which imports this
     .add_local_file("models_manifest.py", remote_path="/pkg/models_manifest.py")
 )

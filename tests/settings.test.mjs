@@ -28,15 +28,17 @@ test('on-device model defaults to Koharu without replacing saved model choices',
   }
 });
 
-test('cloud settings without a saved model keep the supported CTD model', () => {
+test('cloud defaults to Koharu while preserving explicit saved CTD choices', () => {
   for (const stored of [{ inferEngine: 'cloud' }, { inferEngine: 'cloud', layoutModel: 'unknown' }]) {
-    assert.equal(loadPipelineSettings(stored).layoutModel, 'ctd');
+    assert.equal(loadPipelineSettings(stored).layoutModel, 'koharu');
   }
   for (const preset of ['balanced', 'fast', 'best']) {
     assert.equal(applyPreset(preset).layoutModel, 'koharu');
-    assert.equal(applyPreset(preset, { inferEngine: 'cloud' }).layoutModel, 'ctd');
+    assert.equal(applyPreset(preset, { inferEngine: 'cloud' }).layoutModel, 'koharu');
+    assert.equal(applyPreset(preset, { inferEngine: 'cloud', layoutModel: 'ctd' }).layoutModel, 'ctd');
   }
   assert.equal(loadPipelineSettings({ inferEngine: 'cloud', layoutModel: 'koharu' }).layoutModel, 'koharu');
+  assert.equal(loadPipelineSettings({ inferEngine: 'cloud', layoutModel: 'ctd' }).layoutModel, 'ctd');
 });
 
 test('batching defaults to one call with three pages for fresh and partial settings', () => {

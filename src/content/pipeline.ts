@@ -65,7 +65,6 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
     const endpoint = String((mtSettings as LLMSettings | undefined)?.cloudEndpoint ?? '').trim();
     const key = String((mtSettings as LLMSettings | undefined)?.cloudKey ?? '').trim();
     if (pipeline.inferEngine === 'cloud') {
-        if (pipeline.layoutModel === 'koharu') throw Object.assign(new Error('KoharuLayout runs on-device. Select On-device in Settings → Model.'), { kind: 'cloud' });
         recordChapterLog(opts?.chapterTrace, { kind: 'stage', stage: 'detect', execution: 'cloud' });
         if (!endpoint || !key) {
             throw Object.assign(
@@ -80,8 +79,10 @@ export async function detectPage(bitmap: ImageBitmap, onStatus: MtOnStatus, opts
         try {
             return await cloudDetect(bitmap, endpoint, key, {
                 confThr: pipeline.detConf, minSize: pipeline.detMinSize,
+                layoutModel: pipeline.layoutModel,
+                koharu: { text: pipeline.koharuTextConf, sfx: pipeline.koharuSfxConf, bubble: 0.50, panel: pipeline.koharuPanelConf },
                 quality: pipeline.jpegQuality, gray: pipeline.grayscaleBw && pageIsGrayscale(bitmap),
-                // merge AI cleanup into the same roundtrip — the server already has the CTD
+                // merge AI cleanup into the same roundtrip — the server already has the text
                 // mask; a second /v1/inpaint POST re-uploads the page
                 inpaint: inpaintMode(pipeline) !== 'fill',
                 texts: needsTexts,
@@ -126,14 +127,13 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
     const defer = pipeline.deferLabels;
     // extreme-aspect strips: the 640-resize destroys panel geometry, so don't even run YOLO.
     // Normal aspects run it but the output still passes the sanity gate inside orderByPanels.
-    // cloud mode: the server owns boxes and sends no panels by contract — banding directly
-    // keeps cloud-only installs from downloading/running YOLO.
-    if (det.ep === 'cloud') {
-        det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
-    } else if (det.layoutModel === 'koharu') {
+    // Cloud uses server-provided Koharu panels or text-position ordering, never local YOLO.
+    if (det.layoutModel === 'koharu') {
         const panels = det.panels ?? [];
         if (!panelsUsable(panels, page.w, page.h)) det.panelSkipped ??= 'No usable Koharu panels';
         det.boxes = orderByPanels(det.boxes, panels, pipeline.readingDir, page, defer);
+    } else if (det.ep === 'cloud') {
+        det.boxes = sortReadingOrder(det.boxes, pipeline.readingDir, page, defer);
     } else if (page.h / page.w > 3 || page.w / page.h > 3) {
         det.panels = [];
         det.panelSkipped = `strip aspect ${page.w}x${page.h}`;
@@ -155,7 +155,6 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
     // survives IoU and would paint double text. Marginal only (conf < 0.5). Dropped boxes
     // vanish from cloudTexts with them (identity reattach below).
     det.boxes = dropContainedBoxes(det.boxes, 0.9, 0.5);
-    if (det.balloons?.length) det.boxes = attachModelBalloons(det.boxes, det.balloons, det.mask);
     if (cloudTextByBox) det.cloudTexts = det.boxes.map(b => cloudTextByBox.get(b) ?? '');
     if (cloudPatchByBox) {
         det.cloudPatches = [];
@@ -164,6 +163,7 @@ export async function orderDetection(det: DetectResult, bitmap: ImageBitmap): Pr
             if (p) det.cloudPatches!.push({ ...p, i }); // reindex to the post-ordering position
         });
     }
+    if (det.balloons?.length) det.boxes = attachModelBalloons(det.boxes, det.balloons, det.mask);
 }
 
 // Detect phase — kicked off at ENQUEUE time so detection of the next page overlaps the LLM

@@ -63,6 +63,8 @@ interface CloudPageMsg {
     key: string;
     confThr: number;
     minSize: number;
+    layoutModel?: PipelineSettings['layoutModel'];
+    koharu?: { text: number; sfx: number; bubble: number; panel: number };
     jpegB64: string; // base64 JPEG (raw bytes don't survive MV3 messaging)
     inpaint?: boolean; // ask the server to merge cleanup patches into the response
     texts?: boolean; // false = skip the server OCR pass (the LLM reads the image instead)
@@ -397,8 +399,13 @@ chrome.runtime.onMessage.addListener((msg: BgMsg, sender, sendResponse) => {
                 const bytes = new Uint8Array(bin.length);
                 for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                 recordChapterLog(trace, { kind: 'cloud-http-start', deadlineMs: capMs });
+                const query = new URLSearchParams({ conf_thr: String(msg.confThr), min_size: String(msg.minSize),
+                    layout_model: msg.layoutModel ?? 'ctd' });
+                if (msg.koharu) for (const k of ['text', 'sfx', 'bubble', 'panel'] as const) query.set(`${k}_conf`, String(msg.koharu[k]));
+                if (msg.inpaint) query.set('inpaint', '1');
+                if (msg.texts === false) query.set('texts', '0');
                 const r = await fetch(
-                    `${base}/v1/page?conf_thr=${msg.confThr}&min_size=${msg.minSize}${msg.inpaint ? '&inpaint=1' : ''}${msg.texts === false ? '&texts=0' : ''}`,
+                    `${base}/v1/page?${query}`,
                     { method: 'POST', headers: { Authorization: `Bearer ${msg.key}`, 'Content-Type': 'image/jpeg' }, body: bytes, signal: ctrl.signal });
                 recordChapterLog(trace, { kind: 'cloud-http-reply', status: r.status });
                 if (!r.ok) { const t = await r.text().catch(() => ''); recordChapterLog(trace, { kind: 'cloud-response', status: r.status, reason: 'http' }); sendResponse({ ok: false, error: `cloud HTTP ${r.status}: ${t.slice(0, 160)}` }); return; }

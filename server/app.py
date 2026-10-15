@@ -1,5 +1,4 @@
-# Cloud inference: CTD detection + Baberu OCR over HTTP, CPU-only. Recipes mirror src/iframe/worker.ts.
-# Panels: v1 returns [] (client banding fallback). Splits mirror the on-device worker; /v1/page reports SPLIT_GEN.
+# Cloud inference mirrors the on-device layout, Baberu OCR and cleanup contracts over HTTP.
 import asyncio
 import base64
 import io
@@ -8,6 +7,7 @@ import math
 import os
 import re
 import time
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -15,6 +15,9 @@ import onnxruntime as ort
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from PIL import Image
+
+from koharu import THRESHOLDS as KOHARU_THRESHOLDS, decode as decode_koharu, image_input, validate_model
+from models_manifest import KOHARU_FILE, KOHARU_RECIPE, KOHARU_SHA256
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models")
 # EP chain: local default CPU; Modal sets "CUDAExecutionProvider,CPUExecutionProvider"
@@ -40,6 +43,7 @@ PRESENT_OUT = [f"present_k{i}" for i in range(6)] + [f"present_v{i}" for i in ra
 app = FastAPI(title="arn-manga")
 lock = asyncio.Lock()  # one inference at a time (2 vCPU, no oversubscription)
 ctd = None
+koharu = None
 baberu = None  # {vis, pre, stp, bos, eos, id2ch, contentIds}
 inpaint = None  # manga-LaMa fp16w; missing file only disables POST /v1/inpaint
 EPS = {}  # session -> provider chain (proves GPU placement in prod logs)
@@ -63,11 +67,16 @@ def _sess(path, providers):
 
 
 def load_models():
-    global ctd, baberu, inpaint
+    global ctd, koharu, baberu, inpaint
     print("onnxruntime:", ort.__version__,
           "available:", ort.get_available_providers(), flush=True)
     t_all = time.perf_counter()
-    ctd = _sess(f"{MODEL_DIR}/ctd.onnx", ORT_PROVIDERS)
+    koharu = _sess(validate_model(_load(f"{MODEL_DIR}/{KOHARU_FILE}")), ORT_PROVIDERS)
+    try:
+        ctd = _sess(f"{MODEL_DIR}/ctd.onnx", ORT_PROVIDERS)
+    except Exception as e:
+        ctd = None
+        print(f"optional CTD model not loaded: {e}", flush=True)
     vis = _sess(f"{MODEL_DIR}/vision-int4.onnx", ORT_PROVIDERS)
     pre = _sess(f"{MODEL_DIR}/baberu-prefill.onnx", ORT_PROVIDERS)
     stp = _sess(f"{MODEL_DIR}/baberu-step.onnx", ORT_PROVIDERS)
@@ -95,9 +104,10 @@ def load_models():
     except Exception as e:
         inpaint = None
         print(f"inpaint model not loaded: {e}", flush=True)
+    EPS.clear()
     EPS.update({n: s.get_providers() for n, s in
-                {"ctd": ctd, "vis": vis, "pre": pre, "stp": stp}.items()
-                if n != "inpaint"})
+                {"koharu": koharu, "ctd": ctd, "vis": vis, "pre": pre, "stp": stp}.items()
+                if s is not None})
     if inpaint is not None:
         EPS["inpaint"] = inpaint.get_providers()
     print("ORT providers:", EPS, flush=True)
@@ -111,8 +121,10 @@ def _startup():
 @app.get("/health")
 def health():
     # splitGen rides here too so clients verify the server's split/mask logic — stale servers fail back to fused boxes.
-    return {"ok": bool(ctd and baberu), "device": os.environ.get("ORT_DEVICE", "cpu"),
-            "panels": "client-fallback", "ep": EPS or None, "splitGen": SPLIT_GEN}
+    return {"ok": bool(koharu and baberu), "device": os.environ.get("ORT_DEVICE", "cpu"),
+            "layoutModel": "koharu", "layoutModels": [n for n, s in [("koharu", koharu), ("ctd", ctd)] if s is not None],
+            "layoutRecipe": KOHARU_RECIPE, "modelSha256": KOHARU_SHA256,
+            "panels": "koharu", "ep": EPS or None, "splitGen": SPLIT_GEN}
 
 
 @app.get("/")
@@ -401,7 +413,49 @@ def run_detect(pil, conf_thr, min_size):
     boxes = refine_balloon_boxes(np.asarray(pil.convert("RGB")), boxes, mask_img)
     mw, mh, mbytes = pack_mask(w, h, (packed * 255).ravel())
     return boxes, infer_ms, {"w": mw, "h": mh,
-                             "b64": base64.b64encode(mbytes).decode("ascii")}, mask_img
+                              "b64": base64.b64encode(mbytes).decode("ascii")}, mask_img
+
+
+def run_layout(pil, layout_model="koharu", conf_thr=CONF_THR, min_size=MIN_SIZE, thresholds=None):
+    if layout_model == "ctd":
+        boxes, ms, mask, mask_img = run_detect(pil, conf_thr, min_size)
+        return {"boxes": boxes, "panels": [], "balloons": [], "inferMs": ms, "mask": mask,
+                "maskImage": mask_img, "panelSkipped": "CTD server detection uses text-position reading order"}
+    if layout_model != "koharu":
+        raise ValueError("Unknown layout model")
+    if koharu is None:
+        raise RuntimeError("KoharuLayout model not loaded on the server")
+    w, h = pil.size
+    infer_ms = 0.0
+
+    def infer(image):
+        nonlocal infer_ms
+        x = image_input(image)
+        start = time.perf_counter()
+        values = koharu.run(["dets", "labels", "masks"], {"input": x})
+        infer_ms += (time.perf_counter() - start) * 1000
+        return decode_koharu(dict(zip(["dets", "labels", "masks"], values)), image.width, image.height, thresholds, min_size)
+
+    tiles = split_tiles(w, h)
+    if not tiles:
+        result = infer(pil)
+    else:
+        mask_img, per = np.zeros((h, w), bool), []
+        for x0, y0, tw, th in tiles:
+            image = pil.crop((x0, y0, min(w, x0 + tw), min(h, y0 + th)))
+            decoded = infer(image)
+            per.append(((x0, y0), [tuple(b[k] for k in ["x1", "y1", "x2", "y2", "conf"]) for b in decoded["boxes"]]))
+            mask_img[y0:y0 + image.height, x0:x0 + image.width] |= decoded["mask"]
+        result = {"boxes": [dict(zip(["x1", "y1", "x2", "y2", "conf"], b)) for b in merge_tile_boxes(per)],
+                  "panels": [], "balloons": [], "mask": mask_img,
+                  "panelSkipped": "Tiled page: reading order follows text positions"}
+    from balloon_surface import refine_balloon_boxes
+    result["boxes"] = refine_balloon_boxes(np.asarray(pil.convert("RGB")), result["boxes"], result["mask"])
+    result["maskImage"] = result.pop("mask")
+    mw, mh, packed = pack_mask(w, h, (result["maskImage"].astype(np.uint8) * 255).ravel())
+    result["mask"] = {"w": mw, "h": mh, "b64": base64.b64encode(packed).decode("ascii")}
+    result["inferMs"] = infer_ms
+    return result
 
 
 def run_baberu(crop):
@@ -485,7 +539,7 @@ def inpaint_dilate_radius(w, h):
 
 
 def cleanup_mask(raw, boxes, w, h):
-    """Mirror of aiCleanupMask() in src/content/inpaint.ts: keep the raw CTD mask
+    """Mirror of aiCleanupMask() in src/content/inpaint.ts: keep the raw text mask
     inside the erase boxes, then dilate it. A tight mask leaves anti-aliased glyph
     edges and the gaps between strokes outside it, and the model paints ghost
     glyphs back over the window."""
@@ -520,16 +574,17 @@ def run_inpaint(pil, boxes, pad_ratio, mask=None):
     The client sends the prepared binary erase mask (restricted to the erase
     boxes and dilated — thin glyph strokes and the gaps between them drop out of
     the 512px window resize and the model then paints the leftover white glyphs'
-    background over the whole window). Without one the mask is rebuilt from CTD
-    here with the same recipe. Windows are
+    background over the whole window). Without one, the default layout model
+    rebuilds the mask with the same cleanup recipe. Windows are
     cut from the original image, edge-padded to a square, run at 512x512, and
     composited back only where the mask says text was. Returns per-box PNG
     patches (the same shape the on-device worker produces).
     """
     det_ms = 0.0
     if mask is None:
-        _, _, _, _, prob, det_ms = infer_once(pil, CONF_THR)
-        mask = cleanup_mask(prob > MASK_THR, boxes, pil.width, pil.height)
+        detected = run_layout(pil)
+        det_ms = detected["inferMs"]
+        mask = cleanup_mask(detected["maskImage"], boxes, pil.width, pil.height)
     rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
     H, W = rgb.shape[:2]
     out = rgb.copy()
@@ -625,7 +680,12 @@ async def page(req: Request,
                conf_thr: float = Query(CONF_THR), min_size: int = Query(MIN_SIZE),
                inpaint_flag: int = Query(0, alias="inpaint"),
                texts_flag: int = Query(1, alias="texts"),
-               pad_ratio: float = Query(INPAINT_PAD_RATIO)):
+               pad_ratio: float = Query(INPAINT_PAD_RATIO),
+               layout_model: Literal["koharu", "ctd"] = "koharu",
+               text_conf: float = Query(KOHARU_THRESHOLDS["text"], ge=0.05, le=1),
+               sfx_conf: float = Query(KOHARU_THRESHOLDS["sfx"], ge=0.05, le=1),
+               bubble_conf: float = Query(KOHARU_THRESHOLDS["bubble"], ge=0.05, le=1),
+               panel_conf: float = Query(KOHARU_THRESHOLDS["panel"], ge=0.05, le=1)):
     t0 = time.perf_counter()
     raw = await req.body()
     body_ms = (time.perf_counter() - t0) * 1000
@@ -634,7 +694,14 @@ async def page(req: Request,
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"bad image: {e} (got {len(raw)} bytes head={raw[:8].hex()})"}, 400)
     async with lock:
-        boxes, det_ms, mask, mask_img = run_detect(pil, conf_thr, min_size)
+        if (koharu if layout_model == "koharu" else ctd) is None:
+            return JSONResponse({"ok": False, "error": f"{layout_model} model not loaded on the server"}, 503)
+        try:
+            detected = run_layout(pil, layout_model, conf_thr, min_size,
+                                  {"text": text_conf, "sfx": sfx_conf, "bubble": bubble_conf, "panel": panel_conf})
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"{layout_model} detection failed: {e}"}, 500)
+        boxes, det_ms, mask, mask_img = (detected[k] for k in ["boxes", "inferMs", "mask", "maskImage"])
         # texts=0 (client's page/crops modes): the LLM reads the image itself, so this
         # OCR pass — the slowest step — is skipped. Older clients omit the flag (OCR runs).
         texts, ocr_ms = [], 0.0
@@ -652,7 +719,7 @@ async def page(req: Request,
         if inpaint_flag:
             try:
                 # erase with the client's prepared mask recipe (restrict + dilate), not
-                # the raw CTD mask: the thin mask leaves glyph edges behind
+                # the raw text mask: the thin mask leaves glyph edges behind
                 prepared = cleanup_mask(mask_img, boxes, pil.width, pil.height)
                 patches, windows, inpaint_ms, _ = run_inpaint(pil, boxes, pad_ratio, prepared)
             except Exception as e:
@@ -667,8 +734,11 @@ async def page(req: Request,
                    "conf": round(float(b["conf"]), 4),
                    **({"clip": {k: float(v) for k, v in b["clip"].items()}} if "clip" in b else {}),
                    **({"cutAxis": b["cutAxis"]} if "cutAxis" in b else {})} for b in boxes],
-        "panels": [],
-        "panelSkipped": "cloud-v1: panel runs client-side, banding fallback applies",
+        "layoutModel": layout_model,
+        **({"layoutRecipe": KOHARU_RECIPE, "modelSha256": KOHARU_SHA256} if layout_model == "koharu" else {}),
+        "panels": detected["panels"],
+        "balloons": detected["balloons"],
+        **({"panelSkipped": detected["panelSkipped"]} if detected.get("panelSkipped") else {}),
         "splitGen": SPLIT_GEN,
         "mask": mask,
         "texts": texts,

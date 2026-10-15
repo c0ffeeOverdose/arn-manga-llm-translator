@@ -36,9 +36,10 @@ class DetectionResponse(unittest.IsolatedAsyncioTestCase):
                   "clip": clip, "cutAxis": "x"},
                  {"x1": 60, "y1": 20, "x2": 80, "y2": 60, "conf": 0.8}]
         mask = {"w": 1, "h": 1, "b64": "AA=="}
-        with patch.object(app, "run_detect", return_value=(boxes, 1, mask, np.zeros((100, 100), bool))), \
+        with patch.object(app, "ctd", object()), \
+                patch.object(app, "run_detect", return_value=(boxes, 1, mask, np.zeros((100, 100), bool))), \
                 patch.object(app, "run_baberu", side_effect=[("first source", 1), ("second source", 1)]):
-            response = await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=0, pad_ratio=0.5)
+            response = await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=0, pad_ratio=0.5, layout_model="ctd")
         wire = json.loads(json.dumps(response))
         self.assertEqual(wire["boxes"][0]["clip"], {k: float(v) for k, v in clip.items()})
         self.assertEqual(wire["boxes"][0]["cutAxis"], "x")
@@ -56,10 +57,11 @@ class DetectionResponse(unittest.IsolatedAsyncioTestCase):
 
         boxes = [{"x1": 10, "y1": 20, "x2": 30, "y2": 60, "conf": 0.9}]
         mask = {"w": 1, "h": 1, "b64": "AA=="}
-        with patch.object(app, "run_detect", return_value=(boxes, 1, mask, np.zeros((100, 100), bool))), \
+        with patch.object(app, "ctd", object()), \
+                patch.object(app, "run_detect", return_value=(boxes, 1, mask, np.zeros((100, 100), bool))), \
                 patch.object(app, "run_baberu") as baberu:
             response = await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=0,
-                                      texts_flag=0, pad_ratio=0.5)
+                                      texts_flag=0, pad_ratio=0.5, layout_model="ctd")
         baberu.assert_not_called()
         wire = json.loads(json.dumps(response))
         self.assertEqual(wire["texts"], [])

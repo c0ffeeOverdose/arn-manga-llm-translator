@@ -190,8 +190,8 @@ const PRESET_KEEP_KEYS = [
     'prefetchN', 'parallelLlm', 'mergePages', 'cacheEnabled', 'cacheMax', 'showToasts',
 ] as const satisfies readonly (keyof PipelineSettings)[];
 
-export function defaultLayoutModel(engine: unknown): LayoutModel {
-    return engine === 'cloud' ? 'ctd' : DEFAULT_PIPELINE_SETTINGS.layoutModel;
+export function defaultLayoutModel(): LayoutModel {
+    return DEFAULT_PIPELINE_SETTINGS.layoutModel;
 }
 
 // Quality presets retain the reader's language, workflow and resource choices.
@@ -200,7 +200,7 @@ export function applyPreset(name: string, current?: Partial<PipelineSettings>): 
     if (current) for (const key of PRESET_KEEP_KEYS) {
         if (current[key] !== undefined) Object.assign(result, { [key]: current[key] });
     }
-    result.layoutModel = current?.layoutModel ?? defaultLayoutModel(result.inferEngine);
+    result.layoutModel = current?.layoutModel ?? defaultLayoutModel();
     return result;
 }
 
@@ -243,7 +243,7 @@ export function loadPipelineSettings(stored: unknown): PipelineSettings {
         else if (s.visionMode != null || s.useVision != null || s.ocrModel != null) out.textSource = 'page';
     }
     if (out.readingDir !== 'rtl' && out.readingDir !== 'ltr') out.readingDir = 'rtl';
-    if (s.layoutModel !== 'ctd' && s.layoutModel !== 'koharu') out.layoutModel = defaultLayoutModel(out.inferEngine);
+    if (s.layoutModel !== 'ctd' && s.layoutModel !== 'koharu') out.layoutModel = defaultLayoutModel();
     for (const k of ['koharuTextConf', 'koharuSfxConf', 'koharuPanelConf'] as const) {
         if (typeof out[k] !== 'number' || !(Number(out[k]) >= 0.05 && Number(out[k]) <= 1)) out[k] = DEFAULT_PIPELINE_SETTINGS[k];
     }

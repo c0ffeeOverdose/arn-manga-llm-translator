@@ -4,7 +4,7 @@ import { DEFAULT_BASES, DEFAULT_SETTINGS, THINKING_HINTS, THINKING_LEVELS, type 
 import { inpaintMode, mergePipeline, type PipelineSettings } from '../llm/pipeline-settings';
 import { detModelsInstalled, detDownload, detDelete, inpaintInstalled, inpaintDownload, inpaintDelete } from '../llm/ocr-models';
 import { koharuInstalled, koharuDownload, koharuDelete, importKoharuFile } from '../llm/layout-models';
-import { KOHARU_MODEL, type LayoutModel } from '../layout-model';
+import { KOHARU_MODEL } from '../layout-model';
 import { $, setDirty, setStatus, dlProgress } from './shell';
 import { pipeline, loadStoredPipeline, syncOcrManager, syncOcrSeparateUI, syncDetectionTuning } from './pipeline-section';
 import { hostOriginPatterns, requestHostAccess } from './host-access';
@@ -35,10 +35,7 @@ const BASE_HINTS: Record<string, string> = {
     cloudflare: ' Replace <ACCOUNT_ID> with your account ID. The token needs Workers AI access.',
 };
 
-let localLayoutChoice: LayoutModel | undefined;
-
 export function fillModelFields(s: LLMSettings): void {
-    localLayoutChoice = pipeline.inferEngine === 'local' ? pipeline.layoutModel : undefined;
     ($('provider') as HTMLSelectElement).value = s.provider;
     ($('model') as HTMLInputElement).value = s.model;
     ($('apiKey') as HTMLInputElement).value = s.apiKey;
@@ -287,9 +284,9 @@ export function syncInferUI(): void {
     const cloud = pipeline.inferEngine === 'cloud';
     ($('layoutModel') as HTMLSelectElement).value = pipeline.layoutModel;
     $('layoutModelHint').textContent = pipeline.layoutModel === 'koharu'
-        ? cloud ? 'KoharuLayout runs on-device. Select On-device to use it.'
+        ? cloud ? 'Your server uses KoharuLayout to find text, sound effects, speech bubbles and panels.'
             : 'Finds text, sound effects, speech bubbles and panels.'
-        : cloud ? 'Cloud detection uses CTD + Panel.' : 'CTD finds text. The panel model sets the reading order.';
+        : cloud ? 'Your server uses CTD to find text. Reading order follows text positions.' : 'CTD finds text. The panel model sets the reading order.';
     syncDetectionTuning();
     for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
         const on = (b.dataset.inferVal === 'cloud') === cloud;
@@ -434,7 +431,6 @@ $('layoutImportBtn').onclick = () => ($('layoutFile') as HTMLInputElement).click
 
 ($('layoutModel') as HTMLSelectElement).onchange = () => {
     pipeline.layoutModel = ($('layoutModel') as HTMLSelectElement).value === 'koharu' ? 'koharu' : 'ctd';
-    if (pipeline.inferEngine === 'local') localLayoutChoice = pipeline.layoutModel;
     $('layoutFileStatus').textContent = '';
     syncInferUI(); setDirty(true);
 };
@@ -448,12 +444,6 @@ for (const id of ['preset', 'resetAdv']) $(id).addEventListener(id === 'preset' 
 for (const b of document.querySelectorAll<HTMLButtonElement>('#inferSeg button')) {
     b.onclick = () => {
         const engine = b.dataset.inferVal === 'cloud' ? 'cloud' : 'local';
-        if (engine !== pipeline.inferEngine) {
-            if (engine === 'cloud') {
-                localLayoutChoice = pipeline.layoutModel;
-                pipeline.layoutModel = 'ctd';
-            } else if (localLayoutChoice) pipeline.layoutModel = localLayoutChoice;
-        }
         pipeline.inferEngine = engine;
         syncInferUI();
         syncOcrManager();

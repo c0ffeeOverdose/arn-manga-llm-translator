@@ -185,6 +185,15 @@ class BalloonGeometry(unittest.TestCase):
         big = next(p for p in pieces if p["y2"] <= 160)
         self.assertLessEqual(big["y1"], 45)
 
+    def test_lettering_absorbing_all_fragments_keeps_the_original_region(self):
+        from balloon_surface import split_connected_clusters
+
+        comps = [{"x1": 40, "y1": 40, "x2": 120, "y2": 150, "conf": 0.9},
+                 {"x1": 20, "y1": 146, "x2": 45, "y2": 168, "conf": 0.9},
+                 {"x1": 115, "y1": 146, "x2": 140, "y2": 168, "conf": 0.9}]
+        parent = {"x1": 10, "y1": 30, "x2": 150, "y2": 180, "conf": 0.9}
+        self.assertIsNone(split_connected_clusters(comps, parent, 200, 200))
+
     def test_interlocking_blocks_split_with_the_sliver_fallback(self):
         from balloon_surface import split_connected_clusters
 
@@ -267,8 +276,9 @@ class GroupingBeforeOcr(unittest.IsolatedAsyncioTestCase):
             clean_boxes.extend(boxes)
             return [{"i": i} for i in range(len(boxes))], len(boxes), 1, 0
 
-        with patch.object(app, "infer_once", return_value=inference), patch.object(app, "run_baberu", side_effect=ocr), patch.object(app, "run_inpaint", side_effect=clean):
-            result = await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=1, texts_flag=1, pad_ratio=0.5)
+        with patch.object(app, "ctd", object()), patch.object(app, "infer_once", return_value=inference), \
+                patch.object(app, "run_baberu", side_effect=ocr), patch.object(app, "run_inpaint", side_effect=clean):
+            result = await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=1, texts_flag=1, pad_ratio=0.5, layout_model="ctd")
         self.assertEqual(result["texts"], ["1", "2"])
         self.assertEqual(len(clean_boxes), 2)
         self.assertEqual([p["i"] for p in result["patches"]], [0, 1])

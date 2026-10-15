@@ -65,10 +65,11 @@ class MergedInpaint(unittest.IsolatedAsyncioTestCase):
             seen["mask"] = mask
             return [], 0, 0.0, 0.0
 
-        with patch.object(app, "run_detect", return_value=(boxes, 1, {"w": 1, "h": 1, "b64": "AA=="}, raw)), \
+        with patch.object(app, "ctd", object()), \
+                patch.object(app, "run_detect", return_value=(boxes, 1, {"w": 1, "h": 1, "b64": "AA=="}, raw)), \
                 patch.object(app, "run_baberu", return_value=("", 1.0)), \
                 patch.object(app, "run_inpaint", side_effect=fake_inpaint):
-            await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=1, pad_ratio=0.5)
+            await app.page(Request(), conf_thr=0.35, min_size=12, inpaint_flag=1, pad_ratio=0.5, layout_model="ctd")
 
         mask = seen["mask"]
         self.assertIsNotNone(mask, "merged pass must receive a mask")

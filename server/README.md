@@ -1,6 +1,6 @@
 # arn-manga server — optional cloud inference for the manga translator
 
-Runs the same detection + OCR the extension runs on-device (CTD + Baberu,
+Runs the same detection + OCR the extension runs on-device (KoharuLayout + Baberu,
 recipes ported 1:1 from `src/iframe/worker.ts`), for phones or older machines
 too slow to do it locally. The extension stays zero-server by default — this is
 opt-in: run or deploy your own endpoint, paste URL + key into Options → Model.
@@ -45,22 +45,32 @@ MODEL_DIR=/path/to/models ARN_API_KEY=<random> python serve.py # Bearer auth
 (`/` and `/health` stay open for the extension's Test/warm probe), `PORT`
 selects the port. Modal keeps its own wrapper for the same rule.
 
-`MODEL_DIR` needs: `ctd.onnx`, `vision-int4.onnx`, `baberu-prefill.onnx`,
+`MODEL_DIR` needs: `koharu-fp32-chunked.onnx`, `vision-int4.onnx`, `baberu-prefill.onnx`,
 `baberu-step.onnx`, `vocab.json` (see `models_manifest.py` for sources).
+`ctd.onnx` is optional for the legacy detector; `lama-manga-512-fp16w.onnx` is optional
+for AI cleanup. Koharu's exact size and SHA-256 are verified before loading.
+Regenerate/redeploy the server when updating the extension's Koharu model recipe;
+an older or mismatched server reports an error rather than silently returning CTD.
 
 ## API
 
-- `GET /health` → `{ok, device, panels, ep}` (no auth — liveness only)
-- `POST /v1/page?conf_thr=0.35&min_size=12` — raw PNG/JPEG bytes in the body →
-  `{ok, w, h, boxes:[{x1,y1,x2,y2,conf}], panels:[], panelSkipped, splitGen, mask:{w,h,b64}, texts[],
+- `GET /health` → `{ok, device, layoutModel, layoutModels, layoutRecipe, modelSha256, panels, ep, splitGen}` (no auth — Koharu/OCR readiness)
+- `POST /v1/page?layout_model=koharu&min_size=12` — raw PNG/JPEG bytes in the body →
+  `{ok, layoutModel, layoutRecipe, modelSha256, w, h, boxes:[{x1,y1,x2,y2,conf}], panels, balloons, panelSkipped?, splitGen, mask:{w,h,b64}, texts[],
   ms:{body,detect,ocr,total}}`. `texts[i]` belongs to `boxes[i]`; text is raw
   (the client collapses whitespace, same as the local path). `splitGen` is the
   server's box-split generation (bump = client re-detects older cache entries);
-  `mask` is the packed CTD text mask (`packMask` codec — the client restores it
+  `mask` is the packed text/SFX mask (`packMask` codec — the client restores it
   with `unpackMask` for text-color sampling, inpaint and the debug view).
+- Omitting `layout_model` selects Koharu. Its thresholds are `text_conf=0.25`,
+  `sfx_conf=0.20`, `bubble_conf=0.50`, `panel_conf=0.50`. `layout_model=ctd` uses
+  `conf_thr=0.35` and returns empty panels/balloons. Extreme strips use tiled text-position ordering.
+  Balloon rows retain their source dimensions; they are layout metadata, never erase masks.
 
 ## Attribution
 
+- KoharuLayout weights: `mayocream/koharu-layout-rfdetr-seg-2xl-1152` — pinned FP32
+  export from the project mirror; see [model details and license](../docs/koharu-layout.md).
 - CTD weights: `lemondouble/lemon-manga-translator` (upstream
   `dmMaze/comic-text-detector`, GPL-3.0) — downloaded at image build time.
 - Baberu weights: `genshiai-daichi/baberu-ocr` (Apache-2.0).
