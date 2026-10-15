@@ -1,5 +1,7 @@
 # Translation controls
 
+[Documentation index](README.md) · [Chapter architecture](chapter-translation.md)
+
 **Translate this page** translates the visible page or spread. During processing it becomes
 **Stop this page**; a queued page shows **Cancel this page**. The context menu targets the
 image you clicked, while the popup follows your current reading position.
@@ -9,8 +11,8 @@ Translations that already finished remain available. **Resume auto**, or a new T
 command, releases the pause. Re-translate preserves a user-paused Auto loop.
 
 **Translate to chapter end** starts from the page you are viewing. After stopping a run,
-you can move to another page and use this button to choose a new starting point. Completed
-translations remain available and are reused when available in the reader or cache.
+you can move to another page and use this button to choose a new starting point.
+Completed translations are reused from the reader or cache.
 **Resume chapter translation** is a separate button that continues the remaining pages of the
 stopped run, including pages you cancelled individually.
 

@@ -1,28 +1,35 @@
 # Contributing
 
-Thanks for your interest in improving this project.
-
 ## Getting set up
 
 ```bash
-npm install
+npm ci
 node build.mjs             # Chromium build → dist/
 node build.mjs --firefox   # Firefox build → dist-firefox/
 ```
 
 ## Before you open a PR
 
-Run all three checks — they take seconds:
+Use Node.js 22, as CI does. Run typecheck, tests and both build targets:
 
 ```bash
 npx tsc --noEmit     # typecheck (strict mode)
-node --test tests/   # unit tests
+node --test "tests/**/*.test.mjs"   # unit tests (keep the glob quoted)
 node build.mjs && node build.mjs --firefox   # both targets must build
 ```
 
-PR flow: fork → branch from `main` → one logical change per PR → short
-description plus what you verified. Visual changes deserve a screenshot
-before/after.
+Fork and branch from `main`. Keep each PR to one logical change and describe what
+you verified. Include before/after screenshots for visual changes.
+
+## Understanding the code
+
+Start with the [developer documentation index](docs/README.md), then
+[architecture](docs/architecture.md) and the [page pipeline](docs/translation-pipeline.md).
+See the [development guide](docs/development.md) for tests, debugging and release
+packaging. Update the relevant guide when changing a workflow, contract or setting.
+
+English under `docs/` is primary. Update the paired [Thai guide](docs/th/README.md)
+and its translation date, or mark it as outdated. Keep examples and diagrams aligned.
 
 ## Reporting a bug
 
@@ -33,15 +40,12 @@ Open an issue with:
 - the status pill text at the time of the failure
 
 Enable **Debug mode** (Options → Pipeline) first, then copy the
-`[mt] page result` line from the page console into the issue — it makes most
-failures diagnosable in one message.
+`[mt] page result` line from the page console into the issue.
 
 ## Ground rules
 
-- **Strict TypeScript, minimal comments** — a comment only earns its place
-  when it explains the code (a brief why, a constraint, a contract — ~2 lines
-  max). Incident histories and deep detail belong to the owner's memory system,
-  not the code. Read neighboring code and mimic its style.
+- Use strict TypeScript and match the surrounding style. Keep comments to short
+  contracts or constraints; keep incident histories in `LESSONS.md`.
 - **No site-specific hacks in the pipeline.** Reader adaptations must be
   generic, named mechanisms, never keyed to a particular site or title.
 - **Never commit models, profiles, or keys** — `models/`, `.test-local/`,

@@ -1,5 +1,7 @@
 # KoharuLayout
 
+[Documentation index](README.md) · [Inference architecture](inference.md)
+
 KoharuLayout is the default model for on-device and Cloud detection. To change it, open
 **Settings → Model → Layout model** and save your choice. Saved model choices are
 retained. Cloud uses the same pinned Koharu export on your server; it does not run
@@ -8,8 +10,8 @@ Koharu finds text, sound effects, balloons and panels together. OCR, translation
 reading direction and text cleanup continue to use your existing settings.
 
 The supported model is the FP32 1152px export with attention queries processed in
-chunks of 256. It has been tested on an RTX 3060 Laptop with 6 GiB VRAM. Detection
-quality varies with the page; this is an alternative to CTD, not an accuracy guarantee.
+chunks of 256. It has been tested on an RTX 3060 Laptop with 6 GiB VRAM; detection
+quality varies with the page.
 
 ## Install once
 
@@ -18,7 +20,8 @@ builds contain no weights. Use **Download** to install the model from
 [arn-manga-models](https://huggingface.co/c0ffeeOverdose/arn-manga-models), or let the
 first on-device translation download it automatically. A progress bar tracks the
 download. The extension checks the exact size and SHA-256 before saving the model
-locally; subsequent translations work offline without downloading it again.
+locally; subsequent detection can reuse it without another download. Translation still
+requires your configured LLM endpoint.
 
 Once installed, the button becomes **Delete**, matching the OCR model manager.
 Delete removes the downloaded file from the local model store and returns the button
@@ -55,7 +58,7 @@ retains the original 1152px segmentation heads, but has a different graph and ch
 It is not the extension's supported artifact. The browser-specific export preserves
 FP32 weights and 1152px resolution while bounding attention allocations with 256-query
 chunks. It avoids the repeated-inference GPU memory failures observed with straight
-exports on the tested 6 GiB device. This result is scoped to the tested runtime and hardware.
+exports on the tested 6 GiB device.
 
 ## Reproduce the supported export
 
@@ -119,7 +122,8 @@ its width measurement. It tries placement around the source text and the balloon
 center before reducing the font, so a changing contour can use the available height.
 
 Changing quality presets preserves the selected model. New translation requests
-and chapter runs use that choice. Active chapter runs retain their captured settings.
+and chapter runs use that choice. Active chapter runs use captured settings; relevant
+saved setting changes pause the run, and starting a new run applies the new settings.
 Saved results are matched to the selected model and its thresholds; existing legacy
 CTD cache fingerprints are preserved. Use Re-translate to replace an already visible
 translation with fresh detection from the newly selected model.

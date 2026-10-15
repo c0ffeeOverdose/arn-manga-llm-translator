@@ -1,6 +1,8 @@
 # CPU and memory ownership
 
-Translation caching avoids repeated detection, OCR and paid translation when a compatible
+[Documentation index](README.md) · [Inference lifecycle](inference.md) · [Rendering](rendering.md)
+
+Translation caching avoids repeated detection, OCR and LLM requests when a compatible
 result exists. Painting, current font/layout settings, source verification and PNG encoding
 still require work. A cache storage limit bounds saved payloads on disk; it does not bound
 decoded images, model sessions or the browser's GPU/WASM allocations.
@@ -17,28 +19,26 @@ decoded images, model sessions or the browser's GPU/WASM allocations.
 | Temporary synchronous PNG canvas | Encoder; zeroes owned canvas dimensions after success or error, preserving caller-owned canvases |
 | Inpaint page readback | One mutable `ImageData`; no second full-page RGBA copy |
 | Retained page mask | Exact binary pixels packed into bits; expands only for seam stitching, debug views or chapter seeds, without retaining the expanded copy |
-| Inference iframe | Created on demand; released after 60 seconds without work, or when a chapter drains; setup, encoding and active RPCs retain it |
+| Inference iframe | Created on demand; setup, encoding, active RPCs and the whole active chapter pump retain it; released when no owner remains, after the idle grace period or when a chapter drains |
 | Inference/fetch deadlines | Cleared when requests settle; timed-out inference destroys its computing context and rejects sibling requests |
 
-Ownership is independent of cache invalidation and model generation. These changes preserve
-pixel recipes, thresholds, model inputs, output order and current rendering settings.
-
-## Why a page can be expensive
+## Working memory
 
 A 2,000 × 3,000 RGBA image occupies 24 MB before browser overhead. A full-resolution
 float probability field and an int32 component label map each occupy another 24 MB;
 byte masks and visited maps each occupy 6 MB. Detection, cleanup and painting have different
 working buffers, in addition to decoded sources and model sessions. Several prepared pages
-can coexist in a merged chapter request. The cleanup path now avoids one additional 24 MB
-RGBA allocation for that example size.
+can coexist in a merged chapter request.
 
 Retained binary masks for 36 pages of that size take 27 MB instead of 216 MB. This is a
 lossless in-memory representation, separate from the existing sampled disk-cache mask.
-Non-binary masks keep an exact raw copy. Translation, clips and cleanup geometry are unchanged.
+Non-binary masks keep an exact raw copy.
 
-Cloud readers and cache-only reads no longer create a local ORT iframe during startup.
-After local inference is idle, the iframe is removed, including its model runtime. The next
-local request recreates it from the normal model cache; completed translations stay available.
+Cloud readers and cache-only reads do not create a local ORT iframe during startup.
+After local inference is idle with no active owner, the iframe and its model runtime are
+removed. Active chapter work holds it across LLM waits; retaining a host does not itself
+create an iframe. The next local request recreates it from the model cache; completed
+translations stay available.
 This can add model startup time after a long pause. Removing an iframe does not guarantee that
 Chromium immediately returns every native allocation to the OS; process RSS must be measured.
 
@@ -71,7 +71,5 @@ an explicit critical memory-pressure notification. JS backing storage remained a
 The forced notification demonstrates reclaimable native/browser-cache memory; 195 MiB is
 not a natural-idle result or a phone memory claim.
 
-Further reductions should be measured separately: admission limits based on decoded page
-bytes and eviction of inactive reader states. The existing parallel/group settings still
-bound counts rather than bytes; this is not a hard total-RAM budget. A desktop Cloud fixture
-also cannot establish a phone's decoded-image cache behavior or memory ceiling.
+Parallel/group settings bound page counts, not decoded bytes or total browser RAM.
+Desktop Cloud measurements do not establish phone memory limits.

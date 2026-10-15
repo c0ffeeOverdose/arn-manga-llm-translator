@@ -1,23 +1,24 @@
-# arn-manga server — optional cloud inference for the manga translator
+# Optional cloud inference server
 
-Runs the same detection + OCR the extension runs on-device (KoharuLayout + Baberu,
-recipes ported 1:1 from `src/iframe/worker.ts`), for phones or older machines
-too slow to do it locally. The extension stays zero-server by default — this is
-opt-in: run or deploy your own endpoint, paste URL + key into Options → Model.
+[Documentation index](../docs/README.md) · [Cloud architecture and security boundaries](../docs/cloud-and-security.md)
+
+Runs KoharuLayout detection by default, Baberu OCR and optional AI text cleanup outside the browser.
+To use it, deploy an endpoint and paste its URL and key into Options → Model.
+Local inference does not require this server.
+It does not run translation LLM calls or the text renderer. Koharu returns panels
+and balloon shapes for client-side ordering/layout. CTD remains selectable, with
+text-position ordering instead of a separate panel model on the server.
 
 Both notebooks are generated from these sources by `scripts/make-colab.py` —
 don't edit them by hand.
 
-## Run it in Colab (free GPU, Google sign-in only)
+## Run in Colab
 
 Open `colab-server.ipynb` in Google Colab → Runtime → Run all → paste the two
-values it prints. The server runs inside the notebook's VM (T4 GPU if the
-runtime has one) and is exposed through a Cloudflare quick tunnel. The URL is
-new every session, and the VM dies after ~90 minutes without tab activity (12 h
-max), so re-run the cells and paste the new URL when Colab disconnects.
-
-Limits: free T4s come from a shared (unpublished) quota and are not guaranteed;
-sessions have a hard ~12 h cap; the URL changes every session.
+values it prints. The server runs inside the notebook's VM through a Cloudflare
+quick tunnel, using a GPU if available. The URL changes each session; rerun the
+cells and update the endpoint after disconnection. GPU availability and session
+limits vary.
 
 ## Deploy to Modal (stable URL)
 
@@ -29,9 +30,8 @@ modal secret create arn-manga-key ARN_API_KEY=<random>
 modal deploy modal_app.py
 ```
 
-Limits: Modal Starter is free — $30/month of compute (~50 T4-hours), no card
-needed to start. The endpoint scales to zero when idle, so the first request
-after a break waits ~1-2 min (cold start + model load).
+The endpoint scales to zero when idle; the first request after a break includes
+model startup time. Check your account's current compute quota and pricing.
 
 ## Local run
 
@@ -44,6 +44,9 @@ MODEL_DIR=/path/to/models ARN_API_KEY=<random> python serve.py # Bearer auth
 `serve.py` is the platform-neutral launcher: `ARN_API_KEY` set = auth on
 (`/` and `/health` stay open for the extension's Test/warm probe), `PORT`
 selects the port. Modal keeps its own wrapper for the same rule.
+Running `uvicorn app:app` directly does not enable that middleware, even with
+`ARN_API_KEY` set. The Dockerfile also starts the bare app: add authentication/TLS
+at the deployment boundary before exposing it publicly.
 
 `MODEL_DIR` needs: `koharu-fp32-chunked.onnx`, `vision-int4.onnx`, `baberu-prefill.onnx`,
 `baberu-step.onnx`, `vocab.json` (see `models_manifest.py` for sources).
@@ -54,7 +57,8 @@ an older or mismatched server reports an error rather than silently returning CT
 
 ## API
 
-- `GET /health` → `{ok, device, layoutModel, layoutModels, layoutRecipe, modelSha256, panels, ep, splitGen}` (no auth — Koharu/OCR readiness)
+- `GET /health` → `{ok, device, layoutModel, layoutModels, layoutRecipe, modelSha256, panels, ep, splitGen}` (no auth — Koharu/OCR readiness,
+  not proof that the key is accepted or the optional cleanup model is loaded)
 - `POST /v1/page?layout_model=koharu&min_size=12` — raw PNG/JPEG bytes in the body →
   `{ok, layoutModel, layoutRecipe, modelSha256, w, h, boxes:[{x1,y1,x2,y2,conf}], panels, balloons, panelSkipped?, splitGen, mask:{w,h,b64}, texts[],
   ms:{body,detect,ocr,total}}`. `texts[i]` belongs to `boxes[i]`; text is raw
@@ -66,6 +70,19 @@ an older or mismatched server reports an error rather than silently returning CT
   `sfx_conf=0.20`, `bubble_conf=0.50`, `panel_conf=0.50`. `layout_model=ctd` uses
   `conf_thr=0.35` and returns empty panels/balloons. Extreme strips use tiled text-position ordering.
   Balloon rows retain their source dimensions; they are layout metadata, never erase masks.
+- `texts=0` skips server OCR for image-reading workflows. `inpaint=1` attempts
+  cleanup in the same round trip and adds `patches`, `windows`, `ms.inpaint`.
+  Patch `i` refers to the box index before the client reorders it.
+- `POST /v1/inpaint` accepts JSON `{image, boxes, mask?}`: base64 page image,
+  pixel-coordinate rectangles and optional base64 grayscale PNG erase mask.
+  The mask must match the image dimensions. Returns PNG patches, window count
+  and timings; returns 503 if the cleanup model is unavailable.
+
+Detection uploads from the extension are capped at a 1600px long side, then
+response geometry is restored to original-page coordinates. The separate cleanup
+request currently sends the page and mask at matching full dimensions; it does not
+share that cap. See the [Cloud guide](../docs/cloud-and-security.md) for the wire
+contracts, deadlines, security limits and local/Cloud failure distinction.
 
 ## Attribution
 

@@ -1,5 +1,7 @@
 # Translation cache
 
+[Documentation index](README.md) · [Data and settings](data-and-settings.md) · [ภาษาไทย](th/data-and-settings.md)
+
 Normal Translate reuses a saved result for the same source and translation settings.
 Retranslate explicitly requests new detection and a new answer. Loading a reader alone
 does not authorize translation or reveal cached pages; automatic translation and chapter
@@ -21,8 +23,6 @@ commands retain their own scope.
 reader, queue and scheduling helpers are outside the storage implementation.
 
 ## Identity and reuse
-
-There are two keys because there are two different identities:
 
 * `chapter#hash` describes a particular rendition's decoded pixels. Cleanup crops belong here.
 * `chapter@pN` locates a chapter page. It is a candidate for reuse, not proof of which image is displayed.
@@ -47,10 +47,10 @@ lose its row to eviction between reads.
 ## Recipes and checkpoints
 
 The fingerprint covers detection, OCR, image-input, target-language and prompt settings.
-Font, color, text size, cleanup mode, concurrency and cache capacity do not invalidate a paid
+Font, color, text size, cleanup mode, concurrency and cache capacity do not invalidate a cached
 translation. The renderer applies current presentation settings when it displays the result.
 Dynamic character/context contents do not invalidate previously translated pages as the book
-grows. Changing the selected provider/model does not itself discard a paid answer; Retranslate
+grows. Changing the selected provider/model preserves saved answers; Retranslate
 is the explicit command for replacing it.
 
 Detection/OCR checkpoints are recoverable in-flight work. They are read and written even
@@ -86,9 +86,9 @@ browser RAM. Counts and eviction scan small metadata rows, never all image paylo
 
 Writes remain best effort: the current translation can still be shown, and a failed
 transaction must never leave half of its aliases committed. Reader transport failure is an
-error, rather than a miss that silently purchases another translation. The cache retains no in-memory collection
-of page payloads. Decoded originals created by cache arrival and failed preparation are closed
-by their owners.
+error rather than a cache miss that would trigger another LLM request. The cache retains no
+in-memory collection of page payloads. Decoded originals created by cache arrival and failed
+preparation are closed by their owners.
 
 ## Transport and clear
 

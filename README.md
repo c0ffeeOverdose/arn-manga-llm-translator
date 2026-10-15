@@ -2,44 +2,41 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-A zero-server browser extension that machine-translates manga, manhwa and webtoons in your browser.
-Original text is detected, read by OCR (or a vision model), translated by an LLM
-**you** choose, and rendered back onto the page — everything except the LLM call
-runs locally on your machine.
+A browser extension that translates manga, manhwa and webtoons onto the original
+page using your chosen LLM. Detection, OCR and rendering can run locally.
+Optional Cloud inference sends detection, OCR and cleanup to your own endpoint;
+no developer-operated backend is required.
 
 <p align="center">
   <img src="docs/images/hero.png" alt="Arn Manga LLM Translator — read manga, manhwa &amp; webtoons in your language" width="100%">
 </p>
 
-- **Source languages:** Japanese, Korean, Chinese and English — into any
-  language your LLM can write (Thai rendering is battle-tested, including
-  ICU dictionary word breaking and shrink-to-fit text layout).
-- **Your keys, your models:** bring your own API key (OpenAI-compatible,
-  OpenAI Responses, Anthropic, Gemini, Cloudflare Workers AI). Keys never leave
-  your browser's local storage, and page images are sent only to the endpoint
-  you configure.
-- **All detection and OCR run in-browser** — no server, no telemetry. Works on
-  most manga reader sites (image-based and canvas-based readers, including
-  single-image readers with off-DOM preloading).
+- **Languages:** Japanese, Korean, Chinese and English into languages supported by
+  your LLM. Thai layout includes dictionary word breaking and shrink-to-fit text.
+- **Providers:** OpenAI-compatible, OpenAI Responses, Anthropic, Gemini and
+  Cloudflare Workers AI. Keys are stored in your browser and sent to the configured
+  endpoints for authentication, alongside the images or text needed by each workflow.
+- **Readers:** image and canvas layouts, including single-image readers with
+  off-DOM preloading. No telemetry.
 
 ## How it works
 
-1. **Detect** — a comic-text-detector model (ONNX, int8) finds speech bubbles
-   and text regions on the page, running in a hidden extension-origin iframe
-   (WebGPU with a silent wasm fallback).
-2. **Read** — text is extracted either by a vision LLM (no language pack
-   needed — it reads whatever text is on the page) or by OCR. The bundled
-   Baberu OCR model handles JA/EN/ZH well; Tesseract packs cover Japanese,
+1. **Detect** — KoharuLayout (the local and Cloud default) finds text, sound effects,
+   balloons and panels. CTD is an alternative text detector with a separate
+   panel model. Local models run in a hidden extension-origin iframe using
+   WebGPU where supported, with WASM fallback for layout detection.
+2. **Read** — a vision LLM reads image crops, or installed OCR extracts text. The
+   Baberu OCR model handles JA/EN/ZH; Tesseract packs cover Japanese,
    English, Korean, and Chinese (simplified + traditional).
 3. **Translate** — regions are sent to your LLM with a shared context window:
    a character book (names, genders, speech styles learned from the chapter)
-   and recent translation pairs, so pronouns and tone stay consistent page to
-   page. Provider-side prompt caching keeps repeat cost down.
+   and recent translation pairs to help maintain pronouns and tone across pages.
+   Supported providers can cache repeated prompt prefixes.
 4. **Render** — original text is inpainted over and the translation is laid
    out to fit each bubble, with reading-order aware panel ordering.
 
-Results are cached per page (content-hashed, not URL-keyed), so revisiting a
-page is instant and free.
+Compatible translations are cached using page pixels and verified page identity,
+so revisiting them avoids another paid translation. Rendering may still require work.
 
 ## Install
 
@@ -48,12 +45,12 @@ page is instant and free.
 
 ### From source (any OS)
 
-Prerequisites: Node.js 20+ and a Chromium or Firefox browser.
+Prerequisites: Node.js 22 (the CI version), npm and a Chromium or Firefox browser.
 
 ```bash
 git clone https://github.com/c0ffeeOverdose/arn-manga-llm-translator.git
 cd arn-manga-llm-translator
-npm install
+npm ci
 node build.mjs            # Chromium → dist/
 node build.mjs --firefox  # Firefox → dist-firefox/
 ```
@@ -65,17 +62,17 @@ Then load it as an unpacked extension:
 - **Firefox:** `about:debugging#/runtime/this-firefox` → *Load Temporary
   Add-on* → select any file inside `dist-firefox/`
 
-KoharuLayout is the default on-device layout model. Saved model choices are kept.
-
-Models (~150 MB) download automatically on first use and are cached in
-IndexedDB — no bundling, nothing shipped in the repo.
+KoharuLayout (~150 MB) downloads on first use and is cached in IndexedDB.
+Optional OCR and cleanup models have separate downloads; install OCR files in
+Settings before selecting that workflow. Release packages contain no model weights;
+development builds can include local files from `models/`.
 
 ## Quick start
 
 1. Open the extension options → **Model**: pick a provider, paste your API key,
    choose a model, press **Test connection**.
 2. Choose **How the model reads text**: *Vision* (send the page image) or
-   *OCR* (send recognized text only — cheaper).
+   *OCR* (send recognized text only).
 3. Open any manga chapter, right-click the page → **Translate this page**.
    Use the popup to enable auto-translate, pre-translation ahead of your
    reading position, memory depth, and fonts.
@@ -90,21 +87,17 @@ to record and view chapter logs, error history, timing reports and model diagnos
 
 ## Optional: cloud inference
 
-If your machine can't run detection comfortably (older laptops, phones), the
-extension can send pages to an endpoint you run yourself. Two generated
-notebooks cover the options:
+To run inference outside the browser, use one of the generated notebooks:
 
-- **Run it in Colab** (`colab-server.ipynb`) — uses Colab's free T4 GPU
-  directly and exposes it through a Cloudflare quick tunnel. Nothing beyond a
-  Google sign-in; the URL is new every session and the VM dies after ~90 min
-  idle / 12 h, so re-run and paste again when it disconnects.
+- **Colab** (`colab-server.ipynb`) runs inference in the notebook's VM through a
+  Cloudflare quick tunnel. The URL changes each session; rerun the notebook and
+  update the endpoint after disconnection. GPU availability and session limits vary.
 
   [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/colab-server.ipynb)
 
-- **Deploy to Modal** (`cloud-setup.ipynb`) — one-click deploy of the same
-  detection+OCR pipeline to your own Modal account; stable URL. Starter is
-  free ($30/month of compute, no card to start) and scales to zero, so the
-  first page after a break waits ~1-2 min.
+- **Modal** (`cloud-setup.ipynb`) deploys to your Modal account with a stable URL.
+  It scales to zero when idle, so the first request after a break includes model
+  startup time. Check your account's current compute quota and pricing.
 
   [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/c0ffeeOverdose/arn-manga-llm-translator/blob/main/server/cloud-setup.ipynb)
 
@@ -116,24 +109,37 @@ Run all, paste the printed endpoint + key into Options → Model. See
 ```
 src/
   content/      page orchestration: queue, cache, rendering, status UI
-  iframe/       ONNX runtime host (extension-origin iframe): CTD + OCR + panel model
-  background/   service worker: LLM calls (5 protocols)
+  iframe/       ONNX runtime host: Koharu/CTD, panels, OCR and AI cleanup
+  background/   LLM transport, privileged RPCs and cache/chapter brokers
+  chapter/      independent chapter runner, scheduling, artifacts and context ledger
+  cache/        translation policy, image verification, IndexedDB and wire codec
   llm/          prompt building, adapters, character book
   options/      settings UI (model, pipeline, character book, fonts)
   popup/        per-site control center
 server/         optional cloud inference (run on Colab or deploy to Modal)
 scripts/        model export/quantize utilities
 tests/          unit tests (node --test)
+docs/           architecture, subsystem guides and focused references
 ```
+
+## Developer documentation
+
+[English](docs/README.md) | [ภาษาไทย](docs/th/README.md)
+
+Start with [architecture](docs/architecture.md) and the
+[translation pipeline](docs/translation-pipeline.md). The index links to subsystem guides.
 
 ## Development
 
 ```bash
 npx tsc --noEmit   # typecheck
 node --test "tests/**/*.test.mjs" # unit tests
-node build.mjs     # build both targets, see above
+node build.mjs     # Chromium
+node build.mjs --firefox # Firefox
 ```
 
+Setup, focused tests, build/release boundaries and debugging:
+[Development guide](docs/development.md).
 Contribution guidelines: [CONTRIBUTING.md](CONTRIBUTING.md).
 Security policy: [SECURITY.md](SECURITY.md).
 
