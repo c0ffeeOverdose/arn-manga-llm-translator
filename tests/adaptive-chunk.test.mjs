@@ -23,7 +23,8 @@ test('adaptive chunk: no fixed per-request region cap, the whole page is tried f
 test('adaptive chunk: a starved (parse) reply halves the size and retries the same regions', () => {
   assert.match(OCR, /kind === 'parse' && chunk\.length > 1/, 'only a parse-starved multi-region chunk splits');
   assert.match(OCR, /llmChunkSize = nextChunkSize\(chunk\.length\)/, 'the halved size is remembered');
-  assert.match(OCR, /work\.unshift\(\.\.\.regionChunks\(chunk, llmChunkSize\)\)/, 'the same regions retry smaller');
+  assert.match(OCR, /const splits = regionChunks\(chunk, llmChunkSize\)/, 'the same regions retry smaller');
+  assert.match(OCR, /work\.unshift\(\.\.\.splits\)/, 'the splits re-enter the work loop');
 });
 
 test('adaptive chunk: a fresh user intent re-probes the whole page', () => {

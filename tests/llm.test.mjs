@@ -322,6 +322,13 @@ test('missing-region prompts map sparse output IDs to the actual crop order', ()
   assert.ok(transcribe.user.includes('5 crop=2 image=3 page=1 marker=11'));
 });
 
+test('crops image guide names the row stamp so the model trusts it when counting', () => {
+  const crops = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, { textOnly: true }).system;
+  assert.ok(crops.includes('trust the stamp when counting'));
+  const page = buildPrompt([{ index: 1, source: '' }], EMPTY_CONTEXT, true, {}).system;
+  assert.ok(!page.includes('stamp'), 'page mode keeps its badge guide unchanged');
+});
+
 test('image subsets retain page prefixes and match sparse region IDs by crop position', () => {
   const regions = [{ index: 7, source: '' }, { index: 11, source: '' }, { index: 20, source: '' }];
   const requested = [regions[2], regions[0]];
@@ -1677,8 +1684,11 @@ test('prompt budget: rules + roster + pairs stay compact', () => {
   const p = buildPrompt(regions, { pairs, characters }, true, { textOnly: true, targetLang: 'Thai', maxPairs: 15 });
   // Same config on the pre-id prompt measured 5,483 chars (verbose roster) — the speaker
   // contract adds instructions while the compact roster shrinks each entry ~77%; a full
-  // 10-character book is where the new format actually saves.
-  assert.ok(all(p).length < 5700, `prompt grew past the budget: ${all(p).length}`);
+  // 10-character book is where the new format actually saves. Re-baselined 5,700 → 6,000
+  // for the crops row stamps (each crop carries its row number + one guide sentence;
+  // a 44-region merged request silently slipped rows after repetitive SFX, 2026-10-16):
+  // the guard still caps future bloat.
+  assert.ok(all(p).length < 6000, `prompt grew past the budget: ${all(p).length}`);
 });
 
 test('provider roles: system block rides each protocol with its cache hint', async () => {

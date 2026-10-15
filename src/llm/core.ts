@@ -98,7 +98,7 @@ export interface BuildOpts {
 export interface BuiltPrompt { system: string; user: string; }
 
 function imageGuide(opts: BuildOpts): string {
-    if (opts.textOnly) return '<images>Clean crops follow region-list order; crop/image positions are listed per row. Read only that crop. There is no full-page image: no surrounding artwork. Use the row number for output n.</images>\n';
+    if (opts.textOnly) return '<images>Clean crops follow region-list order; crop/image positions are listed per row. Each crop is stamped with its row number in the top-left corner — trust the stamp when counting. Read only that crop. There is no full-page image: no surrounding artwork. Use the row number for output n.</images>\n';
     const count = opts.pageCount ?? 1;
     const prefix = count > 1 ? `The first ${count} images are full pages` : 'First image = full page';
     const pages = count > 1 ? 'full pages' : 'full page';

@@ -388,7 +388,9 @@ export async function ensurePageDebugViews(state: PageState, original?: ImageBit
 // One reused canvas per document: per-crop canvas churn buys nothing, and the
 // sync encode path (see encode.ts) is what avoids the Android blob-encoder stall.
 let cropCanvas: HTMLCanvasElement | null = null;
-async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, pageImg: ImageData, timing: PageTimer): Promise<string> {
+// Row stamp: the prompt row number rides ON its crop (translucent corner pill)
+// so the model verifies counting instead of tracking bare image order.
+async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, pageImg: ImageData, timing: PageTimer, badge?: number): Promise<string> {
     const pad = Math.max(8, (box.y2 - box.y1) * 0.12);
     const r = timing.measure('cropExpand', () => expandCropToInk(pageImg, box, {
         x: Math.max(0, Math.floor(box.x1 - pad)), y: Math.max(0, Math.floor(box.y1 - pad)),
@@ -407,6 +409,21 @@ async function cropRegion(bitmap: ImageBitmap, box: DetBox, grayscale: boolean, 
         ctx.imageSmoothingQuality = 'high';
         ctx.filter = grayscale ? 'grayscale(1)' : 'none';
         ctx.drawImage(bitmap, x, y, w, h, 0, 0, cw, ch);
+        if (badge != null) {
+            ctx.filter = 'none';
+            const fs = Math.max(14, Math.min(30, Math.round(ch * 0.16)));
+            ctx.font = `bold ${fs}px sans-serif`;
+            const label = String(badge);
+            const pw = Math.ceil(ctx.measureText(label).width) + fs;
+            const ph = Math.round(fs * 1.4), m = 4;
+            ctx.fillStyle = 'rgba(0,0,0,0.55)';
+            const rr = (ctx as unknown as { roundRect?: (x: number, y: number, w: number, h: number, r: number) => void }).roundRect;
+            if (rr) { ctx.beginPath(); rr.call(ctx, m, m, pw, ph, ph / 2); ctx.fill(); }
+            else ctx.fillRect(m, m, pw, ph);
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText(label, m + pw / 2, m + ph / 2 + 1);
+        }
     });
     return timing.measure('cropEncode', () => canvasJpegB64(cropCanvas!, Math.min(0.95, pipeline.jpegQuality + 0.05)));
 }
@@ -492,6 +509,9 @@ export async function translateRegions(
         const vision = !ocr;
         const cropsOnly = vision && pipeline.textSource === 'crops';
         let imagesB64: string[] | undefined;
+        // Grayscale decision for crop rendering; assigned in the vision branch,
+        // read again when a starvation split re-cuts crops further below.
+        let gs = false;
         // Page-mode requests carry their annotated full page(s) FIRST; pageImages keeps that
         // prefix separate so chunked requests can re-send it with a subset of crops.
         const pageImages: string[] = [];
@@ -547,9 +567,13 @@ export async function translateRegions(
                 : Math.round(performance.now() - tOcr);
             checkpointOcr(regions.map(r => r.source));
         } else {
-            const gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
+            gs = pipeline.grayscaleBw && pageIsGrayscale(bitmap);
             const crops: string[] = [];
-            for (const box of det.boxes) crops.push(await cropRegion(bitmap, box, gs, pageImg, timing));
+            // Stamped with the prompt row (1..n on the first attempt); a starvation
+            // split re-stamps below because its rows are renumbered per chunk.
+            for (let i = 0; i < det.boxes.length; i++) {
+                crops.push(await cropRegion(bitmap, det.boxes[i], gs, pageImg, timing, regions[i].index));
+            }
             const numberedBoxes = det.boxes.map((box, i) => ({ ...box, marker: regions[i].index }));
             if (!cropsOnly) regions.forEach((region, i) => {
                 const page = segs.length > 1
@@ -752,7 +776,17 @@ export async function translateRegions(
                         llmChunkSize = nextChunkSize(chunk.length);
                         console.warn(`[mt:trace] chunk starved at ${chunk.length} regions — retrying as ${llmChunkSize}`);
                         opts?.onStarve?.();
-                        work.unshift(...regionChunks(chunk, llmChunkSize));
+                        const splits = regionChunks(chunk, llmChunkSize);
+                        // Re-stamp the split crops with their new chunk-local rows: the old
+                        // images carry whole-request numbers the retry rows no longer use.
+                        if (vision && imagesB64?.length) {
+                            for (const part of splits) {
+                                for (let i = 0; i < part.length; i++) {
+                                    cropOf.set(part[i].index, await cropRegion(bitmap, det.boxes[part[i].index - 1], gs, pageImg, timing, i + 1));
+                                }
+                            }
+                        }
+                        work.unshift(...splits);
                         continue;
                     }
                     throw err;
