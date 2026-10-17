@@ -251,6 +251,43 @@ class BalloonGeometry(unittest.TestCase):
             jittered = [dict(c, y1=c["y1"] + dy, y2=c["y2"] + dy) if i >= 2 else c for i, c in enumerate(comps(0))]
             self.assertIsNotNone(split_connected_clusters(jittered, parent, 220, 180), f"±1px y jitter ({dy}) must not stop the split")
 
+    def test_vertical_column_strip_flat_stroke_and_specks_do_not_false_split(self):
+        from balloon_surface import split_connected_clusters
+
+        col_strip = [
+            {"x1": 47, "y1": 39, "x2": 67, "y2": 189, "conf": 0.9},
+            {"x1": 74, "y1": 21, "x2": 94, "y2": 41, "conf": 0.9},
+            {"x1": 75, "y1": 42, "x2": 93, "y2": 63, "conf": 0.9},
+            {"x1": 75, "y1": 64, "x2": 94, "y2": 109, "conf": 0.9},
+            {"x1": 75, "y1": 112, "x2": 93, "y2": 129, "conf": 0.9},
+            {"x1": 75, "y1": 131, "x2": 93, "y2": 152, "conf": 0.9},
+            {"x1": 74, "y1": 154, "x2": 93, "y2": 171, "conf": 0.9},
+        ]
+        self.assertIsNone(
+            split_connected_clusters(col_strip, {"x1": 47, "y1": 21, "x2": 94, "y2": 189, "conf": 0.9}, 240, 300),
+            "a narrow vertical column run is not display lettering",
+        )
+        flat_stroke_col = [
+            {"x1": 50, "y1": 20, "x2": 77, "y2": 88, "conf": 0.9},
+            {"x1": 50, "y1": 99, "x2": 77, "y2": 105, "conf": 0.9},
+            {"x1": 50, "y1": 118, "x2": 77, "y2": 210, "conf": 0.9},
+        ]
+        self.assertIsNone(
+            split_connected_clusters(flat_stroke_col, {"x1": 50, "y1": 20, "x2": 77, "y2": 210, "conf": 0.9}, 240, 300),
+            "a flat stroke in a vertical column links across its normal em-box gap",
+        )
+        line_with_specks = [
+            {"x1": 30, "y1": 40, "x2": 34, "y2": 45, "conf": 0.9},
+            {"x1": 38, "y1": 40, "x2": 42, "y2": 45, "conf": 0.9},
+            {"x1": 25, "y1": 48, "x2": 95, "y2": 70, "conf": 0.9},
+            {"x1": 125, "y1": 40, "x2": 129, "y2": 45, "conf": 0.9},
+            {"x1": 120, "y1": 48, "x2": 190, "y2": 70, "conf": 0.9},
+        ]
+        self.assertIsNone(
+            split_connected_clusters(line_with_specks, {"x1": 25, "y1": 40, "x2": 190, "y2": 70, "conf": 0.9}, 240, 300),
+            "specks neither drag medianH down nor inflate a single line into a two-line block",
+        )
+
 
 class GroupingBeforeOcr(unittest.IsolatedAsyncioTestCase):
     async def test_actual_page_path_splits_physical_twins_before_ocr_and_patch_indices(self):

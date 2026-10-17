@@ -101,7 +101,7 @@ test('model selection migrates defensively and survives quality presets', () => 
 });
 
 test('CTD cache identity ignores Koharu settings; Koharu model and thresholds separate checkpoints', () => {
-    const original = '["Thai","crops","baberu","rtl",0.35,12,0.2,true,false,false,false,null,0,"local",["jpn","eng"],"",false,1280,420,0.85,true,true,true,true,15,10,"auto","none",3,"tile40"]';
+    const original = '["Thai","crops","baberu","rtl",0.35,12,0.2,true,false,false,false,null,0,"local",["jpn","eng"],"",false,1280,420,0.85,true,true,true,true,15,10,"auto","none",3,"tile41"]';
     assert.equal(settingsFingerprint({ layoutModel: 'ctd' }), original);
     assert.equal(settingsFingerprint({ layoutModel: 'ctd', koharuTextConf: .5 }), original);
     const fp = settingsFingerprint({ layoutModel: 'koharu' });

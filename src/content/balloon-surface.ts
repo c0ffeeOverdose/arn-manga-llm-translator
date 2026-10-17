@@ -172,11 +172,13 @@ function maskComponents(mask: Uint8Array, W: number, H: number, box: DetBox): De
 // The predicate is shared with the lettering extraction (which needs the raw neighbourhood).
 function textCompLinked(a: DetBox, b: DetBox): boolean {
     const ha = a.y2 - a.y1, hb = b.y2 - b.y1, unit = Math.min(ha, hb);
+    const wa = a.x2 - a.x1, wb = b.x2 - b.x1;
     const xGap = Math.max(a.x1 - b.x2, b.x1 - a.x2, 0);
     const yGap = Math.max(a.y1 - b.y2, b.y1 - a.y2, 0);
     const xOverlap = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
     const sameRow = Math.abs((a.y1 + a.y2) - (b.y1 + b.y2)) <= 1.2 * unit && xGap <= 0.9 * unit;
-    const stacked = xGap === 0 && xOverlap >= 0.5 * Math.min(a.x2 - a.x1, b.x2 - b.x1) && yGap <= 0.6 * unit;
+    const stackUnit = Math.max(unit, Math.min(wa, wb, Math.max(ha, hb)));
+    const stacked = xGap === 0 && xOverlap >= 0.5 * Math.min(wa, wb) && yGap <= 0.6 * stackUnit;
     return sameRow || stacked;
 }
 export function clusterTextComponents(comps: DetBox[]): DetBox[][] {
@@ -190,16 +192,27 @@ export function clusterTextComponents(comps: DetBox[]): DetBox[][] {
     return [...groups.values()];
 }
 
+// Display lettering is oversized in both dimensions; a connected vertical column strip
+// is tall but only one glyph column wide and must stay with its paragraph.
+function isLettering(c: DetBox, medianH: number): boolean {
+    return c.y2 - c.y1 >= 2.5 * medianH && c.x2 - c.x1 >= 1.8 * medianH;
+}
+
+function blockHeight(cs: DetBox[], medianH: number): number {
+    const main = cs.filter(c => c.y2 - c.y1 > 0.7 * medianH);
+    const use = main.length ? main : cs;
+    return Math.max(...use.map(c => c.y2)) - Math.min(...use.map(c => c.y1));
+}
+
 // Stray fragments and short dot runs must not veto a split or become their own region:
 // blocks that cannot stand alone (a single component, or a cluster under the block floor)
 // attach to the nearest full block when close. Display-lettering scale components stand
 // alone by design — they are the SFX the split is meant to separate.
 function attachOrphans(clusters: DetBox[][], medianH: number): DetBox[][] {
-    const height = (cs: DetBox[]) => Math.max(...cs.map(c => c.y2)) - Math.min(...cs.map(c => c.y1));
-    const out = clusters.filter(cs => cs.length > 1 && height(cs) >= 1.8 * medianH);
+    const out = clusters.filter(cs => cs.length > 1 && blockHeight(cs, medianH) >= 1.8 * medianH);
     for (const cs of clusters) {
         if (out.includes(cs)) continue;
-        if (cs.length === 1 && cs[0].y2 - cs[0].y1 >= 2.5 * medianH) { out.push(cs); continue; }
+        if (cs.length === 1 && isLettering(cs[0], medianH)) { out.push(cs); continue; }
         // Dust (a sliver far below glyph scale) attaches from farther out: a 4px speck
         // floating between blocks must not veto the split.
         const dusty = cs.some(c => c.y2 - c.y1 <= 0.5 * medianH);
@@ -226,7 +239,9 @@ function attachOrphans(clusters: DetBox[][], medianH: number): DetBox[][] {
 export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: number, H: number, sib: number,
     accept?: (clusters: DetBox[][]) => boolean): DetBox[] | null {
     if (comps.length < 2) return null;
-    const heights = comps.map(c => c.y2 - c.y1).sort((a, b) => a - b);
+    const rawHeights = comps.map(c => c.y2 - c.y1).sort((a, b) => a - b);
+    const glyphHeights = rawHeights.filter(h => h >= 12);
+    const heights = glyphHeights.length >= 2 ? glyphHeights : rawHeights;
     const medianH = heights[heights.length >> 1];
     const clusters = attachOrphans(clusterTextComponents(comps), medianH);
     // Display lettering (SFX scale) glued to a dialogue block is its own region: the big
@@ -235,7 +250,7 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
     // grammar neighbour is the lettering component itself).
     const split: DetBox[][] = [];
     for (const cs of clusters) {
-        const big = cs.filter(c => c.y2 - c.y1 >= 2.5 * medianH);
+        const big = cs.filter(c => isLettering(c, medianH));
         if (!big.length || cs.length - big.length < 2) { split.push(cs); continue; }
         const rest = cs.filter(c => !big.includes(c));
         const nearBig = (c: DetBox) => big.some(b => {
@@ -262,8 +277,8 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
     // single OVERSIZED component is display lettering (SFX scale, several times the block's
     // glyphs): keeping it in the box would erase it with the neighbours' cleanup, so it
     // becomes its own (keep-path) region instead.
-    const oversized = (cs: DetBox[]) => cs.length === 1 && cs[0].y2 - cs[0].y1 >= 2.5 * medianH;
-    if (split.some((cs, i) => cs.length < 2 ? !oversized(cs) : boxes[i].y2 - boxes[i].y1 < 1.8 * medianH)) return null;
+    const oversized = (cs: DetBox[]) => cs.length === 1 && isLettering(cs[0], medianH);
+    if (split.some(cs => cs.length < 2 ? !oversized(cs) : blockHeight(cs, medianH) < 1.8 * medianH)) return null;
     // A mid-column seam is not a block boundary: two substantial blocks that share almost the
     // same x-range and sit only about a line apart are rows of one column of text (a single
     // missing row link must not cut a paragraph in half). Lettering pieces exempt themselves
@@ -273,7 +288,7 @@ export function splitConnectedClusters(comps: DetBox[], parent: DetBox, W: numbe
         const overlap = Math.min(boxes[i].x2, boxes[j].x2) - Math.max(boxes[i].x1, boxes[j].x1);
         const gap = Math.max(boxes[i].y1 - boxes[j].y2, boxes[j].y1 - boxes[i].y2, 0);
         if (overlap > 0.6 * Math.min(boxes[i].x2 - boxes[i].x1, boxes[j].x2 - boxes[j].x1)
-            && gap <= 1.2 * medianH) return null;
+            && gap <= 1.3 * medianH) return null;
     }
     const frameFor = (b: DetBox, i: number): { x1: number; y1: number; x2: number; y2: number } | null => {
         const others = comps.filter(c => !split[i].includes(c));

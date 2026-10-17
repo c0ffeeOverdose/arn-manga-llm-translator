@@ -108,12 +108,15 @@ def balloon_surface(rgb, box, mask, cache, search=None):
 
 def _text_comp_linked(a, b):
     """Shared neighbourhood predicate (cluster grammar + lettering extraction). Mirrors TS."""
-    unit = min(a["y2"] - a["y1"], b["y2"] - b["y1"])
+    ha, hb = a["y2"] - a["y1"], b["y2"] - b["y1"]
+    wa, wb = a["x2"] - a["x1"], b["x2"] - b["x1"]
+    unit = min(ha, hb)
     x_gap = max(a["x1"] - b["x2"], b["x1"] - a["x2"], 0)
     y_gap = max(a["y1"] - b["y2"], b["y1"] - a["y2"], 0)
     x_overlap = min(a["x2"], b["x2"]) - max(a["x1"], b["x1"])
     same_row = abs((a["y1"] + a["y2"]) - (b["y1"] + b["y2"])) <= 1.2 * unit and x_gap <= 0.9 * unit
-    stacked = x_gap == 0 and x_overlap >= 0.5 * min(a["x2"] - a["x1"], b["x2"] - b["x1"]) and y_gap <= 0.6 * unit
+    stack_unit = max(unit, min(wa, wb, max(ha, hb)))
+    stacked = x_gap == 0 and x_overlap >= 0.5 * min(wa, wb) and y_gap <= 0.6 * stack_unit
     return same_row or stacked
 
 
@@ -138,18 +141,27 @@ def _cluster_text_components(comps):
     return list(groups.values())
 
 
+def _is_lettering(c, median_h):
+    """Display lettering is oversized in both dimensions; a connected vertical column strip
+    is tall but only one glyph column wide and must stay with its paragraph. Mirrors TS."""
+    return c["y2"] - c["y1"] >= 2.5 * median_h and c["x2"] - c["x1"] >= 1.8 * median_h
+
+
+def _block_height(cs, median_h):
+    main = [c for c in cs if c["y2"] - c["y1"] > 0.7 * median_h]
+    use = main if main else cs
+    return max(c["y2"] for c in use) - min(c["y1"] for c in use)
+
+
 def _attach_orphans(clusters, median_h):
     """A stray fragment or short dot run must not veto a split or become its own region:
     blocks that cannot stand alone attach to the nearest full block when close;
     display-lettering scale components stand alone. Mirrors attachOrphans() in TS."""
-    def height(cs):
-        return max(c["y2"] for c in cs) - min(c["y1"] for c in cs)
-
-    out = [cs for cs in clusters if len(cs) > 1 and height(cs) >= 1.8 * median_h]
+    out = [cs for cs in clusters if len(cs) > 1 and _block_height(cs, median_h) >= 1.8 * median_h]
     for cs in clusters:
         if any(cs is t for t in out):
             continue
-        if len(cs) == 1 and cs[0]["y2"] - cs[0]["y1"] >= 2.5 * median_h:
+        if len(cs) == 1 and _is_lettering(cs[0], median_h):
             out.append(cs)
             continue
         # Dust (a sliver far below glyph scale) attaches from farther out: a 4px speck
@@ -180,7 +192,9 @@ def split_connected_clusters(comps, parent, w, h, accept=None):
     Mirrors splitConnectedClusters() in TS."""
     if len(comps) < 2:
         return None
-    heights = sorted(c["y2"] - c["y1"] for c in comps)
+    raw_heights = sorted(c["y2"] - c["y1"] for c in comps)
+    glyph_heights = [ch for ch in raw_heights if ch >= 12]
+    heights = glyph_heights if len(glyph_heights) >= 2 else raw_heights
     median_h = heights[len(heights) // 2]
     clusters = _attach_orphans(_cluster_text_components(comps), median_h)
 
@@ -189,7 +203,7 @@ def split_connected_clusters(comps, parent, w, h, accept=None):
     # components that hang off the lettering alone. Mirrors TS.
     split = []
     for cs in clusters:
-        big = [c for c in cs if c["y2"] - c["y1"] >= 2.5 * median_h]
+        big = [c for c in cs if _is_lettering(c, median_h)]
         if not big or len(cs) - len(big) < 2:
             split.append(cs)
             continue
@@ -221,10 +235,10 @@ def split_connected_clusters(comps, parent, w, h, accept=None):
     # (SFX scale, several times the block's glyphs): keeping it in the box would erase it with
     # the neighbours' cleanup, so it splits off as its own (keep-path) region. Mirrors TS.
     def _oversized(cs):
-        return len(cs) == 1 and cs[0]["y2"] - cs[0]["y1"] >= 2.5 * median_h
+        return len(cs) == 1 and _is_lettering(cs[0], median_h)
 
-    if any((not _oversized(cs)) if len(cs) < 2 else (b["y2"] - b["y1"] < 1.8 * median_h)
-           for cs, b in zip(split, boxes)):
+    if any((not _oversized(cs)) if len(cs) < 2 else (_block_height(cs, median_h) < 1.8 * median_h)
+           for cs in split):
         return None
     # A mid-column seam is not a block boundary: two substantial blocks that share almost the
     # same x-range and sit about a line apart are rows of one column of text. Lettering pieces
@@ -236,7 +250,7 @@ def split_connected_clusters(comps, parent, w, h, accept=None):
             overlap = min(boxes[i]["x2"], boxes[j]["x2"]) - max(boxes[i]["x1"], boxes[j]["x1"])
             gap = max(boxes[i]["y1"] - boxes[j]["y2"], boxes[j]["y1"] - boxes[i]["y2"], 0)
             if (overlap > 0.6 * min(boxes[i]["x2"] - boxes[i]["x1"], boxes[j]["x2"] - boxes[j]["x1"])
-                    and gap <= 1.2 * median_h):
+                    and gap <= 1.3 * median_h):
                 return None
 
     def soft(clearance):
